@@ -1,0 +1,52 @@
+WOW-BG3 benilla patch 0070: the party's figures hidden while BG3 draws a companion's dialog.
+
+While bg3screen.txt says "1 Dialogue" (RenderScreen.lua) the figures are hidden; BG3's own actors are
+composited over WoW's world, which WoW draws from BG3's dialog camera.
+
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -830,6 +830,8 @@
+     skin_cost: (u128, u32),
+     /// The root last seen and the WoW frame it last moved on, for the trace's walking gate.
+     trace_root: (Vec3, u64),
++    /// Patch 0070: a companion's dialog is BG3's own picture: the figures hidden meanwhile.
++    in_dialog: bool,
+     /// The alpha test of her cut-out materials ([`BG3_CUTOFF`], `WOW_BG3_TAV_CUTOFF`).
+     cutoff: f32,
+     cache: MaterialCache,
+@@ -1017,6 +1019,7 @@
+         trace,
+         skin_cost: (0, 0),
+         trace_root: (Vec3::ZERO, 0),
++        in_dialog: false,
+         cutoff,
+         cache: MaterialCache::default(),
+         material: None,
+@@ -2096,6 +2099,27 @@
+         party_feet.0.clear();
+         return;
+     };
++    // Patch 0070: a companion's dialog (`$WOW_BG3_LINK_DIR/bg3screen.txt` "1 Dialogue", RenderScreen.lua)
++    // is drawn by BG3 itself over WoW's world: its timeline places and turns the actors, which no copied
++    // pose shows (WoW drew Astarion from behind on his usual spot, his face and mouth never seen). The
++    // figures are hidden meanwhile, checked every 10 WoW frames; the next pose after it shows them again.
++    if *wow_frame % 10 == 1 {
++        let link = std::env::var_os("WOW_BG3_LINK_DIR").map(PathBuf::from);
++        let line = link.and_then(|l| std::fs::read_to_string(l.join("bg3screen.txt")).ok()).unwrap_or_default();
++        d.in_dialog = line.starts_with("1 Dialogue");
++    }
++    if d.in_dialog {
++        let figs: Vec<Entity> = std::iter::once(root).chain(d.figs.iter().map(|f| f.root)).collect();
++        for e in figs {
++            if let Ok((_, mut vis)) = roots.get_mut(e) {
++                if *vis != Visibility::Hidden {
++                    *vis = Visibility::Hidden;
++                }
++            }
++        }
++        d.track.drawn = None;
++        return;
++    }
+     // Patch 0013: in lockstep the pose comes with BG3's present packet (`wowbg3_pace`) and is drawn
+     // as it is, with the camera of the same present.
+     let packet = pace.as_deref().and_then(|p| p.current.as_ref()).map(|k| k.pose.clone());

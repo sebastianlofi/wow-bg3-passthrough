@@ -1,0 +1,1535 @@
+WOW-BG3 benilla patch 0034: BG3's figures skinned on the GPU.
+A third companion broke the 82 fps lockstep: wowbg3_tav skinned every vertex of every figure on the
+CPU each frame and uploaded them. Now each mesh goes up once per plan in BG3's bind pose with BG3's
+weights and bones as WoW's joint attributes, holds a slot of benilla's own rig palette (the lane WoW's
+units skin from), and each pose writes only the slot: the figure frame (world transform and world
+mode's mapping, from the figure's root) and BG3's own bone palette (wowbg3_tav rig_rows). rig_palette
+gains RigPalettes::write_rows (caller-composed rows; the slot's origin word w = 1); wow_model.wgsl
+skins such a slot as BG3's SkinningCompute does: F.B.[p,1], tangent frames turned by the rotation of
+the row-normalised blend (bg3_bone_rotation; the CPU path now does the same). WOW_BG3_TAV_SKIN=cpu
+keeps the CPU path (A/B, rollback); =ab adds an in-game A/B (skin-ab request); WOW_BG3_TAV_SKIN_CHECK=N
+checks every N-th pose against the CPU path vertex by vertex. LODs: with a layer that flags which
+planned meshes BG3 drew each frame (the LOD format research), exactly those are drawn; else LOD 0.
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -61,6 +61,27 @@
+ //! `blob_shadow` lays a WoW blob shadow under each. Poses, idle, walking, running and fighting, are
+ //! BG3's own, copied like hers every frame. A rigid mesh borrows the skin of a skinned mesh of its own
+ //! figure only.
++//!
++//! Patch 0034 (a third companion broke the 82 fps lockstep; benilla
++//! skinned about 1.2 ms of vertices per figure on the CPU every frame and uploaded them all): skinned
++//! on the GPU, through the rig palette WoW's own units skin from (`benilla_world::rig_palette`,
++//! `wow_model.wgsl`'s `WOW_RIG_SKIN`). Each mesh goes up once per plan in BG3's bind pose (positions,
++//! normals and tangents in model space, metres; BG3's four u8 weights over 255 and its bones + 1 as
++//! WoW's joint attributes; a rigid mesh as one identity block) and holds a palette slot (a `RigSkin` on
++//! its entity). Each pose writes only the slots ([`rig_rows`]): block 0 the figure frame
++//! `F = [L·q·S | L·(t − anchor)]` (the record's world rotation, scale and translation, world mode's
++//! mirrored mapping `L` into Bevy yards, from the BG3 point the figure's root stands for), blocks 1..
++//! BG3's own palette rows, and the root as the slot's origin with `w` = 1. The vertex stage blends the
++//! weighted blocks into `B` and draws `F·B·[p, 1]` from the origin: the CPU path's vertex, without its
++//! large numbers. Positions, normals and tangents follow BG3's own skinning (`SkinningCompute.bshd`,
++//! [`bg3_bone_rotation`]): the tangent frame turns by the blend's rotation, in both paths (the CPU path
++//! used to turn it by the blend itself). Roots, ground locks, ground shade, blob shadows, [`TavFeet`]
++//! and [`PartyFeet`] are as before: none of them read her vertices. `WOW_BG3_TAV_SKIN=cpu` skins on the
++//! CPU (A/B, rollback); `ab` adds a CPU copy of each mesh for the in-game A/B ([`AbBurst`]);
++//! `WOW_BG3_TAV_SKIN_CHECK=<n>` checks every n-th pose against the CPU path vertex by vertex
++//! ([`skin_check`]). A plan whose slots do not fit the palette skins on the CPU. LODs
++//! (the LOD format research): with a layer that flags per pose record whether BG3 drew the
++//! mesh in that frame's G-buffer pass, exactly those meshes are drawn (the LOD BG3 draws); else LOD 0.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -72,7 +93,7 @@
+ use benilla_world::model_render::{model_material, MaterialCache, ShadeSel};
+ use bevy::asset::RenderAssetUsages;
+ use bevy::camera::visibility::NoFrustumCulling;
+-use bevy::mesh::{Indices, MeshTag, PrimitiveTopology};
++use bevy::mesh::{Indices, MeshTag, PrimitiveTopology, VertexAttributeValues};
+ use bevy::prelude::*;
+ 
+ /// Metres to the yard (world mode's scale, `WorldMode.lua`).
+@@ -89,6 +110,17 @@
+ const START_INTERVAL: f64 = 1.0 / 30.0;
+ const INTERVAL_RANGE: (f64, f64) = (1.0 / 240.0, 0.2);
+ 
++/// Patch 0034: where her meshes are skinned (`WOW_BG3_TAV_SKIN`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum SkinMode {
++    /// On the GPU from the rig palette (the default).
++    Gpu,
++    /// On the CPU every pose, as before patch 0034 (`cpu`).
++    Cpu,
++    /// On the GPU, with a CPU-skinned copy of each mesh for the in-game A/B (`ab`, [`AbBurst`]).
++    Ab,
++}
++
+ /// `.tvt` and `tavtex.txt` flags: alpha test, hidden, linear data (normal and surface maps).
+ pub(crate) const TVT_ALPHA_TEST: u32 = 1;
+ pub(crate) const TVT_HIDDEN: u32 = 2;
+@@ -102,6 +134,9 @@
+     pub(crate) part: u32,
+     /// Patch 0033: whose figure it is (0 the hero, 1... her companions).
+     pub(crate) figure: u32,
++    /// Patch 0034: its level of detail (BG3's ObjectDescs LOD byte, 0 the finest; TVM1 record bytes
++    /// 60..64, 0 in files before LODs were planned; the LOD format research).
++    pub(crate) lod: u32,
+     pub(crate) pos: Vec<Vec3>,
+     pub(crate) nrm: Vec<Vec3>,
+     /// Bind-pose tangents (model space, along +U); `w` = the handedness that makes
+@@ -116,8 +151,8 @@
+     pub(crate) skin_from: Option<u64>,
+ }
+ 
+-/// A `tavmesh.bin` header's mesh records: (key, kind, part, vertex count, index count, figure).
+-type MeshHeads = Vec<(u64, u32, u32, u32, u32, u32)>;
++/// A `tavmesh.bin` header's mesh records: (key, kind, part, vertex count, index count, figure, LOD).
++type MeshHeads = Vec<(u64, u32, u32, u32, u32, u32, u32)>;
+ 
+ /// The plan number, mapping and mesh records of a `tavmesh.bin` without decoding its blobs.
+ pub(crate) fn mesh_heads(b: &[u8]) -> Option<(u32, [f32; 3], [f32; 3], MeshHeads)> {
+@@ -132,7 +167,15 @@
+     let heads = (0..n)
+         .map(|i| {
+             let h = 40 + 64 * i;
+-            Some((u64_at(b, h)?, u32_at(b, h + 8)?, u32_at(b, h + 12)?, u32_at(b, h + 16)?, u32_at(b, h + 20)?, u32_at(b, h + 56)?))
++            Some((
++                u64_at(b, h)?,
++                u32_at(b, h + 8)?,
++                u32_at(b, h + 12)?,
++                u32_at(b, h + 16)?,
++                u32_at(b, h + 20)?,
++                u32_at(b, h + 56)?,
++                u32_at(b, h + 60)?,
++            ))
+         })
+         .collect::<Option<MeshHeads>>()?;
+     Some((seq, f3(16)?, f3(28)?, heads))
+@@ -142,7 +185,8 @@
+ pub(crate) fn same_meshes(f: &MeshFile, heads: &MeshHeads) -> bool {
+     f.meshes.len() == heads.len()
+         && f.meshes.iter().zip(heads).all(|(m, h)| {
+-            (m.key, m.kind, m.part, m.pos.len() as u32, m.idx.len() as u32, m.figure) == (h.0, h.1, h.2, h.3, h.4, h.5)
++            (m.key, m.kind, m.part, m.pos.len() as u32, m.idx.len() as u32, m.figure, m.lod)
++                == (h.0, h.1, h.2, h.3, h.4, h.5, h.6)
+         })
+ }
+ 
+@@ -327,6 +371,8 @@
+         let sizes = [u[8] as usize, u[9] as usize, u[10] as usize, u[11] as usize];
+         // Patch 0033: the figure in the record's spare word (0 in files before the party).
+         let figure = u32_at(b, h + 56)?;
++        // Patch 0034: the LOD in the record's last word (0 in files before LODs were planned).
++        let lod = u32_at(b, h + 60)?;
+         let mut blob = [&b[0..0]; 4];
+         for k in 0..4 {
+             blob[k] = b.get(at..at + sizes[k])?;
+@@ -380,7 +426,7 @@
+             return None;
+         }
+         let (nrm, tan) = qtangent_frames(&pos, &uv, &qt, &idx);
+-        meshes.push(TavMesh { key, kind, part, figure, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
++        meshes.push(TavMesh { key, kind, part, figure, lod, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
+     }
+     borrow_skin(&mut meshes);
+     Some(MeshFile { seq, centre, wow, meshes })
+@@ -487,23 +533,23 @@
+         let (mut lp, mut ln) = (m.pos[v], m.nrm[v]);
+         let mut lt = m.tan.get(v).map_or(Vec3::X, |t| Vec3::new(t[0], t[1], t[2]));
+         if skinned {
+-            let (mut sp, mut sn, mut st) = (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO);
++            // Patch 0034: as BG3's own skinning does it ([`bg3_bone_rotation`]): the four weighted
++            // palette rows summed (bytes over 255, not renormalised), the position through the blend,
++            // the tangent frame turned by the blend's rotation (before: by the blend itself, which
++            // shortens and tilts normals where bones blend).
++            let mut r = [Vec4::ZERO; 3];
+             for k in 0..4 {
+                 let w = m.weights[v][k];
+-                if w <= 0.0 {
+-                    continue;
+-                }
+                 let b = &p.palette[(m.bones[v][k] as usize).min(p.palette.len() - 1)];
+-                let r0 = Vec3::new(b[0], b[1], b[2]);
+-                let r1 = Vec3::new(b[4], b[5], b[6]);
+-                let r2 = Vec3::new(b[8], b[9], b[10]);
+-                sp += w * Vec3::new(r0.dot(lp) + b[3], r1.dot(lp) + b[7], r2.dot(lp) + b[11]);
+-                sn += w * Vec3::new(r0.dot(ln), r1.dot(ln), r2.dot(ln));
+-                st += w * Vec3::new(r0.dot(lt), r1.dot(lt), r2.dot(lt));
+-            }
+-            lp = sp;
+-            ln = sn;
+-            lt = st;
++                for (i, row) in r.iter_mut().enumerate() {
++                    *row += w * Vec4::new(b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]);
++                }
++            }
++            let at = lp.extend(1.0);
++            lp = Vec3::new(r[0].dot(at), r[1].dot(at), r[2].dot(at));
++            let turn = bg3_bone_rotation([r[0].truncate(), r[1].truncate(), r[2].truncate()]);
++            ln = turn * ln;
++            lt = turn * lt;
+         }
+         pos.push(q * (lp * s) + t);
+         nrm.push((q * (ln / s)).normalize_or_zero());
+@@ -511,6 +557,36 @@
+     }
+ }
+ 
++/// Patch 0034: the rotation BG3's skinning turns a vertex's tangent frame by, for a blended bone matrix
++/// (rows of its 3×3 part). BG3's compute skinning (`Shaders/Vulkan/SkinningCompute.bshd` in
++/// EngineShaders.pak; per vertex: four palette rows `3×4` weighted by bytes / 255 and summed, the
++/// position `blend·[p, 1]`) normalises each row, converts the matrix to a quaternion (by the trace when
++/// positive, else by its largest diagonal element) and multiplies the vertex's qtangent by it
++/// (`q·q_vertex`), so each axis of the frame, normal and tangent, turns by it. Unit length here, as the
++/// qtangent's axes come from a normalised quaternion ([`quat_axes`]). Mirrored in `wow_model.wgsl`.
++pub(crate) fn bg3_bone_rotation(rows: [Vec3; 3]) -> Quat {
++    let [r0, r1, r2] = rows.map(Vec3::normalize_or_zero);
++    let t = r0.x + r1.y + r2.z;
++    let q = if t > 0.0 {
++        let s = (t + 1.0).sqrt();
++        let s2 = 2.0 * s;
++        Vec4::new((r2.y - r1.z) / s2, (r0.z - r2.x) / s2, (r1.x - r0.y) / s2, 0.5 * s)
++    } else if r0.x > r1.y && r0.x > r2.z {
++        let s = (1.0 + r0.x - r1.y - r2.z).sqrt();
++        let s2 = 2.0 * s;
++        Vec4::new(0.5 * s, (r0.y + r1.x) / s2, (r0.z + r2.x) / s2, (r2.y - r1.z) / s2)
++    } else if r1.y > r2.z {
++        let s = (1.0 + r1.y - r0.x - r2.z).sqrt();
++        let s2 = 2.0 * s;
++        Vec4::new((r0.y + r1.x) / s2, 0.5 * s, (r1.z + r2.y) / s2, (r0.z - r2.x) / s2)
++    } else {
++        let s = (1.0 + r2.z - r0.x - r1.y).sqrt();
++        let s2 = 2.0 * s;
++        Vec4::new((r0.z + r2.x) / s2, (r1.z + r2.y) / s2, 0.5 * s, (r1.x - r0.y) / s2)
++    };
++    Quat::from_vec4(q).normalize()
++}
++
+ /// Two pose records blended at `t` (0 = `a`, 1 = `b`, above 1 extrapolated): object rotations by
+ /// normalised lerp along the shorter arc, translations, scales and bone palettes (3×4 rows)
+ /// linearly, record by record (by mesh key). A record or palette only in `b` is `b`'s.
+@@ -616,6 +692,16 @@
+     mesh: Handle<Mesh>,
+     /// Its look is in place: maps from `tavtex.txt`, or deliberately hidden.
+     dressed: bool,
++    /// Patch 0034: its rig slot when skinned on the GPU.
++    rig: Option<PartRig>,
++}
++
++/// Patch 0034: a GPU-skinned mesh's rig slot (the `RigSkin` on its entity frees it with the entity),
++/// the rows it takes ([`rig_bones`]), and in the `ab` mode a CPU-skinned copy of the mesh.
++struct PartRig {
++    slot: u16,
++    bones: u32,
++    cpu_mesh: Option<Handle<Mesh>>,
+ }
+ 
+ /// What a mesh key last looked like, carried over plans so a persisting mesh never flashes.
+@@ -670,6 +756,14 @@
+     logged: u64,
+     /// `tavtex.txt` (link/tools/tavtex.py): its stamp, and the textures loaded so far by file.
+     tex_stamp: Option<(SystemTime, u32)>,
++    /// Patch 0034: maps being decoded off the main thread, maps that failed, and whether the file must
++    /// be applied again next frame (maps still pending).
++    tex_jobs: HashMap<(String, Role), bevy::tasks::Task<Option<(Image, bool)>>>,
++    tex_failed: HashSet<(String, Role)>,
++    tex_more: bool,
++    /// Patch 0034: per figure and visual (part), the LOD and the meshes WoW drew the last time BG3 drew
++    /// any mesh of that visual (see the LOD gate in [`apply_pose`]).
++    lod_held: HashMap<(u32, u32), (u32, Vec<u64>)>,
+     textures: HashMap<(String, Role), Handle<Image>>,
+     looks: HashMap<u64, Look>,
+     surface_mats: HashMap<LookKey, Handle<WowModelMaterial>>,
+@@ -692,6 +786,15 @@
+     early: u64,
+     kept_plans: u64,
+     totals: [u64; 2],
++    /// Patch 0034: `WOW_BG3_TAV_SKIN`; whether the loaded plan skins on the GPU; the skin check's
++    /// period in poses (`WOW_BG3_TAV_SKIN_CHECK`, 0 off); the A/B burst running; the posing time per
++    /// drawn pose since the last log line (µs); the last pose's rig load (meshes, rows).
++    skin: SkinMode,
++    gpu: bool,
++    check: u32,
++    ab: Option<AbBurst>,
++    skin_us: Vec<u32>,
++    rig_load: (usize, usize),
+ }
+ 
+ pub(crate) fn build(app: &mut App) {
+@@ -720,6 +823,17 @@
+         if flip_y { "flipped" } else { "as baked" },
+         if smooth { "blended at WoW's frame rate" } else { "as they come" }
+     );
++    // Patch 0034: GPU skinning unless `WOW_BG3_TAV_SKIN=cpu` (or `ab`, GPU with the A/B's CPU copies).
++    let skin = match std::env::var("WOW_BG3_TAV_SKIN").ok().as_deref().map(str::trim) {
++        Some("cpu") => SkinMode::Cpu,
++        Some("ab") => SkinMode::Ab,
++        _ => SkinMode::Gpu,
++    };
++    let check = std::env::var("WOW_BG3_TAV_SKIN_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
++    info!(
++        "wowbg3 tav: skinning {skin:?} (WOW_BG3_TAV_SKIN gpu, cpu or ab), skin check {}",
++        if check > 0 { format!("every {check} poses") } else { "off".to_string() }
++    );
+     app.insert_resource(TavDraw {
+         dir,
+         frame: 0,
+@@ -742,6 +856,10 @@
+         material: None,
+         logged: 0,
+         tex_stamp: None,
++        tex_jobs: HashMap::new(),
++        tex_failed: HashSet::new(),
++        tex_more: false,
++        lod_held: HashMap::new(),
+         textures: HashMap::new(),
+         looks: HashMap::new(),
+         surface_mats: HashMap::new(),
+@@ -756,12 +874,19 @@
+         early: 0,
+         kept_plans: 0,
+         totals: [0; 2],
++        skin,
++        gpu: false,
++        check,
++        ab: None,
++        skin_us: Vec::new(),
++        rig_load: (0, 0),
+     })
+     .init_resource::<TavFeet>()
+     .init_resource::<PartyFeet>()
+     .add_systems(
+         Update,
+-        (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes).in_set(TavPose)),
++        // Patch 0034: posing after the maps, whose visibility the LOD gate in `apply_pose` corrects.
++        (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_textures).in_set(TavPose)),
+     );
+ }
+ 
+@@ -770,6 +895,7 @@
+     idx.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect()
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn load_meshes(
+     mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+@@ -777,6 +903,7 @@
+     mut materials: ResMut<Assets<WowModelMaterial>>,
+     light: Option<Res<benilla_world::lighting::SharedLightBuffer>>,
+     pace: Option<Res<crate::wowbg3_pace::Pace>>,
++    mut palettes: Option<ResMut<benilla_world::rig_palette::RigPalettes>>,
+ ) {
+     d.frame += 1;
+     // Patch 0020: a pose of another plan than the loaded one checks the file this frame (the layer
+@@ -893,18 +1020,15 @@
+             Fig { figure, root, lock: 0.0, posed: false, at: Vec3::ZERO }
+         })
+         .collect();
++    // Patch 0034: a rig slot per mesh for GPU skinning (all or none: the palette full, or `cpu`, skins
++    // the plan on the CPU as before).
++    let (mut rigs, gpu) = alloc_rigs(d.skin, palettes.as_deref_mut(), &file);
++    let (det, ab) = (d.det_sign, d.skin == SkinMode::Ab);
+     let mut parts = Vec::new();
+     let (mut kept, mut waiting) = (0, 0);
+-    for m in &file.meshes {
+-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; m.pos.len()]);
+-        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; m.pos.len()]);
+-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uv.clone());
+-        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0f32, 0.0, 0.0, 1.0]; m.pos.len()]);
+-        // The mirrored mapping turns the winding: re-wind so her outside faces are front faces.
+-        let idx = if d.det_sign < 0.0 { rewind(&m.idx) } else { m.idx.clone() };
+-        mesh.insert_indices(Indices::U32(idx));
+-        let handle = meshes.add(mesh);
++    for (i, m) in file.meshes.iter().enumerate() {
++        let rig = rigs.get_mut(i).and_then(Option::take);
++        let handle = meshes.add(if rig.is_some() { gpu_mesh(m, det) } else { cpu_mesh(m, det) });
+         // A mesh key the last plan had keeps its look; a new one waits hidden for its maps.
+         let (look, visibility, dressed) = match d.looks.get(&m.key) {
+             Some(Look::Shown(h)) => (h.clone(), Visibility::Inherited, true),
+@@ -916,18 +1040,24 @@
+         } else {
+             waiting += 1;
+         }
+-        let entity = commands
+-            .spawn((
+-                Mesh3d(handle.clone()),
+-                MeshMaterial3d(look),
+-                MeshTag(0),
+-                Transform::default(),
+-                NoFrustumCulling,
+-                visibility,
+-                ChildOf(if m.figure == 0 { root } else { figs.iter().find(|f| f.figure == m.figure).map_or(root, |f| f.root) }),
+-            ))
+-            .id();
+-        parts.push(Part { key: m.key, entity, mesh: handle, dressed });
++        // Patch 0034: a GPU-skinned part carries its rig slot in its tag (`benilla_world::mesh_tag`).
++        let tag = rig.as_ref().map_or(0, |(r, _)| benilla_world::mesh_tag::spawn_tag(r.slot, 1.0));
++        let mut spawned = commands.spawn((
++            Mesh3d(handle.clone()),
++            MeshMaterial3d(look),
++            MeshTag(tag),
++            Transform::default(),
++            NoFrustumCulling,
++            visibility,
++            ChildOf(if m.figure == 0 { root } else { figs.iter().find(|f| f.figure == m.figure).map_or(root, |f| f.root) }),
++        ));
++        let rig = rig.map(|(skin, bones)| {
++            let slot = skin.slot;
++            spawned.insert(skin);
++            PartRig { slot, bones, cpu_mesh: ab.then(|| meshes.add(cpu_mesh(m, det))) }
++        });
++        let entity = spawned.id();
++        parts.push(Part { key: m.key, entity, mesh: handle, dressed, rig });
+     }
+     info!(
+         "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals of {} figure(s); {kept} keep their look, {waiting} wait for maps ({} ms); \
+@@ -944,6 +1074,18 @@
+     );
+     d.by_key = 0;
+     d.no_fit = 0;
++    // Patch 0034.
++    if gpu {
++        info!(
++            "wowbg3 tav: plan {} skinned on the GPU: {} rig slots, {} rows",
++            file.seq,
++            parts.len(),
++            parts.iter().filter_map(|p| p.rig.as_ref()).map(|r| r.bones).sum::<u32>()
++        );
++    } else {
++        info!("wowbg3 tav: plan {} skinned on the CPU", file.seq);
++    }
++    d.gpu = gpu;
+     d.parts = parts;
+     d.tex_stamp = None; // new meshes: apply the textures again
+     d.root = Some(root);
+@@ -1128,36 +1270,67 @@
+     }
+ }
+ 
+-/// A `.tvt` as an image for one role, loaded once per file and role.
++/// Patch 0034: where a map stands: loaded, being decoded off the main thread, or failed.
++enum Tex {
++    Ready(Handle<Image>),
++    Pending,
++    Failed,
++}
++
++/// A `.tvt` as an image for one role, loaded once per file version (`key`: the file and its
++/// modification time, so a map rewritten in place, tavtex's preview and then its full bake, loads
++/// again) and role. Patch 0034: read, decoded and its mips built on the async compute pool, so a burst
++/// of new maps no longer stalls a frame; `Pending` until that is done (polled on each call).
++#[allow(clippy::too_many_arguments)]
+ fn load_tvt(
+     textures: &mut HashMap<(String, Role), Handle<Image>>,
++    jobs: &mut HashMap<(String, Role), bevy::tasks::Task<Option<(Image, bool)>>>,
++    failed: &mut HashSet<(String, Role)>,
+     images: &mut Assets<Image>,
+     dir: &Path,
+     file: &str,
++    key: &str,
+     role: Role,
+     cutoff: f32,
+-    logged: &mut HashSet<String>,
+-) -> Option<Handle<Image>> {
+-    if let Some(h) = textures.get(&(file.to_string(), role)) {
+-        return Some(h.clone());
++) -> Tex {
++    let k = (key.to_string(), role);
++    if let Some(h) = textures.get(&k) {
++        return Tex::Ready(h.clone());
++    }
++    if failed.contains(&k) {
++        return Tex::Failed;
++    }
++    if let Some(task) = jobs.get(&k) {
++        if !task.is_finished() {
++            return Tex::Pending;
++        }
++        let Some(task) = jobs.remove(&k) else { return Tex::Pending };
++        return match bevy::tasks::block_on(task) {
++            Some((image, flag_mismatch)) => {
++                if flag_mismatch {
++                    warn!("wowbg3 tav: {file}'s linear flag does not match its use as {role:?}");
++                }
++                let handle = images.add(image);
++                textures.insert(k, handle.clone());
++                Tex::Ready(handle)
++            }
++            None => {
++                warn!("wowbg3 tav: {file} did not load");
++                failed.insert(k);
++                Tex::Failed
++            }
++        };
+     }
+-    let decoded = std::fs::read(dir.join(file)).ok().and_then(|raw| {
++    let path = dir.join(file);
++    let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
++        let raw = std::fs::read(&path).ok()?;
+         let (w, h, flags, px) = decode_tvt(&raw)?;
+         // Normal and surface maps are linear data (flag 4); an albedo is sRGB.
+-        if matches!(role, Role::Normal | Role::Data) != (flags & TVT_LINEAR != 0) && logged.insert(file.to_string()) {
+-            warn!("wowbg3 tav: {file} flags {flags} do not match its use as {role:?}");
+-        }
+-        Some(tvt_image(w, h, px, role, cutoff))
++        let mismatch = matches!(role, Role::Normal | Role::Data) != (flags & TVT_LINEAR != 0);
++        Some((tvt_image(w, h, px, role, cutoff), mismatch))
+     });
+-    let Some(image) = decoded else {
+-        if logged.insert(file.to_string()) {
+-            warn!("wowbg3 tav: {file} did not load");
+-        }
+-        return None;
+-    };
+-    let handle = images.add(image);
+-    textures.insert((file.to_string(), role), handle.clone());
+-    Some(handle)
++    jobs.insert(k, task);
++    Tex::Pending
+ }
+ 
+ /// Her material for one set of maps: the WoW model material she always had (lit, two-sided, scene
+@@ -1224,7 +1397,10 @@
+ 
+ /// Puts the baked maps (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested where the
+ /// material cuts out (hair, fur, lace), hidden where WoW cannot draw it (tear lines, lash shadows,
+-/// BG3's VFX parts).
++/// BG3's VFX parts). Patch 0034: maps decode off the main thread ([`load_tvt`]); while any is pending
++/// the file is applied again the next frame, each mesh taking its look once all its maps are in; a mesh
++/// already wearing its look is left alone, so re-reading the file (tavtex rewrites it as previews and
++/// then full bakes land) costs little.
+ fn load_textures(
+     mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+@@ -1232,7 +1408,7 @@
+     mut materials: ResMut<Assets<WowModelMaterial>>,
+     light: Option<Res<benilla_world::lighting::SharedLightBuffer>>,
+ ) {
+-    if d.frame % 30 != 15 || d.root.is_none() {
++    if (d.frame % 30 != 15 && !d.tex_more) || d.root.is_none() {
+         return;
+     }
+     let Some(light) = light else { return };
+@@ -1251,43 +1427,71 @@
+     let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
+     let Some(seq) = d.file.as_ref().map(|f| f.seq) else { return };
+     if d.tex_stamp == Some((mtime, seq)) {
++        d.tex_more = false;
+         return;
+     }
+     let Ok(text) = std::fs::read_to_string(&path) else { return };
+     let mut lines = text.lines();
+     let head: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
+     if head.len() < 3 || head[0] != "TAVTEX" || head[2].parse::<u32>().ok() != Some(seq) {
++        d.tex_more = false;
+         return; // the baker has not caught up with this plan yet
+     }
+-    d.tex_stamp = Some((mtime, seq));
+-    let (mut applied, mut hidden, mut mapped) = (0, 0, 0);
+-    let mut logged = HashSet::new();
+-    let TavDraw { dir, cache, textures, looks, surface_mats, parts, spec, flip_y, maps, cutoff, .. } = &mut *d;
++    let (mut applied, mut hidden, mut mapped, mut pending) = (0, 0, 0, 0);
++    let TavDraw { dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, .. } =
++        &mut *d;
++    let dir: &Path = dir.as_path();
++    // A map's cache name: the file and its modification time.
++    let version = |f: &str| -> String {
++        let at = std::fs::metadata(dir.join(f))
++            .and_then(|m| m.modified())
++            .ok()
++            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
++            .map_or(0, |t| t.as_nanos());
++        format!("{f}@{at}")
++    };
+     for line in lines {
+         let Some(t) = parse_tex_line(line) else { continue };
+         let Some(part) = parts.iter_mut().find(|p| p.key == t.key) else { continue };
+         if t.hidden() {
+-            commands.entity(part.entity).insert(Visibility::Hidden);
+-            looks.insert(t.key, Look::Hidden);
+-            part.dressed = true;
++            if !(part.dressed && matches!(looks.get(&t.key), Some(Look::Hidden))) {
++                commands.entity(part.entity).insert(Visibility::Hidden);
++                looks.insert(t.key, Look::Hidden);
++                part.dressed = true;
++            }
+             hidden += 1;
+             continue;
+         }
+         let Some(albedo) = t.albedo.clone() else { continue };
+         let alpha_test = t.flags & TVT_ALPHA_TEST != 0;
+-        let key: LookKey = (
+-            albedo.clone(),
+-            t.normal.clone().filter(|_| *maps),
+-            t.surface.clone().filter(|_| *maps),
+-            alpha_test,
+-        );
++        let (normal, surface) = (t.normal.clone().filter(|_| *maps), t.surface.clone().filter(|_| *maps));
++        let key: LookKey = (version(&albedo), normal.as_deref().map(version), surface.as_deref().map(version), alpha_test);
+         let material = match surface_mats.get(&key) {
+             Some(h) => h.clone(),
+             None => {
+                 let role = if alpha_test && *maps { Role::Cutout } else { Role::Albedo };
+-                let Some(a) = load_tvt(textures, &mut images, dir.as_path(), &albedo, role, *cutoff, &mut logged) else { continue };
+-                let n = key.1.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Normal, *cutoff, &mut logged));
+-                let s = key.2.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Data, *cutoff, &mut logged));
++                let a = load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, &albedo, &key.0, role, *cutoff);
++                let n = normal
++                    .as_deref()
++                    .zip(key.1.as_deref())
++                    .map(|(f, k)| load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, f, k, Role::Normal, *cutoff));
++                let s = surface
++                    .as_deref()
++                    .zip(key.2.as_deref())
++                    .map(|(f, k)| load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, f, k, Role::Data, *cutoff));
++                if matches!(a, Tex::Pending) || matches!(n, Some(Tex::Pending)) || matches!(s, Some(Tex::Pending)) {
++                    pending += 1;
++                    continue;
++                }
++                let Tex::Ready(a) = a else { continue };
++                let n = match n {
++                    Some(Tex::Ready(h)) => Some(h),
++                    _ => None,
++                };
++                let s = match s {
++                    Some(Tex::Ready(h)) => Some(h),
++                    _ => None,
++                };
+                 let h = if *maps {
+                     tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff)
+                 } else {
+@@ -1325,12 +1529,19 @@
+         if key.1.is_some() {
+             mapped += 1;
+         }
++        applied += 1;
++        if part.dressed && matches!(looks.get(&t.key), Some(Look::Shown(h)) if *h == material) {
++            continue; // already wears it
++        }
+         commands.entity(part.entity).insert((MeshMaterial3d(material.clone()), Visibility::Inherited));
+         looks.insert(t.key, Look::Shown(material));
+         part.dressed = true;
+-        applied += 1;
+     }
+-    info!("wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped), {hidden} hidden");
++    d.tex_more = pending > 0;
++    if pending == 0 {
++        d.tex_stamp = Some((mtime, seq));
++        info!("wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped), {hidden} hidden");
++    }
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -1345,8 +1556,14 @@
+     pace: Option<Res<crate::wowbg3_pace::Pace>>,
+     collide: benilla_world::collision::WorldCollision,
+     world: benilla_world::world_point::WorldPoint,
++    mut palettes: Option<ResMut<benilla_world::rig_palette::RigPalettes>>,
+ ) {
+     *wow_frame += 1;
++    // Patch 0034: the `ab` mode's A/B request ([`AbBurst`]).
++    if d.skin == SkinMode::Ab && d.ab.is_none() && *wow_frame % 30 == 0 {
++        let burst = AbBurst::request(&d.dir);
++        d.ab = burst;
++    }
+     let Some(root) = d.root else {
+         feet.0 = None;
+         party_feet.0.clear();
+@@ -1410,7 +1627,7 @@
+         d.track.push(pose);
+     }
+     // The pair to draw and where between them (smoothing off: the newest record alone).
+-    let (recs, key) = match (&d.track.prev, &d.track.last) {
++    let (mut recs, key) = match (&d.track.prev, &d.track.last) {
+         (Some(a), Some(b)) if d.smooth && packet.is_none() => {
+             let t = blend_at(a.time, b.time, now, d.track.interval);
+             let key = (a.frame, b.frame, t);
+@@ -1439,12 +1656,36 @@
+             if recs.is_none() { " (unchanged)" } else { "" }
+         );
+     }
++    // Patch 0034: an A/B burst draws one held pose every frame, skinned on the CPU, on the GPU or
++    // hidden, phase by phase ([`AbBurst`]).
++    let packet_no = pace.as_deref().and_then(|p| p.current.as_ref()).map_or(0, |k| k.frame);
++    let mut ab_phase = None;
++    if let Some(mut ab) = d.ab.take() {
++        if ab.held.is_none() {
++            ab.held = recs.clone().or_else(|| d.track.last.as_ref().map(|p| p.recs.clone()));
++        }
++        if ab.held.is_none() {
++            d.ab = Some(ab); // no pose yet: the burst starts with the first
++        } else if let Some(phase) = ab.step(packet_no, *wow_frame) {
++            recs = ab.held.clone();
++            ab_phase = Some(phase);
++            d.ab = Some(ab);
++        } else {
++            ab.finish(packet_no);
++            for p in d.parts.iter().filter(|p| p.rig.is_some()) {
++                commands.entity(p.entity).insert(Mesh3d(p.mesh.clone()));
++            }
++        }
++    }
+     let Some(recs) = recs else { return };
+     d.track.drawn = Some(key);
+     let (det, interval) = (d.det_sign, d.track.interval);
+     let old_root = d.old_root.take();
+     let old_figs = std::mem::take(&mut d.old_figs);
+-    let TavDraw { file, parts, figs, logged, trace, skin_cost, totals, early, kept_plans, .. } = &mut *d;
++    let TavDraw {
++        file, parts, figs, logged, trace, skin_cost, totals, early, kept_plans, gpu, check, skin_us, rig_load, looks, fallback_done,
++        lod_held, ..
++    } = &mut *d;
+     let Some(file) = file.as_ref() else { return };
+     let (centre, wow) = (file.centre, file.wow);
+     // Her root: the first mesh's object origin, mapped; the ground lock lowers her with the camera.
+@@ -1465,6 +1706,8 @@
+     // origin, mapped), standing on WoW's ground under it by a ground lock of its own (hers also lowers
+     // the camera, so she keeps BG3's place in the view), with its own ground shade.
+     let mut bases: Vec<(u32, Vec3)> = vec![(0, base)];
++    // Patch 0034: each figure's anchor (the BG3 point its root stands for) and its root, for the rows.
++    let mut anchors: Vec<(u32, Vec3, Vec3)> = vec![(0, Vec3::new(anchor.world[4], anchor.world[5], anchor.world[6]), origin)];
+     party_feet.0.clear();
+     for f in figs.iter_mut() {
+         let a = file
+@@ -1494,6 +1737,7 @@
+             *vis = Visibility::Inherited;
+         }
+         bases.push((f.figure, at));
++        anchors.push((f.figure, Vec3::new(a.world[4], a.world[5], a.world[6]), f.at));
+         party_feet.0.push(f.at);
+     }
+     if let Some(old) = old_root {
+@@ -1502,9 +1746,333 @@
+     for old in old_figs {
+         commands.entity(old).despawn();
+     }
++    // Patch 0034 (the LOD format research): the meshes BG3 drew. A layer that tracks BG3's draws
++    // (record flag 4) says per mesh whether BG3 drew it in this frame's G-buffer pass (flag 2), so WoW
++    // draws the LOD BG3 draws and leaves out what BG3 never draws (a visual's alternates); without it,
++    // LOD 0 as before. Per figure and visual: while BG3 draws none of the visual's meshes (it culled
++    // them against its own view and level, which are not WoW's: parts of a figure, or a companion at
++    // the screen's edge, for a second or more), and in a frame the layer could not track, WoW keeps
++    // what it drew the last time BG3 drew that visual. When
++    // meshes of two LODs are marked (figures sharing a model share its index buffers, which the layer
++    // tracks by), the LOD held before if it is one of them, else the finest.
++    let tracked = recs.iter().any(|r| r.flags & 4 != 0);
++    if tracked {
++        let drawn: HashSet<u64> = recs.iter().filter(|r| r.flags & 3 == 3).map(|r| r.key).collect();
++        let mut seen: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
++        for m in file.meshes.iter().filter(|m| drawn.contains(&m.key)) {
++            seen.entry((m.figure, m.part)).or_default().push(m.lod);
++        }
++        for (visual, lods) in seen {
++            let lod = match lod_held.get(&visual) {
++                Some(&(held, _)) if lods.contains(&held) => held,
++                _ => lods.iter().copied().min().unwrap_or(0),
++            };
++            let keys = file
++                .meshes
++                .iter()
++                .filter(|m| (m.figure, m.part) == visual && m.lod == lod && drawn.contains(&m.key))
++                .map(|m| m.key)
++                .collect();
++            lod_held.insert(visual, (lod, keys));
++        }
++    }
++    for (m, part) in file.meshes.iter().zip(parts.iter()) {
++        let on = match lod_held.get(&(m.figure, m.part)) {
++            Some((_, keys)) => keys.contains(&m.key),
++            None => m.lod == 0,
++        };
++        let Ok((_, mut vis)) = roots.get_mut(part.entity) else { continue };
++        if !on {
++            if *vis != Visibility::Hidden {
++                *vis = Visibility::Hidden;
++            }
++        } else if *vis == Visibility::Hidden && look_shown(looks, part, *fallback_done) {
++            *vis = Visibility::Inherited;
++        }
++    }
+     let skin_started = Instant::now();
+-    // Skinned on every WoW frame now, so the meshes skin in parallel (the hair alone is a third
+-    // of her vertices); the attributes go in on this thread. Each mesh relative to its figure's root.
++    if *gpu {
++        // Patch 0034: on the GPU only the rig rows change ([`rig_rows`]).
++        if let Some(pal) = palettes.as_deref_mut() {
++            *rig_load = write_rig_rows(file, parts, &recs, &anchors, pal);
++        }
++    } else {
++        // Skinned on every WoW frame now, so the meshes skin in parallel (the hair alone is a third
++        // of her vertices); the attributes go in on this thread. Each mesh relative to its figure's root.
++        for (i, p, n, t) in cpu_skin(file, &recs, &bases, det) {
++            debug_assert_eq!(file.meshes[i].key, parts[i].key);
++            if let Some(mesh) = parts.get(i).and_then(|part| meshes.get_mut(&part.mesh)) {
++                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
++                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
++                mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, t);
++            }
++        }
++    }
++    let skin_time = skin_started.elapsed();
++    // Patch 0034: the A/B burst's phases: the CPU copies skinned and drawn, the GPU meshes back, or
++    // every figure hidden.
++    match ab_phase {
++        Some((0, true)) => {
++            for (i, p, n, t) in cpu_skin(file, &recs, &bases, det) {
++                let Some(h) = parts.get(i).and_then(|part| part.rig.as_ref()).and_then(|r| r.cpu_mesh.clone()) else { continue };
++                if let Some(mesh) = meshes.get_mut(&h) {
++                    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
++                    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
++                    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, t);
++                }
++                commands.entity(parts[i].entity).insert(Mesh3d(h));
++            }
++        }
++        Some((1, true)) => {
++            for part in parts.iter().filter(|p| p.rig.is_some()) {
++                commands.entity(part.entity).insert(Mesh3d(part.mesh.clone()));
++            }
++        }
++        Some((2, _)) => {
++            for e in std::iter::once(root).chain(figs.iter().map(|f| f.root)) {
++                if let Ok((_, mut v)) = roots.get_mut(e) {
++                    *v = Visibility::Hidden;
++                }
++            }
++        }
++        _ => {}
++    }
++    // Patch 0034: the GPU path checked against the CPU path, vertex by vertex ([`skin_check`]).
++    if *check > 0 && *gpu && *logged % u64::from(*check) == 0 {
++        if let Some(pal) = palettes.as_deref() {
++            for (fig, c) in skin_check(file, parts, &recs, &anchors, pal) {
++                info!(
++                    "wowbg3 tav: skin check pose {}: figure {fig}: {} vertices; GPU vs CPU path max {:.6} yd, GPU vs f64 max {:.6} yd, \
++                     CPU path vs f64 max {:.6} yd; normals max {:.4} deg, tangents max {:.4} deg (normals turned by the blend itself, \
++                     as before 0034, differ from BG3's by up to {:.3} deg)",
++                    key.1, c.verts, c.gpu_cpu, c.gpu_exact, c.cpu_exact, c.normal, c.tangent, c.normal_old
++                );
++            }
++        }
++    }
++    skin_us.push(u32::try_from(skin_time.as_micros()).unwrap_or(u32::MAX));
++    if tracing {
++        skin_cost.0 += skin_time.as_micros();
++        skin_cost.1 += 1;
++        if *trace == 0 {
++            info!("wowbg3 tav trace: {} skins, {} us each on average", skin_cost.1, skin_cost.0 / u128::from(skin_cost.1.max(1)));
++        }
++    }
++    *logged += 1;
++    if *logged % 1800 == 1 {
++        info!(
++            "wowbg3 tav: pose {}..{} at {:.2} (BG3 frame interval {:.1} ms, skinned in {} us) at {origin:?}; poses: {} frames by key, \
++             {} without a fitting pose, {} files loaded early, {} plans kept the figure (in all)",
++            key.0,
++            key.1,
++            key.2,
++            interval * 1e3,
++            skin_time.as_micros(),
++            totals[0],
++            totals[1],
++            early,
++            kept_plans
++        );
++        // Patch 0034: what posing cost this thread per drawn pose since the last line.
++        let mut us = std::mem::take(skin_us);
++        us.sort_unstable();
++        let at = |f: f32| us.get(((us.len() as f32 * f) as usize).min(us.len().saturating_sub(1))).copied().unwrap_or(0);
++        info!(
++            "wowbg3 tav: skinning on the {} ({} rows over {} meshes): p50 {} us, p95 {} us, max {} us per pose over {} poses",
++            if *gpu { "GPU" } else { "CPU" },
++            rig_load.1,
++            rig_load.0,
++            at(0.5),
++            at(0.95),
++            us.last().copied().unwrap_or(0),
++            us.len()
++        );
++        // Patch 0033: where each companion stands and its own ground lock.
++        for f in figs.iter() {
++            info!(
++                "wowbg3 tav: companion figure {} {} at {:?}, ground lock {:.2} yd",
++                f.figure,
++                if f.posed { "drawn" } else { "without a pose" },
++                f.at,
++                f.lock
++            );
++        }
++    }
++}
++
++/// Patch 0034: whether a part's look lets it show: its maps applied, or the untextured fallback for a
++/// mesh whose maps never came (as `load_meshes` and `load_textures` set its visibility).
++fn look_shown(looks: &HashMap<u64, Look>, part: &Part, fallback_done: bool) -> bool {
++    match looks.get(&part.key) {
++        Some(Look::Shown(_)) => true,
++        Some(Look::Hidden) => false,
++        None => fallback_done,
++    }
++}
++
++/// Patch 0034: the palette blocks a mesh takes: its highest weighted bone plus one (1 for a rigid
++/// mesh, an identity). Its rig slot holds one more, the figure frame ([`rig_rows`]).
++fn rig_bones(m: &TavMesh) -> u32 {
++    m.weights
++        .iter()
++        .zip(&m.bones)
++        .flat_map(|(w, b)| (0..4).filter_map(move |k| (w[k] > 0.0).then(|| u32::from(b[k]) + 1)))
++        .max()
++        .unwrap_or(1)
++}
++
++/// Patch 0034: a rig slot for each of a plan's meshes and the rows it takes; all or none, so a plan
++/// skins wholly on the GPU or wholly on the CPU (`WOW_BG3_TAV_SKIN=cpu`, or the palette full).
++fn alloc_rigs(
++    skin: SkinMode,
++    palettes: Option<&mut benilla_world::rig_palette::RigPalettes>,
++    file: &MeshFile,
++) -> (Vec<Option<(benilla_world::rig_palette::RigSkin, u32)>>, bool) {
++    let Some(pal) = palettes.filter(|_| skin != SkinMode::Cpu) else {
++        return (Vec::new(), false);
++    };
++    let mut rigs = Vec::with_capacity(file.meshes.len());
++    for m in &file.meshes {
++        let bones = rig_bones(m) + 1;
++        match benilla_world::rig_palette::RigSkin::allocate_bones(pal, bones, Handle::default()) {
++            Some(skin) => rigs.push(Some((skin, bones))),
++            None => {
++                for (skin, _) in rigs.into_iter().flatten() {
++                    pal.free(skin.slot);
++                }
++                warn!(
++                    "wowbg3 tav: the rig palette has no room for plan {}'s {} meshes: skinned on the CPU",
++                    file.seq,
++                    file.meshes.len()
++                );
++                return (Vec::new(), false);
++            }
++        }
++    }
++    (rigs, true)
++}
++
++/// A mesh for the CPU path: positions, normals and tangents written by every pose.
++fn cpu_mesh(m: &TavMesh, det: f32) -> Mesh {
++    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
++    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; m.pos.len()]);
++    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; m.pos.len()]);
++    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uv.clone());
++    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0f32, 0.0, 0.0, 1.0]; m.pos.len()]);
++    // The mirrored mapping turns the winding: re-wind so her outside faces are front faces.
++    let idx = if det < 0.0 { rewind(&m.idx) } else { m.idx.clone() };
++    mesh.insert_indices(Indices::U32(idx));
++    mesh
++}
++
++/// Patch 0034: a mesh for GPU skinning, uploaded once: BG3's bind pose (model space, metres), the
++/// tangents' handedness turned for the mirrored mapping as the CPU path turns it, and the skin as
++/// WoW's joint attributes (`WOW_RIG_SKIN`): BG3's four weights (bytes over 255) and bones, each bone + 1
++/// (block 0 of the slot is the figure frame, [`rig_rows`]), an unweighted influence on block 1; a rigid
++/// mesh as one identity block under its object's own transform.
++fn gpu_mesh(m: &TavMesh, det: f32) -> Mesh {
++    let n = m.pos.len();
++    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
++    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, m.pos.iter().map(|p| p.to_array()).collect::<Vec<_>>());
++    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, m.nrm.iter().map(|v| v.to_array()).collect::<Vec<_>>());
++    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uv.clone());
++    let tan: Vec<[f32; 4]> =
++        (0..n).map(|v| m.tan.get(v).map_or([1.0, 0.0, 0.0, det], |t| [t[0], t[1], t[2], t[3] * det])).collect();
++    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tan);
++    let (joints, weights): (Vec<[u16; 4]>, Vec<[f32; 4]>) = if m.weights.len() == n && m.bones.len() == n {
++        m.weights
++            .iter()
++            .zip(&m.bones)
++            .map(|(w, b)| (std::array::from_fn(|k| if w[k] > 0.0 { u16::from(b[k]) + 1 } else { 1 }), *w))
++            .unzip()
++    } else {
++        (vec![[1; 4]; n], vec![[1.0, 0.0, 0.0, 0.0]; n])
++    };
++    mesh.insert_attribute(benilla_assets::ATTRIBUTE_WOW_JOINT_INDEX, VertexAttributeValues::Uint16x4(joints));
++    mesh.insert_attribute(benilla_assets::ATTRIBUTE_WOW_JOINT_WEIGHT, VertexAttributeValues::Float32x4(weights));
++    let idx = if det < 0.0 { rewind(&m.idx) } else { m.idx.clone() };
++    mesh.insert_indices(Indices::U32(idx));
++    mesh
++}
++
++/// World mode's mapping without its translation: BG3 metres to Bevy yards (a mirror, det < 0).
++fn mapping_linear() -> Mat3 {
++    Mat3::from_cols(bg3_dir_to_bevy(Vec3::X), bg3_dir_to_bevy(Vec3::Y), bg3_dir_to_bevy(Vec3::Z)) * (1.0 / YD)
++}
++
++/// Patch 0034: one pose record's rig rows, as `rig_palette` keeps them (a 3×4 affine a block, row by
++/// row). Block 0 is the figure frame `F = [L·q·S | L·(t − anchor)]`: the record's world rotation `q`,
++/// scale `S` and translation `t`, world mode's mapping `L` (mirrored, into Bevy yards) and the figure's
++/// anchor (the BG3 point its root stands for). Blocks 1.. are BG3's own palette rows as BG3 skins with
++/// them (`bones` of them; past the record's palette the last repeats, as [`pose_mesh`] clamps), or one
++/// identity block for a rigid mesh. The vertex stage blends the weighted blocks (joint indices + 1) into
++/// `B`, draws `F·B·[p, 1]` from the root, and turns the tangent frame by `F` after
++/// [`bg3_bone_rotation`]`(B)`. Since `G(x) − G(anchor) = L·(x − anchor)` for the mapping `G`, that is
++/// [`pose_mesh`]'s vertex mapped as the CPU path maps it, and no row holds a large number.
++pub(crate) fn rig_rows(rec: &PoseRec, anchor: Vec3, skinned: bool, bones: usize, out: &mut Vec<[[f32; 4]; 3]>) {
++    let q = Quat::from_xyzw(rec.world[0], rec.world[1], rec.world[2], rec.world[3]).normalize();
++    let t = Vec3::new(rec.world[4], rec.world[5], rec.world[6]);
++    let s = Vec3::new(rec.world[7], rec.world[8], rec.world[9]);
++    let s = if s.is_finite() && s.length_squared() > 1e-8 { s } else { Vec3::ONE };
++    let f = mapping_linear() * Mat3::from_quat(q) * Mat3::from_diagonal(s);
++    let off = mapping_linear() * (t - anchor);
++    out.push([
++        [f.x_axis.x, f.y_axis.x, f.z_axis.x, off.x],
++        [f.x_axis.y, f.y_axis.y, f.z_axis.y, off.y],
++        [f.x_axis.z, f.y_axis.z, f.z_axis.z, off.z],
++    ]);
++    if skinned && !rec.palette.is_empty() {
++        for b in 0..bones.max(1) {
++            let p = &rec.palette[b.min(rec.palette.len() - 1)];
++            out.push([[p[0], p[1], p[2], p[3]], [p[4], p[5], p[6], p[7]], [p[8], p[9], p[10], p[11]]]);
++        }
++    } else {
++        out.push([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]);
++    }
++}
++
++/// A 3×4 affine's rows as a `Mat4` (bottom row `0 0 0 1`), as `wow_model.wgsl` builds its blends.
++fn affine_rows(r: [Vec4; 3]) -> Mat4 {
++    Mat4::from_cols(r[0], r[1], r[2], Vec4::W).transpose()
++}
++
++/// Patch 0034: every GPU-skinned mesh's rows for this pose, with its figure's root as the slot's
++/// origin. A mesh without a record in this pose keeps its rows and moves with the root, as it kept
++/// its vertices on the CPU. Returns (meshes, rows) written.
++fn write_rig_rows(
++    file: &MeshFile,
++    parts: &[Part],
++    recs: &[PoseRec],
++    anchors: &[(u32, Vec3, Vec3)],
++    pal: &mut benilla_world::rig_palette::RigPalettes,
++) -> (usize, usize) {
++    let mut rows = Vec::new();
++    let (mut meshes, mut written) = (0, 0);
++    for (m, part) in file.meshes.iter().zip(parts) {
++        let Some(rig) = part.rig.as_ref() else { continue };
++        let Some(&(_, anchor, origin)) = anchors.iter().find(|a| a.0 == m.figure) else { continue };
++        rows.clear();
++        let want = m.skin_from.unwrap_or(m.key);
++        if let Some(rec) = recs.iter().find(|r| r.key == want && r.flags & 1 != 0) {
++            if m.weights.is_empty() || !rec.palette.is_empty() {
++                rig_rows(rec, anchor, !m.weights.is_empty(), rig.bones as usize - 1, &mut rows);
++            }
++        }
++        pal.write_rows(rig.slot, &rows, origin);
++        meshes += 1;
++        written += rows.len();
++    }
++    (meshes, written)
++}
++
++/// One mesh skinned on the CPU, mapped and relative to its figure's root: positions, normals, tangents.
++type Skinned = (usize, Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 4]>);
++
++/// The CPU path (before patch 0034; `WOW_BG3_TAV_SKIN=cpu`, and the A/B's CPU copies): every mesh with
++/// a record skinned in parallel ([`pose_mesh`]), mapped into WoW and Bevy, relative to its figure's
++/// root.
++fn cpu_skin(file: &MeshFile, recs: &[PoseRec], bases: &[(u32, Vec3)], det: f32) -> Vec<Skinned> {
++    let (centre, wow) = (file.centre, file.wow);
+     let jobs: Vec<(usize, &TavMesh, &PoseRec, Vec3)> = file
+         .meshes
+         .iter()
+@@ -1516,7 +2084,7 @@
+             (m.weights.is_empty() || !rec.palette.is_empty()).then_some((i, m, rec, base))
+         })
+         .collect();
+-    let skinned = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
++    bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+         for (i, m, rec, base) in jobs {
+             scope.spawn(async move {
+                 let (mut pos, mut nrm, mut tan) = (Vec::new(), Vec::new(), Vec::new());
+@@ -1536,48 +2104,192 @@
+                 (i, p, n, t)
+             });
+         }
+-    });
+-    for (i, p, n, t) in skinned {
+-        debug_assert_eq!(file.meshes[i].key, parts[i].key);
+-        if let Some(mesh) = parts.get(i).and_then(|part| meshes.get_mut(&part.mesh)) {
+-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
+-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
+-            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, t);
++    })
++}
++
++/// Patch 0034, the `ab` mode's in-game A/B (`WOW_BG3_TAV_SKIN=ab`). A file `skin-ab` in the Tav
++/// directory ("<frames a phase> <cycles>", default 60 2) holds the pose of that moment and draws it in
++/// phases of that many WoW frames: skinned on the CPU (each mesh's CPU copy), on the GPU, and hidden,
++/// `cycles` times over. `skin-ab.log` there gets a line as each phase starts (its first BG3 packet)
++/// and `end` after the last, so the WoW frames exported in each phase (WBF1 packet at 36) can be told
++/// apart and compared pixel by pixel while the camera stands (an A/B capture).
++struct AbBurst {
++    per: u32,
++    cycles: u32,
++    frame: u32,
++    held: Option<Vec<PoseRec>>,
++    log: PathBuf,
++}
++
++impl AbBurst {
++    fn request(dir: &Path) -> Option<Self> {
++        let req = dir.join("skin-ab");
++        let text = std::fs::read_to_string(&req).ok()?;
++        let _ = std::fs::rename(&req, dir.join("skin-ab.taken"));
++        let mut v = text.split_whitespace().filter_map(|w| w.parse::<u32>().ok());
++        let per = v.next().unwrap_or(60).clamp(2, 2000);
++        let cycles = v.next().unwrap_or(2).clamp(1, 20);
++        info!("wowbg3 tav: skin A/B: {cycles} cycles of {per} frames each on the CPU, on the GPU and hidden, one pose held");
++        let log = dir.join("skin-ab.log");
++        let _ = std::fs::write(&log, format!("per {per} cycles {cycles}\n"));
++        Some(Self { per, cycles, frame: 0, held: None, log })
++    }
++
++    fn note(&self, line: &str) {
++        use std::io::Write;
++        let ok = std::fs::OpenOptions::new().append(true).create(true).open(&self.log).and_then(|mut f| writeln!(f, "{line}"));
++        if let Err(e) = ok {
++            warn!("wowbg3 tav: skin A/B: {:?} not written: {e}", self.log);
+         }
+     }
+-    if tracing {
+-        skin_cost.0 += skin_started.elapsed().as_micros();
+-        skin_cost.1 += 1;
+-        if *trace == 0 {
+-            info!("wowbg3 tav trace: {} skins, {} us each on average", skin_cost.1, skin_cost.0 / u128::from(skin_cost.1.max(1)));
++
++    /// This frame's phase (0 CPU, 1 GPU, 2 hidden) and whether it starts here; `None` once done.
++    fn step(&mut self, packet: u32, wow_frame: u64) -> Option<(u32, bool)> {
++        let i = self.frame / self.per;
++        if i >= 3 * self.cycles {
++            return None;
+         }
++        let (phase, start) = (i % 3, self.frame % self.per == 0);
++        if start {
++            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64());
++            self.note(&format!(
++                "{} cycle {} packet {packet} wow_frame {wow_frame} time {now:.4}",
++                ["cpu", "gpu", "hidden"][phase as usize],
++                i / 3
++            ));
++        }
++        self.frame += 1;
++        Some((phase, start))
++    }
++
++    fn finish(&self, packet: u32) {
++        self.note(&format!("end packet {packet}"));
++        info!("wowbg3 tav: skin A/B done ({} phases)", 3 * self.cycles);
+     }
+-    *logged += 1;
+-    if *logged % 1800 == 1 {
+-        info!(
+-            "wowbg3 tav: pose {}..{} at {:.2} (BG3 frame interval {:.1} ms, skinned in {} us) at {origin:?}; poses: {} frames by key, \
+-             {} without a fitting pose, {} files loaded early, {} plans kept the figure (in all)",
+-            key.0,
+-            key.1,
+-            key.2,
+-            interval * 1e3,
+-            skin_started.elapsed().as_micros(),
+-            totals[0],
+-            totals[1],
+-            early,
+-            kept_plans
+-        );
+-        // Patch 0033: where each companion stands and its own ground lock.
+-        for f in figs.iter() {
+-            info!(
+-                "wowbg3 tav: companion figure {} {} at {:?}, ground lock {:.2} yd",
+-                f.figure,
+-                if f.posed { "drawn" } else { "without a pose" },
+-                f.at,
+-                f.lock
+-            );
++}
++
++/// Patch 0034 (`WOW_BG3_TAV_SKIN_CHECK=<n>`): one figure's differences between the GPU path and the
++/// CPU path; distances in yards, angles in degrees.
++#[derive(Default, Clone, Copy)]
++struct SkinCheck {
++    verts: u64,
++    /// The vertex stage's position against the CPU path's.
++    gpu_cpu: f64,
++    /// Each against an f64 evaluation of the same skin.
++    gpu_exact: f64,
++    cpu_exact: f64,
++    /// The vertex stage's normal and tangent against the CPU path's.
++    normal: f64,
++    tangent: f64,
++    /// The normals before patch 0034 (turned by the blend itself) against BG3's (for reference).
++    normal_old: f64,
++}
++
++/// Patch 0034: every GPU-skinned mesh's vertices as the vertex stage computes them, from the rows just
++/// written (the palette's CPU mirror of what goes to the GPU: blocks blended row by row in f32 as
++/// `wow_model.wgsl` blends them, the figure frame, the slot's origin, [`bg3_bone_rotation`] for the
++/// tangent frame), against the CPU path ([`cpu_skin`]'s [`pose_mesh`] and mapping, plus the root) and
++/// an f64 evaluation of the position; per figure.
++fn skin_check(
++    file: &MeshFile,
++    parts: &[Part],
++    recs: &[PoseRec],
++    anchors: &[(u32, Vec3, Vec3)],
++    pal: &benilla_world::rig_palette::RigPalettes,
++) -> Vec<(u32, SkinCheck)> {
++    use bevy::math::DVec3;
++    let (centre, wow) = (file.centre, file.wow);
++    let l = mapping_linear().as_dmat3();
++    let angle =
++        |a: Vec3, b: Vec3| f64::from(a.normalize_or_zero().dot(b.normalize_or_zero()).clamp(-1.0, 1.0)).acos().to_degrees();
++    let mut out: Vec<(u32, SkinCheck)> = Vec::new();
++    let (mut cp, mut cn, mut ct) = (Vec::new(), Vec::new(), Vec::new());
++    for (m, part) in file.meshes.iter().zip(parts) {
++        let Some(rig) = part.rig.as_ref() else { continue };
++        let Some(&(fig, anchor, origin)) = anchors.iter().find(|a| a.0 == m.figure) else { continue };
++        let want = m.skin_from.unwrap_or(m.key);
++        let Some(rec) = recs.iter().find(|r| r.key == want && r.flags & 1 != 0) else { continue };
++        let skinned = !m.weights.is_empty();
++        if skinned && rec.palette.is_empty() {
++            continue;
++        }
++        let (Some(rows), Some(slot_origin)) = (pal.rig_rows(rig.slot, rig.bones as usize), pal.slot_origin(rig.slot)) else {
++            continue;
++        };
++        pose_mesh(m, rec, &mut cp, &mut cn, &mut ct);
++        let base = wow_to_bevy(bg3_to_wow(anchor, centre, wow));
++        let q = Quat::from_xyzw(rec.world[0], rec.world[1], rec.world[2], rec.world[3]).normalize().as_dquat();
++        let t = Vec3::new(rec.world[4], rec.world[5], rec.world[6]).as_dvec3();
++        let s = Vec3::new(rec.world[7], rec.world[8], rec.world[9]);
++        let s = if s.is_finite() && s.length_squared() > 1e-8 { s } else { Vec3::ONE }.as_dvec3();
++        let (a64, o64, so64) = (anchor.as_dvec3(), origin.as_dvec3(), slot_origin.as_dvec3());
++        let k = match out.iter().position(|o| o.0 == fig) {
++            Some(k) => k,
++            None => {
++                out.push((fig, SkinCheck::default()));
++                out.len() - 1
++            }
++        };
++        let c = &mut out[k].1;
++        let (frame, f3) = (rows[0], Mat3::from_mat4(rows[0]));
++        for v in 0..m.pos.len().min(cp.len()) {
++            let p = m.pos[v];
++            // The vertex stage: the weighted palette blocks blended (joint indices + 1), the figure
++            // frame after them, then the slot's origin; the tangent frame turned by the blend's rotation.
++            let blend = if skinned && rows.len() > 1 {
++                let r = (0..4).fold([Vec4::ZERO; 3], |mut acc, j| {
++                    let w = m.weights[v][j];
++                    let b = if w > 0.0 { usize::from(m.bones[v][j]) + 1 } else { 1 };
++                    let row = rows[b.min(rows.len() - 1)];
++                    for (i, a) in acc.iter_mut().enumerate() {
++                        *a += row.row(i) * w;
++                    }
++                    acc
++                });
++                affine_rows(r)
++            } else {
++                rows[rows.len().min(2) - 1]
++            };
++            let gp = so64 + (frame * blend).transform_point3(p).as_dvec3();
++            let b3 = Mat3::from_mat4(blend);
++            let turn = bg3_bone_rotation([b3.row(0), b3.row(1), b3.row(2)]);
++            let gn = f3 * (turn * m.nrm[v]);
++            let tv = m.tan.get(v).map_or(Vec3::X, |t| Vec3::new(t[0], t[1], t[2]));
++            let gt = f3 * (turn * tv);
++            let gold = f3 * (b3 * m.nrm[v]);
++            // The CPU path: mapped relative to the root, the root added by the vertex stage.
++            let pc = o64 + (wow_to_bevy(bg3_to_wow(cp[v], centre, wow)) - base).as_dvec3();
++            let nc = bg3_dir_to_bevy(cn[v]);
++            let tc = bg3_dir_to_bevy(ct[v]);
++            // In f64.
++            let p64 = p.as_dvec3();
++            let x = if skinned {
++                (0..4).fold(DVec3::ZERO, |acc, j| {
++                    let w = f64::from(m.weights[v][j]);
++                    if w <= 0.0 {
++                        return acc;
++                    }
++                    let r = rec.palette[usize::from(m.bones[v][j]).min(rec.palette.len() - 1)].map(f64::from);
++                    acc + w * DVec3::new(
++                        r[0] * p64.x + r[1] * p64.y + r[2] * p64.z + r[3],
++                        r[4] * p64.x + r[5] * p64.y + r[6] * p64.z + r[7],
++                        r[8] * p64.x + r[9] * p64.y + r[10] * p64.z + r[11],
++                    )
++                })
++            } else {
++                p64
++            };
++            let exact = o64 + l * (q * (x * s) + t - a64);
++            c.verts += 1;
++            c.gpu_cpu = c.gpu_cpu.max(gp.distance(pc));
++            c.gpu_exact = c.gpu_exact.max(gp.distance(exact));
++            c.cpu_exact = c.cpu_exact.max(pc.distance(exact));
++            c.normal = c.normal.max(angle(gn, nc));
++            c.normal_old = c.normal_old.max(angle(gold, gn));
++            c.tangent = c.tangent.max(angle(gt, tc));
+         }
+     }
++    out
+ }
+ 
+ #[cfg(test)]
+@@ -1831,6 +2543,77 @@
+     }
+ 
+     #[test]
++    fn rig_rows_reproduce_the_cpu_skin() {
++        // Patch 0034: the rows blended as the vertex stage blends them give the CPU path's vertex.
++        let f = decode_mesh(&mesh_file()).expect("decodes");
++        let m = &f.meshes[0];
++        let mut world = [0.0; 10];
++        world[0..4].copy_from_slice(&Quat::from_rotation_y(0.7).to_array());
++        world[4..7].copy_from_slice(&[3.0, 1.0, -2.0]);
++        world[7..10].copy_from_slice(&[1.0; 3]);
++        let r = Mat3::from_quat(Quat::from_rotation_x(0.3));
++        let bone = [r.x_axis.x, r.y_axis.x, r.z_axis.x, 0.5, r.x_axis.y, r.y_axis.y, r.z_axis.y, -1.0, r.x_axis.z, r.y_axis.z, r.z_axis.z, 2.0];
++        let rec = PoseRec { key: 42, flags: 1, world, palette: vec![bone] };
++        let anchor = Vec3::new(2.5, 0.0, -1.0);
++        let mut rows = Vec::new();
++        rig_rows(&rec, anchor, true, rig_bones(m) as usize, &mut rows);
++        assert_eq!(rows.len(), 2, "the figure frame and one palette block");
++        let (mut p, mut n, mut t) = (Vec::new(), Vec::new(), Vec::new());
++        pose_mesh(m, &rec, &mut p, &mut n, &mut t);
++        let base = wow_to_bevy(bg3_to_wow(anchor, f.centre, f.wow));
++        let block = |r: [[f32; 4]; 3]| affine_rows(r.map(Vec4::from_array));
++        let (frame, bone) = (block(rows[0]), block(rows[1]));
++        let turn = bg3_bone_rotation([Vec3::from_slice(&rows[1][0]), Vec3::from_slice(&rows[1][1]), Vec3::from_slice(&rows[1][2])]);
++        for v in 0..3 {
++            // The vertex stage: the frame after the blend, the normal turned by the blend's rotation.
++            let want = wow_to_bevy(bg3_to_wow(p[v], f.centre, f.wow)) - base;
++            assert!(((frame * bone).transform_point3(m.pos[v]) - want).length() < 4e-3, "vertex {v}");
++            let nn = frame.transform_vector3(turn * m.nrm[v]).normalize();
++            assert!((nn - bg3_dir_to_bevy(n[v]).normalize()).length() < 1e-5, "normal {v}");
++        }
++        // A rigid mesh is the frame and one identity block; a bone past the palette repeats its last.
++        rows.clear();
++        rig_rows(&rec, anchor, false, 5, &mut rows);
++        assert_eq!((rows.len(), rows[1]), (2, [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]));
++        rows.clear();
++        rig_rows(&rec, anchor, true, 3, &mut rows);
++        assert_eq!((rows.len(), rows[3]), (4, rows[1]));
++        assert_eq!(rig_bones(m), 1);
++        // The GPU mesh carries the bind pose, the skin (bones + 1: block 0 is the frame) and the
++        // turned handedness.
++        let mesh = gpu_mesh(m, -1.0);
++        let Some(VertexAttributeValues::Uint16x4(joints)) = mesh.attribute(benilla_assets::ATTRIBUTE_WOW_JOINT_INDEX) else { panic!("joints") };
++        assert_eq!(joints[0], [1, 1, 1, 1]);
++        let Some(VertexAttributeValues::Float32x4(tan)) = mesh.attribute(Mesh::ATTRIBUTE_TANGENT) else { panic!("tangents") };
++        assert_eq!(tan[0][3], -m.tan[0][3]);
++    }
++
++    #[test]
++    fn turns_frames_as_bg3_skinning_does() {
++        // Patch 0034: a rotation's rows give back its own quaternion, whichever branch the trace takes.
++        for q in [
++            Quat::IDENTITY,
++            Quat::from_rotation_z(0.8),
++            Quat::from_rotation_x(3.0),
++            Quat::from_rotation_y(-2.9),
++            Quat::from_rotation_z(3.1),
++            Quat::from_axis_angle(Vec3::new(0.3, -0.8, 0.5).normalize(), 2.2),
++        ] {
++            let r = Mat3::from_quat(q);
++            let got = bg3_bone_rotation([r.row(0), r.row(1), r.row(2)]);
++            assert!((got - q).length() < 1e-4 || (got + q).length() < 1e-4, "{q:?} gave {got:?}");
++        }
++        // Two bones turned ±0.6 rad about Z, blended half and half: BG3 turns the frame by the mean
++        // rotation (the identity), where the blend itself would shorten the normal's XY part.
++        let (a, b) = (Mat3::from_rotation_z(0.6), Mat3::from_rotation_z(-0.6));
++        let blend = a * 0.5 + b * 0.5;
++        let turn = bg3_bone_rotation([blend.row(0), blend.row(1), blend.row(2)]);
++        let n = Vec3::new(1.0, 0.0, 1.0).normalize();
++        assert!((turn * n - n).length() < 1e-5);
++        assert!((blend * n).normalize().angle_between(n) > 0.05);
++    }
++
++    #[test]
+     fn cutout_mips_keep_their_coverage() {
+         // A 4x4 stripe pattern: half the texels opaque, half clear; box filtering gives 50% alpha
+         // everywhere, which a 0.5 cut keeps but a 0.88 cut would lose entirely.
+diff --git a/crates/benilla-world/src/rig_palette.rs b/crates/benilla-world/src/rig_palette.rs
+--- a/crates/benilla-world/src/rig_palette.rs
++++ b/crates/benilla-world/src/rig_palette.rs
+@@ -280,8 +280,13 @@
+ 
+     /// Publish a slot's origin, called by each row writer with the origin it subtracted.
+     fn set_origin(&mut self, slot: u16, origin: Vec3) {
++        self.set_origin_word(slot, [origin.x, origin.y, origin.z, 0.0]);
++    }
++
++    /// [`Self::set_origin`] with the word's `w` given: WOW-BG3 (local fork, patch 0034) marks the
++    /// slots of [`Self::write_rows`] with 1.
++    fn set_origin_word(&mut self, slot: u16, word: [f32; 4]) {
+         let s = slot as usize;
+-        let word = [origin.x, origin.y, origin.z, 0.0];
+         match self.origins.get(s) {
+             Some(&cur) if cur != word => {}
+             _ => return,
+@@ -408,6 +413,42 @@
+         self.dirty.push((base, len, mirrored));
+     }
+ 
++    /// WOW-BG3 (local fork, patch 0034): rows the caller composed itself, written as given, measured
++    /// from `origin`. BG3's characters drawn in WoW (`wowbg3_tav`) skin from BG3's own bone palettes,
++    /// with no joint entities or inverse bindposes. Their slot's origin word gets `w` = 1, which makes
++    /// `wow_model.wgsl` turn normals by the blended matrix itself, as BG3's skinning does, instead of
++    /// by its inverse transpose. Fewer rows than the slot holds keep the rest; none moves only the
++    /// origin. A free slot is ignored, and rows past its length are dropped.
++    pub fn write_rows(&mut self, slot: u16, rows: &[[[f32; 4]; 3]], origin: Vec3) {
++        let s = slot as usize;
++        let (Some(&base), Some(&len)) = (self.table.get(s), self.slot_len.get(s)) else {
++            return;
++        };
++        if len == 0 {
++            return;
++        }
++        self.set_origin_word(slot, [origin.x, origin.y, origin.z, 1.0]);
++        let n = rows.len().min(len as usize);
++        if n == 0 {
++            return;
++        }
++        self.cost_rows += n as u32;
++        let wm = self.bone_watermark();
++        let out = rows_make_mut(
++            &mut self.rows,
++            &mut self.spare,
++            wm,
++            &mut self.cost_copies,
++            &mut self.cost_copy_us,
++        );
++        let r0 = 3 * base as usize;
++        for (b, row) in rows[..n].iter().enumerate() {
++            out[r0 + 3 * b..r0 + 3 * b + 3].copy_from_slice(row);
++        }
++        let mirrored = self.mirrored.get(s).copied().unwrap_or(false);
++        self.dirty.push((base, n as u32, mirrored));
++    }
++
+     /// Flag a booth rig's rows to also reach the mirror buffers ([`RigPaletteMirrors`]).
+     pub fn mark_mirrored(&mut self, slot: u16) {
+         if let Some(m) = self.mirrored.get_mut(slot as usize) {
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -89,7 +89,9 @@
+     // Per rig slot: the CM2 body tint (`model+0x184/188/18c`) packed `0xFFRRGGBB` like the
+     // reference's node value (`0x60d840`: `param | 0xff000000`); 0 is identity.
+     rig_tint: array<u32, 2048>,
+-    // Per rig slot: the world origin its palette rows are measured from.
++    // Per rig slot: the world origin its palette rows are measured from. WOW-BG3 (patch 0034): w = 1
++    // marks BG3's own skin (`RigPalettes::write_rows`, `wowbg3_tav`): block 0 is the figure frame,
++    // the joints blend BG3's bone palette after it, tangent frames turn as BG3 turns them.
+     rig_origin: array<vec4<f32>, 2048>,
+     // The mat-anim rows (size mirrored in mat_anim_table.rs), row 0 zero: a UV-scroll delta (xy),
+     // a tint delta (xyz), a texture-transform affine `[cos − 1, sin, sx − 1, sy − 1]` or a UI cell.
+@@ -312,6 +314,51 @@
+         )) * normal
+     );
+ }
++
++// WOW-BG3 (local fork, patch 0034): the rotation BG3's own skinning turns a vertex's tangent frame by
++// (`Shaders/Vulkan/SkinningCompute.bshd` in EngineShaders.pak; mirrored by `wowbg3_tav.rs`
++// `bg3_bone_rotation`): the blended bone matrix's rows normalised, then a quaternion by the trace when
++// positive, else by the largest diagonal element; unit length.
++fn bg3_bone_rotation(m: mat4x4<f32>) -> vec4<f32> {
++    let r0 = normalize(vec3<f32>(m[0].x, m[1].x, m[2].x));
++    let r1 = normalize(vec3<f32>(m[0].y, m[1].y, m[2].y));
++    let r2 = normalize(vec3<f32>(m[0].z, m[1].z, m[2].z));
++    let t = r0.x + r1.y + r2.z;
++    var q: vec4<f32>;
++    if (t > 0.0) {
++        let s = sqrt(t + 1.0);
++        q = vec4<f32>((r2.y - r1.z) / (2.0 * s), (r0.z - r2.x) / (2.0 * s), (r1.x - r0.y) / (2.0 * s), 0.5 * s);
++    } else if (r0.x > r1.y && r0.x > r2.z) {
++        let s = sqrt(1.0 + r0.x - r1.y - r2.z);
++        q = vec4<f32>(0.5 * s, (r0.y + r1.x) / (2.0 * s), (r0.z + r2.x) / (2.0 * s), (r2.y - r1.z) / (2.0 * s));
++    } else if (r1.y > r2.z) {
++        let s = sqrt(1.0 + r1.y - r0.x - r2.z);
++        q = vec4<f32>((r0.y + r1.x) / (2.0 * s), 0.5 * s, (r1.z + r2.y) / (2.0 * s), (r0.z - r2.x) / (2.0 * s));
++    } else {
++        let s = sqrt(1.0 + r2.z - r0.x - r1.y);
++        q = vec4<f32>((r0.z + r2.x) / (2.0 * s), (r1.z + r2.y) / (2.0 * s), 0.5 * s, (r1.x - r0.y) / (2.0 * s));
++    }
++    return normalize(q);
++}
++
++// A vector turned by a unit quaternion (xyz, w).
++fn bg3_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
++    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
++}
++
++// Block 0 of a BG3 slot: the figure frame (`wowbg3_tav::rig_rows`), as a matrix.
++fn bg3_figure_frame(instance_index: u32) -> mat4x4<f32> {
++    let b = 3u * wow_light.rig_table[wow_rig_slot(instance_index)];
++    let r0 = wow_light.palettes[b];
++    let r1 = wow_light.palettes[b + 1u];
++    let r2 = wow_light.palettes[b + 2u];
++    return mat4x4<f32>(
++        vec4<f32>(r0.x, r1.x, r2.x, 0.0),
++        vec4<f32>(r0.y, r1.y, r2.y, 0.0),
++        vec4<f32>(r0.z, r1.z, r2.z, 0.0),
++        vec4<f32>(r0.w, r1.w, r2.w, 1.0),
++    );
++}
+ #endif
+ 
+ // Bevy 0.18's `mesh.wgsl` vertex stage plus our skinning and point lights. A `MaterialExtension`
+@@ -330,6 +377,22 @@
+         vertex.joint_weights
+     );
+     let frame_origin = wow_light.rig_origin[wow_rig_slot(vertex.instance_index)].xyz;
++    // WOW-BG3 (local fork, patch 0034): a slot whose origin's w is 1 holds BG3's own skin
++    // (`wowbg3_tav`): the joints blended BG3's bone palette (model space, metres); block 0, the figure
++    // frame, goes after it; the tangent frame turns by the blend's rotation as BG3's skinning turns it.
++    let bg3_rig = wow_light.rig_origin[wow_rig_slot(vertex.instance_index)].w > 0.5;
++    var bg3_turn = vec4<f32>(0.0, 0.0, 0.0, 1.0);
++    var bg3_frame = mat4x4<f32>(
++        vec4<f32>(1.0, 0.0, 0.0, 0.0),
++        vec4<f32>(0.0, 1.0, 0.0, 0.0),
++        vec4<f32>(0.0, 0.0, 1.0, 0.0),
++        vec4<f32>(0.0, 0.0, 0.0, 1.0),
++    );
++    if (bg3_rig) {
++        bg3_turn = bg3_bone_rotation(frame_from_local);
++        bg3_frame = bg3_figure_frame(vertex.instance_index);
++        frame_from_local = bg3_frame * frame_from_local;
++    }
+ #else
+     var frame_from_local = mesh_world_from_local;
+     let frame_origin = mesh_world_from_local[3].xyz;
+@@ -338,7 +401,11 @@
+ 
+ #ifdef VERTEX_NORMALS
+ #ifdef WOW_RIG_SKIN
+-    out.world_normal = wow_skin_normals(frame_from_local, vertex.normal);
++    if (bg3_rig) {
++        out.world_normal = wow_normalize((bg3_frame * vec4<f32>(bg3_rotate(bg3_turn, vertex.normal), 0.0)).xyz);
++    } else {
++        out.world_normal = wow_skin_normals(frame_from_local, vertex.normal);
++    }
+ #else
+     out.world_normal = mesh_functions::mesh_normal_local_to_world(
+         vertex.normal,
+@@ -348,10 +415,11 @@
+ #endif
+ #ifdef VERTEX_TANGENTS
+ #ifdef WOW_RIG_SKIN
+-    out.world_tangent = vec4<f32>(
+-        wow_normalize((frame_from_local * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz),
+-        vertex.tangent.w,
+-    );
++    var rig_tangent = (frame_from_local * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz;
++    if (bg3_rig) {
++        rig_tangent = (bg3_frame * vec4<f32>(bg3_rotate(bg3_turn, vertex.tangent.xyz), 0.0)).xyz;
++    }
++    out.world_tangent = vec4<f32>(wow_normalize(rig_tangent), vertex.tangent.w);
+ #else
+     out.world_tangent = mesh_functions::mesh_tangent_local_to_world(
+         mesh_world_from_local,

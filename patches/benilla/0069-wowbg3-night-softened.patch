@@ -1,0 +1,29 @@
+WOW-BG3 benilla patch 0069: WoW's night on BG3's figures, softened.
+
+A light whose blue leads its red (the night ambient) is taken toward its own luminance by up to
+half for the figures (wow_model.wgsl tav_light); daylight and torches are left as WoW gives them.
+
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -612,7 +612,20 @@
+ // Before (flag 32 off), linear albedo × gamma `lit`, encoded, showed `srgb(albedo) × lit^(1/2.4)`:
+ // brighter than WoW's world in its light, flatter between lit and shaded sides (seen in
+ // playtesting). `WOW_BG3_TAV_LIGHT=linear` turns flag 32 off.
+-fn tav_light(c: vec3<f32>) -> vec3<f32> {
++// Patch 0069: WoW's night on BG3's figures, softened. WoW's light at night is blue at the source
++// (ground light 87, 119, 186), and on her BG3 albedo, less saturated than WoW's own textures (a teal
++// skirt, B/R 0.74), it reads far bluer than on WoW's orange-skinned models beside her (playtest feedback: "I
++// don't like how blue characters look at night"). A light whose blue leads its red is taken toward its
++// own luminance, by up to TAV_NIGHT_SOFT (fully at (b - r) / b >= 0.5, the night ambient); daylight and
++// torches (red leading) are left as WoW gives them, so the daytime match stays.
++const TAV_NIGHT_SOFT: f32 = 0.5;
++fn tav_night_soft(c: vec3<f32>) -> vec3<f32> {
++    let k = clamp((c.b - c.r) / max(c.b, 1e-3) * 2.0, 0.0, 1.0) * TAV_NIGHT_SOFT;
++    let y = dot(c, vec3<f32>(0.299, 0.587, 0.114));
++    return mix(c, vec3<f32>(y), k);
++}
++fn tav_light(c0: vec3<f32>) -> vec3<f32> {
++    let c = tav_night_soft(c0);
+     if ((u32(max(m.tav_a.w, 0.0)) & 32u) != 0u) {
+         return tav_lin(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+     }

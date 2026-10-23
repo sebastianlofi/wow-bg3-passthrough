@@ -1,0 +1,113 @@
+--- a/crates/benilla-app/src/sound/combat.rs
++++ b/crates/benilla-app/src/sound/combat.rs
+@@ -346,12 +346,21 @@
+         }
+     };
+ 
++    // WOW-BG3 (patch 0045): in world mode BG3 voices and sounds the own
++    // character. Its WoW vocals (exertion, wounds) never play, and a BG3 strike on a WoW mob (the
++    // replay `wowbg3_fight::flinch`, attacker = the own body) plays no WoW weapon sound (impact,
++    // natural impact, clang, swing): BG3's own hit and spell sounds are the ones heard. The mob's
++    // own sounds (its wound vocal, its attacks on her, aggro, death) stay.
++    let world_mode = crate::wowbg3_lead::hide_self();
+     // `force = 0` (`0x62477e`), so the class roll applies: class 0 is 70 for a creature and 35
+     // for a player, class 1 (a crit) 100.
+     for (attacker, crit) in exertions {
+-        let Ok((tr, _, net, _, _)) = units.get(attacker) else {
++        let Ok((tr, _, net, own, _)) = units.get(attacker) else {
+             continue;
+         };
++        if world_mode && own {
++            continue;
++        }
+         // The `AISOUNDDESC` gate on the attacker: exertion is classes 0/1.
+         if net.kind != EntityKind::Player && object_sound_playing(&out, attacker) {
+             continue;
+@@ -392,9 +401,12 @@
+         let Some(swing) = last.0.get(&ev.entity) else {
+             continue; // an attack anim without a tracked swing (e.g. spawned mid-fight)
+         };
+-        let Ok((attacker_tr, wielded, _, _, _)) = units.get(ev.entity) else {
++        let Ok((attacker_tr, wielded, _, own, _)) = units.get(ev.entity) else {
+             continue;
+         };
++        if world_mode && own {
++            continue; // patch 0045: the own body's weapon is BG3's to sound
++        }
+         let offhand = swing.hit_info & HITINFO_LEFTSWING != 0;
+         if whiffed(swing.victim_state) {
+             let (subclass, _) = swing_weapon(wielded, offhand, mats);
+@@ -467,7 +479,9 @@
+             continue;
+         };
+         let crit = swing.hit_info & HITINFO_CRITICAL != 0;
+-        if !no_contact(swing) {
++        // Patch 0045: a BG3 strike replayed on a WoW mob plays no WoW weapon sound.
++        let bg3_strike = world_mode && attacker.is_some_and(|(_, _, _, own, _)| own);
++        if !no_contact(swing) && !bg3_strike {
+             // The attacker's weapon row (`0x625460`); `None` for a wand or thrown weapon.
+             let offhand = swing.hit_info & HITINFO_LEFTSWING != 0;
+             let (subclass, metal) = swing_weapon(attacker.and_then(|(_, w, ..)| w), offhand, mats);
+@@ -604,6 +618,8 @@
+                     || net.kind == EntityKind::Player
+                     || !swing.victim.is_some_and(|v| object_sound_playing(&out, v))
+             });
++            // Patch 0045: the own character's wounds are BG3's to voice.
++            let vocal_victim = vocal_victim.filter(|(_, _, _, victim_is_you, _)| !(world_mode && *victim_is_you));
+             if let Some((victim_tr, _, net, victim_is_you, _)) = vocal_victim {
+                 // The class roll, keyed on the victim's type (`[vt+0x88]`): class 2 is 60 for a
+                 // creature and 30 for a player; classes 3 and 9 are 100.
+--- a/crates/benilla-app/src/sound/creature.rs
++++ b/crates/benilla-app/src/sound/creature.rs
+@@ -128,7 +128,7 @@
+ /// unit that streams in dead cries nothing: create edges are suppressed.
+ fn death_vocals(
+     mut edges: MessageReader<FieldChanged>,
+-    units: Query<(&NetEntity, &Transform)>,
++    units: Query<(&NetEntity, &Transform, Has<crate::net::Embodied>)>,
+     voices: Option<Res<CreatureVoices>>,
+     kits: Option<ResMut<SoundKits>>,
+     assets: Option<Res<WorldAssets>>,
+@@ -149,9 +149,13 @@
+         if !died {
+             continue;
+         }
+-        let Ok((net, transform)) = units.get(e.entity) else {
+-            continue;
+-        };
++        let Ok((net, transform, own)) = units.get(e.entity) else {
++            continue;
++        };
++        // WOW-BG3 (patch 0045): in world mode the own character's vocals are BG3's.
++        if own && crate::wowbg3_lead::hide_self() {
++            continue;
++        }
+         let Some(voice) = net.display_id.and_then(|d| voices.0.for_display(d)) else {
+             continue;
+         };
+@@ -518,7 +522,7 @@
+ /// (`0x605f30`, `0x602d71`) in the 13-70 yd band.
+ fn fall_landing_vocals(
+     mut landings: MessageReader<crate::creature_anim::HardLanding>,
+-    units: Query<(&NetEntity, &Transform)>,
++    units: Query<(&NetEntity, &Transform, Has<crate::net::Embodied>)>,
+     voices: Option<Res<CreatureVoices>>,
+     kits: Option<ResMut<SoundKits>>,
+     assets: Option<Res<WorldAssets>>,
+@@ -537,9 +541,13 @@
+         if l.descent <= crate::creature_anim::HARD_LANDING_DESCENT {
+             continue;
+         }
+-        let Ok((net, transform)) = units.get(l.entity) else {
+-            continue;
+-        };
++        let Ok((net, transform, own)) = units.get(l.entity) else {
++            continue;
++        };
++        // WOW-BG3 (patch 0045): in world mode the own character's vocals are BG3's.
++        if own && crate::wowbg3_lead::hide_self() {
++            continue;
++        }
+         let kit = net
+             .display_id
+             .and_then(|d| voices.0.for_display(d))

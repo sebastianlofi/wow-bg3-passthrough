@@ -1,0 +1,200 @@
+WOW-BG3 benilla patch 0068: the point lights on BG3's figures in WoW's units.
+
+- wow_model.wgsl `tav_point`: WoW's own models add the point lights (torches, braziers) to the light
+  inside the clamp, `tex x clamp(lit + point)`, in gamma. Patch 0052 took WoW's light to linear for
+  BG3's lighting of a figure but took the point lights to linear apart, `lin(lit) + lin(point)`, so a
+  torch added far less on her than on a WoW model beside her (lit 0.3 and point 0.3: 0.42 shown, WoW
+  0.6). With flag 128 her light at the normal plus the point's share is `lin(clamp(lit + point))`.
+- Debug view 12 (`<tav dir>/tavdebug`): WoW's light plus the point lights at the normal, beside view 11.
+- wowbg3_tav.rs: flag 128 with flag 32; `WOW_BG3_TAV_POINTS=linear` turns it off (as before), and
+  `<tav dir>/tavpoint` (`linear` or `gamma`) overrides that at run time, as `tavlight` does.
+
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index c168013f..9f1a1cde 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -904,13 +904,19 @@ struct TavDraw {
+     /// lighting. `WOW_BG3_TAV_LAW=linear`: as before, a linear albedo as the gamma byte (2 to 4
+     /// times too dark while a figure waits for its maps).
+     gamma_law: bool,
++    /// Patch 0068: with `gamma_light`, the point lights (torches, braziers) join WoW's light before it is
++    /// taken to linear (flag 128, `wow_model.wgsl` `tav_point`), as a WoW model adds them inside its clamp.
++    /// `WOW_BG3_TAV_POINTS=linear`: as before, each taken to linear apart (a torch far weaker on her).
++    gamma_points: bool,
++    /// The start's choice (`WOW_BG3_TAV_POINTS`); `<tav dir>/tavpoint` overrides it at run time.
++    gamma_points_env: bool,
+     debug: TavDebug,
+ }
+ 
+-/// Patch 0037: the debug view of her surfaces (`<tav dir>/tavdebug` holding 0 to 10, read every 60 frames):
++/// Patch 0037: the debug view of her surfaces (`<tav dir>/tavdebug` holding 0 to 12, read every 60 frames):
+ /// 1 albedo, 2 view-space normal, 3 roughness/metalness/occlusion, 4 specular, 5 diffuse, 6 extra map, 7 lit,
+-/// 8 patch 0006's WoW law, 9 the base colour as sampled, 10 a constant (0.25, 0.5, 0.75); 1 to 10 without WoW's
+-/// mouseover highlight.
++/// 8 patch 0006's WoW law, 9 the base colour as sampled, 10 a constant (0.25, 0.5, 0.75), 11 WoW's light at the
++/// normal (patch 0052), 12 that plus the point lights (patch 0068); 1 to 12 without WoW's mouseover highlight.
+ #[derive(Default)]
+ struct TavDebug {
+     view: u32,
+@@ -961,6 +967,8 @@ pub(crate) fn build(app: &mut App) {
+     let gamma_light = gamma_out && !std::env::var("WOW_BG3_TAV_LIGHT").is_ok_and(|v| v.trim() == "linear");
+     // Patch 0059.
+     let gamma_law = gamma_out && !std::env::var("WOW_BG3_TAV_LAW").is_ok_and(|v| v.trim() == "linear");
++    // Patch 0068.
++    let gamma_points = gamma_light && !std::env::var("WOW_BG3_TAV_POINTS").is_ok_and(|v| v.trim() == "linear");
+     info!(
+         "wowbg3 tav: shading {}, out {} (WOW_BG3_TAV_SHADE bg3 or wow, WOW_BG3_TAV_OUT linear or gamma)",
+         if bg3_shade { "BG3's lighting of its G-buffer with WoW's light" } else { "patch 0006's WoW law" },
+@@ -975,6 +983,10 @@ pub(crate) fn build(app: &mut App) {
+          (patch 0059; WOW_BG3_TAV_LAW=linear: as before)",
+         if gamma_law { "her albedo taken to gamma, so it writes srgb(albedo) x lit" } else { "her linear albedo as the gamma byte" }
+     );
++    info!(
++        "wowbg3 tav: WoW's point lights {} (patch 0068; WOW_BG3_TAV_POINTS=linear: as before)",
++        if gamma_points { "summed with WoW's light before it is taken to linear, as WoW's models add them" } else { "taken to linear apart" }
++    );
+     info!(
+         "wowbg3 tav: BG3's vertex-colour cuts {} (WOW_BG3_TAV_CUTS off: none)",
+         if cuts_on { "on" } else { "off" }
+@@ -1045,6 +1057,8 @@ pub(crate) fn build(app: &mut App) {
+         gamma_light,
+         gamma_light_env: gamma_light,
+         gamma_law,
++        gamma_points,
++        gamma_points_env: gamma_points,
+         debug: TavDebug::default(),
+     })
+     .init_resource::<TavFeet>()
+@@ -1768,7 +1782,7 @@ fn tav_material(
+     materials.add(m)
+ }
+ 
+-/// Patch 0037: the debug view (`<tav dir>/tavdebug`, 0 to 10; [`TavDebug`]) set on every material she wears, when
++/// Patch 0037: the debug view (`<tav dir>/tavdebug`, 0 to 12; [`TavDebug`]) set on every material she wears, when
+ /// the file changes (looked at every 60 frames).
+ fn tav_debug_view(mut d: ResMut<TavDraw>, mut materials: ResMut<Assets<WowModelMaterial>>) {
+     if d.frame % 60 != 45 {
+@@ -1799,6 +1813,29 @@ fn tav_debug_view(mut d: ResMut<TavDraw>, mut materials: ResMut<Assets<WowModelM
+                 if want { "taken to linear" } else { "used as a linear multiplier" }
+             );
+         }
++        // Patch 0068: `<tav dir>/tavpoint` (`linear` or `gamma`) overrides `WOW_BG3_TAV_POINTS` the same way.
++        let want = match std::fs::read_to_string(d.dir.join("tavpoint")).ok().as_deref().map(str::trim) {
++            Some("linear") => false,
++            Some("gamma") => true,
++            _ => d.gamma_points_env,
++        };
++        if want != d.gamma_points {
++            d.gamma_points = want;
++            let mut n = 0;
++            for h in d.surface_mats.values() {
++                if let Some(m) = materials.get_mut(h) {
++                    let f = m.extension.tav_a.w.max(0.0) as u32;
++                    if f & 16 != 0 {
++                        m.extension.tav_a.w = ((f & !128) | if want { 128 } else { 0 }) as f32;
++                        n += 1;
++                    }
++                }
++            }
++            info!(
++                "wowbg3 tav: WoW's point lights {} on {n} materials (tavpoint)",
++                if want { "summed with WoW's light" } else { "taken to linear apart" }
++            );
++        }
+     }
+     let path = d.dir.join("tavdebug");
+     let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+@@ -1806,7 +1843,7 @@ fn tav_debug_view(mut d: ResMut<TavDraw>, mut materials: ResMut<Assets<WowModelM
+         return;
+     }
+     d.debug.stamp = stamp;
+-    let view = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0).min(11);
++    let view = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0).min(12);
+     if view == d.debug.view {
+         return;
+     }
+@@ -1819,7 +1856,7 @@ fn tav_debug_view(mut d: ResMut<TavDraw>, mut materials: ResMut<Assets<WowModelM
+             n += 1;
+         }
+     }
+-    info!("wowbg3 tav: debug view {view} on {n} materials (tavdebug: 1 albedo, 2 normal, 3 rough/metal/occl, 4 specular, 5 diffuse, 6 extra, 7 lit, 8 WoW's law, 9 base colour, 10 constant, 11 WoW's light; no highlight)");
++    info!("wowbg3 tav: debug view {view} on {n} materials (tavdebug: 1 albedo, 2 normal, 3 rough/metal/occl, 4 specular, 5 diffuse, 6 extra, 7 lit, 8 WoW's law, 9 base colour, 10 constant, 11 WoW's light, 12 with the point lights; no highlight)");
+ }
+ 
+ /// Puts the baked maps (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested where the
+@@ -1869,7 +1906,7 @@ fn load_textures(
+     let mut lawed = 0;
+     let TavDraw {
+         dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, bg3_shade,
+-        gamma_out, gamma_light, gamma_law, debug, ..
++        gamma_out, gamma_light, gamma_law, gamma_points, debug, ..
+     } =
+         &mut *d;
+     let dir: &Path = dir.as_path();
+@@ -1971,6 +2008,10 @@ fn load_textures(
+                         // Patch 0059: flag 64, the law path's albedo taken to gamma (`srgb(albedo) × lit`).
+                         lanes[0].w += 64.0;
+                     }
++                    if *gamma_light && *gamma_points {
++                        // Patch 0068: flag 128, the point lights summed with WoW's light (`tav_point`).
++                        lanes[0].w += 128.0;
++                    }
+                 }
+                 let h = if *maps {
+                     tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided, x, dt, lanes)
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+index c067d866..f3ccfcb4 100644
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -619,6 +619,20 @@ fn tav_light(c: vec3<f32>) -> vec3<f32> {
+     return c;
+ }
+ 
++// Patch 0068: the point lights' share (torches, braziers, `point_g` gamma) on top of WoW's light
++// `lit` at the normal, in the units of her other light. WoW's own models add them inside the clamp,
++// `tex × clamp(lit + point)`; taken to linear apart, `lin(lit) + lin(point)` gave a torch far less
++// than that on anything already lit (lit 0.3 and point 0.3: 0.42 shown, WoW 0.6), so at night she
++// stayed blue-grey beside the warm NPCs a brazier lights. With flag 128 her light at N plus the
++// point's share is exactly `lin(clamp(lit + point))`. `WOW_BG3_TAV_POINTS=linear` (or `<tav
++// dir>/tavpoint`) turns flag 128 off.
++fn tav_point(lit: vec3<f32>, point_g: vec3<f32>) -> vec3<f32> {
++    if ((u32(max(m.tav_a.w, 0.0)) & 128u) != 0u) {
++        return max(tav_light(lit + point_g) - tav_light(lit), vec3<f32>(0.0));
++    }
++    return tav_light(point_g);
++}
++
+ // WoW's ambient alone (the lobe's DC without the sun's bands, or the FFP ambient).
+ fn tav_wow_ambient(doodad: bool) -> vec3<f32> {
+     return clamp(
+@@ -787,7 +801,8 @@ fn tav_bg3(
+     // analytic lobe) is WoW's ambient.
+     let e_amb = tav_light(tav_wow_ambient(doodad));
+     let sun = max(tav_light(tav_wow_lit(L, L, intensity, doodad)) - e_amb, vec3<f32>(0.0)) * sun_on;
+-    let e_point = tav_light(point_g);
++    let lit_n = tav_wow_lit(N, L, intensity, doodad);
++    let e_point = tav_point(lit_n, point_g);
+     var diffuse = vec3<f32>(0.0);
+     var specular = vec3<f32>(0.0);
+     if (model > 4.5) {
+@@ -807,7 +822,7 @@ fn tav_bg3(
+         var a2_a = pow(f.rough, 4.0);
+         var a2_b = a2_a;
+         var lobe_mix = 0.0;
+-        let e_n = tav_light(tav_wow_lit(N, L, intensity, doodad));
++        let e_n = tav_light(lit_n);
+         var e_diff = e_n;
+         if (model > 2.5) {
+             // Skin (model 3): the diffusion profile's two specular lobes (roughness scales of the raw
+@@ -856,7 +871,10 @@ fn tav_bg3(
+         return tav_lin(f.extra.rgb);
+     } else if (dbg == 11u) {
+         // Patch 0052: WoW's light multiplier at N as WoW uses it (gamma), shown as it is.
+-        return tav_lin(tav_wow_lit(N, L, intensity, doodad));
++        return tav_lin(lit_n);
++    } else if (dbg == 12u) {
++        // Patch 0068: WoW's light plus the point lights at N as a WoW model sums them (gamma).
++        return tav_lin(clamp(lit_n + point_g, vec3<f32>(0.0), vec3<f32>(1.0)));
+     }
+     // 0, or 7: the lit figure (7 without WoW's highlight, in the fragment; 8 is WoW's law there).
+     return diffuse + specular;

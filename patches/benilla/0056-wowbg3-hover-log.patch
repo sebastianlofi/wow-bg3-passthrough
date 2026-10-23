@@ -1,0 +1,36 @@
+WOW-BG3 benilla patch 0056: what WoW has under BG3's pointer, in the log.
+
+- wowbg3_lead.rs, `forward_pointer`: every time the hover record changes, one line says whether a
+  click where BG3's pointer is would be WoW's (a corpse to loot, an object, an NPC WoW claims), BG3's
+  (a mirrored mob, whose stand-in takes the click) or neither, with the unit, corpse and object guids,
+  WoW's cursor kind and the quest-giver status. On change only, so it costs nothing in a quiet frame.
+- Why: looting and talking to quest givers stopped working in 0.1.0, and the two halves of that path
+  (WoW's pick and the click routing) cannot be told apart from the logs there are. A desktop session
+  with this line answers it: a line that never names a unit while the pointer sits on one puts the
+  fault in the pick, one that names it while a click does nothing puts it in the routing. Release mode
+  cannot test it at all, as it is headless and BG3 reports a fixed pointer there.
+
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -669,6 +669,21 @@
+     if key != link.hover_flags || link.hover_seq == 0 {
+         link.hover_flags = key;
+         link.hover_seq = link.hover_seq.wrapping_add(1).max(1);
++        // What WoW has under BG3's pointer, each time it changes: whether a click there is WoW's
++        // (flag 2: a corpse to loot, an object, an NPC WoW claims), BG3's (flag 4: a mirrored mob,
++        // whose stand-in takes the click) or neither. A line that never names a unit while the
++        // pointer sits on one says the pick is at fault; one that names it while nothing happens on
++        // a click says the routing is.
++        info!(
++            "wowbg3 hover: flags {flags} (WoW's UI {}, WoW's to click {}, a mirrored mob {}), \
++             unit {:?}, corpse {:?}, object {:?}, cursor {kind}, quest status {status}",
++            over_ui.0,
++            flags & 2 != 0,
++            flags & 4 != 0,
++            hovered.guid,
++            hovered.corpse_guid,
++            object.guid,
++        );
+         // 36 bytes since patch 0047: the 28 of 0019, the status at 28 and the seq again at 32.
+         let mut rec = [0u8; 36];
+         rec[0..4].copy_from_slice(b"WBH1");

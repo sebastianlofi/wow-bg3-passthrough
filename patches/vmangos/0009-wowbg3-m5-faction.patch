@@ -1,0 +1,66 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 76da3f4..aece50d 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -35,6 +35,8 @@
+ #include "ObjectAccessor.h"
+ #include "ObjectGuid.h"
+ #include "Player.h"
++#include "ReputationMgr.h"
++#include "ObjectMgr.h"
+ #include "SharedDefines.h"
+ #include "SpellMgr.h"
+ #include "ThreatManager.h"
+@@ -1178,6 +1180,43 @@ namespace
+                 out.Add(MobLine("-", c, "aggro"));
+     }
+ 
++    // faction (0009, WOW-BG3 tele.sh to the other side's towns): the player counts as the
++    // given side until logout or `faction own`: its faction template becomes that side's race's
++    // (Orc for horde, Human for alliance) and every reputation faction is forced to the rank that
++    // race starts with (forced reactions, as SPELL_AURA_FORCE_REACTION does), so guards and towns
++    // treat the player as that side. Team, quests and saved reputation are unchanged.
++    std::mutex g_factionLock;
++    std::unordered_map<uint64, std::vector<uint32>> g_factionForced;
++
++    void Faction(Player* p, std::string const& side, Out& out)
++    {
++        uint8 const race = side == "horde" ? uint8(RACE_ORC) : side == "alliance" ? uint8(RACE_HUMAN) : p->GetRace();
++        ReputationMgr& rep = p->GetReputationMgr();
++        std::lock_guard<std::mutex> lock(g_factionLock);
++        std::vector<uint32>& mine = g_factionForced[p->GetObjectGuid().GetRawValue()];
++        for (uint32 id : mine)
++            rep.ApplyForceReaction(id, REP_NEUTRAL, false);
++        mine.clear();
++        if (side != "own")
++        {
++            uint32 const raceMask = 1u << (race - 1);
++            uint32 const classMask = p->GetClassMask();
++            for (auto const& kv : sObjectMgr.GetFactionMap())
++            {
++                FactionEntry const* f = &kv.second;
++                if (f->reputationListID < 0)
++                    continue;
++                int const idx = f->GetIndexFitTo(raceMask, classMask);
++                int32 const base = idx >= 0 ? f->BaseRepValue[idx] : 0;
++                rep.ApplyForceReaction(f->ID, ReputationMgr::ReputationToRank(base), true);
++                mine.push_back(f->ID);
++            }
++        }
++        p->SetFactionTemplateId(Player::GetFactionForRace(race));
++        rep.SendForceReactions();
++        out.Add("WOWBG3 faction " + side + " " + std::to_string(p->GetFactionTemplateId()) + " " + std::to_string(mine.size()));
++    }
++
+     void Execute(WorldSession* session, std::string const& text)
+     {
+         Player* p = session->GetPlayer();
+@@ -1204,6 +1243,8 @@ namespace
+             Keep(p, a[2], out);
+         else if (verb == "pos" && a.size() == 7 && ValidId(a[2]))
+             Place(p, a[2], a[3], a[4], a[5], a[6], out);
++        else if (verb == "faction" && a.size() == 3 && (a[2] == "horde" || a[2] == "alliance" || a[2] == "own"))
++            Faction(p, a[2], out);
+         else
+             out.Add("WOWBG3 refused usage " + (verb.empty() ? std::string("-") : verb));
+ 

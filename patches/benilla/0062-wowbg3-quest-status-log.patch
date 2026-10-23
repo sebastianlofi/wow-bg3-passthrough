@@ -1,0 +1,100 @@
+WOW-BG3 benilla patch 0062: the quest giver's status and the talk ladder's refusal, in the log.
+
+- target/click.rs talk: when the service ladder matches nothing (a quest giver whose status never came, or
+  one with nothing to offer) the line is info, with the NPC flags and the quest status it saw.
+- ui_quest/net.rs: each change of a quest giver's status (SMSG_QUESTGIVER_STATUS), at info.
+- quest_markers/query.rs: a unit's own status query, and a quest giver dropped as hostile, at info.
+  (the 0.1.0 playtest: quest givers that would not talk, and nothing in the log said why.)
+
+--- a/crates/benilla-app/src/target/click.rs
++++ b/crates/benilla-app/src/target/click.rs
+@@ -616,7 +616,12 @@
+         let ghost = self_store.is_some_and(|s| s.0.player_is_ghost());
+         let Some(arm) = service_arm(npc_flags, self.service.quest.status(guid)) else {
+             // `0x5f05ca`: no consulted bit does nothing, gesture included.
+-            debug!("right-click interact: {guid:#x} matches no service bit — nothing sent");
++            // WOW-BG3 (patch 0062): at info, with what it saw: a quest giver whose status never came
++            // (none) or says nothing to offer declines here, and nothing else on the path says so.
++            info!(
++                "right-click interact: {guid:#x} matches no service bit — nothing sent (npc flags {npc_flags:#x}, quest status {:?})",
++                self.service.quest.status(guid)
++            );
+             return;
+         };
+         match service_action(arm, guid, ghost, cursor_sale) {
+--- a/crates/benilla-app/src/ui_quest/net.rs
++++ b/crates/benilla-app/src/ui_quest/net.rs
+@@ -170,6 +170,10 @@
+         quest.refuse_status(npc, status);
+         return;
+     }
++    // WOW-BG3 (patch 0062): each change of a giver's status, at info (one line per change).
++    if quest.status(npc) != Some(status) {
++        info!("net: questgiver status {npc:#x} → {status}");
++    }
+     quest.set_status(npc, status);
+ }
+ 
+--- a/crates/benilla-app/src/quest_markers/query.rs
++++ b/crates/benilla-app/src/quest_markers/query.rs
+@@ -75,6 +75,21 @@
+     mut ecs: Commands,
+     mut state: Local<QueryState>,
+ ) {
++    // WOW-BG3 (patch 0062): once a minute (3600 frames), what this system sees: our own player, the
++    // quest givers in view, how many it asked and how many answers are kept.
++    state.frames = state.frames.wrapping_add(1);
++    if state.frames % 3600 == 1 {
++        let givers = objects.iter().filter(|(_, _, n, o, _)| {
++            matches!(n.kind, EntityKind::Unit) && o.0.unit_npc_flags() & NPC_FLAG_QUESTGIVER != 0
++        });
++        info!(
++            "quest markers: self {}, quest givers in view {}, asked {}, statuses kept {}",
++            self_q.iter().next().is_some(),
++            givers.count(),
++            state.asked.len(),
++            quest.statuses().len()
++        );
++    }
+     let Some(store) = self_q.iter().next() else {
+         return;
+     };
+@@ -135,6 +150,15 @@
+                     Some(&store),
+                 );
+                 if reaction <= 1 {
++                    // WOW-BG3 (patch 0062): a quest giver taken for hostile is never asked (once per change).
++                    if obj.0.unit_npc_flags() & NPC_FLAG_QUESTGIVER != 0 && state.hostile.insert(guid.0) {
++                        info!(
++                            "quest markers: {:#x} reads hostile (reaction {reaction}, its faction template {:?}, ours {:?}), not asked",
++                            guid.0,
++                            obj.0.unit_faction_template(),
++                            store.0.unit_faction_template()
++                        );
++                    }
+                     // The sweep's one teardown (`0x5eb143`), questgiver or not. Dropping the ask
+                     // key brings the marker back through a `0x607380` when the reaction recovers.
+                     state.asked.remove(&guid.0);
+@@ -155,6 +179,11 @@
+                 // `0x1aa` has one sender, `0x607380` (`0x6073e8`), so never on a light sweep.
+                 let flags = obj.0.unit_npc_flags();
+                 if (per_unit || swept) && flags & NPC_FLAG_QUESTGIVER != 0 {
++                    // WOW-BG3 (patch 0062): the unit's own asks at info (not the sweeps').
++                    state.hostile.remove(&guid.0);
++                    if per_unit {
++                        info!("quest markers: asking {:#x} its status (reaction {reaction})", guid.0);
++                    }
+                     let _ = commands
+                         .0
+                         .send(ClientCommand::QuestgiverStatusQuery { npc: guid.0 });
+@@ -250,6 +279,10 @@
+     /// a world is never a full sweep.
+     was_dead: bool,
+     my_faction: Option<u32>,
++    /// WOW-BG3 (patch 0062): quest givers logged as read hostile, so each says it once per change.
++    hostile: std::collections::HashSet<u64>,
++    /// WOW-BG3 (patch 0062): frames run, for the once-a-minute line.
++    frames: u32,
+ }
+ 
+ #[cfg(test)]

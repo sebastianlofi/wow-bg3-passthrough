@@ -1,0 +1,234 @@
+WOW-BG3 benilla patch 0035: the figures' look as BG3 draws them (on top of 0001-0009, 0011-0034).
+
+A desktop session (Gale save with Astarion): parts of the clothes black, body showing through the
+clothes, less detail than in the morning. Here (wowbg3_tav.rs):
+- LOD: each visual BG3 shows is drawn at its finest LOD (its LOD-0 meshes BG3 has drawn, or all of
+  them before it has), not the coarser LOD BG3 picks at its default 10 m camera (0034 drew BG3's LOD:
+  LOD-1 bodies, heads, hair and genitals at play distance, a coarse body bulging through the clothes).
+  The palettes of all LODs of a visual are BG3's of the frame. WOW_BG3_TAV_LOD=bg3: 0034's behaviour.
+- Sides: tavtex.txt flag 16 (TVT_ONE_SIDED, set by link/tools/tavtex.py from the material shader's
+  RasterizerStateID) culls the back faces of the materials BG3 draws one-sided; everything was drawn
+  two-sided, so the inner faces of Gale's robe showed through its front. WOW_BG3_TAV_SIDES=two: all
+  two-sided as before.
+- Size: plans and poses of up to 512 meshes/records (the layer's TAV_MAX; wowbg3_tav.rs MAX_MESHES, also
+  wowbg3_body.rs's pose root); at 256 the Gale save with five companions (296 meshes, every LOD
+  planned) did not decode, no pose fitted and every figure vanished, and the body stopped following.
+The black pieces were tavtex.py's (virtual texture layers read as zeros where the tile set stops above
+level 0), fixed there; vertex-colour cuts (legs in boots) are not in this patch (benilla 0010 WIP).
+
+--- a/crates/benilla-app/src/wowbg3_body.rs
++++ b/crates/benilla-app/src/wowbg3_body.rs
+@@ -117,7 +117,9 @@
+     let u = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+     let f = |o: usize| -> Option<f32> { Some(f32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+     let n = u(12)? as usize;
+-    if n > 256 {
++    // Patch 0035: up to the layer's TAV_MAX records (`wowbg3_tav::MAX_MESHES`; 256 refused Gale and five
++    // companions, 296 records with every LOD planned, and the body stopped following).
++    if n > crate::wowbg3_tav::MAX_MESHES {
+         return None;
+     }
+     let mut at = 24;
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -82,6 +82,24 @@
+ //! ([`skin_check`]). A plan whose slots do not fit the palette skins on the CPU. LODs
+ //! (the LOD format research): with a layer that flags per pose record whether BG3 drew the
+ //! mesh in that frame's G-buffer pass, exactly those meshes are drawn (the LOD BG3 draws); else LOD 0.
++//!
++//! Patch 0035 (a desktop session with Gale and Astarion: "this morning Tav looked
++//! pretty much 1 to 1 ... now" coarse, with patches through the clothes):
++//! - LOD: at BG3's default camera distance (10 m) BG3 draws the bodies, heads, genitals and some
++//!   clothes at LOD 1 (12 m: footwear, underwear, the staff too), so since 0034 WoW drew those coarse
++//!   meshes: hair of 4 k instead of 47 k vertices, LOD-1 heads with their own (brighter) bake, and a
++//!   LOD-1 body bulging through LOD-0 clothes. The palettes of every LOD of a visual are fresh in every
++//!   frame (LOD-0 rows change as much as the drawn LOD's), so each visual BG3 shows is now drawn at
++//!   its finest LOD: the LOD-0 meshes of it BG3 has drawn (a visual's alternates, never drawn, stay out),
++//!   or all of its LOD-0 meshes before BG3 has drawn it at LOD 0. Culled visuals and untracked frames keep
++//!   what was drawn, as in 0034. `WOW_BG3_TAV_LOD=bg3` draws the LOD BG3 draws (0034's behaviour).
++//! - Sides: every mesh was drawn two-sided, so one-sided BG3 cloth showed its inner faces through the
++//!   outside (lighter patches on the front of Gale's robe). `tavtex.py` flags in `tavtex.txt` (16,
++//!   [`TVT_ONE_SIDED`]) the meshes whose BG3 material culls back faces (its shader's RasterizerStateID 1;
++//!   the `_2S` shaders, hair, fur and pubes are two-sided), and their back faces are culled here too.
++//!   `WOW_BG3_TAV_SIDES=two` draws everything two-sided as before.
++//! - Size: plans of up to [`MAX_MESHES`] (512, the layer's TAV_MAX) meshes and pose records; at 256, Gale
++//!   and five companions (296 meshes with every LOD planned) did not decode and every figure vanished.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -125,6 +143,13 @@
+ pub(crate) const TVT_ALPHA_TEST: u32 = 1;
+ pub(crate) const TVT_HIDDEN: u32 = 2;
+ pub(crate) const TVT_LINEAR: u32 = 4;
++/// Patch 0035: in `tavtex.txt`'s flags column only (never in a `.tvt` header): BG3 draws the material
++/// one-sided (back faces culled), so WoW culls them too.
++pub(crate) const TVT_ONE_SIDED: u32 = 16;
++/// Patch 0035: the most meshes a plan and records a pose may hold, the capture layer's TAV_MAX (was 256:
++/// with every LOD planned, Gale and five companions made 296, `tavmesh.bin` "did not decode", no pose
++/// fitted and every figure vanished).
++pub(crate) const MAX_MESHES: usize = 512;
+ 
+ /// One mesh as copied: bind-pose positions and normals (model space, metres), uv0, skin.
+ pub(crate) struct TavMesh {
+@@ -160,7 +185,7 @@
+         return None;
+     }
+     let (seq, n) = (u32_at(b, 8)?, u32_at(b, 12)? as usize);
+-    if n > 256 {
++    if n > MAX_MESHES {
+         return None;
+     }
+     let f3 = |o| -> Option<[f32; 3]> { Some([f32_at(b, o)?, f32_at(b, o + 4)?, f32_at(b, o + 8)?]) };
+@@ -355,7 +380,7 @@
+     }
+     let seq = u32_at(b, 8)?;
+     let n = u32_at(b, 12)? as usize;
+-    if n > 256 {
++    if n > MAX_MESHES {
+         return None;
+     }
+     let f3 = |o| -> Option<[f32; 3]> { Some([f32_at(b, o)?, f32_at(b, o + 4)?, f32_at(b, o + 8)?]) };
+@@ -471,7 +496,7 @@
+     }
+     let (seq, frame, n) = (u32_at(b, 4)?, u32_at(b, 8)?, u32_at(b, 12)? as usize);
+     let time = f64::from_le_bytes(b.get(16..24)?.try_into().ok()?);
+-    if n > 256 {
++    if n > MAX_MESHES {
+         return None;
+     }
+     let mut at = 24;
+@@ -721,8 +746,8 @@
+     Data,
+ }
+ 
+-/// One material's maps: albedo, normal, surface files and the alpha test.
+-type LookKey = (String, Option<String>, Option<String>, bool);
++/// One material's maps: albedo, normal, surface files, the alpha test and (patch 0035) one-sided.
++type LookKey = (String, Option<String>, Option<String>, bool, bool);
+ 
+ #[derive(Resource)]
+ struct TavDraw {
+@@ -795,6 +820,12 @@
+     ab: Option<AbBurst>,
+     skin_us: Vec<u32>,
+     rig_load: (usize, usize),
++    /// Patch 0035: `WOW_BG3_TAV_LOD` (`fine`, the default: each visual BG3 shows at its finest LOD; `bg3`:
++    /// the LOD BG3 draws), the LOD-0 meshes BG3 has drawn (by key), and `WOW_BG3_TAV_SIDES` (`two`: every
++    /// material two-sided, as before; else BG3's one-sided materials cull back faces).
++    lod_fine: bool,
++    lod0_drawn: HashSet<u64>,
++    sides: bool,
+ }
+ 
+ pub(crate) fn build(app: &mut App) {
+@@ -830,6 +861,14 @@
+         _ => SkinMode::Gpu,
+     };
+     let check = std::env::var("WOW_BG3_TAV_SKIN_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
++    // Patch 0035.
++    let lod_fine = std::env::var("WOW_BG3_TAV_LOD").map_or(true, |v| v.trim() != "bg3");
++    let sides = std::env::var("WOW_BG3_TAV_SIDES").map_or(true, |v| v.trim() != "two");
++    info!(
++        "wowbg3 tav: LOD {} (WOW_BG3_TAV_LOD fine or bg3), sides {} (WOW_BG3_TAV_SIDES two: all two-sided)",
++        if lod_fine { "finest of each visual BG3 shows" } else { "as BG3 draws it" },
++        if sides { "as BG3 draws them" } else { "all two-sided" }
++    );
+     info!(
+         "wowbg3 tav: skinning {skin:?} (WOW_BG3_TAV_SKIN gpu, cpu or ab), skin check {}",
+         if check > 0 { format!("every {check} poses") } else { "off".to_string() }
+@@ -880,6 +919,9 @@
+         ab: None,
+         skin_us: Vec::new(),
+         rig_load: (0, 0),
++        lod_fine,
++        lod0_drawn: HashSet::new(),
++        sides,
+     })
+     .init_resource::<TavFeet>()
+     .init_resource::<PartyFeet>()
+@@ -1348,13 +1390,14 @@
+     flip_y: bool,
+     spec: f32,
+     cutoff: f32,
++    two_sided: bool,
+ ) -> Handle<WowModelMaterial> {
+     let plain = model_material(
+         cache,
+         materials,
+         Some(albedo),
+         if alpha_test { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
+-        true,
++        two_sided, // patch 0035: as BG3 draws the material (was always two-sided)
+         false,
+         false,
+         false,
+@@ -1438,7 +1481,7 @@
+         return; // the baker has not caught up with this plan yet
+     }
+     let (mut applied, mut hidden, mut mapped, mut pending) = (0, 0, 0, 0);
+-    let TavDraw { dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, .. } =
++    let TavDraw { dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, .. } =
+         &mut *d;
+     let dir: &Path = dir.as_path();
+     // A map's cache name: the file and its modification time.
+@@ -1464,8 +1507,11 @@
+         }
+         let Some(albedo) = t.albedo.clone() else { continue };
+         let alpha_test = t.flags & TVT_ALPHA_TEST != 0;
++        // Patch 0035: BG3 culls this material's back faces.
++        let one_sided = *sides && t.flags & TVT_ONE_SIDED != 0;
+         let (normal, surface) = (t.normal.clone().filter(|_| *maps), t.surface.clone().filter(|_| *maps));
+-        let key: LookKey = (version(&albedo), normal.as_deref().map(version), surface.as_deref().map(version), alpha_test);
++        let key: LookKey =
++            (version(&albedo), normal.as_deref().map(version), surface.as_deref().map(version), alpha_test, one_sided);
+         let material = match surface_mats.get(&key) {
+             Some(h) => h.clone(),
+             None => {
+@@ -1493,14 +1539,14 @@
+                     _ => None,
+                 };
+                 let h = if *maps {
+-                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff)
++                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided)
+                 } else {
+                     model_material(
+                         cache,
+                         &mut materials,
+                         Some(a),
+                         if alpha_test { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
+-                        true,
++                        !one_sided,
+                         false,
+                         false,
+                         false,
+@@ -1684,7 +1730,7 @@
+     let old_figs = std::mem::take(&mut d.old_figs);
+     let TavDraw {
+         file, parts, figs, logged, trace, skin_cost, totals, early, kept_plans, gpu, check, skin_us, rig_load, looks, fallback_done,
+-        lod_held, ..
++        lod_held, lod_fine, lod0_drawn, ..
+     } = &mut *d;
+     let Some(file) = file.as_ref() else { return };
+     let (centre, wow) = (file.centre, file.wow);
+@@ -1761,8 +1807,21 @@
+         let mut seen: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+         for m in file.meshes.iter().filter(|m| drawn.contains(&m.key)) {
+             seen.entry((m.figure, m.part)).or_default().push(m.lod);
++            if m.lod == 0 {
++                lod0_drawn.insert(m.key);
++            }
+         }
+         for (visual, lods) in seen {
++            // Patch 0035: the visual at its finest LOD: its LOD-0 meshes BG3 has drawn, or all of them
++            // before BG3 has drawn it at LOD 0 (their palettes are BG3's of this frame either way).
++            if *lod_fine {
++                let of_visual = |m: &&TavMesh| (m.figure, m.part) == visual && m.lod == 0;
++                let known: Vec<u64> =
++                    file.meshes.iter().filter(of_visual).filter(|m| lod0_drawn.contains(&m.key)).map(|m| m.key).collect();
++                let keys = if known.is_empty() { file.meshes.iter().filter(of_visual).map(|m| m.key).collect() } else { known };
++                lod_held.insert(visual, (0, keys));
++                continue;
++            }
+             let lod = match lod_held.get(&visual) {
+                 Some(&(held, _)) if lods.contains(&held) => held,
+                 _ => lods.iter().copied().min().unwrap_or(0),

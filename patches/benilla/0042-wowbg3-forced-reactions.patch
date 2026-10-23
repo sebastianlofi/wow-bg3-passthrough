@@ -1,0 +1,156 @@
+--- a/crates/benilla-protocol/src/messages/opcode.rs
++++ b/crates/benilla-protocol/src/messages/opcode.rs
+@@ -58,6 +58,9 @@
+ /// A faction became visible in the reputation pane: one `u32` list slot. It is the only notice of
+ /// `FACTION_FLAG_VISIBLE`; no fresh standing comes with it (`ReputationMgr::SendVisible`).
+ pub const SMSG_SET_FACTION_VISIBLE: u16 = 0x0123;
++/// WOW-BG3 (patch 0042): the forced reactions (`ReputationMgr::SendForceReactions`), `u32` count
++/// then `(u32 Faction.dbc id, u32 rank)` each; the whole set every time.
++pub const SMSG_SET_FORCED_REACTIONS: u16 = 0x02A5;
+ pub const SMSG_SET_FACTION_STANDING: u16 = 0x0124;
+ /// Set a faction's at-war flag from the reputation pane; none of the pane's three verbs is acked.
+ pub const CMSG_SET_FACTION_ATWAR: u16 = 0x0125; // 293
+--- a/crates/benilla-protocol/src/messages/packet.rs
++++ b/crates/benilla-protocol/src/messages/packet.rs
+@@ -305,6 +305,11 @@
+     /// `SMSG_SET_FACTION_VISIBLE`: sets `FACTION_FLAG_VISIBLE` on one slot; it carries no standing.
+     SetFactionVisible {
+         list_id: u32,
++    },
++    /// `SMSG_SET_FORCED_REACTIONS` (WOW-BG3 patch 0042): `(Faction.dbc id, rank 0..=7)` per forced
++    /// faction, the whole set (an empty list clears it).
++    SetForcedReactions {
++        reactions: Vec<(u32, u32)>,
+     },
+     /// `SMSG_NAME_QUERY_RESPONSE`: guid, name, realm (empty on one realm), race/gender/class as
+     /// `u32`s (`NameQueryResponse::AppendBodyTo`); an unknown guid gets an empty name.
+@@ -1338,6 +1343,7 @@
+             ServerPacket::InitializeFactions { .. } => "SMSG_INITIALIZE_FACTIONS".into(),
+             ServerPacket::SetFactionStanding { .. } => "SMSG_SET_FACTION_STANDING".into(),
+             ServerPacket::SetFactionVisible { .. } => "SMSG_SET_FACTION_VISIBLE".into(),
++            ServerPacket::SetForcedReactions { .. } => "SMSG_SET_FORCED_REACTIONS".into(),
+             ServerPacket::NameQueryResponse { .. } => "SMSG_NAME_QUERY_RESPONSE".into(),
+             ServerPacket::CreatureQueryResponse { .. } => "SMSG_CREATURE_QUERY_RESPONSE".into(),
+             ServerPacket::PetNameQueryResponse { .. } => "SMSG_PET_NAME_QUERY_RESPONSE".into(),
+--- a/crates/benilla-protocol/src/messages/parse.rs
++++ b/crates/benilla-protocol/src/messages/parse.rs
+@@ -1195,6 +1195,17 @@
+         opcode::SMSG_SET_FACTION_VISIBLE => ServerPacket::SetFactionVisible {
+             list_id: read_u32_le(&mut r)?,
+         },
++        opcode::SMSG_SET_FORCED_REACTIONS => {
++            let count = read_u32_le(&mut r)?;
++            // Faction.dbc holds a few hundred rows; the hint only bounds the allocation.
++            let mut reactions = Vec::with_capacity(capacity_hint(count, 1024));
++            for _ in 0..count {
++                let faction = read_u32_le(&mut r)?;
++                let rank = read_u32_le(&mut r)?;
++                reactions.push((faction, rank));
++            }
++            ServerPacket::SetForcedReactions { reactions }
++        }
+         opcode::SMSG_NAME_QUERY_RESPONSE => {
+             let guid = read_u64_le(&mut r)?;
+             let name = read_cstring(&mut r)?;
+--- a/crates/benilla-protocol/src/events.rs
++++ b/crates/benilla-protocol/src/events.rs
+@@ -412,6 +412,9 @@
+     ReputationDelta { standings: Vec<(u32, i32)> },
+     /// `SMSG_SET_FACTION_VISIBLE`: sets the slot's visible flag, which decides if it is listed.
+     ReputationVisible { list_id: u32 },
++    /// `SMSG_SET_FORCED_REACTIONS` (WOW-BG3 patch 0042): `(Faction.dbc id, rank)` pairs that
++    /// override every reaction with those factions, the whole set.
++    ForcedReactions { reactions: Vec<(u32, u32)> },
+     /// `SMSG_NAME_QUERY_RESPONSE`: names are never descriptor fields in 1.12, only query answers.
+     /// An unknown guid answers with an empty `name`.
+     PlayerName {
+--- a/crates/benilla-protocol/src/events/decode.rs
++++ b/crates/benilla-protocol/src/events/decode.rs
+@@ -825,6 +825,9 @@
+         }
+         ServerPacket::SetFactionVisible { list_id } => {
+             vec![SessionEvent::ReputationVisible { list_id }]
++        }
++        ServerPacket::SetForcedReactions { reactions } => {
++            vec![SessionEvent::ForcedReactions { reactions }]
+         }
+         ServerPacket::NameQueryResponse {
+             guid,
+--- a/crates/benilla-app/src/net/session.rs
++++ b/crates/benilla-app/src/net/session.rs
+@@ -52,6 +52,7 @@
+         .net_handler(K::Reputations, on_reputations)
+         .net_handler(K::ReputationDelta, on_reputation_delta)
+         .net_handler(K::ReputationVisible, on_reputations)
++        .net_handler(K::ForcedReactions, on_forced_reactions)
+         .net_handler(K::BindPoint, on_player_store)
+         .net_handler(K::Proficiency, on_player_store)
+         .net_handler(K::PacketDropped, on_packet_dropped)
+@@ -339,6 +340,18 @@
+             reputation_visible(list_id, &mut b.reputations)
+         }
+         _ => {}
++    }
++}
++
++/// `SMSG_SET_FORCED_REACTIONS` (WOW-BG3 patch 0042): the server forces our
++/// reaction with whole factions (vmangos `ReputationMgr::ApplyForceReaction`: auras such as
++/// SPELL_AURA_FORCE_REACTION, and `.wowbg3 faction` of server patch 0009). Every reaction the
++/// client draws or acts on (nameplates, the cursor, right click, the target ring) reads it first,
++/// as the reference's forced-reaction table (`0x4d6490`).
++fn on_forced_reactions(In(ev): In<SessionEvent>) {
++    if let SessionEvent::ForcedReactions { reactions } = ev {
++        info!("net: {} forced faction reaction(s)", reactions.len());
++        crate::target::ring::set_forced_reactions(&reactions);
+     }
+ }
+ 
+--- a/crates/benilla-app/src/target/ring.rs
++++ b/crates/benilla-app/src/target/ring.rs
+@@ -469,6 +469,10 @@
+         let catalog = &factions?.0;
+         let self_store = self_store?;
+         let target_tpl = catalog.template(target_store?.0.unit_faction_template()?)?;
++        // Patch 0042: a forced reaction answers first.
++        if let Some(rank) = forced_rank(target_tpl.faction) {
++            return Some(rank);
++        }
+         // A reputation faction: our rank with it.
+         if let Some(info) = catalog.reputation_faction(target_tpl.faction) {
+             let standing = reputations
+@@ -485,6 +489,24 @@
+     })();
+     // `0x606439` (`cmp esi,6` / `jl` / `mov esi,6`) caps `0x606530`'s answer: Exalted's 7 reads 6.
+     resolved.map_or(Reaction::Neutral as u8, |rank| rank.min(REACTION_CAP))
++}
++
++/// WOW-BG3 (patch 0042): the forced reactions (`SMSG_SET_FORCED_REACTIONS`), by
++/// `Faction.dbc` id, rank `0..=7`. One table for the local player, as the reference keeps it on the
++/// active player (`0x4d6490`); replaced whole by each packet, which vmangos sends at login too.
++static FORCED: std::sync::RwLock<Vec<(u32, u8)>> = std::sync::RwLock::new(Vec::new());
++
++/// Replaces the forced reactions.
++pub(crate) fn set_forced_reactions(reactions: &[(u32, u32)]) {
++    if let Ok(mut f) = FORCED.write() {
++        *f = reactions.iter().map(|&(id, rank)| (id, rank.min(7) as u8)).collect();
++    }
++}
++
++/// The forced rank with a `Faction.dbc` faction, if the server forces one (vmangos
++/// `ReputationMgr::GetForcedRankIfAny`, read by `Unit::GetReactionTo` in both directions).
++pub(crate) fn forced_rank(faction: u32) -> Option<u8> {
++    FORCED.read().ok()?.iter().find(|&&(id, _)| id == faction).map(|&(_, r)| r)
+ }
+ 
+ /// Revered, the highest rank `UnitReaction`'s generic leg answers (`0x606439`).
+@@ -574,6 +596,10 @@
+     let resolved = (|| {
+         let catalog = &factions?.0;
+         let target_tpl = catalog.template(target_store?.0.unit_faction_template()?)?;
++        // Patch 0042: a forced reaction answers first (`0x4d6490`), capped as the generic leg.
++        if let Some(rank) = forced_rank(target_tpl.faction) {
++            return Some(rank.min(REACTION_CAP));
++        }
+         // Leg 3: a reputation faction answers by the at-war bit alone.
+         if let Some(at_war) = at_war_with(catalog, reputations, target_tpl.faction) {
+             return Some(if at_war {

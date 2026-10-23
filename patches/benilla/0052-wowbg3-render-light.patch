@@ -1,0 +1,235 @@
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -599,6 +599,20 @@
+     return clamp(lobe, vec3<f32>(0.0), vec3<f32>(1.0));
+ }
+ 
++// Patch 0052: WoW's light in the units it is used in. WoW's own models multiply
++// their gamma-space texel by `lit` (gamma bytes in, gamma bytes out); her albedo is linear, so with
++// `WOW_BG3_TAV_OUT=gamma` (flag 16) and flag 32 the light is taken to linear first and her encoded
++// result is `srgb(albedo) × lit` for a plain diffuse surface, as a WoW model with that texel shows.
++// Before (flag 32 off), linear albedo × gamma `lit`, encoded, showed `srgb(albedo) × lit^(1/2.4)`:
++// brighter than WoW's world in its light, flatter between lit and shaded sides (seen in
++// playtesting). `WOW_BG3_TAV_LIGHT=linear` turns flag 32 off.
++fn tav_light(c: vec3<f32>) -> vec3<f32> {
++    if ((u32(max(m.tav_a.w, 0.0)) & 32u) != 0u) {
++        return tav_lin(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
++    }
++    return c;
++}
++
+ // WoW's ambient alone (the lobe's DC without the sun's bands, or the FFP ambient).
+ fn tav_wow_ambient(doodad: bool) -> vec3<f32> {
+     return clamp(
+@@ -764,9 +778,9 @@
+     // WoW's light: ambient alone, the whole lit at N, the sun's peak (its part at N = L), the point
+     // lights. The environment BG3 reflects (its prefiltered probe, which holds no sun: the sun is the
+     // analytic lobe) is WoW's ambient.
+-    let e_amb = tav_wow_ambient(doodad);
+-    let sun = max(tav_wow_lit(L, L, intensity, doodad) - e_amb, vec3<f32>(0.0)) * sun_on;
+-    let e_point = point_g;
++    let e_amb = tav_light(tav_wow_ambient(doodad));
++    let sun = max(tav_light(tav_wow_lit(L, L, intensity, doodad)) - e_amb, vec3<f32>(0.0)) * sun_on;
++    let e_point = tav_light(point_g);
+     var diffuse = vec3<f32>(0.0);
+     var specular = vec3<f32>(0.0);
+     if (model > 4.5) {
+@@ -786,7 +800,7 @@
+         var a2_a = pow(f.rough, 4.0);
+         var a2_b = a2_a;
+         var lobe_mix = 0.0;
+-        let e_n = tav_wow_lit(N, L, intensity, doodad);
++        let e_n = tav_light(tav_wow_lit(N, L, intensity, doodad));
+         var e_diff = e_n;
+         if (model > 2.5) {
+             // Skin (model 3): the diffusion profile's two specular lobes (roughness scales of the raw
+@@ -803,7 +817,7 @@
+             lobe_mix = m.tav_b.z;
+             // (The light at the mesh's normal mixed in per colour: WoW's lobe is smooth in the normal.)
+             let w = clamp(m.tav_c.xyz * (min(m.tav_b.w, 30.0) / 30.0) * 0.75, vec3<f32>(0.0), vec3<f32>(0.85));
+-            e_diff = mix(e_n, tav_wow_lit(f.ng, L, intensity, doodad), w);
++            e_diff = mix(e_n, tav_light(tav_wow_lit(f.ng, L, intensity, doodad)), w);
+         }
+         diffuse = diff_col * (max(e_diff - (1.0 - f.ao) * e_amb, vec3<f32>(0.0)) + e_point);
+         if (model > 2.5 && f.extra.a > 0.0) {
+@@ -833,6 +847,9 @@
+         return diffuse;
+     } else if (dbg == 6u) {
+         return tav_lin(f.extra.rgb);
++    } else if (dbg == 11u) {
++        // Patch 0052: WoW's light multiplier at N as WoW uses it (gamma), shown as it is.
++        return tav_lin(tav_wow_lit(N, L, intensity, doodad));
+     }
+     // 0, or 7: the lit figure (7 without WoW's highlight, in the fragment; 8 is WoW's law there).
+     return diffuse + specular;
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -890,6 +890,11 @@
+     /// view (`tavdebug`).
+     bg3_shade: bool,
+     gamma_out: bool,
++    /// Patch 0052: with `gamma_out`, WoW's light is a gamma-space multiplier taken to
++    /// linear before it lights her (`WOW_BG3_TAV_LIGHT=linear`: as before, linear albedo × gamma light).
++    gamma_light: bool,
++    /// The start's choice (`WOW_BG3_TAV_LIGHT`); `<tav dir>/tavlight` overrides it at run time.
++    gamma_light_env: bool,
+     debug: TavDebug,
+ }
+ 
+@@ -944,12 +949,17 @@
+     // Patch 0037.
+     let bg3_shade = std::env::var("WOW_BG3_TAV_SHADE").map_or(true, |v| v.trim() != "wow");
+     let gamma_out = std::env::var("WOW_BG3_TAV_OUT").is_ok_and(|v| v.trim() == "gamma");
++    let gamma_light = gamma_out && !std::env::var("WOW_BG3_TAV_LIGHT").is_ok_and(|v| v.trim() == "linear");
+     info!(
+         "wowbg3 tav: shading {}, out {} (WOW_BG3_TAV_SHADE bg3 or wow, WOW_BG3_TAV_OUT linear or gamma)",
+         if bg3_shade { "BG3's lighting of its G-buffer with WoW's light" } else { "patch 0006's WoW law" },
+         if gamma_out { "gamma" } else { "linear" }
+     );
+     info!(
++        "wowbg3 tav: WoW's light {} (patch 0052; WOW_BG3_TAV_LIGHT=linear: as before)",
++        if gamma_light { "taken to linear (gamma-space multiplier, as WoW's models use it)" } else { "used as a linear multiplier" }
++    );
++    info!(
+         "wowbg3 tav: BG3's vertex-colour cuts {} (WOW_BG3_TAV_CUTS off: none)",
+         if cuts_on { "on" } else { "off" }
+     );
+@@ -1016,6 +1026,8 @@
+         cut_stamp: None,
+         bg3_shade,
+         gamma_out,
++        gamma_light,
++        gamma_light_env: gamma_light,
+         debug: TavDebug::default(),
+     })
+     .init_resource::<TavFeet>()
+@@ -1743,13 +1755,39 @@
+     if d.frame % 60 != 45 {
+         return;
+     }
++    // Patch 0052: `<tav dir>/tavlight` (`linear` or `gamma`) overrides `WOW_BG3_TAV_LIGHT` at run time (an A/B
++    // in one session); without the file the start's choice stands.
++    if d.gamma_out {
++        let want = match std::fs::read_to_string(d.dir.join("tavlight")).ok().as_deref().map(str::trim) {
++            Some("linear") => false,
++            Some("gamma") => true,
++            _ => d.gamma_light_env,
++        };
++        if want != d.gamma_light {
++            d.gamma_light = want;
++            let mut n = 0;
++            for h in d.surface_mats.values() {
++                if let Some(m) = materials.get_mut(h) {
++                    let f = m.extension.tav_a.w.max(0.0) as u32;
++                    if f & 16 != 0 {
++                        m.extension.tav_a.w = ((f & !32) | if want { 32 } else { 0 }) as f32;
++                        n += 1;
++                    }
++                }
++            }
++            info!(
++                "wowbg3 tav: WoW's light {} on {n} materials (tavlight)",
++                if want { "taken to linear" } else { "used as a linear multiplier" }
++            );
++        }
++    }
+     let path = d.dir.join("tavdebug");
+     let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+     if stamp == d.debug.stamp {
+         return;
+     }
+     d.debug.stamp = stamp;
+-    let view = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0).min(10);
++    let view = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0).min(11);
+     if view == d.debug.view {
+         return;
+     }
+@@ -1762,7 +1800,7 @@
+             n += 1;
+         }
+     }
+-    info!("wowbg3 tav: debug view {view} on {n} materials (tavdebug: 1 albedo, 2 normal, 3 rough/metal/occl, 4 specular, 5 diffuse, 6 extra, 7 lit, 8 WoW's law, 9 base colour, 10 constant; no highlight)");
++    info!("wowbg3 tav: debug view {view} on {n} materials (tavdebug: 1 albedo, 2 normal, 3 rough/metal/occl, 4 specular, 5 diffuse, 6 extra, 7 lit, 8 WoW's law, 9 base colour, 10 constant, 11 WoW's light; no highlight)");
+ }
+ 
+ /// Puts the baked maps (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested where the
+@@ -1810,7 +1848,7 @@
+     let (mut applied, mut hidden, mut mapped, mut pending) = (0, 0, 0, 0);
+     let TavDraw {
+         dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, bg3_shade,
+-        gamma_out, debug, ..
++        gamma_out, gamma_light, debug, ..
+     } =
+         &mut *d;
+     let dir: &Path = dir.as_path();
+@@ -1905,6 +1943,9 @@
+                 let mut lanes = tav_lanes(&t, bg3, debug.view, (n.is_some(), dt.is_some(), x.is_some(), s.is_some()));
+                 if *gamma_out {
+                     lanes[0].w += 16.0; // `wow_model.wgsl`: flag 16, sRGB-encoded output
++                    if *gamma_light {
++                        lanes[0].w += 32.0; // patch 0052: flag 32, WoW's light taken to linear (`tav_light`)
++                    }
+                 }
+                 let h = if *maps {
+                     tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided, x, dt, lanes)
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -111,6 +111,10 @@
+     pub(crate) flags: u32,
+     /// `wowbg3_lead::depth_offset` for this frame (the render world runs a frame behind).
+     pub(crate) depth_offset: f32,
++    /// Patch 0052: WoW's light on level, sunlit ground for this frame, as the terrain
++    /// pass uses it (`clamp(ambient + diffuse × N·L)`, gamma 0..255 per channel, RGB), byte 3 = 1 when set.
++    /// The capture layer lights BG3's ground surfaces with it (WBF1 bytes 60..64).
++    pub(crate) ground_light: [u8; 4],
+ }
+ 
+ /// CLOCK_MONOTONIC in seconds (the clock BG3's layer and plugin stamp with).
+@@ -254,15 +258,25 @@
+ }
+ 
+ /// End of a frame's update: what it was drawn from, for the export.
+-fn tag_frame(p: Res<Pace>, mut tag: ResMut<FrameTag>) {
++fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLighting>>, mut tag: ResMut<FrameTag>) {
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+         flags: u32::from(p.current.is_some()),
+         depth_offset: crate::wowbg3_lead::depth_offset(),
++        ground_light: lighting.map_or([0; 4], |l| ground_light(&l)),
+     };
+ }
+ 
++/// Patch 0052: the terrain pass's light on level ground in full sun (`terrain.wgsl`: `clamp(ambient +
++/// diffuse × max(N·L, 0))` per channel, gamma), as bytes, byte 3 = 1.
++fn ground_light(l: &benilla_world::lighting::WowLighting) -> [u8; 4] {
++    let up = benilla_assets::coords::wow_to_bevy([0.0, 0.0, 1.0]).normalize();
++    let ndotl = up.dot(-l.sun_dir.normalize_or_zero()).max(0.0);
++    let c = |i: usize| ((l.ambient[i] + l.diffuse[i] * ndotl).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
++    [c(0), c(1), c(2), 1]
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -17,7 +17,9 @@
+ //! Patch 0013 (frame pacing, `wowbg3_pace`): bytes 36..56 say what the frame was drawn from:
+ //! packet u32 at 36 (the BG3 present whose camera and pose it shows, 0 none), camera record seq
+ //! u32 at 40 (`bg3cam.bin`, 0 none), flags u32 at 44 (bit 0: drawn in lockstep from a packet),
+-//! publish time f64 at 48 (CLOCK_MONOTONIC s, when the file became whole). The readback no longer
++//! publish time f64 at 48 (CLOCK_MONOTONIC s, when the file became whole). Patch 0052: bytes 60..64
++//! WoW's light on level sunlit ground (RGB gamma bytes, byte 63 = 1 when given; the layer lights BG3's
++//! ground surfaces with it). The readback no longer
+ //! blocks the render thread: [`SLOTS`] buffer pairs, each frame's copies are mapped without
+ //! waiting and a writer thread waits for the GPU and writes the file (the render thread used to
+ //! wait for the whole frame's GPU work and the 40 MB write at 3440x1440 every frame). A frame
+@@ -124,6 +126,7 @@
+     h[40..44].copy_from_slice(&tag.cam.to_le_bytes());
+     h[44..48].copy_from_slice(&tag.flags.to_le_bytes());
+     h[48..56].copy_from_slice(&publish.to_le_bytes());
++    h[60..64].copy_from_slice(&tag.ground_light); // patch 0052: WoW's light on level sunlit ground
+ }
+ 
+ pub(crate) fn build(app: &mut App) {

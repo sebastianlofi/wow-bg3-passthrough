@@ -1,0 +1,1541 @@
+diff --git a/src/game/CMakeLists.txt b/src/game/CMakeLists.txt
+index 4352b9f..c38f32e 100644
+--- a/src/game/CMakeLists.txt
++++ b/src/game/CMakeLists.txt
+@@ -46,6 +46,7 @@ set (game_SRCS
+     UnitAuraProcHandler.cpp
+     Weather.cpp
+     World.cpp
++    WowBg3Fights.cpp
+     AI/BasicAI.cpp
+     AI/CreatureAI.cpp
+     AI/CreatureAIRegistry.cpp
+@@ -286,6 +287,7 @@ set (game_SRCS
+     UnitEvents.h
+     Weather.h
+     World.h
++    WowBg3Fights.h
+     WorldStates.h
+     AI/BasicAI.h
+     AI/CreatureAI.h
+diff --git a/src/game/Handlers/ChatHandler.cpp b/src/game/Handlers/ChatHandler.cpp
+index 47f576d..c554b5b 100644
+--- a/src/game/Handlers/ChatHandler.cpp
++++ b/src/game/Handlers/ChatHandler.cpp
+@@ -40,6 +40,7 @@
+ #include "CellImpl.h"
+ #include "Anticheat.h"
+ #include "AccountMgr.h"
++#include "WowBg3Fights.h"
+ 
+ bool WorldSession::SanitizeChatMessage(std::string& msg, uint32 lang, uint32 msgType)
+ {
+@@ -156,6 +157,11 @@ void WorldSession::HandleChatMessageOpcode(WorldPackets::Chat::ChatMessage const
+         return;
+     }
+ 
++    // WOW-BG3: the client's fight handoff commands. Never said aloud, not
++    // subject to flood control or the PlayerCommands setting.
++    if (packet.lang != LANG_ADDON && WowBg3::HandleChat(this, packet.message))
++        return;
++
+     if (!IsLanguageAllowedForChatType(packet.lang, packet.type))
+     {
+         sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "CHAT: Wrong language %u received for chat type %u.", packet.lang, packet.type);
+diff --git a/src/game/Objects/Creature.cpp b/src/game/Objects/Creature.cpp
+index 21da2ce..57ea866 100644
+--- a/src/game/Objects/Creature.cpp
++++ b/src/game/Objects/Creature.cpp
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "Creature.h"
++#include "WowBg3Fights.h"
+ #include "Database/DatabaseEnv.h"
+ #include "WorldPacket.h"
+ #include "World.h"
+@@ -967,6 +968,10 @@ void Creature::Update(uint32 update_diff, uint32 diff)
+             if (!IsAlive())
+                 break;
+ 
++            // WOW-BG3: a mob in a BG3 fight stays frozen: no AI (attacks, casts, scripts), leash, evade or regeneration.
++            if (WowBg3::UpdateHeld(this))
++                break;
++
+             float hpPercent = GetHealthPercent();
+             ModifyAuraState(AURA_STATE_HEALTHLESS_15_PERCENT, hpPercent < 16.0f);
+             ModifyAuraState(AURA_STATE_HEALTHLESS_10_PERCENT, hpPercent < 11.0f);
+@@ -3649,6 +3654,9 @@ void Creature::OnEnterCombat(Unit* pWho, bool notInCombat)
+     if (!pWho)
+         return;
+ 
++    // WOW-BG3: hold the mob before its AI reacts if this fight belongs to BG3.
++    WowBg3::OnCreatureEnterCombat(this, pWho);
++
+     if (m_AI && !HasUnitState(UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING))
+         m_AI->AttackedBy(pWho);
+ 
+diff --git a/src/game/Objects/SpellCaster.cpp b/src/game/Objects/SpellCaster.cpp
+index 9ce3685..b3e9342 100644
+--- a/src/game/Objects/SpellCaster.cpp
++++ b/src/game/Objects/SpellCaster.cpp
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "ObjectMgr.h"
++#include "WowBg3Fights.h"
+ #include "SpellCaster.h"
+ #include "DynamicObject.h"
+ #include "GameObject.h"
+@@ -1025,6 +1026,10 @@ float SpellCaster::SpellCriticalHealingBonus(SpellEntry const* spellProto, uint3
+ 
+ int32 SpellCaster::DealHeal(Unit* pVictim, uint32 addhealth, SpellEntry const* spellProto, bool critical)
+ {
++    // WOW-BG3: a mob in a BG3 fight is not healed in WoW.
++    if (WowBg3::BlocksDamage(pVictim))
++        return 0;
++
+     Unit* pUnit = ToUnit();
+ 
+     // Script Event HealedBy
+diff --git a/src/game/Objects/Unit.cpp b/src/game/Objects/Unit.cpp
+index 6b9a89a..6b90cf5 100644
+--- a/src/game/Objects/Unit.cpp
++++ b/src/game/Objects/Unit.cpp
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "Unit.h"
++#include "WowBg3Fights.h"
+ #include "Creature.h"
+ #include "Pet.h"
+ #include "Totem.h"
+@@ -660,6 +661,10 @@ void Unit::DoKillUnit(Unit* pVictim)
+ 
+ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDamage, DamageEffectType damagetype, SpellSchoolMask damageSchoolMask, SpellEntry const* spellProto, bool durabilityLoss, Spell* spell, bool reflected)
+ {
++    // WOW-BG3: only the BG3 fight's own damage reaches a held mob.
++    if (WowBg3::BlocksDamage(pVictim))
++        return 0;
++
+     // World of Warcraft Client Patch 1.7.0 (2005-09-13)
+     // - Fixed bug where self-inflicted damage, like Poisonous Blood, wouldn't
+     //   break stealth.
+@@ -785,6 +790,10 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
+         SetInCombatWithVictim(pVictim);
+     }
+ 
++    // WOW-BG3: this hit just started a BG3 fight (the mob is held now); BG3 decides the damage.
++    if (WowBg3::BlocksDamage(pVictim))
++        return 0;
++
+     if (pVictim->IsCreature())
+         pVictim->ToCreature()->CountDamageTaken(damage, GetCharmerOrOwnerOrOwnGuid().IsPlayer() || pVictim == this);
+     else if (pVictim != this)
+@@ -2237,6 +2246,10 @@ void Unit::AttackerStateUpdate(Unit* pVictim, WeaponAttackType attType, bool ext
+     if (!pVictim->IsAlive())
+         return;
+ 
++    // WOW-BG3: a mob in a BG3 fight never swings in WoW; BG3 decides its attacks.
++    if (WowBg3::IsHeld(this))
++        return;
++
+     if (!extra && IsNonMeleeSpellCasted(false))
+         return;
+ 
+@@ -2683,6 +2696,9 @@ void Unit::_UpdateSpells(uint32 time)
+         }
+     }
+ 
++    // WOW-BG3: time stands still for a mob in a BG3 fight: no aura ticks, no expiry.
++    bool const heldByWowBg3 = WowBg3::IsHeld(this);
++
+     // update auras
+     // m_AurasUpdateIterator can be updated in inderect called code at aura remove to skip next planned to update but removed auras
+     for (m_spellAuraHoldersUpdateIterator = m_spellAuraHolders.begin(); m_spellAuraHoldersUpdateIterator != m_spellAuraHolders.end();)
+@@ -2690,6 +2706,9 @@ void Unit::_UpdateSpells(uint32 time)
+         SpellAuraHolder* i_holder = m_spellAuraHoldersUpdateIterator->second;
+         ++m_spellAuraHoldersUpdateIterator;                            // need shift to next for allow update if need into aura update
+ 
++        if (heldByWowBg3)
++            continue;
++
+         // If channeled spell, do not update. The spell caster will update the holder on spell
+         // update to prevent loss of periodic ticks due to out of sync updates
+         if (i_holder->IsChanneled())
+diff --git a/src/game/Server/WorldSession.cpp b/src/game/Server/WorldSession.cpp
+index 8c54d5b..e1d7935 100644
+--- a/src/game/Server/WorldSession.cpp
++++ b/src/game/Server/WorldSession.cpp
+@@ -26,6 +26,7 @@
+ #include "Opcodes.h"
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
++#include "WowBg3Fights.h"
+ #include "Player.h"
+ #include "ObjectMgr.h"
+ #include "Group.h"
+@@ -682,6 +683,9 @@ void WorldSession::LogoutPlayer(bool Save)
+ 
+     if (_player)
+     {
++        // WOW-BG3: a BG3 fight ends with its player; the mobs go home.
++        WowBg3::OnLogout(_player);
++
+         bool inWorld = _player->IsInWorld() && _player->FindMap();
+ 
+         sLog.Player(this, LOG_CHAR, "Logout", LOG_LVL_DETAIL, "");
+diff --git a/src/game/World.cpp b/src/game/World.cpp
+index ca0b522..b5771f9 100644
+--- a/src/game/World.cpp
++++ b/src/game/World.cpp
+@@ -24,6 +24,7 @@
+ */
+ 
+ #include "World.h"
++#include "WowBg3Fights.h"
+ #include "Database/DatabaseEnv.h"
+ #include "Config/Config.h"
+ #include "Platform/Define.h"
+@@ -2016,6 +2017,9 @@ void World::Update(uint32 diff)
+ 
+         GetMessager().Execute(this);
+ 
++        // WOW-BG3: fight timeouts and cleanup, while no map updates.
++        WowBg3::Update(diff);
++
+         // <li> Handle session updates
+         uint32 updateSessionsTime = WorldTimer::getMSTime();
+         UpdateSessions(diff);
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+new file mode 100644
+index 0000000..ee3a3ec
+--- /dev/null
++++ b/src/game/WowBg3Fights.cpp
+@@ -0,0 +1,1254 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++// WOW-BG3 (local patch): the server side of a fight that BG3 runs. See
++// WowBg3Fights.h for the hooks and `AI Context/m5-server-handoff.md` in the
++// WOW-BG3 project for the protocol.
++//
++// Threads: commands, timeouts and logout run on the world thread while no map
++// updates (the messager and session phase of World::Update). The combat hook
++// and the per-creature update run on map threads and touch only their own
++// creature and its owner, who is on the same map. The tables below are shared,
++// so every access takes the lock, and no game code runs while it is held (game
++// code can call back into the hooks).
++
++#include "WowBg3Fights.h"
++#include "Chat.h"
++#include "Creature.h"
++#include "CreatureAI.h"
++#include "Log.h"
++#include "Map.h"
++#include "MapManager.h"
++#include "ObjectAccessor.h"
++#include "ObjectGuid.h"
++#include "Player.h"
++#include "SharedDefines.h"
++#include "ThreatManager.h"
++#include "Timer.h"
++#include "World.h"
++#include "WorldSession.h"
++
++#include <atomic>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <shared_mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace WowBg3
++{
++namespace
++{
++    uint32 const FREEZE_SPELL  = 9454;                      // GM "Freeze": stun aura without duration
++    size_t const MAX_MOBS      = 8;                         // per encounter, and pending per player
++    float const CLAIM_RANGE    = 50.0f;                     // yards, begin and join
++    float const DAMAGE_RANGE   = 100.0f;                    // yards, hp
++    uint32 const PENDING_MS    = 15 * IN_MILLISECONDS;      // unclaimed aggro holds
++    uint32 const IDLE_MS       = 120 * IN_MILLISECONDS;     // encounter without any command
++    uint32 const MAX_FIGHT_MS  = 30 * MINUTE * IN_MILLISECONDS;
++    uint32 const TICK_MS       = IN_MILLISECONDS;
++    size_t const CLOSED_KEPT   = 64;                        // finished encounter ids kept per player
++
++    struct Mob
++    {
++        ObjectGuid guid;
++        uint32 map = 0;
++        uint32 instance = 0;
++        uint32 since = 0;
++        bool killed = false;                                // dead or gone: never held or damaged again
++        bool announced = false;                             // the client has its `mob` line
++    };
++
++    struct Encounter
++    {
++        std::string id;
++        uint32 map = 0;
++        uint32 instance = 0;
++        uint32 started = 0;
++        uint32 last = 0;
++        std::vector<Mob> mobs;
++
++        Mob* Find(ObjectGuid guid)
++        {
++            for (Mob& m : mobs)
++                if (m.guid == guid)
++                    return &m;
++            return nullptr;
++        }
++        uint32 Alive() const
++        {
++            uint32 n = 0;
++            for (Mob const& m : mobs)
++                if (!m.killed)
++                    ++n;
++            return n;
++        }
++    };
++
++    struct Fighter
++    {
++        bool armed = false;
++        std::unique_ptr<Encounter> active;
++        std::vector<Mob> pending;
++        std::deque<std::string> closed;
++
++        bool IsClosed(std::string const& id) const
++        {
++            for (std::string const& c : closed)
++                if (c == id)
++                    return true;
++            return false;
++        }
++        void Close()
++        {
++            if (!active)
++                return;
++            closed.push_back(active->id);
++            while (closed.size() > CLOSED_KEPT)
++                closed.pop_front();
++            active.reset();
++        }
++        Mob* FindPending(ObjectGuid guid)
++        {
++            for (Mob& m : pending)
++                if (m.guid == guid)
++                    return &m;
++            return nullptr;
++        }
++        void DropPending(ObjectGuid guid)
++        {
++            for (auto it = pending.begin(); it != pending.end(); ++it)
++            {
++                if (it->guid == guid)
++                {
++                    pending.erase(it);
++                    return;
++                }
++            }
++        }
++    };
++
++    std::shared_timed_mutex g_lock;
++    std::unordered_map<ObjectGuid, Fighter> g_fighters;     // by player
++    std::unordered_map<ObjectGuid, ObjectGuid> g_held;      // held mob -> player
++    std::atomic<uint32> g_heldCount(0);
++    std::atomic<uint32> g_armedCount(0);
++    thread_local uint32 t_bridgeDamage = 0;                 // inside `.wowbg3 hp`
++    uint32 g_tickTimer = 0;
++
++    typedef std::unique_lock<std::shared_timed_mutex> WriteLock;
++    typedef std::shared_lock<std::shared_timed_mutex> ReadLock;
++
++    // Callers hold the write lock.
++    void Hold(ObjectGuid mob, ObjectGuid player)
++    {
++        if (g_held.emplace(mob, player).second)
++            ++g_heldCount;
++    }
++    void Unhold(ObjectGuid mob)
++    {
++        if (g_held.erase(mob))
++            --g_heldCount;
++    }
++    void SetArmed(Fighter& f, bool armed)
++    {
++        if (f.armed == armed)
++            return;
++        f.armed = armed;
++        if (armed)
++            ++g_armedCount;
++        else
++            --g_armedCount;
++    }
++
++    std::string Hex(ObjectGuid guid)
++    {
++        char buf[24];
++        snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)guid.GetRawValue());
++        return buf;
++    }
++
++    bool ParseGuid(std::string const& s, ObjectGuid& out)
++    {
++        if (s.empty() || s.size() > 18)
++            return false;
++        char const* p = s.c_str();
++        if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
++            p += 2;
++        char* end = nullptr;
++        unsigned long long v = strtoull(p, &end, 16);
++        if (!end || *end || end == p || !v)
++            return false;
++        out = ObjectGuid(uint64(v));
++        return out.IsCreature();
++    }
++
++    bool ValidId(std::string const& id)
++    {
++        if (id.empty() || id.size() > 32 || id == "-")
++            return false;
++        for (char c : id)
++            if (!isalnum((unsigned char)c) && c != '-' && c != '_')
++                return false;
++        return true;
++    }
++
++    std::vector<std::string> Split(std::string const& text, char sep)
++    {
++        std::vector<std::string> out;
++        std::string cur;
++        for (char c : text)
++        {
++            if (c == sep || (sep == ' ' && (c == '\t' || c == '\r' || c == '\n')))
++            {
++                if (!cur.empty())
++                    out.push_back(cur);
++                cur.clear();
++            }
++            else
++                cur += c;
++        }
++        if (!cur.empty())
++            out.push_back(cur);
++        return out;
++    }
++
++    void Say(Player* player, std::string const& line)
++    {
++        if (player && player->GetSession())
++            ChatHandler(player->GetSession()).SendSysMessage(line.c_str());
++    }
++
++    // `WOWBG3 mob <enc|-> <guid> <entry> <level> <hp> <maxhp> <mindmg> <maxdmg> <attack ms> <x> <y> <z> <why>`
++    std::string MobLine(std::string const& enc, Creature const* c, char const* why)
++    {
++        char buf[320];
++        snprintf(buf, sizeof(buf), "WOWBG3 mob %s %s %u %u %u %u %.1f %.1f %u %.2f %.2f %.2f %s",
++            enc.c_str(), Hex(c->GetObjectGuid()).c_str(), c->GetEntry(), c->GetLevel(),
++            c->GetHealth(), c->GetMaxHealth(),
++            c->GetFloatValue(UNIT_FIELD_MINDAMAGE), c->GetFloatValue(UNIT_FIELD_MAXDAMAGE),
++            c->GetAttackTime(BASE_ATTACK), c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), why);
++        return buf;
++    }
++
++    Creature* FindMob(uint32 map, uint32 instance, ObjectGuid guid, Player* near = nullptr)
++    {
++        Map* m = nullptr;
++        if (near && near->IsInWorld() && near->GetMapId() == map && near->GetInstanceId() == instance)
++            m = near->GetMap();
++        else
++            m = sMapMgr.FindMap(map, instance);
++        return m ? m->GetCreature(guid) : nullptr;
++    }
++
++    // Stun with the GM freeze aura. False if the mob cannot be stunned.
++    bool Freeze(Creature* c)
++    {
++        if (!c->HasAura(FREEZE_SPELL))
++        {
++            c->InterruptNonMeleeSpells(false);
++            c->CastSpell(c, FREEZE_SPELL, true);
++        }
++        // Stunned mobs keep their leash anyway; this also covers the moment after release.
++        c->UpdateLeashExtensionTime();
++        return c->HasAura(FREEZE_SPELL);
++    }
++
++    // Let a mob go that is no longer held: back to its spawn (evade) or on with the WoW fight.
++    void Thaw(Creature* c, bool evade)
++    {
++        if (!c || !c->IsAlive())
++            return;
++        c->RemoveAurasDueToSpell(FREEZE_SPELL);
++        if (evade)
++        {
++            if (c->AI())
++                c->AI()->EnterEvadeMode();
++            else
++            {
++                c->CombatStop(true);
++                c->DeleteThreatList();
++            }
++        }
++        else
++            c->UpdateLeashExtensionTime();
++    }
++
++    // Anyone on the threat list who is not this player, their pet or their group.
++    bool Contested(Player* p, Creature* c)
++    {
++        for (HostileReference* ref : c->GetThreatManager().getThreatList())
++        {
++            Unit* u = ref ? ref->getTarget() : nullptr;
++            if (!u)
++                continue;
++            Player* owner = u->GetCharmerOrOwnerPlayerOrPlayerItself();
++            if (!owner || (owner != p && !owner->IsInSameRaidWith(p)))
++                return true;
++        }
++        return false;
++    }
++
++    char const* CheckPlayer(Player* p)
++    {
++        if (!p || !p->IsInWorld())
++            return "offline";
++        if (!p->IsAlive())
++            return "dead";
++        if (p->IsTaxiFlying())
++            return "taxi";
++        return nullptr;
++    }
++
++    // Can this player claim this mob for a fight? nullptr if yes, else the reason.
++    char const* CheckMob(Player* p, Creature* c, bool claim)
++    {
++        if (!c || !c->IsInWorld())
++            return "missing";
++        if (!c->IsAlive())
++            return "dead";
++        if (c->IsPet() || c->IsTotem() || c->GetCharmerOrOwnerGuid().IsPlayer())
++            return "controlled";
++        if (c->IsInEvadeMode())
++            return "evading";
++        if (!p->IsValidAttackTarget(c))
++            return "friendly";
++        if (claim && !p->IsWithinDistInMap(c, CLAIM_RANGE))
++            return "far";
++        if (c->HasLootRecipient() && !c->IsTappedBy(p))
++            return "tapped";
++        if (Contested(p, c))
++            return "contested";
++        return nullptr;
++    }
++
++    struct Release
++    {
++        ObjectGuid player;
++        std::string enc;                                    // "-" for a pending hold
++        ObjectGuid mob;
++        uint32 map;
++        uint32 instance;
++        bool evade;
++        char const* why;
++    };
++
++    // Thaw and report releases decided under the lock (world thread only).
++    void ApplyReleases(std::vector<Release> const& releases)
++    {
++        for (Release const& r : releases)
++        {
++            Player* p = ObjectAccessor::FindPlayer(r.player);
++            Thaw(FindMob(r.map, r.instance, r.mob, p), r.evade);
++            if (r.why)
++                Say(p, "WOWBG3 release " + r.enc + " " + Hex(r.mob) + " " + r.why);
++        }
++    }
++
++    // A held mob that cannot be stunned (immune) stays a WoW fight. Map thread
++    // of the mob, or the world thread.
++    void DropUnfreezable(Creature* c, ObjectGuid owner)
++    {
++        ObjectGuid const guid = c->GetObjectGuid();
++        std::string enc = "-";
++        {
++            WriteLock lock(g_lock);
++            Unhold(guid);
++            auto f = g_fighters.find(owner);
++            if (f != g_fighters.end())
++            {
++                f->second.DropPending(guid);
++                if (f->second.active)
++                {
++                    auto& v = f->second.active->mobs;
++                    for (auto it = v.begin(); it != v.end(); ++it)
++                    {
++                        if (it->guid == guid)
++                        {
++                            enc = f->second.active->id;
++                            v.erase(it);
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        Say(c->GetMap()->GetPlayer(owner), "WOWBG3 release " + enc + " " + Hex(guid) + " immune");
++    }
++
++    // Send the `mob ... aggro` line once for a mob the server held by itself.
++    void Announce(Creature* c, ObjectGuid owner)
++    {
++        ObjectGuid const guid = c->GetObjectGuid();
++        std::string enc;
++        bool send = false;
++        {
++            WriteLock lock(g_lock);
++            auto f = g_fighters.find(owner);
++            if (f != g_fighters.end())
++            {
++                Mob* m = f->second.active ? f->second.active->Find(guid) : nullptr;
++                if (m)
++                    enc = f->second.active->id;
++                else if ((m = f->second.FindPending(guid)))
++                    enc = "-";
++                if (m && !m->announced)
++                {
++                    m->announced = true;
++                    send = true;
++                }
++            }
++        }
++        if (send)
++            Say(c->GetMap()->GetPlayer(owner), MobLine(enc, c, "aggro"));
++    }
++
++    // ---- commands (world thread) ----
++
++    struct Out
++    {
++        std::vector<std::string> lines;
++        void Add(std::string const& s) { lines.push_back(s); }
++    };
++
++    void Arm(Player* p, bool armed, Out& out)
++    {
++        std::vector<Release> releases;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[p->GetObjectGuid()];
++            SetArmed(f, armed);
++            if (!armed)
++            {
++                for (Mob const& m : f.pending)
++                {
++                    Unhold(m.guid);
++                    releases.push_back({ p->GetObjectGuid(), "-", m.guid, m.map, m.instance, false, "disarmed" });
++                }
++                f.pending.clear();
++            }
++        }
++        ApplyReleases(releases);
++        out.Add(armed ? "WOWBG3 armed 1" : "WOWBG3 armed 0");
++    }
++
++    // begin <enc> <guids>: hold these mobs (all or none) as a new encounter.
++    // join <enc> <guids>: add more mobs to the running encounter.
++    // <guids> is a comma list of 16-digit hex guids and/or `pending` (every unclaimed aggro hold).
++    void Claim(Player* p, std::string const& enc, std::string const& list, bool join, Out& out)
++    {
++        std::string const verb = join ? "join" : "begin";
++        std::string const head = "WOWBG3 " + verb + " " + enc + " ";
++        if (char const* why = CheckPlayer(p))
++            return out.Add(head + "refused " + why + " -");
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        uint32 const map = p->GetMapId();
++        uint32 const instance = p->GetInstanceId();
++        std::vector<ObjectGuid> guids;
++        std::vector<ObjectGuid> resend;                     // begin retried after a lost reply
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (f.IsClosed(enc))
++                return out.Add(head + "refused closed -");
++            if (join)
++            {
++                if (!f.active || f.active->id != enc)
++                    return out.Add(head + "refused unknown -");
++            }
++            else if (f.active)
++            {
++                if (f.active->id != enc)
++                    return out.Add(head + "refused busy " + f.active->id);
++                for (Mob const& m : f.active->mobs)
++                    resend.push_back(m.guid);
++            }
++
++            if (resend.empty())
++            {
++                for (std::string const& item : Split(list, ','))
++                {
++                    if (item == "pending")
++                    {
++                        for (Mob const& m : f.pending)
++                            guids.push_back(m.guid);
++                        continue;
++                    }
++                    ObjectGuid g;
++                    if (!ParseGuid(item, g))
++                        return out.Add(head + "refused badguid " + item);
++                    guids.push_back(g);
++                }
++                // no duplicates
++                std::vector<ObjectGuid> unique;
++                for (ObjectGuid g : guids)
++                {
++                    bool seen = false;
++                    for (ObjectGuid u : unique)
++                        seen = seen || u == g;
++                    if (!seen)
++                        unique.push_back(g);
++                }
++                guids.swap(unique);
++                if (guids.empty())
++                    return out.Add(head + "refused empty -");
++
++                size_t const have = f.active ? f.active->mobs.size() : 0;
++                if (have + guids.size() > MAX_MOBS)
++                    return out.Add(head + "refused toomany -");
++
++                for (ObjectGuid g : guids)
++                {
++                    if (f.active && f.active->Find(g))
++                        return out.Add(head + "refused member " + Hex(g));
++                    auto it = g_held.find(g);
++                    if (it != g_held.end() && it->second != pg)
++                        return out.Add(head + "refused held " + Hex(g));
++                }
++            }
++        }
++
++        if (!resend.empty())
++        {
++            // Same begin again: answer it again, change nothing.
++            uint32 alive = 0;
++            std::vector<std::string> lines;
++            for (ObjectGuid g : resend)
++            {
++                Creature* c = FindMob(map, instance, g, p);
++                if (c && c->IsAlive())
++                {
++                    ++alive;
++                    lines.push_back(MobLine(enc, c, "begin"));
++                }
++            }
++            out.Add(head + "ok " + std::to_string(alive) + " " + std::to_string(p->GetHealth()) + " " + std::to_string(p->GetMaxHealth()));
++            for (std::string const& l : lines)
++                out.Add(l);
++            return;
++        }
++
++        std::vector<Creature*> mobs;
++        for (ObjectGuid g : guids)
++        {
++            Creature* c = p->GetMap()->GetCreature(g);
++            if (char const* why = CheckMob(p, c, true))
++                return out.Add(head + "refused " + why + " " + Hex(g));
++            mobs.push_back(c);
++        }
++
++        // Atomic: no map updates run during this command, so every mob freezes
++        // in the same server tick or none stays frozen.
++        uint32 const now = WorldTimer::getMSTime();
++        std::vector<ObjectGuid> wasPending;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (!join)
++            {
++                f.active.reset(new Encounter());
++                f.active->id = enc;
++                f.active->map = map;
++                f.active->instance = instance;
++                f.active->started = now;
++            }
++            f.active->last = now;
++            for (ObjectGuid g : guids)
++            {
++                if (f.FindPending(g))
++                {
++                    wasPending.push_back(g);
++                    f.DropPending(g);
++                }
++                Mob m;
++                m.guid = g;
++                m.map = map;
++                m.instance = instance;
++                m.since = now;
++                m.announced = true;
++                f.active->mobs.push_back(m);
++                Hold(g, pg);
++            }
++        }
++
++        Creature* failed = nullptr;
++        for (Creature* c : mobs)
++        {
++            if (!Freeze(c))
++            {
++                failed = c;
++                break;
++            }
++        }
++        if (failed)
++        {
++            // All or none: take this command's mobs out again. Aggro holds stay
++            // pending (still frozen), the others go back to their WoW fight.
++            std::vector<Creature*> thaw;
++            {
++                WriteLock lock(g_lock);
++                Fighter& f = g_fighters[pg];
++                for (size_t i = 0; i < guids.size(); ++i)
++                {
++                    ObjectGuid const g = guids[i];
++                    bool restored = false;
++                    for (ObjectGuid w : wasPending)
++                    {
++                        if (w == g)
++                        {
++                            Mob m;
++                            m.guid = g;
++                            m.map = map;
++                            m.instance = instance;
++                            m.since = now;
++                            m.announced = true;
++                            f.pending.push_back(m);
++                            restored = true;
++                        }
++                    }
++                    if (!restored)
++                    {
++                        Unhold(g);
++                        thaw.push_back(mobs[i]);
++                    }
++                    if (f.active)
++                    {
++                        auto& v = f.active->mobs;
++                        for (auto it = v.begin(); it != v.end(); ++it)
++                        {
++                            if (it->guid == g)
++                            {
++                                v.erase(it);
++                                break;
++                            }
++                        }
++                    }
++                }
++                if (!join)
++                    f.active.reset();
++            }
++            for (Creature* c : thaw)
++                Thaw(c, false);
++            return out.Add(head + "refused immune " + Hex(failed->GetObjectGuid()));
++        }
++
++        for (Creature* c : mobs)
++        {
++            // Tap it for the player and make sure both are in combat (a pull the
++            // client kept off the wire has not reached the server yet).
++            if (!c->HasLootRecipient())
++                c->SetLootRecipient(p);
++            c->AddThreat(p);
++            c->SetInCombatWith(p);
++            p->SetInCombatWith(c);
++            c->UpdateLeashExtensionTime();
++        }
++
++        uint32 alive = 0;
++        {
++            ReadLock lock(g_lock);
++            auto it = g_fighters.find(pg);
++            if (it != g_fighters.end() && it->second.active)
++                alive = it->second.active->Alive();
++        }
++        out.Add(head + "ok " + std::to_string(alive) + " " + std::to_string(p->GetHealth()) + " " + std::to_string(p->GetMaxHealth()));
++        for (Creature* c : mobs)
++            out.Add(MobLine(enc, c, verb.c_str()));
++    }
++
++    // hp <enc> <guid> <bg3 hp> <bg3 max hp>: the mob's WoW health follows BG3's
++    // as a fraction, through damage from the player (never healing). 0 kills it,
++    // which gives XP, loot and quest credit. Applying the same line again
++    // changes nothing, so a retry is safe.
++    void Health(Player* p, std::string const& enc, std::string const& guidText,
++        std::string const& hpText, std::string const& maxText, Out& out)
++    {
++        ObjectGuid g;
++        if (!ParseGuid(guidText, g))
++            return out.Add("WOWBG3 hp " + enc + " " + guidText + " refused badguid");
++        std::string const head = "WOWBG3 hp " + enc + " " + Hex(g) + " ";
++        char* end = nullptr;
++        unsigned long bg3hp = strtoul(hpText.c_str(), &end, 10);
++        bool okHp = end && !*end && !hpText.empty();
++        unsigned long bg3max = strtoul(maxText.c_str(), &end, 10);
++        bool okMax = end && !*end && !maxText.empty();
++        if (!okHp || !okMax || bg3max == 0 || bg3max > 1000000 || bg3hp > bg3max)
++            return out.Add(head + "refused badhp");
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        uint32 map = 0, instance = 0;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (f.IsClosed(enc))
++                return out.Add(head + "refused closed");
++            if (!f.active || f.active->id != enc)
++                return out.Add(head + "refused unknown");
++            Mob* m = f.active->Find(g);
++            if (!m)
++                return out.Add(head + "refused notmember");
++            f.active->last = WorldTimer::getMSTime();
++            if (m->killed)
++                return out.Add(head + "dead 0 0");
++            map = f.active->map;
++            instance = f.active->instance;
++        }
++
++        if (char const* why = CheckPlayer(p))
++            return out.Add(head + "refused " + why);
++        Creature* c = FindMob(map, instance, g, p);
++        if (!c || !c->IsAlive())
++        {
++            {
++                WriteLock lock(g_lock);
++                Fighter& f = g_fighters[pg];
++                if (f.active && f.active->id == enc)
++                    if (Mob* m = f.active->Find(g))
++                        m->killed = true;
++                Unhold(g);
++            }
++            return out.Add(head + "gone 0 0");
++        }
++        if (p->GetMapId() != map || p->GetInstanceId() != instance || !p->IsWithinDistInMap(c, DAMAGE_RANGE))
++            return out.Add(head + "refused far");
++
++        uint32 const maxHealth = c->GetMaxHealth();
++        uint64 target = bg3hp == 0 ? 0 : (uint64(maxHealth) * bg3hp + bg3max - 1) / bg3max;
++        if (bg3hp > 0 && target == 0)
++            target = 1;
++        if (target > maxHealth)
++            target = maxHealth;
++        uint32 const health = c->GetHealth();
++        if (target < health)
++        {
++            ++t_bridgeDamage;
++            p->DealDamage(c, health - uint32(target), nullptr, SPELL_DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
++            --t_bridgeDamage;
++        }
++
++        if (!c->IsAlive())
++        {
++            {
++                WriteLock lock(g_lock);
++                Fighter& f = g_fighters[pg];
++                if (f.active && f.active->id == enc)
++                    if (Mob* m = f.active->Find(g))
++                        m->killed = true;
++                Unhold(g);
++            }
++            return out.Add(head + "killed 0 " + std::to_string(maxHealth));
++        }
++        out.Add(head + "ok " + std::to_string(c->GetHealth()) + " " + std::to_string(maxHealth));
++    }
++
++    // hero <enc> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
++    // follows Tav's as a fraction (rounded, at least 1 while Tav lives), both
++    // ways. 0 is a normal WoW death: the
++    // killing blow comes from a living mob of the encounter (the killer if
++    // given), so it is a PvE death with the usual durability loss and nobody
++    // gets credit. Applying the same line again changes nothing.
++    void HeroHealth(Player* p, std::string const& enc, std::string const& hpText,
++        std::string const& maxText, std::string const& killerText, Out& out)
++    {
++        std::string const head = "WOWBG3 hero " + enc + " ";
++        char* end = nullptr;
++        unsigned long tavHp = strtoul(hpText.c_str(), &end, 10);
++        bool okHp = end && !*end && !hpText.empty();
++        unsigned long tavMax = strtoul(maxText.c_str(), &end, 10);
++        bool okMax = end && !*end && !maxText.empty();
++        if (!okHp || !okMax || tavMax == 0 || tavMax > 1000000 || tavHp > tavMax)
++            return out.Add(head + "refused badhp");
++        ObjectGuid killerGuid;
++        if (!killerText.empty() && !ParseGuid(killerText, killerGuid))
++            return out.Add(head + "refused badguid");
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        std::vector<ObjectGuid> alive;                      // candidates for the killing blow
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (f.IsClosed(enc))
++                return out.Add(head + "refused closed");
++            if (!f.active || f.active->id != enc)
++                return out.Add(head + "refused unknown");
++            f.active->last = WorldTimer::getMSTime();
++            if (!killerGuid.IsEmpty())
++            {
++                Mob* m = f.active->Find(killerGuid);
++                if (!m)
++                    return out.Add(head + "refused notmember");
++                if (!m->killed)
++                    alive.push_back(killerGuid);
++            }
++            for (Mob const& m : f.active->mobs)
++                if (!m.killed && m.guid != killerGuid)
++                    alive.push_back(m.guid);
++        }
++
++        uint32 const maxHealth = p->GetMaxHealth();
++        if (!p->IsInWorld())
++            return out.Add(head + "refused offline");
++        if (!p->IsAlive())
++            return out.Add(head + "dead 0 " + std::to_string(maxHealth));
++
++        uint64 target = tavHp == 0 ? 0 : (uint64(maxHealth) * tavHp * 2 + tavMax) / (tavMax * 2);
++        if (tavHp > 0 && target == 0)
++            target = 1;
++        if (target > maxHealth)
++            target = maxHealth;
++
++        if (target > 0)
++        {
++            if (p->GetHealth() != uint32(target))
++                p->SetHealth(uint32(target));
++            return out.Add(head + "ok " + std::to_string(p->GetHealth()) + " " + std::to_string(maxHealth));
++        }
++
++        // Death. A mob's blow keeps it a normal PvE death (no PvP corpse, the
++        // usual 10% durability loss, no reward for anyone).
++        Creature* killer = nullptr;
++        for (ObjectGuid g : alive)
++        {
++            Creature* c = p->GetMap()->GetCreature(g);
++            if (c && c->IsAlive())
++            {
++                killer = c;
++                break;
++            }
++        }
++        uint32 const health = p->GetHealth();
++        if (killer)
++            killer->DealDamage(p, health, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, true);
++        else
++        {
++            // Every mob is already dead: die like an environmental death.
++            p->DealDamage(p, health, nullptr, SELF_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
++            if (!p->IsAlive())
++                p->DurabilityLossAll(0.10f, false);
++        }
++        if (p->IsAlive())
++            return out.Add(head + "ok " + std::to_string(p->GetHealth()) + " " + std::to_string(maxHealth));
++        out.Add(head + "died 0 " + std::to_string(maxHealth));
++    }
++
++    // end <enc> <outcome>: close the encounter. `resume` hands living mobs back
++    // to a real-time WoW fight; anything else sends them home (evade, full
++    // health, no credit). A retry of the same end is answered `closed`.
++    void End(Player* p, std::string const& enc, std::string const& outcome, Out& out)
++    {
++        std::string const head = "WOWBG3 end " + enc + " ";
++        bool const resume = outcome == "resume";
++        if (!resume && outcome != "victory" && outcome != "defeat" && outcome != "fled" && outcome != "abort")
++            return out.Add(head + "refused badoutcome");
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        std::vector<Release> releases;
++        uint32 killed = 0;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (f.IsClosed(enc))
++                return out.Add(head + "closed");
++            if (!f.active || f.active->id != enc)
++                return out.Add(head + "refused unknown");
++            for (Mob const& m : f.active->mobs)
++            {
++                if (m.killed)
++                {
++                    ++killed;
++                    continue;
++                }
++                Unhold(m.guid);
++                releases.push_back({ pg, enc, m.guid, m.map, m.instance, !resume, nullptr });
++            }
++            f.Close();
++        }
++        ApplyReleases(releases);
++        out.Add(head + outcome + " ok " + std::to_string(killed) + " " + std::to_string(releases.size()));
++    }
++
++    void Keep(Player* p, std::string const& enc, Out& out)
++    {
++        WriteLock lock(g_lock);
++        Fighter& f = g_fighters[p->GetObjectGuid()];
++        if (f.IsClosed(enc))
++            return out.Add("WOWBG3 keep " + enc + " closed");
++        if (!f.active || f.active->id != enc)
++            return out.Add("WOWBG3 keep " + enc + " refused unknown");
++        f.active->last = WorldTimer::getMSTime();
++        out.Add("WOWBG3 keep " + enc + " ok " + std::to_string(f.active->Alive()));
++    }
++
++    void Status(Player* p, Out& out)
++    {
++        std::vector<ObjectGuid> pending;
++        std::string line;
++        {
++            ReadLock lock(g_lock);
++            auto it = g_fighters.find(p->GetObjectGuid());
++            Fighter const* f = it == g_fighters.end() ? nullptr : &it->second;
++            std::string enc = f && f->active ? f->active->id : "-";
++            uint32 alive = f && f->active ? f->active->Alive() : 0;
++            uint32 total = f && f->active ? uint32(f->active->mobs.size()) : 0;
++            line = "WOWBG3 status " + enc + " " + std::to_string(alive) + " " + std::to_string(total - alive) + " " +
++                std::to_string(f ? f->pending.size() : 0) + " armed " + (f && f->armed ? "1" : "0");
++            if (f)
++                for (Mob const& m : f->pending)
++                    pending.push_back(m.guid);
++        }
++        out.Add(line);
++        for (ObjectGuid g : pending)
++            if (Creature* c = p->GetMap()->GetCreature(g))
++                out.Add(MobLine("-", c, "aggro"));
++    }
++
++    void Execute(WorldSession* session, std::string const& text)
++    {
++        Player* p = session->GetPlayer();
++        if (!p)
++            return;
++        std::vector<std::string> a = Split(text, ' ');
++        std::string const verb = a.size() > 1 ? a[1] : "";
++        Out out;
++        if (verb == "arm" && a.size() == 2)
++            Arm(p, true, out);
++        else if (verb == "disarm" && a.size() == 2)
++            Arm(p, false, out);
++        else if (verb == "status" && a.size() == 2)
++            Status(p, out);
++        else if ((verb == "begin" || verb == "join") && a.size() == 4 && ValidId(a[2]))
++            Claim(p, a[2], a[3], verb == "join", out);
++        else if (verb == "hp" && a.size() == 6 && ValidId(a[2]))
++            Health(p, a[2], a[3], a[4], a[5], out);
++        else if (verb == "end" && a.size() == 4 && ValidId(a[2]))
++            End(p, a[2], a[3], out);
++        else if (verb == "hero" && (a.size() == 5 || a.size() == 6) && ValidId(a[2]))
++            HeroHealth(p, a[2], a[3], a[4], a.size() == 6 ? a[5] : std::string(), out);
++        else if (verb == "keep" && a.size() == 3 && ValidId(a[2]))
++            Keep(p, a[2], out);
++        else
++            out.Add("WOWBG3 refused usage " + (verb.empty() ? std::string("-") : verb));
++
++        ChatHandler handler(session);
++        for (std::string const& line : out.lines)
++            handler.SendSysMessage(line.c_str());
++    }
++}
++
++bool IsHeld(Unit const* unit)
++{
++    if (!g_heldCount.load(std::memory_order_relaxed) || !unit || unit->GetTypeId() != TYPEID_UNIT)
++        return false;
++    ReadLock lock(g_lock);
++    return g_held.find(unit->GetObjectGuid()) != g_held.end();
++}
++
++bool BlocksDamage(Unit const* victim)
++{
++    return t_bridgeDamage == 0 && IsHeld(victim);
++}
++
++bool UpdateHeld(Creature* creature)
++{
++    if (!g_heldCount.load(std::memory_order_relaxed))
++        return false;
++
++    ObjectGuid const guid = creature->GetObjectGuid();
++    ObjectGuid owner;
++    bool announced = true;
++    {
++        ReadLock lock(g_lock);
++        auto it = g_held.find(guid);
++        if (it == g_held.end())
++            return false;
++        owner = it->second;
++        auto f = g_fighters.find(owner);
++        if (f != g_fighters.end())
++        {
++            if (f->second.active)
++                if (Mob const* m = f->second.active->Find(guid))
++                    announced = m->announced;
++            if (Mob const* m = f->second.FindPending(guid))
++                announced = m->announced;
++        }
++    }
++
++    if (!Freeze(creature))
++    {
++        DropUnfreezable(creature, owner);
++        return false;
++    }
++    if (!announced)
++        Announce(creature, owner);
++    return true;
++}
++
++void OnCreatureEnterCombat(Creature* creature, Unit* enemy)
++{
++    if (!enemy || (!g_armedCount.load(std::memory_order_relaxed) && !g_heldCount.load(std::memory_order_relaxed)))
++        return;
++    Player* p = enemy->GetCharmerOrOwnerPlayerOrPlayerItself();
++    if (!p || !p->IsInWorld() || !p->IsAlive())
++        return;
++    if (CheckMob(p, creature, false))
++        return;
++
++    ObjectGuid const guid = creature->GetObjectGuid();
++    ObjectGuid const pg = p->GetObjectGuid();
++    uint32 const now = WorldTimer::getMSTime();
++    WriteLock lock(g_lock);
++    if (g_held.find(guid) != g_held.end())
++        return;
++    auto it = g_fighters.find(pg);
++    if (it == g_fighters.end())
++        return;
++    Fighter& f = it->second;
++
++    Mob m;
++    m.guid = guid;
++    m.map = creature->GetMapId();
++    m.instance = creature->GetInstanceId();
++    m.since = now;
++    if (f.active && f.active->Alive() && f.active->map == m.map && f.active->instance == m.instance)
++    {
++        // An add: it joins the running BG3 fight.
++        if (f.active->Find(guid) || f.active->mobs.size() >= MAX_MOBS)
++            return;
++        f.active->mobs.push_back(m);
++    }
++    else if (f.armed)
++    {
++        if (f.FindPending(guid) || f.pending.size() >= MAX_MOBS)
++            return;
++        f.pending.push_back(m);
++    }
++    else
++        return;
++    Hold(guid, pg);
++    lock.unlock();
++
++    // Stun now, inside the combat start, so the AI's aggro reaction (and any
++    // swing or cast later in this update) finds the mob already frozen.
++    if (!Freeze(creature))
++        return DropUnfreezable(creature, pg);
++    Announce(creature, pg);
++}
++
++bool HandleChat(WorldSession* session, std::string const& text)
++{
++    static char const prefix[] = ".wowbg3";
++    size_t const n = sizeof(prefix) - 1;
++    if (text.compare(0, n, prefix) != 0 || (text.size() > n && text[n] != ' '))
++        return false;
++    if (!session || text.size() > 255)
++        return true;
++
++    sWorld.GetMessager().AddMessage([txt = text, accountId = session->GetAccountId(), sessionGuid = session->GetGUID()](World* world)
++    {
++        WorldSession* s = world->FindSession(accountId);
++        if (s && s->GetGUID() == sessionGuid && s->GetPlayer() && s->GetPlayer()->IsInWorld())
++            Execute(s, txt);
++    });
++    return true;
++}
++
++void OnLogout(Player* player)
++{
++    if (!player)
++        return;
++    std::vector<Release> releases;
++    {
++        WriteLock lock(g_lock);
++        auto it = g_fighters.find(player->GetObjectGuid());
++        if (it == g_fighters.end())
++            return;
++        Fighter& f = it->second;
++        SetArmed(f, false);
++        for (Mob const& m : f.pending)
++        {
++            Unhold(m.guid);
++            releases.push_back({ player->GetObjectGuid(), "-", m.guid, m.map, m.instance, true, nullptr });
++        }
++        f.pending.clear();
++        if (f.active)
++        {
++            for (Mob const& m : f.active->mobs)
++            {
++                if (m.killed)
++                    continue;
++                Unhold(m.guid);
++                releases.push_back({ player->GetObjectGuid(), f.active->id, m.guid, m.map, m.instance, true, nullptr });
++            }
++            f.Close();
++        }
++    }
++    // Only the player's own map is safe to touch here (logout can also run
++    // while a map unloads); the timeout tick closes fights on other maps first.
++    for (Release const& r : releases)
++    {
++        if (player->IsInWorld() && player->GetMapId() == r.map && player->GetInstanceId() == r.instance)
++            Thaw(player->GetMap()->GetCreature(r.mob), true);
++        else
++            sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WOWBG3: %s logged out away from held mob %s", player->GetName(), Hex(r.mob).c_str());
++    }
++}
++
++void Update(uint32 diff)
++{
++    g_tickTimer += diff;
++    if (g_tickTimer < TICK_MS)
++        return;
++    g_tickTimer = 0;
++
++    struct Check
++    {
++        ObjectGuid player;
++        std::string enc;                                    // "-" for pending
++        ObjectGuid mob;
++        uint32 map;
++        uint32 instance;
++        bool expired;
++    };
++    std::vector<Check> checks;
++    std::vector<std::pair<ObjectGuid, std::string>> empty; // encounters with every mob dead, timed out
++    uint32 const now = WorldTimer::getMSTime();
++    {
++        ReadLock lock(g_lock);
++        if (g_fighters.empty())
++            return;
++        for (auto const& kv : g_fighters)
++        {
++            Fighter const& f = kv.second;
++            for (Mob const& m : f.pending)
++                checks.push_back({ kv.first, "-", m.guid, m.map, m.instance, WorldTimer::getMSTimeDiff(m.since, now) > PENDING_MS });
++            if (f.active)
++            {
++                Encounter const& e = *f.active;
++                bool const expired = WorldTimer::getMSTimeDiff(e.last, now) > IDLE_MS ||
++                    WorldTimer::getMSTimeDiff(e.started, now) > MAX_FIGHT_MS;
++                if (!e.Alive())
++                {
++                    if (expired)
++                        empty.push_back({ kv.first, e.id });
++                    continue;
++                }
++                for (Mob const& m : e.mobs)
++                    if (!m.killed)
++                        checks.push_back({ kv.first, e.id, m.guid, e.map, e.instance, expired });
++            }
++        }
++    }
++
++    // Decide outside the lock (no map updates run now, so lookups are safe).
++    struct Closing
++    {
++        ObjectGuid player;
++        std::string enc;
++        char const* why;
++    };
++    std::vector<Release> releases;
++    std::vector<Closing> closing;
++    for (Check const& c : checks)
++    {
++        Player* p = ObjectAccessor::FindPlayer(c.player);
++        bool const playerOk = p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == c.map && p->GetInstanceId() == c.instance;
++        Creature* mob = FindMob(c.map, c.instance, c.mob, p);
++        bool const mobOk = mob && mob->IsAlive();
++        char const* why = nullptr;
++        if (!mobOk)
++            why = "gone";
++        else if (!playerOk)
++            why = "player";
++        else if (c.expired)
++            why = "timeout";
++        if (!why)
++            continue;
++        if (c.enc == "-")
++            releases.push_back({ c.player, "-", c.mob, c.map, c.instance, !playerOk, why });
++        else if (!mobOk)
++            releases.push_back({ c.player, c.enc, c.mob, c.map, c.instance, true, why });
++        else
++            closing.push_back({ c.player, c.enc, why });
++    }
++
++    std::vector<Release> applied;
++    std::vector<std::pair<ObjectGuid, std::string>> endLines;
++    {
++        WriteLock lock(g_lock);
++        for (Release const& r : releases)
++        {
++            auto it = g_fighters.find(r.player);
++            if (it == g_fighters.end())
++                continue;
++            Fighter& f = it->second;
++            if (r.enc == "-")
++            {
++                if (!f.FindPending(r.mob))
++                    continue;
++                f.DropPending(r.mob);
++            }
++            else
++            {
++                Mob* m = f.active && f.active->id == r.enc ? f.active->Find(r.mob) : nullptr;
++                if (!m || m->killed)
++                    continue;
++                m->killed = true;                           // gone without credit: never again
++            }
++            Unhold(r.mob);
++            applied.push_back(r);
++        }
++        for (Closing const& c : closing)
++        {
++            auto it = g_fighters.find(c.player);
++            if (it == g_fighters.end() || !it->second.active || it->second.active->id != c.enc)
++                continue;                                   // already closed for another of its mobs
++            Fighter& f = it->second;
++            uint32 killed = 0, released = 0;
++            for (Mob const& m : f.active->mobs)
++            {
++                if (m.killed)
++                {
++                    ++killed;
++                    continue;
++                }
++                Unhold(m.guid);
++                applied.push_back({ c.player, c.enc, m.guid, m.map, m.instance, true, nullptr });
++                ++released;
++            }
++            f.Close();
++            endLines.push_back({ c.player, "WOWBG3 end " + c.enc + " " + c.why + " ok " + std::to_string(killed) + " " + std::to_string(released) });
++        }
++        for (auto const& pe : empty)
++        {
++            auto it = g_fighters.find(pe.first);
++            if (it == g_fighters.end() || !it->second.active || it->second.active->id != pe.second || it->second.active->Alive())
++                continue;
++            uint32 const killed = uint32(it->second.active->mobs.size());
++            it->second.Close();
++            endLines.push_back({ pe.first, "WOWBG3 end " + pe.second + " timeout ok " + std::to_string(killed) + " 0" });
++        }
++    }
++    ApplyReleases(applied);
++    for (auto const& l : endLines)
++        Say(ObjectAccessor::FindPlayer(l.first), l.second);
++}
++}
+diff --git a/src/game/WowBg3Fights.h b/src/game/WowBg3Fights.h
+new file mode 100644
+index 0000000..f1adc47
+--- /dev/null
++++ b/src/game/WowBg3Fights.h
+@@ -0,0 +1,66 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++// WOW-BG3 (local patch, not upstream VMaNGOS): hand a WoW fight to a hidden
++// Baldur's Gate 3. While BG3 runs the fight turn by turn, the mobs in it are
++// held here: stunned with the GM freeze aura, no AI (attacks, casts, scripts),
++// no leash or evade, no regeneration, aura timers stopped, and no damage or
++// healing except what the fight's owner applies through `.wowbg3 hp`. That
++// damage comes from the player, so a kill gives normal XP, loot and quest
++// credit, once. The player's own client drives it with `.wowbg3` chat
++// commands; see `AI Context/m5-server-handoff.md` in the WOW-BG3 project.
++
++#ifndef MANGOS_WOWBG3_FIGHTS_H
++#define MANGOS_WOWBG3_FIGHTS_H
++
++#include "Common.h"
++#include <string>
++
++class Creature;
++class Player;
++class Unit;
++class WorldSession;
++
++namespace WowBg3
++{
++    // True while a WOW-BG3 fight holds this unit. Cheap when nothing is held.
++    bool IsHeld(Unit const* unit);
++
++    // Unit::DealDamage and SpellCaster::DealHeal: true drops damage or healing
++    // to a held mob unless it comes from `.wowbg3 hp`.
++    bool BlocksDamage(Unit const* victim);
++
++    // Creature::Update (map thread): keeps a held mob frozen. True means skip
++    // its AI, leash, evade and regeneration this update.
++    bool UpdateHeld(Creature* creature);
++
++    // Creature::OnEnterCombat (map thread): a mob entering combat with an armed
++    // player, or with a player whose BG3 fight is running, is held at once,
++    // before its AI can swing or cast.
++    void OnCreatureEnterCombat(Creature* creature, Unit* enemy);
++
++    // WorldSession::HandleChatMessageOpcode: true if `text` was a `.wowbg3`
++    // command. It is then queued for the world thread and never said aloud.
++    bool HandleChat(WorldSession* session, std::string const& text);
++
++    // WorldSession::LogoutPlayer: lets the player's mobs go (they evade).
++    void OnLogout(Player* player);
++
++    // World::Update, in the exclusive session phase: timeouts and cleanup.
++    void Update(uint32 diff);
++}
++
++#endif

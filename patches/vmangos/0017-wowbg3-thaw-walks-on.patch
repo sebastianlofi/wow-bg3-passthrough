@@ -1,0 +1,39 @@
+WOW-BG3 vmangos patch 0017: held creatures walk on at once when they are let go.
+
+Thaw (a release without evade: BG3's turn-based mode ended, or a fight let a mob go) now resets a
+waypoint or random movement generator. The hold's StopMoving made the waypoint generator wait
+STOP_TIME_FOR_PLAYER (30 s), as for a creature a player talks to, so every patrol stood half a
+minute after turn-based mode (a playtest report).
+
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 13af21a..742c7ff 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -34,6 +34,7 @@
+ #include "GridNotifiersImpl.h"
+ #include "Creature.h"
+ #include "CreatureAI.h"
++#include "MovementGenerator.h"                       // 0017: Thaw resets a patrol
+ #include "Log.h"
+ #include "Map.h"
+ #include "MapManager.h"
+@@ -435,7 +436,19 @@ namespace
+             }
+         }
+         else
++        {
+             c->UpdateLeashExtensionTime();
++            // 0017: a patrol or a wanderer goes on at once. The hold stopped it (StopMoving), and the
++            // waypoint generator takes a stopped creature for one a player is talking to: it waits
++            // STOP_TIME_FOR_PLAYER (30 s) before it walks again, so after BG3's turn-based mode
++            // every walking NPC stood half a minute. Reset starts the next leg now.
++            if (!c->IsInCombat())
++            {
++                MovementGeneratorType const t = c->GetMotionMaster()->GetCurrentMovementGeneratorType();
++                if (t == WAYPOINT_MOTION_TYPE || t == RANDOM_MOTION_TYPE)
++                    const_cast<MovementGenerator*>(c->GetMotionMaster()->GetCurrent())->Reset(*c);
++            }
++        }
+     }
+ 
+     // Anyone on the threat list who is not this player, their pet or their group.

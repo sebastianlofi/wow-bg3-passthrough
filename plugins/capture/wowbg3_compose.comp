@@ -1,0 +1,217 @@
+// WOW-BG3 capture layer: the world-mode compositor on the GPU (wowbg3_compose_gpu.inc.c).
+// Same per-pixel rule as the CPU path in compose_frame: BG3's final picture stays where its
+// surface is nearer than WoW's (and within "far"); elsewhere the HUD over WoW,
+// out = hud.rgb + wow * (1 - hud.a) (premultiplied), plus BG3's scene with the word "light".
+// All images arrive as raw bytes in storage buffers (copies of BG3's images, WoW's WBF1 payload),
+// so the arithmetic is the CPU path's, on bytes. WoW's frame may differ in size from BG3's
+// swapchain: then it is sampled scaled (depth nearest, colour bilinear).
+// Ground surfaces (wowbg3_surf.inc.c): where BG3 drew a surface (water, grease,
+// fire...) on WoW's ground in its own frame N, WoW's colour gets BG3's change of that ground: the
+// decal's change of the albedo (A1 - A0, both linear bytes) plus the forward layer BG3 laid over it
+// (H, linear light), added to WoW's colour in linear light. Each WoW pixel is taken back to its world
+// point (WoW's depth, the camera WoW's frame was drawn for) and looked up in frame N where that point
+// is WoW's ground there too (Z), so the surface stays on WoW's ground although WoW's frame is 2-3
+// frames older than BG3's; Tav, mobs and trees in WoW's frame stay in front.
+// WoW's light on the decals: the albedo pass gives BG3 WoW's
+// ground colour without WoW's light (divided by WoW's light on level sunlit ground, benilla 0052), so a
+// decal's change A1 - A0 is a change of unlit albedo; it is lit by that same light here (sflags.x 32,
+// light in sflags.y). Before, a decal showed its albedo as if under full white light: brighter and paler
+// than WoW's lit ground round it.
+// Regenerate wowbg3_compose_spv.h after editing (glslang-tools):
+//   glslangValidator -V --target-env vulkan1.0 --vn wowbg3_compose_spv -o wowbg3_compose_spv.h wowbg3_compose.comp
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, set = 0, binding = 0) buffer Out { uint px[]; } o;           // BG3's final picture, BGRA8; result in place
+layout(std430, set = 0, binding = 1) readonly buffer Dep { uint d[]; } dep;  // BG3's scene depth (depth aspect bytes)
+layout(std430, set = 0, binding = 2) readonly buffer Ui { uint u[]; } ui;    // BG3's HUD target (premultiplied)
+layout(std430, set = 0, binding = 3) readonly buffer Wow { uint w[]; } wow;  // WBF1 payload: colour rows, depth rows
+layout(std430, set = 0, binding = 4) buffer Cnt { uint n, sp, ok, bad; } cnt; // WoW pixels; surfaces: changed, ground matched, not matched
+layout(set = 0, binding = 5, r32f) uniform readonly image2D zimg;            // frame N: WoW's ground view depth (m), 0 none
+layout(set = 0, binding = 6, rgba8) uniform readonly image2D a0img;          // frame N: albedo the layer gave it (a: 1 seen, 0.5 unsure, 0 none)
+layout(set = 0, binding = 7, rgba8) uniform readonly image2D a1img;          // frame N: albedo after BG3's surface decals
+layout(set = 0, binding = 8, r32ui) uniform readonly uimage2D himg;          // frame N: BG3's forward target after its surface layers (B10G11R11)
+layout(std430, set = 0, binding = 9) readonly buffer Cam {
+    mat4 vpN;       // BG3's camera-relative view-projection of frame N
+    vec4 fwdN;      // frame N's forward axis
+    vec4 eyeM;      // WoW frame M's eye minus frame N's eye (BG3 metres); w: tan(half horizontal fov)
+    vec4 fwdM;      // M's axes in BG3's world; fwdM.w: tan(half vertical fov)
+    vec4 rightM;
+    vec4 upM;
+    vec4 par;       // decal weight, forward weight, forward floor, depth tolerance (m)
+    uvec4 sflags;   // x: 1 on, 2 decal copy, 4 forward copy, 8 same pixel (no reprojection), 16 debug view,
+                    // 32 WoW's ground light in y (RGB gamma bytes)
+} cam;
+layout(push_constant) uniform PC {
+    uint W, H, ww, wh, cbpr, dbpr, code, flags;  // flags: 1 hud, 2 hud RGBA, 4 light, 8 D16, 16 D24, 32 scaled, 64 decode
+    float P22, P32, P23, P33, wnear, wzoff, far, wgamma;
+} pc;
+
+shared uint s_n, s_sp, s_ok, s_bad;
+
+float s2l(float v) { return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
+float l2s(float v) { return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
+float uf(uint v, uint mb) {  // unsigned small float: mb mantissa bits, 5 exponent bits
+    uint m = v & ((1u << mb) - 1u), e = (v >> mb) & 31u;
+    if (e == 31u) return 0.0;  // inf / nan: nothing
+    float f = float(m) / float(1u << mb);
+    return e == 0u ? f * exp2(-14.0) : (1.0 + f) * exp2(float(e) - 15.0);
+}
+vec3 b10g11r11(uint v) { return vec3(uf(v & 0x7ffu, 6u), uf((v >> 11) & 0x7ffu, 6u), uf(v >> 22, 5u)); }
+
+// BG3's change of the ground under BG3 pixel... for WoW pixel (x, y) whose WoW depth value is wdv
+// (linear RGB, 0 when no surface or not WoW's ground there). st: 0 nothing, 1 matched, 2 not matched.
+vec3 surf_delta(uint x, uint y, float wdv, out uint st) {
+    st = 0u;
+    uint fl = cam.sflags.x;
+    ivec2 q = ivec2(int(x), int(y));
+    if ((fl & 8u) == 0u) {
+        if (!(wdv > 0.0)) return vec3(0.0);
+        float zm = (pc.wnear / wdv + pc.wzoff) * 0.9144;
+        vec2 ndc = (vec2(float(x), float(y)) + 0.5) / vec2(float(pc.W), float(pc.H)) * 2.0 - 1.0;  // y down
+        vec3 dir = cam.fwdM.xyz + cam.rightM.xyz * (ndc.x * cam.eyeM.w) - cam.upM.xyz * (ndc.y * cam.fwdM.w);
+        vec3 rel = cam.eyeM.xyz + dir * zm;  // the world point, relative to frame N's eye
+        vec4 c = cam.vpN * vec4(rel, 1.0);
+        if (!(c.w > 1e-6)) return vec3(0.0);
+        vec2 n = vec2(c.x, -c.y) / c.w;  // BG3 flips clip y
+        vec2 qf = (n * 0.5 + 0.5) * vec2(float(pc.W), float(pc.H));
+        if (!(qf.x >= 0.0 && qf.y >= 0.0 && qf.x < float(pc.W) && qf.y < float(pc.H))) return vec3(0.0);
+        q = ivec2(qf);
+        float zq = imageLoad(zimg, q).r;
+        if (!(zq > 0.0)) return vec3(0.0);
+        float zn = dot(rel, cam.fwdN.xyz);
+        if (abs(zq - zn) > cam.par.w + 0.02 * zn) { st = 2u; return vec3(0.0); }
+    }
+    vec4 a0 = imageLoad(a0img, q);
+    if (a0.a < 0.25) return vec3(0.0);
+    st = 1u;
+    vec3 d = vec3(0.0);
+    if ((fl & 2u) != 0u) {
+        vec3 dd = (imageLoad(a1img, q).rgb - a0.rgb) * cam.par.x;
+        if ((fl & 32u) != 0u) {
+            uint g = cam.sflags.y;
+            vec3 lg = vec3(float(g & 0xffu), float((g >> 8) & 0xffu), float((g >> 16) & 0xffu)) / 255.0;
+            dd *= vec3(s2l(lg.r), s2l(lg.g), s2l(lg.b));
+        }
+        d += dd;
+    }
+    if ((fl & 4u) != 0u) d += max(b10g11r11(imageLoad(himg, q).r) - vec3(cam.par.z), vec3(0.0)) * cam.par.y;
+    return d;
+}
+
+float bg3_depth(uint i) {
+    if ((pc.flags & 8u) != 0u) {
+        uint v = dep.d[i >> 1];
+        v = (i & 1u) != 0u ? (v >> 16) : (v & 0xffffu);
+        return float(v) / 65535.0;
+    }
+    uint v = dep.d[i];
+    if ((pc.flags & 16u) != 0u) return float(v & 0xffffffu) / 16777215.0;
+    return uintBitsToFloat(v);
+}
+
+// WoW's colour at texel (x, y) as B, G, R bytes (as floats).
+vec3 wow_bgr(uint x, uint y) {
+    if (pc.code == 5u) {  // RGBA16F, linear: encoded to sRGB like the CPU path's table
+        uint a = (y * pc.cbpr + x * 8u) >> 2;
+        vec2 rg = unpackHalf2x16(wow.w[a]);
+        vec2 ba = unpackHalf2x16(wow.w[a + 1u]);
+        vec3 l = clamp(vec3(rg.x, rg.y, ba.x), 0.0, 1.0);
+        vec3 s = mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l));
+        return floor(s.bgr * 255.0 + 0.5);
+    }
+    uint v = wow.w[(y * pc.cbpr + x * 4u) >> 2];
+    vec3 b = vec3(float(v & 0xffu), float((v >> 8) & 0xffu), float((v >> 16) & 0xffu));
+    b = (pc.code == 3u || pc.code == 4u) ? b : b.zyx;  // BGRA bytes as they are; RGBA swapped
+    if (pc.code == 2u && (pc.flags & 64u) != 0u) {
+        // benilla's sRGB target holds display values encoded a second time; its own
+        // window shows 255 * pow(srgb_to_linear(byte / 255), gamma) (ui_gamma.wgsl), so do the same.
+        vec3 l = vec3(s2l(b.x / 255.0), s2l(b.y / 255.0), s2l(b.z / 255.0));
+        if (pc.wgamma != 1.0) l = pow(max(l, vec3(1e-6)), vec3(pc.wgamma));
+        b = min(floor(l * 255.0 + 0.5), vec3(255.0));
+    }
+    return b;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) { s_n = 0u; s_sp = 0u; s_ok = 0u; s_bad = 0u; }
+    barrier();
+    uint sst = 0u;
+    bool schanged = false;
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    bool inside = x < pc.W && y < pc.H;
+    bool wowpx = false;
+    if (inside) {
+        uint i = y * pc.W + x;
+        float dv = bg3_depth(i);
+        float denom = dv * pc.P23 - pc.P22;
+        float bz = abs(denom) > 1e-12 ? (pc.P32 - dv * pc.P33) / denom : 1e30;
+        if (!(bz > 0.0)) bz = 1e30;
+        bool scaled = (pc.flags & 32u) != 0u;
+        vec2 wp = (vec2(x, y) + 0.5) * vec2(pc.ww, pc.wh) / vec2(pc.W, pc.H);
+        uint wx = scaled ? min(uint(wp.x), pc.ww - 1u) : x;
+        uint wy = scaled ? min(uint(wp.y), pc.wh - 1u) : y;
+        float wdv = uintBitsToFloat(wow.w[(pc.cbpr * pc.wh + wy * pc.dbpr + wx * 4u) >> 2]);
+        // Reverse infinite: view z = near / depth; plus how far WoW's eye sits ahead of BG3's (yards to metres).
+        float wz = wdv > 0.0 ? (pc.wnear / wdv + pc.wzoff) * 0.9144 : 1e30;
+        if (!(bz < wz && bz < pc.far)) {
+            wowpx = true;
+            vec3 base;
+            if (scaled) {
+                vec2 t = wp - 0.5;
+                vec2 fl = floor(t);
+                vec2 f = t - fl;
+                int ix = int(fl.x), iy = int(fl.y);
+                uint x0 = uint(clamp(ix, 0, int(pc.ww) - 1)), x1 = uint(clamp(ix + 1, 0, int(pc.ww) - 1));
+                uint y0 = uint(clamp(iy, 0, int(pc.wh) - 1)), y1 = uint(clamp(iy + 1, 0, int(pc.wh) - 1));
+                base = floor(mix(mix(wow_bgr(x0, y0), wow_bgr(x1, y0), f.x), mix(wow_bgr(x0, y1), wow_bgr(x1, y1), f.x), f.y) + 0.5);
+            } else {
+                base = wow_bgr(x, y);
+            }
+            if (cam.sflags.x != 0u) {  // BG3's ground surfaces on WoW's ground
+                vec3 d = surf_delta(x, y, wdv, sst);
+                if ((cam.sflags.x & 16u) != 0u) {  // debug view: surfaces magenta, unmatched ground red
+                    if (sst == 2u) base = vec3(0.0, 0.0, 255.0);
+                    else if (d != vec3(0.0)) base = vec3(255.0, 0.0, 255.0);
+                } else if (d != vec3(0.0)) {
+                    vec3 rgb = base.zyx / 255.0;
+                    vec3 l = vec3(s2l(rgb.r), s2l(rgb.g), s2l(rgb.b)) + d;
+                    l = clamp(l, 0.0, 1.0);
+                    base = floor(vec3(l2s(l.b), l2s(l.g), l2s(l.r)) * 255.0 + 0.5);
+                }
+                schanged = d != vec3(0.0);
+            }
+            uint ov = o.px[i];
+            ivec3 oc = ivec3(int(ov & 0xffu), int((ov >> 8) & 0xffu), int((ov >> 16) & 0xffu));  // B G R
+            ivec3 uc = ivec3(0);
+            int ua = 0;
+            if ((pc.flags & 1u) != 0u) {
+                uint uv = ui.u[i];
+                ivec4 u = ivec4(int(uv & 0xffu), int((uv >> 8) & 0xffu), int((uv >> 16) & 0xffu), int(uv >> 24));
+                uc = (pc.flags & 2u) != 0u ? u.zyx : u.xyz;
+                ua = u.w;
+            }
+            ivec3 res;
+            for (int k = 0; k < 3; k++) {
+                int b = int(base[k]);
+                if ((pc.flags & 4u) != 0u) {  // "light": BG3's scene under the HUD, (final - hud) / (1 - a), added
+                    int sc = ua < 250 ? (oc[k] - uc[k]) * 255 / (255 - ua) : 0;
+                    if (sc > 0) b += sc;
+                    b = min(b, 255);
+                }
+                res[k] = min(uc[k] + b * (255 - ua) / 255, 255);
+            }
+            o.px[i] = uint(res.x) | (uint(res.y) << 8) | (uint(res.z) << 16) | (255u << 24);
+        }
+    }
+    if (wowpx) atomicAdd(s_n, 1u);
+    if (schanged) atomicAdd(s_sp, 1u);
+    if (sst == 1u) atomicAdd(s_ok, 1u);
+    if (sst == 2u) atomicAdd(s_bad, 1u);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (s_n != 0u) atomicAdd(cnt.n, s_n);
+        if (s_sp != 0u) atomicAdd(cnt.sp, s_sp);
+        if (s_ok != 0u) atomicAdd(cnt.ok, s_ok);
+        if (s_bad != 0u) atomicAdd(cnt.bad, s_bad);
+    }
+}

@@ -1,0 +1,23 @@
+--- a/src/vendor/bg3le_noesis_lua.inl
++++ b/src/vendor/bg3le_noesis_lua.inl
+@@ -1063,3 +1063,10 @@
+     if (cmd == nullptr) return luaL_error(L, "%s is not a command", o->GetClassType()->GetName());
+-    lua_pushboolean(L, cmd->CanExecute(static_cast<BaseComponent*>(optional_object(L, 2))) ? 1 : 0);
++    // Property reads unbox CommandParameter. Rebox scalar Lua values for the
++    // engine, keeping the creation reference alive through the synchronous call.
++    const bool owned = plain_value(L, 2);
++    auto parameter = owned ? box_lua(L, 2) : static_cast<BaseComponent*>(optional_object(L, 2));
++    if (owned && parameter == nullptr) return luaL_error(L, "Cannot box command parameter for this game layout");
++    const bool allowed = cmd->CanExecute(parameter);
++    if (owned) parameter->Release();
++    lua_pushboolean(L, allowed ? 1 : 0);
+     return 1;
+@@ -1073,3 +1080,7 @@
+     if (cmd == nullptr) return luaL_error(L, "%s is not a command", o->GetClassType()->GetName());
+-    cmd->Execute(static_cast<BaseComponent*>(optional_object(L, 2)));
++    const bool owned = plain_value(L, 2);
++    auto parameter = owned ? box_lua(L, 2) : static_cast<BaseComponent*>(optional_object(L, 2));
++    if (owned && parameter == nullptr) return luaL_error(L, "Cannot box command parameter for this game layout");
++    cmd->Execute(parameter);
++    if (owned) parameter->Release();
+     return 0;

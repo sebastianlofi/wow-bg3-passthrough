@@ -1,0 +1,756 @@
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -43,6 +43,32 @@
+ //! k * C + c and over white k * W + c: the transmittance becomes k * T and the composite gets
+ //! exactly BG3's overlay of WoW's scene with everything drawn before it. Its records also take the
+ //! eye shift (`rebase_camera`), and its rays are WoW's.
++//!
++//! Patch 0026 (BG3's combat ring drew on the WoW enemy model): BG3 lays a
++//! projected decal only on surfaces whose material receives decals. Its G-buffer pass writes a
++//! decal normal (pass 7d71be5d copies the normal there only for materials with "receives decals",
++//! material byte bit 3; characters lack it) and its decal shaders discard where that normal is
++//! (0, 0) (special key 6). The replay bound one texel of level ground there, so every pixel in a
++//! decal box took the decal, the WoW models standing in it too (Tav was kept out by 0020's
++//! capsule). Now special key 6 is a decal normal of WoW's own receivers, as WoW's ground-decal
++//! projector (`benilla_world::decal`, the selection ring's: terrain and WMO faces, never doodads,
++//! GameObjects or units) finds them: each frame the main world gathers the receiver triangles inside
++//! every projected decal's box (its object block's world matrix, BG3's coordinates mapped into
++//! WoW's), and before the draws a pass rasterises them with WoW's camera at BG3's extent, writing
++//! BG3's normal encoding where the receiver is the surface WoW drew there (its view depth within
++//! [`RECV_TOL`] of WoW's depth) and leaving (0, 0) elsewhere: on creatures, players, Tav, doodads
++//! and the sky a decal finds no receiver, as on BG3's characters. The same pass writes the
++//! receivers' linear depth (WoW's, as the prep pass converts it; the far plane elsewhere) as the
++//! projected decals' special key 4, so a decal that does not test the normal finds no surface off
++//! the receivers either (0020's capsule round Tav stays for BG3's sight records, which read the
++//! normal too, do not discard on it, and keep the level-ground texel).
++//!
++//! Patch 0026 (long black lines across the view for a few seconds, Lacerate): wgpu binds a
++//! vertex buffer from its offset to the end of the arena (Vulkan bounds a vertex fetch by the whole
++//! buffer), so an indexed draw whose indices name vertices past what the layer captured for it read
++//! the next blobs (other draws' constants, indices, textures) as vertices: triangles spanning the
++//! view. wgpu does not check index values; [`index_span`] does, and such a draw is not replayed
++//! (logged once per pipe with the numbers; counted in the per-second line).
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::num::NonZeroU64;
+@@ -55,6 +81,7 @@
+ use bevy::render::render_graph::{
+     NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
+ };
++use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
+ use bevy::render::render_resource::TextureUsages;
+ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
+ use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
+@@ -80,9 +107,21 @@
+ const TAV_MASK: [f32; 3] = [0.7, 0.25, 2.6];
+ /// Patch 0021: inline (sight overlay) textures kept uploaded.
+ const INLINE_KEEP: usize = 256;
++/// Patch 0026: how far (yards) a decal receiver's view depth may lie from WoW's drawn depth and
++/// still be the surface WoW drew there: a constant plus a fraction of the distance.
++const RECV_TOL: [f32; 2] = [0.08, 0.002];
++/// Patch 0026: a decal box larger than this (metres, any side) is not a ground decal: no receivers.
++const RECV_MAX_BOX: f32 = 80.0;
++/// Patch 0026: receiver triangles per frame at most.
++const RECV_MAX_TRIS: usize = 200_000;
+ 
+ pub(crate) fn build(app: &mut App) {
+     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<crate::wowbg3_tav::TavFeet>::default());
++    // Patch 0026: WoW's decal receivers under BG3's projected decals, gathered after the frame is
++    // picked (`wowbg3_fx::read_fx`, PostUpdate) and the camera and ground lock are set.
++    app.init_resource::<FxReceivers>()
++        .add_plugins(ExtractResourcePlugin::<FxReceivers>::default())
++        .add_systems(Last, gather_receivers);
+     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+         warn!("wowbg3 fx: no render app");
+         return;
+@@ -327,6 +366,29 @@
+     pub(crate) instance: bool,
+ }
+ 
++/// Patch 0026: the lowest and highest index in `ix` (little-endian u16 or u32), the
++/// primitive restart value left out for a strip that restarts; `None` when there is none.
++pub(crate) fn index_span(ix: &[u8], wide: bool, restart: bool) -> Option<(u32, u32)> {
++    let mut span: Option<(u32, u32)> = None;
++    let mut take = |v: u32| span = Some(span.map_or((v, v), |(a, b)| (a.min(v), b.max(v))));
++    if wide {
++        for c in ix.chunks_exact(4) {
++            let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
++            if !(restart && v == u32::MAX) {
++                take(v);
++            }
++        }
++    } else {
++        for c in ix.chunks_exact(2) {
++            let v = u16::from_le_bytes([c[0], c[1]]) as u32;
++            if !(restart && v == 0xffff) {
++                take(v);
++            }
++        }
++    }
++    span
++}
++
+ /// (vertex limit, instance limit) for buffers of these sizes, as wgpu-core computes them.
+ pub(crate) fn vertex_limits(slots: &[VbSlot], sizes: &[u64]) -> (u64, u64) {
+     let (mut vl, mut il) = (u64::MAX, u64::MAX);
+@@ -394,6 +456,10 @@
+     /// Patch 0023: the second pair (scene readers write one pair while reading the other).
+     c2: wgpu::TextureView,
+     w2: wgpu::TextureView,
++    /// Patch 0026: special key 6 for projected decals, WoW's receivers' normals ((0, 0) elsewhere),
++    /// and their key 4, the receivers' linear depth (the far plane elsewhere).
++    decal_normal: wgpu::TextureView,
++    lin_r: wgpu::TextureView,
+ }
+ 
+ struct Base {
+@@ -417,6 +483,8 @@
+     comp_bgl: wgpu::BindGroupLayout,
+     table_pipeline: wgpu::RenderPipeline,
+     prep_pipeline: wgpu::RenderPipeline,
++    /// Patch 0026: rasterises WoW's decal receivers into the decal normal.
++    recv_pipeline: wgpu::RenderPipeline,
+     comp_layout: wgpu::PipelineLayout,
+     comp_module: wgpu::ShaderModule,
+ }
+@@ -446,6 +514,10 @@
+     c2: wgpu::TextureView,
+     w2: wgpu::TextureView,
+     final_second: bool,
++    /// Patch 0026: the decal normal and receiver depth targets and the pass that fills them.
++    decal_normal: wgpu::TextureView,
++    lin_r: wgpu::TextureView,
++    recv_pipeline: wgpu::RenderPipeline,
+ }
+ 
+ struct PreparedDraw {
+@@ -525,6 +597,15 @@
+     stats: Stats,
+     /// Errors met while recording (the node only reads the resource).
+     node_log: Mutex<HashSet<String>>,
++    /// Patch 0026: this frame's decal receivers (position, normal: 6 floats a vertex), their
++    /// vertex count, and the boxes they came from (for the log).
++    recv_buf: Option<wgpu::Buffer>,
++    recv_n: u32,
++    recv_boxes: u32,
++    /// Patch 0026: pipes already logged for indices past their captured vertices, and
++    /// the draws refused for it in the current frame set.
++    oob_logged: HashSet<u64>,
++    oob_draws: usize,
+ }
+ 
+ /// Runs `f` inside validation and internal error scopes: wgpu's default handler panics.
+@@ -786,6 +867,36 @@
+                 multiview: None,
+                 cache: None,
+             });
++            // Patch 0026: WoW's decal receivers into the decal normal (special key 6).
++            let recv_module = wgsl("wowbg3_fx_recv", WGSL_RECV);
++            let recv_pipeline = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some("wowbg3_fx_recv"),
++                layout: Some(&layout(&[&chain_bgl, &table_bgl, &prep_bgl])),
++                vertex: wgpu::VertexState {
++                    module: &recv_module,
++                    entry_point: Some("vs_recv"),
++                    compilation_options: Default::default(),
++                    buffers: &[wgpu::VertexBufferLayout {
++                        array_stride: 24,
++                        step_mode: wgpu::VertexStepMode::Vertex,
++                        attributes: &[
++                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
++                            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
++                        ],
++                    }],
++                },
++                primitive: wgpu::PrimitiveState::default(),
++                depth_stencil: None,
++                multisample: wgpu::MultisampleState::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &recv_module,
++                    entry_point: Some("fs_recv"),
++                    compilation_options: Default::default(),
++                    targets: &[Some(COLOR_FMT.into()), Some(wgpu::TextureFormat::R32Float.into())],
++                }),
++                multiview: None,
++                cache: None,
++            });
+             let comp_module = wgsl("wowbg3_fx_comp", &format!("{WGSL_INVERSE}\n{WGSL_COMP}"));
+             let comp_layout = layout(&[&chain_bgl, &table_bgl, &comp_bgl]);
+             Base {
+@@ -806,6 +917,7 @@
+                 comp_bgl,
+                 table_pipeline,
+                 prep_pipeline,
++                recv_pipeline,
+                 comp_layout,
+                 comp_module,
+             }
+@@ -813,7 +925,8 @@
+     }
+ }
+ 
+-const PARAMS_BYTES: u64 = 192;
++/// 0026: 336 (WoW's clip_from_world, view_from_world and the receiver tolerance appended).
++const PARAMS_BYTES: u64 = 336;
+ 
+ impl FxGpu {
+     fn log_once(&mut self, msg: String) {
+@@ -1266,6 +1379,7 @@
+         key: u64,
+         kind: Kind,
+         decal: bool,
++        projected: bool,
+     ) -> Result<wgpu::TextureView, Skip> {
+         let (Some(base), Some(t)) = (self.base.as_ref(), self.targets.as_ref()) else { return Err(Skip::Silent) };
+         match kind {
+@@ -1279,9 +1393,18 @@
+                     1 if plain => Ok(t.depth.clone()),
+                     2 if plain => Ok(t.scene.clone()),
+                     // Patch 0020: a projected decal reads the depth with Tav taken out.
+-                    4 if plain => Ok(if decal { t.lin_d.clone() } else { t.lin_a.clone() }),
++                    // Patch 0026: a projected decal reads WoW's receivers' depth (far elsewhere).
++                    4 if plain => Ok(if projected {
++                        t.lin_r.clone()
++                    } else if decal {
++                        t.lin_d.clone()
++                    } else {
++                        t.lin_a.clone()
++                    }),
+                     5 if grid => Ok(base.light3d.clone()),
+-                    6 if plain => Ok(base.normal.clone()),
++                    // Patch 0026: a projected decal reads WoW's receivers' normals ((0, 0) where
++                    // none is drawn: it discards there); BG3's sight records the level texel.
++                    6 if plain => Ok(if projected { t.decal_normal.clone() } else { base.normal.clone() }),
+                     1..=6 => Ok(neutral),
+                     k => {
+                         let Some(file) = set.textures.get(&k) else {
+@@ -1363,6 +1486,8 @@
+         };
+         // Patch 0020: a projected decal is a draw that reads the G-buffer normal (special key 6).
+         let decal = d.sets.iter().any(|x| x.slots.iter().any(|y| y.res == SlotRes::Image(6)));
++        // Patch 0026: and not one of BG3's sight records (they read it too).
++        let projected = projected_decal(d, &set.recipes);
+         // Patch 0023: a scene reader, an EoCSight record (it reads BG3's scene, special key 2, and
+         // writes every pixel of its one target without blending), reads the targets as the draws
+         // before it left them. Only these: a draw covering part of the screen would lose the rest.
+@@ -1470,7 +1595,7 @@
+                             Some(v) if k == 2 && matches!(kind, Kind::Tex { dim: wgpu::TextureViewDimension::D2, scalar: Scalar::Float }) => {
+                                 Bound::View(v.clone())
+                             }
+-                            _ => Bound::View(self.image_for(dev, queue, set, k, kind, decal)?),
++                            _ => Bound::View(self.image_for(dev, queue, set, k, kind, decal, projected)?),
+                         },
+                         (k, res) => {
+                             return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b}: {k:?} bound to {res:?}")));
+@@ -1527,6 +1652,22 @@
+             if size == 0 || off % isz != 0 || off + size > blob_len || (d.first as u64 + d.count as u64) * isz > size {
+                 return Err(Skip::Once(format!("{pipe_name}: index range {off}+{size} for {}+{}", d.first, d.count)));
+             }
++            // Patch 0026: every vertex the indices name must be in the captured buffers.
++            let at = (off + d.first as u64 * isz) as usize;
++            let ix = set.frame.blob.get(at..at + d.count as usize * isz as usize).ok_or(Skip::Silent)?;
++            if let Some((lo, hi)) = index_span(ix, isz == 4, strip.is_some()) {
++                let (lo, hi) = (lo as i64 + d.vertex_offset as i64, hi as i64 + d.vertex_offset as i64);
++                if lo < 0 || hi >= vlimit.min(i64::MAX as u64) as i64 {
++                    self.oob_draws += 1;
++                    if self.oob_logged.insert(d.pipe) {
++                        warn!(
++                            "wowbg3 fx: {pipe_name}: its indices name vertices {lo}..={hi}, the layer captured {vlimit}: not replayed (BG3 frame {}; logged once per pipe)",
++                            set.frame.frame
++                        );
++                    }
++                    return Err(Skip::Silent);
++                }
++            }
+             Some((off, size, fmt))
+         } else {
+             if d.first as u64 + d.count as u64 > vlimit {
+@@ -1574,6 +1715,8 @@
+                 w: mk("wowbg3_fx_over_white", COLOR_FMT, ra),
+                 c2: mk("wowbg3_fx_over_black_2", COLOR_FMT, ra),
+                 w2: mk("wowbg3_fx_over_white_2", COLOR_FMT, ra),
++                decal_normal: mk("wowbg3_fx_decal_normal", COLOR_FMT, ra),
++                lin_r: mk("wowbg3_fx_lin_receivers", wgpu::TextureFormat::R32Float, ra),
+             }
+         });
+         match made {
+@@ -1692,6 +1835,7 @@
+         let arena_len = self.base.as_ref()?.arena.size();
+         let mut draws = Vec::with_capacity(set.frame.draws.len());
+         let mut skipped = 0;
++        self.oob_draws = 0;
+         // Patch 0023: scene readers so far (each reads the pair of targets the previous one wrote).
+         let mut readers = 0usize;
+         for d in &set.frame.draws {
+@@ -1770,6 +1914,9 @@
+             c2: t.c2.clone(),
+             w2: t.w2.clone(),
+             final_second: readers % 2 == 1,
++            decal_normal: t.decal_normal.clone(),
++            lin_r: t.lin_r.clone(),
++            recv_pipeline: base.recv_pipeline.clone(),
+         })
+     }
+ }
+@@ -1871,6 +2018,7 @@
+     queue: Res<RenderQueue>,
+     views: Query<(&ExtractedView, &ViewTarget), With<FxView>>,
+     feet: Option<Res<crate::wowbg3_tav::TavFeet>>,
++    recv: Option<Res<FxReceivers>>,
+ ) {
+     let gpu = &mut *gpu;
+     let set = ext.and_then(|e| e.set.clone());
+@@ -1926,8 +2074,15 @@
+     // Tav's capsule (her root where benilla draws her), for the decal mask.
+     let world_from_clip = Mat4::from(view.world_from_view.affine()) * view.clip_from_view.inverse();
+     let tav = feet.and_then(|f| f.0).filter(|p| p.is_finite());
+-    let mut params = [0f32; 48];
++    let mut params = [0f32; 84];
+     params[24..40].copy_from_slice(&world_from_clip.to_cols_array());
++    // Patch 0026: WoW's camera for the decal receivers (Bevy world, yards) and their tolerance.
++    let view_from_world = view.world_from_view.affine().inverse();
++    let clip_from_world = view.clip_from_view * Mat4::from(view_from_world);
++    params[48..64].copy_from_slice(&clip_from_world.to_cols_array());
++    params[64..80].copy_from_slice(&Mat4::from(view_from_world).to_cols_array());
++    params[80..84].copy_from_slice(&[RECV_TOL[0], RECV_TOL[1], 0.0, 0.0]);
++    gpu.upload_receivers(dev, &queue, recv.as_deref());
+     if let Some(p) = tav {
+         params[40..48].copy_from_slice(&[p.x, p.y, p.z, TAV_MASK[0], TAV_MASK[1], TAV_MASK[2], 0.0, 0.0]);
+     }
+@@ -1971,13 +2126,16 @@
+     let since = *st.since.get_or_insert_with(Instant::now);
+     if since.elapsed().as_secs_f32() >= 1.0 {
+         info!(
+-            "wowbg3 fx: BG3 frame {}: {replayed} draws replayed, {skipped} skipped (last second: {} frames, {} replayed, {} skipped), {} colours, exposure {:.3}",
++            "wowbg3 fx: BG3 frame {}: {replayed} draws replayed, {skipped} skipped ({} with indices past their vertices) (last second: {} frames, {} replayed, {} skipped), {} colours, exposure {:.3}, decal receivers {} triangles in {} boxes",
+             set.frame.frame,
++            gpu.oob_draws,
+             st.frames,
+             st.replayed,
+             st.skipped,
+             if gpu.mode > 0.5 { "BG3's" } else { "sRGB" },
+-            set.exposure
++            set.exposure,
++            gpu.recv_n / 3,
++            gpu.recv_boxes
+         );
+         *st = Stats { since: Some(Instant::now()), ..Default::default() };
+     }
+@@ -2238,6 +2396,157 @@
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
++// Patch 0026: WoW's decal receivers under BG3's projected decals
++
++/// This frame's decal receivers: terrain and WMO triangles inside the replayed projected decals'
++/// boxes, in Bevy's world (yards), 6 floats a vertex (position, face normal), and the box count.
++#[derive(Resource, Clone, Default, ExtractResource)]
++pub(crate) struct FxReceivers {
++    pub(crate) verts: Arc<Vec<f32>>,
++    pub(crate) boxes: u32,
++}
++
++/// The 8 corners of a projected decal's box in BG3's world (metres): its object block (set 1
++/// binding 0, row-major, applied as `[p, 1] * M`) maps the unit box [-0.5, 0.5]^3 (the decal
++/// shaders discard outside it) to an offset from BG3's eye `eye`.
++pub(crate) fn decal_box_corners(world: &[f32], eye: Vec3) -> Option<[Vec3; 8]> {
++    if world.len() < 16 || !world[..16].iter().all(|v| v.is_finite()) {
++        return None;
++    }
++    let row = |r: usize| Vec3::new(world[r * 4], world[r * 4 + 1], world[r * 4 + 2]);
++    let (x, y, z, t) = (row(0), row(1), row(2), row(3));
++    let mut out = [Vec3::ZERO; 8];
++    for (i, c) in out.iter_mut().enumerate() {
++        let s = |b: usize| if i >> b & 1 == 1 { 0.5 } else { -0.5 };
++        *c = eye + x * s(0) + y * s(1) + z * s(2) + t;
++    }
++    Some(out)
++}
++
++/// BG3 to Bevy, world mode's mapping (`bg3 = k + YD * (-x, y, z)`), less the ground lock (benilla
++/// lowers the world camera and Tav by it; `cam_pose` adds it back the other way).
++pub(crate) fn bevy_from_bg3(k: [f32; 3], lock: f32, p: Vec3) -> Vec3 {
++    Vec3::new((k[0] - p.x) / YD, (p.y - k[1]) / YD - lock, (p.z - k[2]) / YD)
++}
++
++/// Each frame: the receiver triangles inside every projected decal's box, by WoW's ground-decal
++/// projector (`WorldDecal`: terrain and WMO faces). A box is gathered once however many draws
++/// share it; one larger than [`RECV_MAX_BOX`] is not a ground decal and gets none.
++fn gather_receivers(
++    ext: Res<FxExtract>,
++    decals: benilla_world::decal::WorldDecal,
++    mut out: ResMut<FxReceivers>,
++    mut scratch: Local<Vec<benilla_world::particles::buffer::EffectVertex>>,
++) {
++    let Some(set) = ext.set.as_ref() else {
++        if out.boxes > 0 || !out.verts.is_empty() {
++            *out = FxReceivers::default();
++        }
++        return;
++    };
++    let Some(k) = crate::wowbg3_fx::bg3_map() else { return };
++    let lock = crate::wowbg3_lead::ground_lock();
++    let f = &set.frame;
++    let floats = |off: u32, n: usize| -> Option<Vec<f32>> {
++        let b = f.blob.get(off as usize..off as usize + n * 4)?;
++        Some(b.chunks_exact(4).map(|x| f32::from_le_bytes(x.try_into().unwrap())).collect())
++    };
++    let mut verts: Vec<f32> = Vec::new();
++    let mut seen = HashSet::new();
++    let mut boxes = 0u32;
++    for d in &f.draws {
++        if !projected_decal(d, &set.recipes) {
++            continue;
++        }
++        let buf = |s: u32, b: u32| {
++            d.sets.iter().find(|x| x.set == s).and_then(|x| x.slots.iter().find(|y| y.binding == b)).and_then(|y| match y.res {
++                SlotRes::Buffer { blob, size } => Some((blob, size)),
++                _ => None,
++            })
++        };
++        let (Some((b2, s2)), Some((b0, s0))) = (buf(0, 2), buf(1, 0)) else { continue };
++        if s2 < 224 || s0 < 128 || !seen.insert(b0) {
++            continue;
++        }
++        let (Some(vb), Some(m)) = (floats(b2, 56), floats(b0, 16)) else { continue };
++        let Some(corners) = decal_box_corners(&m, Vec3::new(vb[52], vb[53], vb[54])) else { continue };
++        let (lo, hi) = corners.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), c| (a.min(*c), b.max(*c)));
++        if (hi - lo).max_element() > RECV_MAX_BOX {
++            continue;
++        }
++        boxes += 1;
++        let (a, b) = (bevy_from_bg3(k, lock, lo), bevy_from_bg3(k, lock, hi));
++        let (lo, hi) = (a.min(b), a.max(b));
++        let c = (lo + hi) * 0.5;
++        let frame = benilla_world::decal::DecalFrame {
++            center: c,
++            sin: 0.0,
++            cos: 1.0,
++            min_x: lo.x - c.x,
++            max_x: hi.x - c.x,
++            min_z: lo.z - c.z,
++            max_z: hi.z - c.z,
++            min_y: lo.y - c.y,
++            max_y: hi.y - c.y,
++        };
++        scratch.clear();
++        if !decals.project(&mut scratch, &frame, |_| 1.0, |_, _| [0.0, 0.0]) {
++            continue;
++        }
++        for t in scratch.chunks_exact(3) {
++            if verts.len() / 18 >= RECV_MAX_TRIS {
++                break;
++            }
++            let p = [Vec3::from(t[0].pos), Vec3::from(t[1].pos), Vec3::from(t[2].pos)];
++            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
++            if n == Vec3::ZERO {
++                continue;
++            }
++            for q in p {
++                verts.extend_from_slice(&[q.x, q.y, q.z, n.x, n.y, n.z]);
++            }
++        }
++    }
++    *out = FxReceivers { verts: Arc::new(verts), boxes };
++}
++
++impl FxGpu {
++    /// Patch 0026: this frame's receivers into the vertex buffer (grown as needed).
++    fn upload_receivers(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, recv: Option<&FxReceivers>) {
++        let verts: &[f32] = recv.map_or(&[], |r| r.verts.as_slice());
++        self.recv_boxes = recv.map_or(0, |r| r.boxes);
++        let n = (verts.len() / 6) as u32;
++        let need = (verts.len() * 4) as u64;
++        if need == 0 {
++            self.recv_n = 0;
++            return;
++        }
++        if self.recv_buf.as_ref().is_none_or(|b| b.size() < need) {
++            let size = need.next_power_of_two().max(1 << 16);
++            match scoped(dev, || {
++                dev.create_buffer(&wgpu::BufferDescriptor {
++                    label: Some("wowbg3_fx_receivers"),
++                    size,
++                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
++                    mapped_at_creation: false,
++                })
++            }) {
++                Ok(b) => self.recv_buf = Some(b),
++                Err(e) => {
++                    self.log_once(format!("decal receivers buffer of {size} bytes: {e}"));
++                    self.recv_n = 0;
++                    return;
++                }
++            }
++        }
++        if let Some(b) = self.recv_buf.as_ref() {
++            queue.write_buffer(b, 0, bytemuck::cast_slice(verts));
++            self.recv_n = n;
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
+ // The node
+ 
+ #[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -2372,6 +2681,36 @@
+                 pass.set_bind_group(2, &prep_bg, &[]);
+                 pass.draw(0..3, 0..1);
+             }
++            // Patch 0026: WoW's decal receivers (the decal normal, special key 6 of projected
++            // decals); cleared to (0, 0), where every projected decal discards.
++            {
++                let att = |view, clear| {
++                    Some(wgpu::RenderPassColorAttachment {
++                        view,
++                        depth_slice: None,
++                        resolve_target: None,
++                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
++                    })
++                };
++                let far = wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
++                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    label: Some("wowbg3_fx_receivers"),
++                    color_attachments: &[att(&r.decal_normal, wgpu::Color::TRANSPARENT), att(&r.lin_r, far)],
++                    depth_stencil_attachment: None,
++                    timestamp_writes: None,
++                    occlusion_query_set: None,
++                });
++                if let (Some(buf), n) = (gpu.recv_buf.as_ref(), gpu.recv_n) {
++                    if n > 0 {
++                        pass.set_pipeline(&r.recv_pipeline);
++                        pass.set_bind_group(0, &r.chain_bg, &[]);
++                        pass.set_bind_group(1, &r.table_bg, &[]);
++                        pass.set_bind_group(2, &prep_bg, &[]);
++                        pass.set_vertex_buffer(0, buf.slice(..n as u64 * 24));
++                        pass.draw(0..n, 0..1);
++                    }
++                }
++            }
+             // Patch 0023: each scene reader starts a pass on the other target of the pair, reading
+             // the one before (it writes every pixel, as BG3's EoCSight records do).
+             let n = r.draws.len();
+@@ -2450,6 +2789,9 @@
+     world_from_clip: mat4x4<f32>,  // WoW's camera (Bevy world, yards)
+     mask: vec4<f32>,    // Tav's root (Bevy world) and the capsule's radius (0: no mask)
+     mask_h: vec4<f32>,  // the capsule's height range above her root
++    clip_from_world: mat4x4<f32>,  // patch 0026: WoW's camera, for the decal receivers
++    view_from_world: mat4x4<f32>,
++    recv: vec4<f32>,    // receiver depth tolerance: yards, fraction of the distance
+ };
+ @group(0) @binding(0) var<uniform> P: Params;
+ @group(0) @binding(1) var grade_lut: texture_3d<f32>;
+@@ -2655,6 +2997,66 @@
+ }
+ "#;
+ 
++/// Patch 0026: WoW's decal receivers (terrain and WMO faces in the frame's decal boxes, Bevy world)
++/// into the decal normal at BG3's extent: BG3's encoding of the face normal in BG3's camera axes
++/// (right, up, forward; Bevy's view looks down -z) where the receiver is the surface WoW drew there,
++/// nothing elsewhere (the target stays (0, 0): projected decals discard there).
++const WGSL_RECV: &str = r#"
++@group(2) @binding(0) var wow_depth: texture_depth_2d;
++
++struct RIn {
++    @location(0) pos: vec3<f32>,
++    @location(1) n: vec3<f32>,
++};
++struct ROut {
++    @builtin(position) pos: vec4<f32>,
++    @location(0) nv: vec3<f32>,
++    @location(1) pv: vec3<f32>,
++};
++
++@vertex
++fn vs_recv(v: RIn) -> ROut {
++    var o: ROut;
++    o.pos = P.clip_from_world * vec4<f32>(v.pos, 1.0);
++    o.nv = (P.view_from_world * vec4<f32>(v.n, 0.0)).xyz;
++    o.pv = (P.view_from_world * vec4<f32>(v.pos, 1.0)).xyz;
++    return o;
++}
++
++struct RFrag {
++    @location(0) normal: vec4<f32>,
++    @location(1) lin: f32,
++};
++
++@fragment
++fn fs_recv(in: ROut) -> RFrag {
++    let vsz = P.sizes.zw;
++    let q = vec2<i32>(clamp(floor(in.pos.xy * vsz / P.sizes.xy), vec2<f32>(0.0), vsz - 1.0));
++    let d = textureLoad(wow_depth, q, 0);
++    if (d <= 0.0) {
++        discard;
++    }
++    // WoW's drawn surface and this receiver, as view z (yards); reverse infinite: z = near / depth.
++    let zs = P.depth.x / d;
++    let zf = -in.pv.z;
++    if (abs(zf - zs) > P.recv.x + P.recv.y * zs) {
++        discard;
++    }
++    var n = normalize(in.nv);
++    if (dot(n, in.pv) > 0.0) {
++        n = -n;
++    }
++    let b = vec3<f32>(n.x, n.y, -n.z);
++    let k = max(1.0 - b.z, 1e-4);
++    var o: RFrag;
++    o.normal = vec4<f32>((b.x / k + 1.7777) / 3.5554, (b.y / k + 1.7777) / 3.5554, 0.0, 1.0);
++    // WoW's linear depth there, exactly as the prep pass writes it (special key 4).
++    let z = max((zs + P.depth.y) * P.depth.w + P.proj.z, 0.01);
++    o.lin = min(z / P.depth.z, 1.0);
++    return o;
++}
++"#;
++
+ const WGSL_COMP: &str = r#"
+ @group(2) @binding(0) var src: texture_2d<f32>;
+ @group(2) @binding(1) var fx_c: texture_2d<f32>;
+@@ -2806,6 +3208,35 @@
+     }
+ 
+     #[test]
++    fn decal_boxes_map_onto_wows_world() {
++        // A 4 x 1 x 2 m box, yawed 90 degrees, 3 m ahead (+z) of BG3's eye at (10, 20, 30).
++        let world: [f32; 16] = [0.0, 0.0, -4.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, -1.0, 3.0, 1.0];
++        let eye = Vec3::new(10.0, 20.0, 30.0);
++        let c = decal_box_corners(&world, eye).expect("a box");
++        let (lo, hi) = c.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
++        assert!((lo - Vec3::new(9.0, 18.5, 31.0)).length() < 1e-5, "{lo:?}");
++        assert!((hi - Vec3::new(11.0, 19.5, 35.0)).length() < 1e-5, "{hi:?}");
++        assert!(decal_box_corners(&world[..12], eye).is_none());
++        // BG3 to Bevy is the inverse of `cam_pose`'s mapping, ground lock included.
++        let k = [-1400.0f32, 120.0, -350.0];
++        let b = Vec3::new(3.0, -2.0, 7.5);
++        let lock = 0.4;
++        let bg3 = Vec3::from(k) + mirror(b + Vec3::Y * lock) * YD;
++        assert!((bevy_from_bg3(k, lock, bg3) - b).length() < 1e-3);
++    }
++
++    #[test]
++    fn receiver_shader_validates() {
++        use wgpu::naga;
++        let src = format!("{WGSL_PRELUDE}
++{WGSL_RECV}");
++        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
++        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
++            .validate(&module)
++            .expect("the receiver shader validates");
++    }
++
++    #[test]
+     fn encodes_normals_as_bg3s_decals_decode_them() {
+         for n in [Vec3::new(0.0, 0.85, -0.52), Vec3::new(0.3, 0.6, -0.74), Vec3::new(0.0, 1.0, 0.0)] {
+             let n = n.normalize();
+@@ -2843,6 +3274,16 @@
+     }
+ 
+     #[test]
++    fn index_spans_leave_restarts_out() {
++        let ix16: Vec<u8> = [5u16, 0xffff, 2, 9].iter().flat_map(|v| v.to_le_bytes()).collect();
++        assert_eq!(index_span(&ix16, false, true), Some((2, 9)));
++        assert_eq!(index_span(&ix16, false, false), Some((2, 0xffff)));
++        let ix32: Vec<u8> = [7u32, u32::MAX, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
++        assert_eq!(index_span(&ix32, true, true), Some((3, 7)));
++        assert_eq!(index_span(&[], false, false), None);
++    }
++
++    #[test]
+     fn vertex_limits_like_wgpu() {
+         let slots = [
+             VbSlot { binding: 0, stride: 64, last_stride: 64, instance: true },
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -4,6 +4,18 @@
+ //! WoW world coordinates. benilla's own camera still runs underneath; this system overwrites the
+ //! result just before transforms propagate, so its collision and smoothing never show.
+ //!
++//! Patch 0026 (WoW's own click targeting was off; a merchant or a wolf
++//! took a click only on the ground in front of it): the overwrite came too late. WoW's controller
++//! seats its own camera in `Update` (`WorldStage::Input`, with the spyglass's 45 degree field of
++//! view), and `benilla_world::view::publish_camera_pose` (`CameraPoseSet`) copies that `Transform`
++//! into `GlobalTransform` right after, so every `Update` reader of the camera, WoW's mouseover and
++//! click picks among them (`target::TargetUpdate`), cast their rays through WoW's own orbit camera
++//! (harness: an eye 21 yd from BG3's, looking another way), while the frame was drawn through
++//! BG3's. [`follow_bg3`] now runs in `Update` right after the controller and before
++//! `CameraPoseSet` and the picks, so the pose published for the frame, the picks' camera and the
++//! drawn camera are BG3's; [`keep_bg3_pose`] writes the same pose again before propagation, as
++//! the one write used to, against any later writer.
++//!
+ //! Record (96 bytes, little endian): `BGC1`, seq u32, eye[3], forward[3], up[3] f32 (WoW world,
+ //! yards), vertical fov f32 (radians), aspect f32, pad, time f64, seq again u32 (equal when the
+ //! record is whole), pad, BG3's projection terms. A record older than half a second is ignored
+@@ -485,6 +497,9 @@
+     last_at: Option<Instant>,
+     pose: Option<LeadPose>,
+     frames: u64,
++    /// Patch 0026: this frame's camera (translation, rotation, field of view) as [`follow_bg3`]
++    /// set it in `Update`, written again before propagation by [`keep_bg3_pose`].
++    held: Option<(Vec3, Quat, f32)>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq)]
+@@ -720,13 +735,41 @@
+         last_at: None,
+         pose: None,
+         frames: 0,
++        held: None,
+     })
++    // Patch 0026: right after WoW's own camera seat, before its pose is published for
++    // the frame (`CameraPoseSet`) and before the picks (`TargetUpdate`).
++    .add_systems(
++        Update,
++        follow_bg3
++            .after(benilla_world::schedule::WorldStage::Input)
++            .after(keep_ground_lock)
++            .before(benilla_world::view::CameraPoseSet)
++            .before(crate::target::TargetUpdate),
++    )
+     .add_systems(
+         PostUpdate,
+-        follow_bg3.before(bevy::transform::TransformSystems::Propagate),
++        keep_bg3_pose.before(bevy::transform::TransformSystems::Propagate),
+     );
+ }
+ 
++/// Patch 0026: BG3's camera of this frame (set in `Update` by [`follow_bg3`]) once more, just before
++/// transforms propagate, over anything that wrote the world camera since.
++fn keep_bg3_pose(s: Res<LeadStream>, mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>) {
++    let (Some((at, rot, fov)), Ok((mut tf, mut proj))) = (s.held, cam.single_mut()) else {
++        return;
++    };
++    if tf.translation != at || tf.rotation != rot {
++        tf.translation = at;
++        tf.rotation = rot;
++    }
++    if let Projection::Perspective(p) = proj.as_mut() {
++        if p.fov != fov {
++            p.fov = fov;
++        }
++    }
++}
++
+ /// WoW's ground under Tav (Bevy y, yards): the walking collision's floor within the lock's reach,
+ /// else the terrain.
+ fn ground_under(
+@@ -773,6 +816,8 @@
+     pace: Option<Res<crate::wowbg3_pace::Pace>>,
+ ) {
+     CAMERA_SEQ.store(0, Ordering::Relaxed);
++    // Patch 0026: set again below when this frame follows BG3's camera.
++    s.held = None;
+     if s.file.is_none() {
+         if s.retry > 0 {
+             s.retry -= 1;
+@@ -873,6 +918,7 @@
+     if let Projection::Perspective(p) = proj.as_mut() {
+         p.fov = debug_zoom_fov(pose.fovy);
+     }
++    s.held = Some((tf.translation, tf.rotation, debug_zoom_fov(pose.fovy)));
+     s.frames += 1;
+     if s.frames % 600 == 1 {
+         info!("wowbg3 lead: camera at {eye:?} looking {fwd:?}, fov {:.3}, ground lock {:.2}", pose.fovy, t.lock);

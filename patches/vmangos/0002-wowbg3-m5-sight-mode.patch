@@ -1,0 +1,213 @@
+diff --git a/src/game/Maps/GridNotifiersImpl.h b/src/game/Maps/GridNotifiersImpl.h
+index 06b025e..4f37586 100644
+--- a/src/game/Maps/GridNotifiersImpl.h
++++ b/src/game/Maps/GridNotifiersImpl.h
+@@ -28,6 +28,7 @@
+ #include "Player.h"
+ #include "UpdateData.h"
+ #include "CreatureAI.h"
++#include "WowBg3Fights.h"
+ #include "SpellAuras.h"
+ #include "DBCStores.h"
+ #include "DBCEnums.h"
+@@ -59,6 +60,10 @@ inline void CallAIMoveLOS(Creature* c, Unit* moving)
+     // Creature AI reaction
+     if (!c->HasUnitState(UNIT_STATE_LOST_CONTROL | UNIT_STATE_NO_SEARCH_FOR_OTHERS) && !c->IsInEvadeMode() && c->AI())
+     {
++        // WOW-BG3: in sight mode BG3 decides when a hostile mob notices the player.
++        if (WowBg3::SuppressesSightAggro(c, moving))
++            return;
++
+         bool alert = false;
+         if (moving->IsVisibleForOrDetect(c, c, true, false, &alert))
+               c->AI()->MoveInLineOfSight(moving);
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index ee3a3ec..a40a580 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -106,6 +106,7 @@ namespace
+     struct Fighter
+     {
+         bool armed = false;
++        bool sight = false;                                     // BG3 decides proximity aggro (`arm sight`)
+         std::unique_ptr<Encounter> active;
+         std::vector<Mob> pending;
+         std::deque<std::string> closed;
+@@ -151,6 +152,7 @@ namespace
+     std::unordered_map<ObjectGuid, ObjectGuid> g_held;      // held mob -> player
+     std::atomic<uint32> g_heldCount(0);
+     std::atomic<uint32> g_armedCount(0);
++    std::atomic<uint32> g_sightCount(0);
+     thread_local uint32 t_bridgeDamage = 0;                 // inside `.wowbg3 hp`
+     uint32 g_tickTimer = 0;
+ 
+@@ -179,6 +181,17 @@ namespace
+             --g_armedCount;
+     }
+ 
++    void SetSight(Fighter& f, bool sight)
++    {
++        if (f.sight == sight)
++            return;
++        f.sight = sight;
++        if (sight)
++            ++g_sightCount;
++        else
++            --g_sightCount;
++    }
++
+     std::string Hex(ObjectGuid guid)
+     {
+         char buf[24];
+@@ -429,13 +442,16 @@ namespace
+         void Add(std::string const& s) { lines.push_back(s); }
+     };
+ 
+-    void Arm(Player* p, bool armed, Out& out)
++    // arm: hold mobs that enter combat with the player; sight: BG3 also decides
++    // proximity aggro (hostile mobs no longer notice the player by themselves).
++    void Arm(Player* p, bool armed, bool sight, Out& out)
+     {
+         std::vector<Release> releases;
+         {
+             WriteLock lock(g_lock);
+             Fighter& f = g_fighters[p->GetObjectGuid()];
+             SetArmed(f, armed);
++            SetSight(f, armed && sight);
+             if (!armed)
+             {
+                 for (Mob const& m : f.pending)
+@@ -447,7 +463,7 @@ namespace
+             }
+         }
+         ApplyReleases(releases);
+-        out.Add(armed ? "WOWBG3 armed 1" : "WOWBG3 armed 0");
++        out.Add(!armed ? "WOWBG3 armed 0" : sight ? "WOWBG3 armed 1 sight" : "WOWBG3 armed 1");
+     }
+ 
+     // begin <enc> <guids>: hold these mobs (all or none) as a new encounter.
+@@ -910,7 +926,8 @@ namespace
+             uint32 alive = f && f->active ? f->active->Alive() : 0;
+             uint32 total = f && f->active ? uint32(f->active->mobs.size()) : 0;
+             line = "WOWBG3 status " + enc + " " + std::to_string(alive) + " " + std::to_string(total - alive) + " " +
+-                std::to_string(f ? f->pending.size() : 0) + " armed " + (f && f->armed ? "1" : "0");
++                std::to_string(f ? f->pending.size() : 0) + " armed " + (f && f->armed ? "1" : "0") +
++                " sight " + (f && f->sight ? "1" : "0");
+             if (f)
+                 for (Mob const& m : f->pending)
+                     pending.push_back(m.guid);
+@@ -929,10 +946,10 @@ namespace
+         std::vector<std::string> a = Split(text, ' ');
+         std::string const verb = a.size() > 1 ? a[1] : "";
+         Out out;
+-        if (verb == "arm" && a.size() == 2)
+-            Arm(p, true, out);
++        if (verb == "arm" && (a.size() == 2 || (a.size() == 3 && a[2] == "sight")))
++            Arm(p, true, a.size() == 3, out);
+         else if (verb == "disarm" && a.size() == 2)
+-            Arm(p, false, out);
++            Arm(p, false, false, out);
+         else if (verb == "status" && a.size() == 2)
+             Status(p, out);
+         else if ((verb == "begin" || verb == "join") && a.size() == 4 && ValidId(a[2]))
+@@ -1053,6 +1070,22 @@ void OnCreatureEnterCombat(Creature* creature, Unit* enemy)
+     Announce(creature, pg);
+ }
+ 
++bool SuppressesSightAggro(Creature const* creature, Unit const* moving)
++{
++    if (!g_sightCount.load(std::memory_order_relaxed) || !creature || !moving || creature->IsInCombat())
++        return false;
++    Player const* p = moving->GetCharmerOrOwnerPlayerOrPlayerItself();
++    if (!p || !p->IsAlive())
++        return false;
++    {
++        ReadLock lock(g_lock);
++        auto it = g_fighters.find(p->GetObjectGuid());
++        if (it == g_fighters.end() || !it->second.sight)
++            return false;
++    }
++    return creature->IsHostileTo(moving);
++}
++
+ bool HandleChat(WorldSession* session, std::string const& text)
+ {
+     static char const prefix[] = ".wowbg3";
+@@ -1083,6 +1116,7 @@ void OnLogout(Player* player)
+             return;
+         Fighter& f = it->second;
+         SetArmed(f, false);
++        SetSight(f, false);
+         for (Mob const& m : f.pending)
+         {
+             Unhold(m.guid);
+@@ -1119,6 +1153,37 @@ void Update(uint32 diff)
+         return;
+     g_tickTimer = 0;
+ 
++    // Death ends sight mode (normal WoW aggro again until the client sends `arm sight`).
++    if (g_sightCount.load(std::memory_order_relaxed))
++    {
++        std::vector<ObjectGuid> sighted;
++        {
++            ReadLock lock(g_lock);
++            for (auto const& kv : g_fighters)
++                if (kv.second.sight)
++                    sighted.push_back(kv.first);
++        }
++        std::vector<Player*> died;
++        for (ObjectGuid g : sighted)
++            if (Player* p = ObjectAccessor::FindPlayer(g))
++                if (!p->IsAlive())
++                    died.push_back(p);
++        if (!died.empty())
++        {
++            {
++                WriteLock lock(g_lock);
++                for (Player* p : died)
++                {
++                    auto it = g_fighters.find(p->GetObjectGuid());
++                    if (it != g_fighters.end())
++                        SetSight(it->second, false);
++                }
++            }
++            for (Player* p : died)
++                Say(p, "WOWBG3 sight 0 died");
++        }
++    }
++
+     struct Check
+     {
+         ObjectGuid player;
+diff --git a/src/game/WowBg3Fights.h b/src/game/WowBg3Fights.h
+index f1adc47..8f875d8 100644
+--- a/src/game/WowBg3Fights.h
++++ b/src/game/WowBg3Fights.h
+@@ -52,6 +52,14 @@ namespace WowBg3
+     // before its AI can swing or cast.
+     void OnCreatureEnterCombat(Creature* creature, Unit* enemy);
+ 
++    // CallAIMoveLOS in GridNotifiersImpl.h (map thread): true while `moving` is,
++    // or belongs to, a living player in sight mode (`.wowbg3 arm sight`) and
++    // `creature` is hostile to it and not fighting yet. That creature's proximity
++    // (line of sight) aggro and stealth alert are skipped: BG3 decides when it
++    // notices the player and the client sends `begin`. Attacks, spells, pack
++    // links and assistance still start fights (and holds) as usual.
++    bool SuppressesSightAggro(Creature const* creature, Unit const* moving);
++
+     // WorldSession::HandleChatMessageOpcode: true if `text` was a `.wowbg3`
+     // command. It is then queued for the world thread and never said aloud.
+     bool HandleChat(WorldSession* session, std::string const& text);
+diff --git a/src/shared/Progression.h b/src/shared/Progression.h
+index f9a08bc..a92c9e0 100644
+--- a/src/shared/Progression.h
++++ b/src/shared/Progression.h
+@@ -33,7 +33,7 @@
+ // Change this to define which build of the game to emulate.
+ // Has an effect on things such as core gameplay mechanics,
+ // loading of client data, and network packets structure.
+-#define SUPPORTED_CLIENT_BUILD CLIENT_BUILD_1_12_1
++#define SUPPORTED_CLIENT_BUILD 5875
+ 
+ // This defines which client builds the world server will accept.
+ #if SUPPORTED_CLIENT_BUILD >= CLIENT_BUILD_1_12_1

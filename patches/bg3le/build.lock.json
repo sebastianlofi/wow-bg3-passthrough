@@ -1,0 +1,135 @@
+{
+  "extender_commit": "5c729b72296defd4a09556ee723b12b76a0d445d",
+  "compiler": "clang-22.1.8-4.fc44.x86_64",
+  "sdk": "registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:1c33c507bc75d012e77df5727f93b0d5b8c3f7c8d4142ba5f7a16882cc92e014",
+  "vulkan_tag_note": "Upstream fetch script omits .0; official matching tag is vulkan-sdk-1.4.357.0.",
+  "runtime_source_patched": true,
+  "source_test_adaptation": "tools/check-view-contract.py corrects stale expectations and missing fixture stubs only.",
+  "llvm_commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
+  "max_glibc": "2.29",
+  "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
+  "library_sha256": "ddd870524eaf7915a39dc5cc0a5a753e6ffa3165678014d274c879f74485ed49",
+  "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
+  "runtime_patches": [
+    {
+      "file": "patches/0001-box-command-parameters.patch",
+      "sha256": "4de810c1db60f52b088c57a2f3b5c2328709bb228c3a5e161b41d85ce48f3863",
+      "purpose": "Noesis command parameters boxed from Lua scalars",
+      "targets": [
+        {
+          "path": "src/vendor/bg3le_noesis_lua.inl",
+          "before_sha256": "e945bd2a24a7cbf8f5284ff912220fefc083fac2ad5d22f1fd010beda2efc464",
+          "after_sha256": "bef9d2b7074bcbd2cd47b22985bdcd904fff9c62d52852929790353348b48823"
+        }
+      ]
+    },
+    {
+      "file": "patches/0002-harness-mouse-input.patch",
+      "sha256": "cbdf5632cac0437162b0baa621b06de16c672f2b09ff2b0c2a313123df273c56",
+      "purpose": "WOW-BG3 test tooling: pointer warp and mouse button events through the SDL injection queue",
+      "targets": [
+        {
+          "path": "src/sdl_forward.cpp",
+          "before_sha256": "b934ed1469c173aaf750c23fbc0f835edf777a44a3961b164a0cb49736f86552",
+          "after_sha256": "30f664a0fdfb070500935d90fa985d38aff346a1a10fa40c5cf0ba84ef899648"
+        },
+        {
+          "path": "src/lua_host.cpp",
+          "before_sha256": "46474e812296dee28466bc6a90ae2c7aa013ed64af9f7e2bf498929e6b43db85",
+          "after_sha256": "28acd5044a6af0a5ef561f34b2a846b67975a73cbf0c14b86c3d2d1ad9b01cde"
+        }
+      ]
+    },
+    {
+      "file": "patches/0003-plugin-state-gates-and-mod-plugins.patch",
+      "sha256": "acc4498735484eba99f4d4f9e4901350341537225120122c08d210539f65f997",
+      "purpose": "Plugin state gates (add_state_gate, game_state) and plugins a pak's Config.json lists in NativePlugins (proposed upstream)",
+      "targets": [
+        {
+          "path": "include/bg3le_plugin.h",
+          "before_sha256": "557abaf9d9858929794a5b0caa55e019f168c8cf617001e9eadd5f2f1043a17b",
+          "after_sha256": "9145a2fc549774bb38b2223d9add7ec3ae35ee642892486fc24e9827470a3045"
+        },
+        {
+          "path": "src/game_state.cpp",
+          "before_sha256": "c864c434bb457de842354ca058e660c7b1aaf7121dab3f7f1b4b65009cb5c204",
+          "after_sha256": "ca27ce599d899b7d68325e38f591b44597a6c571faa2f130629b82fdb606e4f3"
+        },
+        {
+          "path": "src/game_state.h",
+          "before_sha256": "6952fdc67422158433091f58e449a9117c1277eb24b1dd9616171bebdbe10059",
+          "after_sha256": "e2b4ea0ac7eae5cd2274c821cd08c3013940542a823a2ef8ae1d222d2c88d7f1"
+        },
+        {
+          "path": "src/plugins.cpp",
+          "before_sha256": "e2fdd1a65da7a8ae6a275b84396134db724f911c048f51eb2c5aa27f108a7870",
+          "after_sha256": "0209fd6374f1cec45563795d5b341049a7fe408591a27e8267eb4d586f274316"
+        }
+      ]
+    },
+    {
+      "file": "patches/0004-prepare-running-hold-and-static-data.patch",
+      "sha256": "78042206c57eeb4abf685d0117106906741d44ae04050b212474ec487ae641ba",
+      "purpose": "Plugins can hold the client in PrepareRunning (the never-queued PrepareRunning -> Running, through the state gates and state_gate_can_hold); a server Save queued during that hold waits for its end; the static-data resource manager search checks the whole HashMap, so a look-alike table is skipped (a fresh main-menu Load asserted index < size_).",
+      "targets": [
+        {
+          "path": "include/bg3le_plugin.h",
+          "before_sha256": "9145a2fc549774bb38b2223d9add7ec3ae35ee642892486fc24e9827470a3045",
+          "after_sha256": "a3990e4a70785f889a1485336160bb9fb2cce357fd12c5d2e42aaf0e853599ea"
+        },
+        {
+          "path": "src/game_state.cpp",
+          "before_sha256": "ca27ce599d899b7d68325e38f591b44597a6c571faa2f130629b82fdb606e4f3",
+          "after_sha256": "41cddb08510b4d89061725674ad79b209fe3e8b24166209625f4b2896cd03329"
+        },
+        {
+          "path": "src/game_state.h",
+          "before_sha256": "e2b4ea0ac7eae5cd2274c821cd08c3013940542a823a2ef8ae1d222d2c88d7f1",
+          "after_sha256": "33b3f4800758f8c32776fe70a60c6bc5760afd6c7a597d65e1da9ec083a40ad4"
+        },
+        {
+          "path": "src/plugins.cpp",
+          "before_sha256": "0209fd6374f1cec45563795d5b341049a7fe408591a27e8267eb4d586f274316",
+          "after_sha256": "1f4d7535966a86474da74bc0097170db4468579aed89158afe19e6104bb59be8"
+        },
+        {
+          "path": "src/vendor/static_data.cpp",
+          "before_sha256": "27d678e16410802acadf8906226ffbe591b060138298bfa13eb9e52fdef4f110",
+          "after_sha256": "43eea7420594482c1cc96f9ba10a0455547843b06c3efe72ac289f5655988be3"
+        }
+      ]
+    },
+    {
+      "file": "patches/0005-early-plugins.patch",
+      "sha256": "d2da1b5a08955f7aa04515bd2273dcf8ae2c4510bdd7b17fde810d2e6874d2f5",
+      "purpose": "Early native plugins (a mod's Config.json EarlyNativePlugins, or <name>.early) start before the game makes its Vulkan objects; host vk_device()",
+      "targets": [
+        {
+          "path": "include/bg3le_plugin.h",
+          "before_sha256": "a3990e4a70785f889a1485336160bb9fb2cce357fd12c5d2e42aaf0e853599ea",
+          "after_sha256": "51246b035553c832790ef14abe2472790c36f64b44d52725814a403e9bce8e3b"
+        },
+        {
+          "path": "src/plugins.cpp",
+          "before_sha256": "1f4d7535966a86474da74bc0097170db4468579aed89158afe19e6104bb59be8",
+          "after_sha256": "79008ed4a2e51a2437e6116381576c9d61d64a44b38e2ee56549451f857c7c3e"
+        },
+        {
+          "path": "src/vulkan_forward.cpp",
+          "before_sha256": "a94f3f89f25e7ae40ca416c39bc6480149bd5d74a7e910927c7b9b641a763490",
+          "after_sha256": "46f247e57c924a061ad458eb76fbf9c912804dd75bdb1452881f1984083b8f58"
+        }
+      ]
+    }
+  ],
+  "previous_library_sha256": "8407e9d29e6f70dd94c1a74d28aaa1d69ad22796beb7461f620ebc4d108360af",
+  "retired_patches": [
+    {
+      "file": "patches/0003-wow-arena-hooks.patch",
+      "sha256": "224bbb86d30944ada19f6856707de33e4b78ea13cf5a5041151b2eb033902231",
+      "library_sha256": "957680586553bedb64e6baac7366a54b02b893ec1391d592650dcbf6b0112a0b",
+      "retired": "2026-10-13",
+      "replaced_by": "plugins/ (the WOW-BG3 bg3le native plugin)"
+    }
+  ]
+}

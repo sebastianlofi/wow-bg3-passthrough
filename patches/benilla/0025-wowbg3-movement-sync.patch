@@ -1,0 +1,829 @@
+WOW-BG3 benilla patch 0025: movement sync in world mode.
+Issues 22/23: wowmobs.bin streams every nearby mob as this frame draws it (position,
+orientation, velocity) for BG3's stand-ins: the own body follows BG3's character
+frame by frame from the packet pose (wowbg3_body.rs): mobs.txt's hero line ends with
+the body's state (alive, dead, ghost).
+
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -53,8 +53,18 @@
+ //!   has no impact key): written as the swing's impact itself (`SwingImpact`), the path the client
+ //!   takes for a swing whose attacker it cannot resolve.
+ //!
+-//! Files in `$WOW_BG3_LINK_DIR`: `pull.json`, `join.json`, `input.json` and `server-events.txt` are
+-//! written here, `fight.txt` (plain lines, see `Fight::text` in the bridge), `server-cmd.txt`,
++//! Patch 0025 (out of combat the stand-ins trailed the WoW
++//! models by about 0.4 s, moved in jumps and faced elsewhere): every frame `wowmobs.bin` gives BG3
++//! each mob `mobs.txt` lists, as this frame draws it: `WMB1`, seq u32, n u32, CLOCK_MONOTONIC ms
++//! f64 (this frame), n x (guid hi u32, guid lo u32, WoW x, y, z (yd), orientation (rad), velocity
++//! x, y, z (yd/s) f32, flags u32: 1 held by a BG3 fight, 2 moving), seq again; written whole (a
++//! temporary file and a rename). BG3's client (`MirrorsClient.lua`) puts each idle stand-in there
++//! every BG3 frame, its server (`Mirrors.lua`) every server tick. `mobs.txt`'s hero line now ends
++//! with the body's state (0 alive, 1 dead, 2 ghost), which `Mirrors.lua` mirrors onto BG3's
++//! character (a WoW resurrection resurrects her).
++//!
++//! Files in `$WOW_BG3_LINK_DIR`: `pull.json`, `join.json`, `input.json`, `server-events.txt`,
++//! `mobs.txt` and `wowmobs.bin` are written here, `fight.txt` (plain lines, see `Fight::text` in the bridge), `server-cmd.txt`,
+ //! `standins.bin` and `strikes.bin` are read.
+ 
+ use std::collections::{HashMap, HashSet, VecDeque};
+@@ -117,6 +127,12 @@
+ const WOUND_MATCH: f32 = 8.0;
+ /// Seconds between `wowbg3 live:` lines per moving model.
+ const LIVE_TRACE: f32 = 0.25;
++/// `wowmobs.bin` (patch 0025): bytes per mob, and the flags.
++const MOBS_LIVE_REC: usize = 40;
++pub(crate) const MOB_HELD: u32 = 1;
++pub(crate) const MOB_MOVING: u32 = 2;
++/// Yards per second over which a frame's step is a jump (a teleport, a respawn), not a walk.
++const MOBS_LIVE_JUMP: f32 = 60.0;
+ /// `strikes.bin` flags (`Mirrors.lua`).
+ const STRIKE_HIT: u32 = 1;
+ const STRIKE_WOUND: u32 = 2;
+@@ -304,6 +320,79 @@
+     t.is_finite().then_some((seq, t, out))
+ }
+ 
++/// One mob in `wowmobs.bin` (patch 0025): where this frame draws it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct MobLive {
++    pub(crate) guid: u64,
++    /// WoW yards.
++    pub(crate) pos: [f32; 3],
++    /// WoW orientation (radians), the drawn model's.
++    pub(crate) orient: f32,
++    /// WoW yards per second, from the last frame.
++    pub(crate) vel: [f32; 3],
++    pub(crate) flags: u32,
++}
++
++/// `wowmobs.bin` (see the module notes).
++pub(crate) fn encode_mobs_live(seq: u32, t_ms: f64, mobs: &[MobLive]) -> Vec<u8> {
++    let mut b = Vec::with_capacity(24 + MOBS_LIVE_REC * mobs.len());
++    b.extend_from_slice(b"WMB1");
++    b.extend_from_slice(&seq.to_le_bytes());
++    b.extend_from_slice(&(mobs.len() as u32).to_le_bytes());
++    b.extend_from_slice(&t_ms.to_le_bytes());
++    for m in mobs {
++        b.extend_from_slice(&((m.guid >> 32) as u32).to_le_bytes());
++        b.extend_from_slice(&(m.guid as u32).to_le_bytes());
++        for v in m.pos.iter().chain([m.orient].iter()).chain(m.vel.iter()) {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&m.flags.to_le_bytes());
++    }
++    b.extend_from_slice(&seq.to_le_bytes());
++    b
++}
++
++/// Reads `wowmobs.bin` back: (seq, ms, mobs); None for a torn or foreign file (BG3's readers are
++/// `Mirrors.lua` and `MirrorsClient.lua`; this one checks the format).
++#[cfg(test)]
++pub(crate) fn decode_mobs_live(b: &[u8]) -> Option<(u32, f64, Vec<MobLive>)> {
++    if b.len() < 24 || &b[0..4] != b"WMB1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let (seq, n) = (u(4), u(8) as usize);
++    if n > 512 || b.len() != 24 + MOBS_LIVE_REC * n || u(20 + MOBS_LIVE_REC * n) != seq {
++        return None;
++    }
++    let t = f64::from_le_bytes(b[12..20].try_into().unwrap());
++    let mobs = (0..n)
++        .map(|i| {
++            let o = 20 + MOBS_LIVE_REC * i;
++            MobLive {
++                guid: (u64::from(u(o)) << 32) | u64::from(u(o + 4)),
++                pos: [f(o + 8), f(o + 12), f(o + 16)],
++                orient: f(o + 20),
++                vel: [f(o + 24), f(o + 28), f(o + 32)],
++                flags: u(o + 36),
++            }
++        })
++        .collect();
++    Some((seq, t, mobs))
++}
++
++/// The per-frame stream of `wowmobs.bin` (patch 0025).
++#[derive(Resource)]
++struct MobsLive {
++    path: PathBuf,
++    seq: u32,
++    /// Per guid: last frame's WoW position, its game time (s) and velocity.
++    prev: HashMap<u64, ([f32; 3], f64, [f32; 3])>,
++    /// Frames written, and the write time (µs) summed and its maximum, for the log.
++    frames: u64,
++    write_us: (u64, u64),
++}
++
+ /// One record of `strikes.bin`.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub(crate) struct EarlyStrike {
+@@ -462,6 +551,8 @@
+     early_seen: Option<(u32, u32)>,
+     /// Seconds since start (`fight_hold`), for matching early strikes with fight.txt.
+     clock: f32,
++    /// Patch 0025: the mobs `mobs.txt` listed last (`wowmobs.bin` streams these every frame).
++    mirror_near: HashSet<u64>,
+ }
+ 
+ /// One parsed `fight.txt`.
+@@ -545,6 +636,7 @@
+     let auto = std::env::var("WOW_BG3_AUTOFIGHT")
+         .ok()
+         .map(|v| Auto { adds: v.trim() == "2", ..Auto::default() });
++    let dir_live = dir.join("wowmobs.bin");
+     app.insert_resource(Fight {
+         dir,
+         seq: 0,
+@@ -575,11 +667,22 @@
+         live_clock: None,
+         early_seen: None,
+         clock: 0.0,
++        mirror_near: HashSet::new(),
++    })
++    .insert_resource(MobsLive {
++        path: dir_live,
++        seq: 0,
++        prev: HashMap::new(),
++        frames: 0,
++        write_us: (0, 0),
+     })
+     .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
+     .add_systems(
+         PostUpdate,
+-        fight_hold.before(bevy::transform::TransformSystems::Propagate),
++        (
++            fight_hold.before(bevy::transform::TransformSystems::Propagate),
++            stream_mobs_live.after(fight_hold).before(bevy::transform::TransformSystems::Propagate),
++        ),
+     );
+ }
+ 
+@@ -802,8 +905,16 @@
+     let frozen: HashSet<u64> = SHARED.lock().map(|s| s.frozen.clone()).unwrap_or_default();
+     // The mobs near you for the bridge's mirrors (`mobs.txt`).
+     if f.frame % 12 == 5 && player.active {
++        // Patch 0025: the body's state last, 0 alive, 1 dead (a corpse), 2 a ghost.
++        let state = if my_store.0.player_is_ghost() {
++            2
++        } else if my_store.0.unit_is_dead() || my_store.0.unit_health() == Some(0) {
++            1
++        } else {
++            0
++        };
+         let mut text = format!(
+-            "seq {}\nhero {my_guid:016x} {} {} {} 0 {} {} {}\n",
++            "seq {}\nhero {my_guid:016x} {} {} {} 0 {} {} {} {state}\n",
+             f.frame,
+             bevy_to_wow(player.pos)[0],
+             bevy_to_wow(player.pos)[1],
+@@ -812,6 +923,7 @@
+             my_store.0.unit_max_health().unwrap_or(1).max(1),
+             my_store.0.unit_level().unwrap_or(0),
+         );
++        let mut near = HashSet::new();
+         for (g, store, tf) in &units {
+             if player.pos.distance(tf.translation) > MIRROR_RANGE {
+                 continue;
+@@ -819,6 +931,7 @@
+             let Some(hostile) = fightable(store, my_store, factions.as_deref(), reps) else {
+                 continue;
+             };
++            near.insert(g.0);
+             let s = &store.0;
+             let w = bevy_to_wow(tf.translation);
+             let flags = u32::from(s.unit_flags() & UNIT_FLAG_IN_COMBAT != 0)
+@@ -842,6 +955,7 @@
+         if let Err(e) = write_atomic(&f.dir.join("mobs.txt"), &text) {
+             warn!("wowbg3 fight: cannot write mobs: {e}");
+         }
++        f.mirror_near = near;
+     }
+     let scan = (f.frame % 30 == 1).then(|| {
+         let mut s = Scan {
+@@ -1312,6 +1426,71 @@
+     next: u64,
+ }
+ 
++/// Patch 0025: `wowmobs.bin`, every frame in world mode (see the module notes): the mobs `mobs.txt`
++/// lists, where this frame draws them (after the splines and `fight_hold`).
++fn stream_mobs_live(
++    mut live: ResMut<MobsLive>,
++    f: Res<Fight>,
++    player: Res<Player>,
++    time: Res<Time>,
++    units: Query<(&Guid, &Transform), Without<SelfPlayer>>,
++) {
++    if !f.world || !player.active {
++        return;
++    }
++    let started = std::time::Instant::now();
++    let now = time.elapsed_secs_f64();
++    let held: HashSet<u64> = SHARED.lock().map(|s| s.held.clone()).unwrap_or_default();
++    let mut mobs = Vec::with_capacity(f.mirror_near.len());
++    for (g, tf) in &units {
++        if !f.mirror_near.contains(&g.0) {
++            continue;
++        }
++        let pos = bevy_to_wow(tf.translation);
++        let vel = match live.prev.get(&g.0) {
++            Some((p, t, _)) if now - t > 1e-4 && now - t < 0.5 => {
++                let dt = (now - t) as f32;
++                let step = [(pos[0] - p[0]) / dt, (pos[1] - p[1]) / dt, (pos[2] - p[2]) / dt];
++                let speed = (step[0] * step[0] + step[1] * step[1] + step[2] * step[2]).sqrt();
++                if speed > MOBS_LIVE_JUMP { [0.0; 3] } else { step }
++            }
++            // Same frame time (a repeated frame): keep the last velocity.
++            Some((_, t, v)) if now - t <= 1e-4 => *v,
++            _ => [0.0; 3],
++        };
++        live.prev.insert(g.0, (pos, now, vel));
++        let moving = vel[0] * vel[0] + vel[1] * vel[1] > 0.01;
++        mobs.push(MobLive {
++            guid: g.0,
++            pos,
++            orient: tf.rotation.to_euler(EulerRot::YXZ).0,
++            vel,
++            flags: (if held.contains(&g.0) { MOB_HELD } else { 0 }) | (if moving { MOB_MOVING } else { 0 }),
++        });
++    }
++    live.prev.retain(|_, (_, t, _)| now - *t < 2.0);
++    live.seq = live.seq.wrapping_add(1).max(1);
++    let bytes = encode_mobs_live(live.seq, crate::wowbg3_pace::mono_seconds() * 1000.0, &mobs);
++    let tmp = live.path.with_extension("tmp");
++    if std::fs::write(&tmp, &bytes).is_ok() {
++        let _ = std::fs::rename(&tmp, &live.path);
++    }
++    let us = started.elapsed().as_micros() as u64;
++    live.frames += 1;
++    live.write_us.0 += us;
++    live.write_us.1 = live.write_us.1.max(us);
++    if live.frames.is_multiple_of(3000) {
++        info!(
++            "wowbg3 mobs live: {} frames of wowmobs.bin, {} mobs now, {:.0} us a frame (max {})",
++            live.frames,
++            mobs.len(),
++            live.write_us.0 as f64 / 3000.0,
++            live.write_us.1
++        );
++        live.write_us = (0, 0);
++    }
++}
++
+ fn fight_walk(mut f: ResMut<Fight>, mut auto: AutoMove) {
+     if let Some(at) = f.walk_to.take() {
+         auto.walk_to_ground_bg3(at);
+@@ -1687,6 +1866,22 @@
+     }
+ 
+     #[test]
++    fn mobs_live_round_trips() {
++        let m = MobLive { guid: 0xf130_0000_4501_390c, pos: [-8960.5, -259.8, 75.1], orient: 1.25, vel: [2.5, -0.5, 0.0], flags: MOB_MOVING };
++        let h = MobLive { guid: 7, pos: [1.0, 2.0, 3.0], orient: -3.0, vel: [0.0; 3], flags: MOB_HELD };
++        let b = encode_mobs_live(42, 1234.5, &[m, h]);
++        assert_eq!(b.len(), 24 + 2 * MOBS_LIVE_REC);
++        assert_eq!(decode_mobs_live(&b), Some((42, 1234.5, vec![m, h])));
++        // Torn (seq again differs) or cut: refused.
++        let mut torn = b.clone();
++        let n = torn.len();
++        torn[n - 1] ^= 1;
++        assert_eq!(decode_mobs_live(&torn), None);
++        assert_eq!(decode_mobs_live(&b[..n - 4]), None);
++        assert_eq!(decode_mobs_live(&encode_mobs_live(3, 1.0, &[])), Some((3, 1.0, vec![])));
++    }
++
++    #[test]
+     fn decodes_early_strikes() {
+         let mut b = b"STK1".to_vec();
+         for v in [99u32, 3, 1] {
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -64,6 +64,14 @@
+ //! runs the layout addon's `WowBg3Layout_Map(mode, x, y, w, h)` (WoW's world map drawn into that
+ //! rect) and has the frame export write WoW's depth there as the near plane
+ //! (`wowbg3_frames::set_near_rect`), so the compositor never lets BG3's scene (Tav) cover WoW's map.
++//!
++//! Patch 0025 (the body trailed Tav by 1.4 yd, WoW's ripples came late):
++//! the own body follows her frame by frame from the BG3 packet's pose ([`body`]); the `tav.bin`
++//! Click to Move follow above is the fallback without packets.
++
++// Patch 0025: the own body follows BG3's character frame by frame.
++#[path = "wowbg3_body.rs"]
++pub(crate) mod body;
+ 
+ use std::fs::File;
+ use std::path::PathBuf;
+@@ -451,6 +459,11 @@
+         auto.approach.enabled = true;
+     }
+     let Some(at) = t.walk_to.take() else { return };
++    // Patch 0025: the body follows her frame by frame from the packet poses (`wowbg3_lead::body`, `wowbg3_body.rs`); Click
++    // to Move after `tav.bin` stays the fallback without packets.
++    if body::active() {
++        return;
++    }
+     auto.walk_to_ground_bg3(at);
+ }
+ 
+@@ -670,6 +683,8 @@
+     .add_systems(PreUpdate, forward_pointer.before(bevy::input::InputSystems));
+     info!("wowbg3: BG3 leads the camera ({:?})", dir.join("bg3cam.bin"));
+     HIDE_SELF.store(true, Ordering::Relaxed);
++    // Patch 0025: the own body follows BG3's character frame by frame.
++    body::build(app);
+     app.insert_resource(TavFollow {
+         path: dir.join("tav.bin"),
+         last_seq: 0,
+diff --git a/crates/benilla-app/src/player/controller.rs b/crates/benilla-app/src/player/controller.rs
+--- a/crates/benilla-app/src/player/controller.rs
++++ b/crates/benilla-app/src/player/controller.rs
+@@ -361,7 +361,7 @@
+         }
+         // `0x514560`, after `apply_server_moves`, so this frame's root edge is already in `modes`.
+         let may_translate = mover.may_translate(player.modes.rooted);
+-        let axes = input::move_axes(
++        let mut axes = input::move_axes(
+             binds,
+             &buttons,
+             &mut player,
+@@ -370,6 +370,25 @@
+             may_translate,
+             may_turn,
+         );
++        // WOW-BG3 (patch 0025): in world mode the body walks onto BG3's character every
++        // frame (`wowbg3_lead::body`, `wowbg3_body.rs`): forward along her bearing at the speed that lands it on her, her
++        // facing while she stands. Keys and Click to Move do not move it meanwhile.
++        let body_follow =
++            crate::wowbg3_lead::body::steer(player.pos, player.face_yaw, dt, may_translate && !player.settling);
++        if let Some(f) = body_follow {
++            axes.fwd = i32::from(f.moving);
++            axes.side = 0;
++            axes.mouselook = false;
++            axes.turning = false;
++            axes.translating = f.moving;
++            axes.strafe_left = false;
++            axes.strafe_right = false;
++            axes.turn_left = false;
++            axes.turn_right = false;
++            player.autorun = false;
++            player.auto_forward = false;
++            player.face_yaw = f.yaw;
++        }
+         let input::MoveAxes {
+             fwd: fwd_axis,
+             side: side_axis,
+@@ -490,6 +509,8 @@
+                 0
+             },
+         );
++        // Patch 0025: the speed that lands the body on BG3's character this frame.
++        let speed = body_follow.filter(|f| f.moving).map_or(speed, |f| f.speed);
+         // `Jump` (`0x513bd0`) inlines `0x5144e0` and `0x514560`, which is `may_translate` term for
+         // term: health, root and stand state 7. Hover's refusal is the movement handler's
+         // (`0x7c623a`), which keeps the mounted flourish reachable while hovering.
+@@ -588,7 +609,11 @@
+                 surface_y,
+                 (move_fwd, move_right),
+                 (swim_fwd, swim_side),
+-                mover_speeds,
++                // Patch 0025: a swimming body follows BG3's character at the speed that lands it on her.
++                match body_follow.filter(|f| f.moving) {
++                    Some(f) => mover_speeds.map(|s| benilla_protocol::MoveSpeeds { swim: f.speed, ..s }),
++                    None => mover_speeds,
++                },
+                 move_speed,
+                 if translating { drunk_wobble } else { 0.0 },
+             );
+@@ -622,6 +647,11 @@
+             )
+         };
+ 
++        // Patch 0025: a gap the mover left (a WoW collision she does not have, a jump) is closed by
++        // placing the body on her (`wowbg3_lead::body::SNAP`).
++        if body_follow.is_some() {
++            crate::wowbg3_lead::body::settle(&mut player.pos);
++        }
+         // Traced here, the first point that knows both the latch and the mover's verdict.
+         if let Some(k) = knockback {
+             move_trace::knockback(knocked, k.launch);
+diff --git a/crates/benilla-app/src/wowbg3_body.rs b/crates/benilla-app/src/wowbg3_body.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_body.rs
+@@ -0,0 +1,412 @@
++//! WOW-BG3 (local fork, patch 0025): in world mode the own
++//! WoW body stands where WoW draws BG3's character, in the same frame.
++//!
++//! Before, `tav.bin` (`WorldMode.lua`, every third BG3 tick, read every fourth WoW frame) re-armed
++//! Click to Move once she was 1.5 yd from the body, which then ran after her at its own run speed:
++//! in the harness the body trailed her by 1.4 yd (0.36 s) whenever she walked, so the server's
++//! position and everything WoW draws from the own body (the wade ripples and wake in shallow
++//! water, the blob of foam when she steps in) came late.
++//!
++//! Now every frame drawn in lockstep (`wowbg3_pace`) takes her root from that frame's BG3 packet,
++//! the pose `wowbg3_tav` draws her with: the first object marked as her root (pose flags bit 0),
++//! mapped with the mapping of `tavmesh.bin` and lowered by the ground lock, as `TavFeet`. Only while
++//! world mode runs, which `tav.bin` says (`WorldMode.lua` writes it only then, with her position in
++//! WoW from the live mapping): a fresh `tav.bin` within [`MATCH`] yd of the packet's root. Without
++//! that gate a world-mode Stop (she goes home into BG3's level while the layer still sends poses)
++//! put the body 1608 yd away in the harness, where it fell to its death. A jump of more than
++//! [`FAR`] yd (a release as a ghost) waits until the aim has held for [`FAR_HOLD`] s. The
++//! controller (`player::controller`) then drives the body there through its own mover: forward,
++//! along her bearing, at the speed that lands it on her this frame ([`steer`]), facing her own
++//! facing while she stands. WoW's ground, water (wade ripples, the swim latch) and wire (start,
++//! heartbeat, stop, facing) see an ordinary walk. What the mover could not close (a WoW collision
++//! she does not have, a jump of more than [`SNAP`] yd such as a release as a ghost) is closed by
++//! placing the body on her ([`settle`]); vmangos takes the position (its movement anticheat is off
++//! on the test server). A corpse, a stun or a root, or the settle hold after a teleport, keeps the
++//! body where it is.
++//!
++//! Without packets (world mode off, an older layer, `WOW_BG3_PACE=off`) or with
++//! `WOW_BG3_BODY=ctm`, the old Click to Move follow (`wowbg3_lead`) runs instead. Logs `wowbg3
++//! body:` every 600 frames: frames followed, mean and largest gap left after the mover, snaps.
++
++use std::path::PathBuf;
++use std::sync::Mutex;
++
++use benilla_assets::coords::wow_to_bevy;
++use bevy::prelude::*;
++
++/// Yards the mover may leave between the body and her before the body is placed on her (a WoW
++/// collision she does not have: harness, 0.24 yd left standing and 0.8 yd walking).
++pub(crate) const SNAP: f32 = 0.1;
++/// Yards between the packet's root and `tav.bin`'s position that still read as the same world mode
++/// (`tav.bin` is up to three BG3 ticks and four WoW frames older).
++const MATCH: f32 = 4.0;
++/// Milliseconds a `tav.bin` record stays fresh.
++const TAV_FRESH_MS: u64 = 300;
++/// Yards of a jump that waits for a steady aim ([`FAR_HOLD`] seconds).
++const FAR: f32 = 50.0;
++const FAR_HOLD: f32 = 0.5;
++/// Yards under which the body stands (no start and stop flicker from rounding)...
++const STILL: f32 = 0.03;
++/// ...for this many frames in a row: a repeated packet (BG3 hitching) is no stop and start.
++const STILL_FRAMES: u32 = 4;
++/// Radians a standing body may differ from her facing before it turns.
++const TURN: f32 = 0.05;
++/// Seconds a packet's pose stays the follow's aim (BG3 hitching); older, Click to Move takes over.
++const STALE_SECS: f64 = 0.5;
++/// Yards per second the mover is never asked for (a frame of 2 ms over a whole snap).
++const MAX_SPEED: f32 = 400.0;
++
++/// Where she is in this frame's packet.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Aim {
++    /// Bevy world, at her feet (the ground lock applied).
++    pub(crate) at: Vec3,
++    /// Bevy yaw (WoW orientation) of her facing.
++    pub(crate) yaw: f32,
++    /// The packet (BG3 present) it came from.
++    pub(crate) packet: u32,
++    /// Seconds the gate has passed without a break (see the module notes).
++    pub(crate) steady: f32,
++}
++
++/// What the controller does with the body this frame ([`steer`]).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Follow {
++    /// Walk forward this frame.
++    pub(crate) moving: bool,
++    /// The facing to take (Bevy yaw).
++    pub(crate) yaw: f32,
++    /// Yards per second that land the body on her this frame.
++    pub(crate) speed: f32,
++}
++
++#[derive(Default)]
++struct Shared {
++    aim: Option<Aim>,
++    /// The aim [`steer`] steered to this frame (what [`settle`] checks).
++    steered: Option<Vec3>,
++    /// Frames in a row the body has been on her while walking (see [`STILL_FRAMES`]).
++    still: u32,
++    walking: bool,
++    /// This frame's steer was a stand (a placement then is a hold in place, not a missed walk).
++    standing: bool,
++    /// Standing frames whose body something pushed off her (put back).
++    pinned: u64,
++    followed: u64,
++    gap_sum: f64,
++    gap_max: f32,
++    snaps: u64,
++    /// Frames whose packet root did not match `tav.bin` (not world mode), for the log.
++    refused: u64,
++}
++
++static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
++
++/// The body follow runs this frame (a fresh packet pose): Click to Move's follow stands aside.
++pub(crate) fn active() -> bool {
++    SHARED.lock().ok().is_some_and(|s| s.as_ref().is_some_and(|s| s.aim.is_some()))
++}
++
++/// The pose file's root record: (translate, rotation quaternion xyzw) in BG3's world, from the
++/// first object flagged as her root (`tavpose.bin`: "TVP1", seq, frame, n, time f64, then n x (key
++/// u64, bones u32, flags u32, world: quat xyzw, translate xyz, scale xyz f32, palette 48 x bones)).
++pub(crate) fn pose_root(b: &[u8]) -> Option<([f32; 3], [f32; 4])> {
++    if b.get(0..4)? != b"TVP1" {
++        return None;
++    }
++    let u = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
++    let f = |o: usize| -> Option<f32> { Some(f32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
++    let n = u(12)? as usize;
++    if n > 256 {
++        return None;
++    }
++    let mut at = 24;
++    for _ in 0..n {
++        let bones = u(at + 8)? as usize;
++        let flags = u(at + 12)?;
++        if bones > 512 {
++            return None;
++        }
++        if flags & 1 != 0 {
++            let q = [f(at + 16)?, f(at + 20)?, f(at + 24)?, f(at + 28)?];
++            let t = [f(at + 32)?, f(at + 36)?, f(at + 40)?];
++            return (q.iter().chain(t.iter()).all(|v| v.is_finite())).then_some((t, q));
++        }
++        at += 56 + 48 * bones;
++    }
++    None
++}
++
++/// A BG3 rotation's facing as a WoW orientation (= Bevy yaw): a character faces along its rotated
++/// -z (`LinkLive.lua`), and world mode's mapping turns a BG3 direction (dx, dz) into WoW's (-dz, dx).
++pub(crate) fn bg3_yaw_to_wow(q: [f32; 4]) -> f32 {
++    let [x, y, z, w] = q;
++    let (fx, fz) = (2.0 * (x * z + w * y), 1.0 - 2.0 * (x * x + y * y));
++    (-fx).atan2(fz)
++}
++
++/// The smallest signed difference a - b of two angles.
++fn angle_diff(a: f32, b: f32) -> f32 {
++    let mut d = (a - b) % std::f32::consts::TAU;
++    if d > std::f32::consts::PI {
++        d -= std::f32::consts::TAU;
++    } else if d < -std::f32::consts::PI {
++        d += std::f32::consts::TAU;
++    }
++    d
++}
++
++/// This frame's steering for a body at `pos` facing `face`, over a frame of `dt` s; None when the
++/// follow is off this frame (no fresh aim), so the controller runs as before. `may_move` false (a
++/// corpse, a root or stun, the settle hold) keeps the body still but still answers (no Click to Move).
++pub(crate) fn steer(pos: Vec3, face: f32, dt: f32, may_move: bool) -> Option<Follow> {
++    let mut g = SHARED.lock().ok()?;
++    let s = g.as_mut()?;
++    let aim = s.aim?;
++    let gap = Vec2::new(aim.at.x - pos.x, aim.at.z - pos.z);
++    let d = gap.length();
++    if d > FAR && aim.steady < FAR_HOLD {
++        // A long jump waits for a steady aim (the body holds meanwhile).
++        s.steered = None;
++        return Some(Follow { moving: false, yaw: face, speed: 0.0 });
++    }
++    if !may_move || d < STILL {
++        // Standing on her: still held there (a WoW collision she stands in pushes the capsule out
++        // while it stands; harness: 1 to 3 yd every other frame), with no walk.
++        s.steered = may_move.then_some(aim.at);
++        s.standing = true;
++        s.still = s.still.saturating_add(1);
++        if may_move && s.walking && s.still < STILL_FRAMES {
++            // Still walking (a repeated packet): forward at no speed, the facing kept.
++            return Some(Follow { moving: true, yaw: face, speed: 0.0 });
++        }
++        s.walking = false;
++        let yaw = if may_move && angle_diff(aim.yaw, face).abs() > TURN { aim.yaw } else { face };
++        return Some(Follow { moving: false, yaw, speed: 0.0 });
++    }
++    s.still = 0;
++    s.walking = true;
++    s.standing = false;
++    s.steered = Some(aim.at);
++    // Forward along her bearing: Bevy yaw y walks toward (-sin y, -cos y).
++    let yaw = (-gap.x).atan2(-gap.y);
++    Some(Follow { moving: true, yaw, speed: (d / dt.max(1e-3)).min(MAX_SPEED) })
++}
++
++/// After the mover: what it left between the body and her this frame. Beyond [`SNAP`] the body
++/// is placed on her (true). Only after a [`steer`] that moved.
++pub(crate) fn settle(pos: &mut Vec3) -> bool {
++    let Ok(mut g) = SHARED.lock() else { return false };
++    let Some(s) = g.as_mut() else { return false };
++    let Some(at) = s.steered.take() else { return false };
++    let gap = Vec2::new(at.x - pos.x, at.z - pos.z).length();
++    s.followed += 1;
++    s.gap_sum += f64::from(gap);
++    s.gap_max = s.gap_max.max(gap);
++    if gap > SNAP {
++        if s.standing {
++            s.pinned += 1;
++        } else {
++            s.snaps += 1;
++            if s.snaps <= 20 || s.snaps.is_multiple_of(100) {
++                info!("wowbg3 body: placed on BG3's character ({gap:.2} yd the mover did not close; {} so far)", s.snaps);
++            }
++        }
++        *pos = at;
++        return true;
++    }
++    false
++}
++
++#[derive(Resource)]
++struct BodyAim {
++    /// Since when the gate has passed without a break.
++    steady_since: Option<std::time::Instant>,
++    mesh: PathBuf,
++    /// `tavmesh.bin`'s mapping (BG3 centre, WoW origin), read once a second.
++    mapping: Option<([f32; 3], [f32; 3])>,
++    frame: u64,
++    last_packet: u32,
++}
++
++pub(crate) fn build(app: &mut App) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    if std::env::var("WOW_BG3_BODY").is_ok_and(|v| v.trim() == "ctm") {
++        info!("wowbg3 body: WOW_BG3_BODY=ctm, the body follows BG3's character by Click to Move");
++        return;
++    }
++    let dir = std::env::var_os("WOW_BG3_TAV_DIR").map_or_else(|| PathBuf::from("/tmp/wowbg3/tav"), PathBuf::from);
++    if let Ok(mut g) = SHARED.lock() {
++        *g = Some(Shared::default());
++    }
++    info!("wowbg3 body: the own body follows BG3's character frame by frame (packet poses)");
++    app.insert_resource(BodyAim { steady_since: None, mesh: dir.join("tavmesh.bin"), mapping: None, frame: 0, last_packet: 0 })
++        .add_systems(Update, aim.before(crate::player::PlayerControlSet));
++}
++
++/// The header of `tavmesh.bin`: BG3 centre and WoW origin of world mode's mapping.
++fn read_mapping(path: &std::path::Path) -> Option<([f32; 3], [f32; 3])> {
++    use std::io::Read;
++    let mut b = [0u8; 40];
++    std::fs::File::open(path).ok()?.read_exact(&mut b).ok()?;
++    if &b[0..4] != b"TVM1" {
++        return None;
++    }
++    let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let m = ([f(16), f(20), f(24)], [f(28), f(32), f(36)]);
++    m.0.iter().chain(m.1.iter()).all(|v| v.is_finite()).then_some(m)
++}
++
++/// Her root in this frame's packet, for [`steer`].
++fn aim(
++    mut a: ResMut<BodyAim>,
++    pace: Option<Res<crate::wowbg3_pace::Pace>>,
++    follow: Option<Res<super::TavFollow>>,
++) {
++    a.frame += 1;
++    if a.mapping.is_none() || a.frame % 60 == 1 {
++        if let Some(m) = read_mapping(&a.mesh) {
++            a.mapping = Some(m);
++        }
++    }
++    let now = crate::wowbg3_pace::mono_seconds();
++    let packet = pace.as_deref().and_then(|p| p.current.as_ref());
++    let fresh = packet.filter(|p| (now - p.present_time).abs() < STALE_SECS);
++    let aim = match (fresh, a.mapping) {
++        (Some(p), Some((centre, wow))) => pose_root(&p.pose).map(|(t, q)| Aim {
++            at: wow_to_bevy(crate::wowbg3_tav::bg3_to_wow(Vec3::from_array(t), centre, wow))
++                - Vec3::Y * crate::wowbg3_lead::ground_lock(),
++            yaw: bg3_yaw_to_wow(q),
++            packet: p.frame,
++            steady: 0.0,
++        }),
++        _ => None,
++    };
++    // The gate: world mode runs (a fresh `tav.bin`) and the packet's root is where it says she is.
++    let seen = super::TAV_SEEN_MS.load(std::sync::atomic::Ordering::Relaxed);
++    let tav = follow.as_deref().and_then(|t| t.tav).filter(|_| {
++        seen != 0 && super::clock_ms().saturating_sub(seen) < TAV_FRESH_MS
++    });
++    let matched = aim.filter(|x| tav.is_some_and(|t| Vec2::new(t.x - x.at.x, t.z - x.at.z).length() < MATCH));
++    let refused = aim.is_some() && matched.is_none();
++    if matched.is_some() {
++        a.steady_since.get_or_insert_with(std::time::Instant::now);
++    } else {
++        a.steady_since = None;
++    }
++    let steady = a.steady_since.map_or(0.0, |t| t.elapsed().as_secs_f32());
++    let aim = matched.map(|x| Aim { steady, ..x });
++    if let Some(x) = aim {
++        a.last_packet = x.packet;
++    }
++    if a.frame % 600 == 0 {
++        info!("wowbg3 body: aim {:?} (packet {}, mapping {})", aim.map(|x| x.at), a.last_packet, a.mapping.is_some());
++    }
++    if let Ok(mut g) = SHARED.lock() {
++        if let Some(s) = g.as_mut() {
++            s.aim = aim;
++            s.refused += u64::from(refused);
++            if a.frame % 600 == 0 && s.followed > 0 {
++                info!(
++                    "wowbg3 body: {} frames followed, gap after the mover mean {:.3} yd, max {:.3}; {} placed on her walking, {} standing; {} packet roots away from tav.bin (not followed)",
++                    s.followed,
++                    s.gap_sum / s.followed as f64,
++                    s.gap_max,
++                    s.snaps,
++                    s.pinned,
++                    s.refused
++                );
++                s.gap_max = 0.0;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pose(recs: &[(u32, u32, [f32; 4], [f32; 3])]) -> Vec<u8> {
++        let mut b = Vec::new();
++        b.extend_from_slice(b"TVP1");
++        b.extend_from_slice(&1u32.to_le_bytes());
++        b.extend_from_slice(&7u32.to_le_bytes());
++        b.extend_from_slice(&(recs.len() as u32).to_le_bytes());
++        b.extend_from_slice(&1.5f64.to_le_bytes());
++        for (bones, flags, q, t) in recs {
++            b.extend_from_slice(&9u64.to_le_bytes());
++            b.extend_from_slice(&bones.to_le_bytes());
++            b.extend_from_slice(&flags.to_le_bytes());
++            for v in q.iter().chain(t.iter()).chain([1.0f32, 1.0, 1.0].iter()) {
++                b.extend_from_slice(&v.to_le_bytes());
++            }
++            b.extend(std::iter::repeat_n(0u8, 48 * *bones as usize));
++        }
++        b
++    }
++
++    #[test]
++    fn finds_the_root_record() {
++        let b = pose(&[(3, 0, [0.0, 0.0, 0.0, 1.0], [9.0, 9.0, 9.0]), (2, 1, [0.0, 0.5, 0.0, 0.5], [1.0, 2.0, 3.0])]);
++        let (t, q) = pose_root(&b).unwrap();
++        assert_eq!(t, [1.0, 2.0, 3.0]);
++        assert_eq!(q, [0.0, 0.5, 0.0, 0.5]);
++        assert!(pose_root(b"TVP2xxxxxxxxxxxxxxxxxxxx").is_none());
++    }
++
++    #[test]
++    fn facing_follows_bg3s_minus_z() {
++        // Identity: BG3 -z is (0, -1), WoW (-dz, dx) = (1, 0): orientation 0.
++        assert!(bg3_yaw_to_wow([0.0, 0.0, 0.0, 1.0]).abs() < 1e-6);
++        // Yaw a about +y: -z = (-sin a, -cos a) in BG3, WoW (cos a, -sin a): orientation -a.
++        let a: f32 = 0.7;
++        let o = bg3_yaw_to_wow([0.0, (a / 2.0).sin(), 0.0, (a / 2.0).cos()]);
++        assert!((o + a).abs() < 1e-5, "{o}");
++    }
++
++    #[test]
++    fn steers_onto_her_this_frame() {
++        *SHARED.lock().unwrap() = Some(Shared::default());
++        SHARED.lock().unwrap().as_mut().unwrap().aim =
++            Some(Aim { at: Vec3::new(3.0, 0.0, -4.0), yaw: 0.3, packet: 1, steady: 1.0 });
++        let f = steer(Vec3::ZERO, 0.0, 0.01, true).unwrap();
++        assert!(f.moving);
++        assert_eq!(f.speed, MAX_SPEED);
++        // Bevy yaw y walks toward (-sin y, -cos y): (3, -4) / 5.
++        let dir = Quat::from_rotation_y(f.yaw) * Vec3::NEG_Z;
++        assert!((dir - Vec3::new(0.6, 0.0, -0.8)).length() < 1e-5, "{dir:?}");
++        // The mover stopped 1 yd short: placed on her.
++        let mut p = Vec3::new(2.4, 0.0, -3.2);
++        assert!(settle(&mut p));
++        assert_eq!(p, Vec3::new(3.0, 0.0, -4.0));
++        // On her after a walk: still walking (no speed) for a few frames, then standing, her facing.
++        for _ in 1..STILL_FRAMES {
++            let f = steer(Vec3::new(3.0, 0.0, -4.0), 0.0, 0.01, true).unwrap();
++            assert!(f.moving && f.speed == 0.0);
++        }
++        let f = steer(Vec3::new(3.0, 0.0, -4.0), 0.0, 0.01, true).unwrap();
++        assert!(!f.moving && (f.yaw - 0.3).abs() < 1e-6);
++        // Standing on her and pushed off by the mover (a WoW collision): put back, no walk.
++        let f = steer(Vec3::new(3.0, 0.0, -4.0), 0.3, 0.01, true).unwrap();
++        assert!(!f.moving);
++        let mut pushed = Vec3::new(4.5, 0.0, -4.0);
++        assert!(settle(&mut pushed));
++        assert_eq!(pushed, Vec3::new(3.0, 0.0, -4.0));
++        // A corpse stays.
++        let f = steer(Vec3::ZERO, 0.0, 0.01, false).unwrap();
++        assert!(!f.moving && f.yaw == 0.0);
++        // A jump of more than FAR waits for a steady aim.
++        SHARED.lock().unwrap().as_mut().unwrap().aim =
++            Some(Aim { at: Vec3::new(300.0, 0.0, 0.0), yaw: 0.3, packet: 2, steady: 0.1 });
++        let f = steer(Vec3::ZERO, 0.0, 0.01, true).unwrap();
++        assert!(!f.moving);
++        let mut z = Vec3::ZERO;
++        assert!(!settle(&mut z));
++        SHARED.lock().unwrap().as_mut().unwrap().aim =
++            Some(Aim { at: Vec3::new(300.0, 0.0, 0.0), yaw: 0.3, packet: 3, steady: 0.6 });
++        assert!(steer(Vec3::ZERO, 0.0, 0.01, true).unwrap().moving);
++        *SHARED.lock().unwrap() = None;
++    }
++}

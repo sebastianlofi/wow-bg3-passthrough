@@ -1,0 +1,78 @@
+WOW-BG3 benilla patch 0064: WoW's merchant cursor over a vendor in BG3.
+
+- wowbg3_cursors.rs: also merchant.cur, merchant-gray.cur and their pressed looks, from WoW's own
+  Interface\Cursor\Buy.blp and UnableBuy.blp the way the quest cursors are made (each pair only when
+  missing); the wowbg3-early plugin swaps BG3's OpenDoor cursors for them.
+- wowbg3_lead.rs: a vendor under the pointer reads WoW's Buy cursor kind in wowhover.bin even when it
+  also talks (gossip wins WoW's own cursor ladder, so most vendors read Speak; a playtest report:
+  a merchant showed the talk cursor).
+
+--- a/crates/benilla-app/src/wowbg3_cursors.rs
++++ b/crates/benilla-app/src/wowbg3_cursors.rs
+@@ -8,6 +8,9 @@
+ //! Pillow's LANCZOS, on premultiplied alpha) to 30 px on its long side at 1,1, or 26 px at 3,3
+ //! pressed. `WowCursor.lua` points two unused BG3 cursor types at them. Off-thread; logs
+ //! `wowbg3 cursors:`.
++//! Patch 0064: also `merchant.cur`, `merchant-gray.cur` and their pressed looks from WoW's own merchant
++//! cursors (`Interface\Cursor\Buy.blp`, `UnableBuy.blp`), the same way; the wowbg3-early plugin swaps
++//! BG3's OpenDoor cursors (no BG3 door in world mode) for them.
+ 
+ use std::path::{Path, PathBuf};
+ 
+@@ -16,9 +19,11 @@
+ use benilla_assets::{AssetSet, LockRecover, WorldAssets};
+ 
+ const SIZE: usize = 32;
+-const ICONS: [(&str, &str); 2] = [
++const ICONS: [(&str, &str); 4] = [
+     ("quest-available", "Interface\\GossipFrame\\AvailableQuestIcon.blp"),
+     ("quest-turnin", "Interface\\GossipFrame\\ActiveQuestIcon.blp"),
++    ("merchant", "Interface\\Cursor\\Buy.blp"),
++    ("merchant-gray", "Interface\\Cursor\\UnableBuy.blp"),
+ ];
+ 
+ pub(crate) fn build(app: &mut App, link: PathBuf) {
+@@ -34,14 +39,16 @@
+ 
+ fn write_cursors(dir: Res<CursorDir>, assets: Option<Res<WorldAssets>>) {
+     let dir = dir.0.clone();
+-    let names = ["quest-available", "quest-available-pressed", "quest-turnin", "quest-turnin-pressed"];
+-    if names.iter().all(|n| dir.join(format!("{n}.cur")).exists()) {
++    if ICONS.iter().all(|(n, _)| dir.join(format!("{n}.cur")).exists() && dir.join(format!("{n}-pressed.cur")).exists()) {
+         return;
+     }
+     let Some(assets) = assets else { return };
+     let chain = assets.chain.clone();
+     let _ = std::thread::Builder::new().name("wowbg3-cursors".into()).spawn(move || {
+         for (stem, path) in ICONS {
++            if dir.join(format!("{stem}.cur")).exists() && dir.join(format!("{stem}-pressed.cur")).exists() {
++                continue;
++            }
+             let icon = chain
+                 .lock_recover()
+                 .read_file(path)
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -635,6 +635,7 @@
+     (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
+     world_cursor: Res<crate::target::WorldCursor>,
+     quest: Res<crate::ui_quest::QuestGiver>,
++    stores: Query<&crate::net::ObjectStore>,
+ ) {
+     use bevy::input::mouse::MouseButtonInput;
+     use bevy::input::ButtonState;
+@@ -668,7 +669,13 @@
+         | (u32::from(unit || object.target.is_some()) << 1)
+         | (u32::from(mirrored) << 2);
+     // Patch 0009: WoW's cursor kind and its grayed state follow (BG3 shows its closest cursor).
+-    let kind = crate::wowbg3_fight::cursor_code(world_cursor.kind);
++    let mut kind = crate::wowbg3_fight::cursor_code(world_cursor.kind);
++    // Patch 0064: a vendor is WoW's merchant cursor in BG3 even when it also talks (gossip wins WoW's
++    // own cursor ladder, so most vendors read Speak there).
++    let vendor = crate::target::cursor_mode::npc_flags::VENDOR;
++    if kind == 2 && hovered.target.and_then(|e| stores.get(e).ok()).is_some_and(|s| s.0.unit_npc_flags() & vendor != 0) {
++        kind = 6;
++    }
+     // Patch 0047: the hovered unit's quest-giver status (WoW's DIALOG_STATUS,
+     // 0 none), for WoW's quest cursor in BG3 (`WowCursor.lua`).
+     let status = hovered.guid.filter(|_| hovered.target.is_some()).and_then(|g| quest.status(g)).unwrap_or(0);

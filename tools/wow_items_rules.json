@@ -1,0 +1,108 @@
+{
+  "_doc": "WoW item -> BG3 item rules. Read by link/tools/wow_items.py; explained in the inventory notes. Edit numbers here, run wow_items.py again; nothing else changes.",
+
+  "copper_per_bg3_gold": 1,
+
+  "rarity_by_quality": {"0": "Common", "1": "Common", "2": "Uncommon", "3": "Rare", "4": "VeryRare", "5": "Legendary", "6": "Legendary"},
+
+  "_weapons": "WoW weapon subclass -> BG3 weapon stats entry (its root template is the look). 'fast' is used instead when the WoW swing time (delay, ms) is at most fast_delay.",
+  "weapons": {
+    "0":  {"name": "Axe",          "base": "WPN_Handaxe"},
+    "1":  {"name": "Axe 2H",       "base": "WPN_Greataxe"},
+    "2":  {"name": "Bow",          "base": "WPN_Longbow", "fast": "WPN_Shortbow", "fast_delay": 2600},
+    "3":  {"name": "Gun",          "base": "WPN_HeavyCrossbow"},
+    "4":  {"name": "Mace",         "base": "WPN_Mace", "fast": "WPN_LightHammer", "fast_delay": 1900},
+    "5":  {"name": "Mace 2H",      "base": "WPN_Maul"},
+    "6":  {"name": "Polearm",      "base": "WPN_Halberd"},
+    "7":  {"name": "Sword",        "base": "WPN_Longsword", "fast": "WPN_Shortsword", "fast_delay": 1900},
+    "8":  {"name": "Sword 2H",     "base": "WPN_Greatsword"},
+    "10": {"name": "Staff",        "base": "WPN_Quarterstaff"},
+    "13": {"name": "Fist weapon",  "base": "WPN_Club"},
+    "14": {"name": "Misc weapon",  "base": "WPN_Club"},
+    "15": {"name": "Dagger",       "base": "WPN_Dagger"},
+    "16": {"name": "Thrown",       "base": "WPN_Dart"},
+    "17": {"name": "Spear",        "base": "WPN_Spear"},
+    "18": {"name": "Crossbow",     "base": "WPN_LightCrossbow"},
+    "19": {"name": "Wand",         "base": "WPN_HandCrossbow"},
+    "20": {"name": "Fishing pole", "base": "WPN_Quarterstaff"}
+  },
+
+  "_enchant": "Weapon +N (BG3's WeaponEnchantment boost: to hit and damage) from the WoW weapon's damage per second. Thresholds for +1, +2, +3.",
+  "enchant_dps": {"one_hand": [18, 32, 46], "two_hand": [24, 44, 64], "ranged": [18, 32, 46]},
+
+  "damage_types": {"0": "", "1": "Radiant", "2": "Fire", "3": "Poison", "4": "Cold", "5": "Necrotic", "6": "Force"},
+  "_extra_damage": "A second WoW damage line (e.g. +5-10 Fire) becomes WeaponDamage(die, type); the die is the first whose average reaches the WoW average x extra_damage_scale.",
+  "extra_damage_scale": 0.15,
+
+  "_armor": "Body armour by WoW armour subclass (1 cloth, 2 leather, 3 mail, 4 plate): the BG3 armour type by item level (tiers: [from item level, BG3 stats entry], the last one reached wins). Its AC is BG3's own for that type (base_ac), plus the magic bonus below, as BG3's own +1..+3 armours (Helldusk Armour 21).",
+  "body": {
+    "1": {"name": "Cloth",   "tiers": [[0, "ARM_Robe_Body"]]},
+    "2": {"name": "Leather", "tiers": [[0, "ARM_Leather_Body"], [20, "ARM_StuddedLeather_Body"]]},
+    "3": {"name": "Mail",    "tiers": [[0, "ARM_ChainShirt_Body"], [20, "ARM_ScaleMail_Body"], [40, "ARM_HalfPlate_Body"]]},
+    "4": {"name": "Plate",   "tiers": [[0, "ARM_ChainMail_Body"], [50, "ARM_Splint_Body"], [60, "ARM_Plate_Body"]]}
+  },
+  "_base_ac": "BG3's own AC of each base (Shared Armor.txt): robe 10; light padded/leather 11, studded 12 (+ full DEX); medium hide 12, chain shirt 13, scale/breastplate 14, half plate 15 (+ DEX max 2); heavy ring 14, chain mail 16, splint 17, plate 18; shield 2.",
+  "base_ac": {
+    "ARM_Robe_Body": 10, "ARM_Padded_Body": 11, "ARM_Leather_Body": 11, "ARM_StuddedLeather_Body": 12,
+    "ARM_Hide_Body": 12, "ARM_ChainShirt_Body": 13, "ARM_ScaleMail_Body": 14, "ARM_Breastplate_Body": 14,
+    "ARM_HalfPlate_Body": 15, "ARM_RingMail_Body": 14, "ARM_ChainMail_Body": 16, "ARM_Splint_Body": 17,
+    "ARM_Plate_Body": 18, "ARM_Shield": 2
+  },
+  "_magic": "Magic bonus (+AC) on body armour and shields from WoW quality (2 uncommon, 3 rare, 4 epic, 5 legendary) and item level: the highest bonus whose quality and item level are both reached, at most magic_cap.",
+  "magic": [
+    {"quality": 2, "item_level": 40, "bonus": 1},
+    {"quality": 3, "item_level": 30, "bonus": 1},
+    {"quality": 3, "item_level": 55, "bonus": 2},
+    {"quality": 4, "item_level": 40, "bonus": 2},
+    {"quality": 4, "item_level": 60, "bonus": 3},
+    {"quality": 5, "item_level": 0,  "bonus": 3}
+  ],
+  "magic_cap": 3,
+
+  "_slots": "WoW inventory type -> BG3. 'base' per armour subclass (0 misc, 1 cloth, 2 leather, 3 mail, 4 plate) or 'any'. Types not listed here have no BG3 equipment slot: they are kept as WoW-worn items (see 'worn').",
+  "slots": {
+    "1":  {"name": "Head",    "base": {"1": "ARM_Hat", "2": "ARM_Helmet_Leather", "3": "ARM_Helmet_Metal", "4": "ARM_Helmet_Metal", "any": "ARM_Hat"}},
+    "2":  {"name": "Neck",    "base": {"any": "ARM_Amulet"}},
+    "5":  {"name": "Chest",   "body": true},
+    "20": {"name": "Robe",    "body": true},
+    "8":  {"name": "Feet",    "base": {"1": "ARM_Shoes", "2": "ARM_Boots_Leather", "3": "ARM_Boots_Metal", "4": "ARM_Boots_Metal", "any": "ARM_Shoes"}},
+    "10": {"name": "Hands",   "base": {"1": "ARM_Gloves_Leather", "2": "ARM_Gloves_Leather", "3": "ARM_Gloves_Metal", "4": "ARM_Gloves_Metal", "any": "ARM_Gloves_Leather"}},
+    "11": {"name": "Finger",  "base": {"any": "ARM_Ring"}},
+    "14": {"name": "Shield",  "base": {"any": "ARM_Shield"}, "magic": true},
+    "16": {"name": "Back",    "base": {"any": "ARM_Cloak"}}
+  },
+  "_small_ac": "Head, feet, hands and back pieces give AC(+1) once the item level and quality reach these (BG3's own small pieces give AC only when magic).",
+  "small_ac": {"item_level": 45, "quality": 3},
+
+  "_worn": "WoW slots with no BG3 slot (shoulders, legs, waist, wrists, shirt, tabard, trinket, off-hand holdable, relic, ammo). Shown in BG3 bags as this item; its stats count while the WoW character wears it.",
+  "worn": {"base": "OBJ_Bone", "types": {"3": "Shoulders", "4": "Shirt", "6": "Waist", "7": "Legs", "9": "Wrists", "12": "Trinket", "19": "Tabard", "23": "Held in off-hand", "24": "Ammo", "28": "Relic"}},
+
+  "_abilities": "WoW stat -> BG3 ability: +1 per 'per' WoW points, at most 'cap' per item. WoW stat ids: 3 agility, 4 strength, 5 intellect, 6 spirit, 7 stamina.",
+  "abilities": {"3": "Dexterity", "4": "Strength", "5": "Intelligence", "6": "Wisdom", "7": "Constitution"},
+  "ability_per": 8,
+  "ability_cap": 2,
+
+  "_resist": "WoW resistance (holy, fire, nature, frost, shadow, arcane) of at least resist_at -> BG3 Resistance(type, Resistant).",
+  "resist": {"holy_res": "Radiant", "fire_res": "Fire", "nature_res": "Poison", "frost_res": "Cold", "shadow_res": "Necrotic", "arcane_res": "Force"},
+  "resist_at": 15,
+
+  "_objects": "Everything else by WoW class (and subclass). 0 consumable, 1 container, 5 reagent, 7 trade goods, 9 recipe, 11 quiver, 12 quest, 13 key, 15 misc. First match wins: 'class:subclass', then 'class'.",
+  "objects": {
+    "0":    {"name": "Consumable", "base": "OBJ_Bone", "food": "CONS_FOOD_Bread_Bun", "drink": "CONS_DRINK_Water", "heal": "OBJ_Potion_Healing"},
+    "1":    {"name": "Bag",        "base": "OBJ_Bag"},
+    "5":    {"name": "Reagent",    "base": "OBJ_Bone"},
+    "7":    {"name": "Trade goods","base": "OBJ_Bone"},
+    "9":    {"name": "Recipe",     "base": "OBJ_Book"},
+    "11":   {"name": "Quiver",     "base": "OBJ_Bag"},
+    "12":   {"name": "Quest item", "base": "OBJ_Bone"},
+    "13":   {"name": "Key",        "base": "OBJ_Bone"},
+    "default": {"name": "Misc",    "base": "OBJ_Bone"}
+  },
+  "_food": "WoW consumables whose name contains one of these words use BG3's healing potion, food or drink (their BG3 use effect too). Other consumables are plain items in BG3 until WoW's own use is wired (see inventory.md).",
+  "heal_words": ["healing potion", "healing draught"],
+  "_categories": "WoW's own markers: a consumable whose first spell is in spell category 11 is food, 59 drink.",
+  "food_category": 11,
+  "drink_category": 59,
+  "food_words": ["bread", "meat", "cheese", "apple", "fish", "steak", "pie", "cake", "jerky", "mushroom", "ribs", "sausage", "egg", "melon", "muffin", "biscuit", "roll", "venison", "chop", "kabob", "stew"],
+  "drink_words": ["water", "milk", "juice", "ale", "wine", "beer", "brew", "rum", "grog", "mead", "tea"]
+}

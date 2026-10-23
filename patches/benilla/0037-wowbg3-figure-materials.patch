@@ -1,0 +1,1016 @@
+WOW-BG3 benilla patch 0037: the figures' materials as BG3 shades them, under WoW's light (on top of
+0001-0009, 0011-0036).
+
+The characters must look as they do in BG3, only with WoW's lighting; their detail and porous skin
+visible. Before, patch 0006's law drew them as WoW's diffuse (`albedo x lit`) with a restrained GGX of the sun:
+metal kept its whole albedo as diffuse (Lae'zel's armour white), hair showed its reddish-brown G-buffer base colour
+without BG3's strand lighting (Tav's blonde hair), the skin had no sheen and none of BG3's tiled detail normals
+(its pores), and the normal and surface maps were raw texture layers, not what BG3's shaders make of them. Here:
+- wow_model.wgsl (`WOW_TAV_SURFACE`, `tav_fetch`, `tav_bg3`): BG3's lighting of its G-buffer values
+  (`Shaders/Vulkan/ClusteredLighting/*.bshd` in EngineShaders.pak): Frostbite's GGX with the sun as a disc, the
+  height-correlated Smith visibility and BG3's specular antialiasing; diffuse colour albedo x (1 - metalness), F0
+  0.16 x specular^2 toward the albedo by metalness, the split-sum environment; the skin's dual specular lobes from
+  its diffusion profile, its thin-object transmission and (a stand-in for BG3's screen-space diffusion) the normal
+  flattened per colour by the profile; UE4's hair (R, TT, TRT, its diffuse) along BG3's strand direction. The
+  light is WoW's: its lit term per normal as the irradiance multiplier (a plain diffuse surface keeps patch 0006's
+  `albedo x lit` exactly), the sun's radiance pi x (lit(L) - ambient), WoW's ambient as the environment, point
+  lights, entity shade, fog and the mouseover highlight as WoW adds them. Units as patch 0006 (measured in world
+  mode: the albedo samples linear and the pass's output reaches the frame sRGB-encoded): linear radiance out;
+  flag 16 (WOW_BG3_TAV_OUT=gamma) writes it sRGB-encoded instead. Detail normal maps tiled at BG3's tiling.
+  tav_a.x < 0 keeps patch 0006's law; tav_a.z the debug view (1 to 10, without the highlight; 8 is 0006's law).
+- materials.rs: WowModelExt lanes tav_a..tav_d (zero on every WoW material; model_render.rs and
+  world_assets/mod.rs set them so).
+- wowbg3_tav.rs: tavtex.txt's 0037 tokens (model:, extra:, detail:, profile:), the extra map in the emissive slot
+  and the detail normal map in the occlusion slot, albedo mip chains of tavtex (TVT flag 8), the debug view
+  (`tavdebug`), WOW_BG3_TAV_SHADE=wow (patch 0006's law, rollback), WOW_BG3_TAV_OUT=gamma.
+
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -115,6 +115,31 @@
+ //! the six origins' meshes has only some of its vertices cut; such a one is kept whole and counted (BG3 would
+ //! stretch it to the origin). A mesh key keeps its cut across plans until `tavtex.txt` gives the plan's own.
+ //! `WOW_BG3_TAV_CUTS=off`: no cuts, as before. Supersedes the cut half of the 0010 WIP.
++//!
++//! Patch 0037 (the characters must look as in BG3, only lit by WoW's light, their
++//! detail and porous skin visible): her surfaces are shaded the way BG3's lighting shades its G-buffer
++//! (`wow_model.wgsl` `tav_bg3`: Frostbite's GGX and diffuse split, the skin's dual specular lobes and diffusion
++//! profile, UE4's hair) with WoW's sun, ambient, point lights and fog as the light: WoW's diffuse law is kept as it
++//! is (`albedo × lit`), BG3's specular, metal, skin and hair terms are added in the same linear units. Before, patch
++//! 0006's law had none of those (a restrained GGX of the sun only): metal kept its whole albedo as diffuse
++//! (Lae'zel's armour white), hair had no strand lighting (Tav's blonde hair showed its reddish-brown G-buffer base
++//! colour), skin no pores and no sheen, and the maps were raw texture layers. `tavtex.py` now bakes every
++//! G-buffer output with BG3's own material shader: the shading normal (normal map, wrinkles, BG3's layers), the
++//! surface map (R occlusion, G roughness, B metalness or a hair's backlit, A specular level), an extra map (a skin's
++//! profile data, a hair's strand direction and scatter) and, for skin, BG3's tiled detail normal map (its pores,
++//! 15 to 40 times the body's UV frequency: too fine to bake) with its tiling, its strength in the normal map's alpha.
++//! `tavtex.txt` carries them as tokens after the five columns: `model:<0|3|5>`, `extra:<file>`,
++//! `detail:<file>,<tiling>`, `profile:<lobe A>,<lobe B>,<mix>,<distance>,<scatter rgb>,<thickness min>,<max>,<tint rgb>`
++//! ([`TexLine`]). Albedos with BG3's own mip chain (TVT flag 8, [`TVT_MIPS`]: each level shaded by BG3's shader
++//! from inputs at that level's density, as BG3 samples them at a distance) upload those levels. A line without
++//! `model:` (an older bake) keeps patch 0006's WoW law. `WOW_BG3_TAV_SHADE=wow`: patch 0006's law for every
++//! mesh (rollback). Units: as patch 0006, her albedo is sampled linear and the pass writes linear radiance, which
++//! world mode's frame shows sRGB-encoded (measured: a written 0.25/0.5/0.75 arrives as 147/212/255 with FFXGlow);
++//! `WOW_BG3_TAV_OUT=gamma` writes it sRGB-encoded instead, the units of WoW's own gamma-space models, should the
++//! frame come to show the pass's values as they are. A file `tavdebug` in the Tav directory holding 1 to 6 shows
++//! albedo, view-space normal, roughness/metalness/occlusion, specular, diffuse or the extra map, 7 the lit figure,
++//! 8 patch 0006's law (A/B without a restart), 9 the base colour as sampled, 10 a constant (0.25, 0.5, 0.75) (the
++//! frame's transfer); every view leaves WoW's mouseover highlight out (captures beside BG3's frame) ([`TavDebug`]).
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -161,6 +186,9 @@
+ /// Patch 0035: in `tavtex.txt`'s flags column only (never in a `.tvt` header): BG3 draws the material
+ /// one-sided (back faces culled), so WoW culls them too.
+ pub(crate) const TVT_ONE_SIDED: u32 = 16;
++/// Patch 0037 (the 0010 WIP's): a `.tvt` albedo carries its own mip chain after level 0, each level shaded by
++/// `tavtex.py` with BG3's shader from inputs at that level's density.
++pub(crate) const TVT_MIPS: u32 = 8;
+ /// Patch 0035: the most meshes a plan and records a pose may hold, the capture layer's TAV_MAX (was 256:
+ /// with every LOD planned, Gale and five companions made 296, `tavmesh.bin` "did not decode", no pose
+ /// fitted and every figure vanished).
+@@ -770,8 +798,9 @@
+     Data,
+ }
+ 
+-/// One material's maps: albedo, normal, surface files, the alpha test and (patch 0035) one-sided.
+-type LookKey = (String, Option<String>, Option<String>, bool, bool);
++/// One material's maps: albedo, normal, surface files, the alpha test and (patch 0035) one-sided; patch 0037:
++/// the extra and detail maps and BG3's shading lanes (their text).
++type LookKey = (String, Option<String>, Option<String>, bool, bool, Option<String>, Option<String>, String);
+ 
+ #[derive(Resource)]
+ struct TavDraw {
+@@ -855,6 +884,23 @@
+     cuts_on: bool,
+     cuts: HashMap<u64, Vec<u8>>,
+     cut_stamp: Option<(SystemTime, u32)>,
++    /// Patch 0037: `WOW_BG3_TAV_SHADE` (`bg3`, the default: BG3's lighting; `wow`: patch 0006's WoW law),
++    /// `WOW_BG3_TAV_OUT` (`linear`, the default, as patch 0006 writes her; `gamma`: sRGB-encoded, the units of
++    /// WoW's own gamma-space models, for a frame that shows the model pass's values as they are) and the debug
++    /// view (`tavdebug`).
++    bg3_shade: bool,
++    gamma_out: bool,
++    debug: TavDebug,
++}
++
++/// Patch 0037: the debug view of her surfaces (`<tav dir>/tavdebug` holding 0 to 10, read every 60 frames):
++/// 1 albedo, 2 view-space normal, 3 roughness/metalness/occlusion, 4 specular, 5 diffuse, 6 extra map, 7 lit,
++/// 8 patch 0006's WoW law, 9 the base colour as sampled, 10 a constant (0.25, 0.5, 0.75); 1 to 10 without WoW's
++/// mouseover highlight.
++#[derive(Default)]
++struct TavDebug {
++    view: u32,
++    stamp: Option<SystemTime>,
+ }
+ 
+ pub(crate) fn build(app: &mut App) {
+@@ -895,6 +941,14 @@
+     let sides = std::env::var("WOW_BG3_TAV_SIDES").map_or(true, |v| v.trim() != "two");
+     // Patch 0036.
+     let cuts_on = std::env::var("WOW_BG3_TAV_CUTS").map_or(true, |v| v.trim() != "off");
++    // Patch 0037.
++    let bg3_shade = std::env::var("WOW_BG3_TAV_SHADE").map_or(true, |v| v.trim() != "wow");
++    let gamma_out = std::env::var("WOW_BG3_TAV_OUT").is_ok_and(|v| v.trim() == "gamma");
++    info!(
++        "wowbg3 tav: shading {}, out {} (WOW_BG3_TAV_SHADE bg3 or wow, WOW_BG3_TAV_OUT linear or gamma)",
++        if bg3_shade { "BG3's lighting of its G-buffer with WoW's light" } else { "patch 0006's WoW law" },
++        if gamma_out { "gamma" } else { "linear" }
++    );
+     info!(
+         "wowbg3 tav: BG3's vertex-colour cuts {} (WOW_BG3_TAV_CUTS off: none)",
+         if cuts_on { "on" } else { "off" }
+@@ -960,6 +1014,9 @@
+         cuts_on,
+         cuts: HashMap::new(),
+         cut_stamp: None,
++        bg3_shade,
++        gamma_out,
++        debug: TavDebug::default(),
+     })
+     .init_resource::<TavFeet>()
+     .init_resource::<PartyFeet>()
+@@ -971,6 +1028,7 @@
+             load_meshes,
+             apply_cuts.after(load_meshes).before(load_textures),
+             load_textures.after(load_meshes),
++            tav_debug_view.after(load_textures),
+             apply_pose.after(load_textures).in_set(TavPose),
+         ),
+     );
+@@ -1325,7 +1383,12 @@
+             for (c, val) in [v.x, v.y, v.z].into_iter().enumerate() {
+                 next[o + c] = ((val * 0.5 + 0.5) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+             }
+-            next[o + 3] = 255;
++            // Patch 0037: the alpha (the detail normal's strength) is averaged, as a box mip does.
++            let a: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
++                .iter()
++                .map(|(dx, dy)| prev[((2 * y + dy).min(ch - 1) * cw + (2 * x + dx).min(cw - 1)) * 4 + 3] as u32)
++                .sum();
++            next[o + 3] = ((a + 2) / 4) as u8;
+         }
+     }
+     (next, nw, nh)
+@@ -1374,14 +1437,20 @@
+ /// A baked texture as a mipmapped, anisotropically filtered image (sharp up close, calm at a
+ /// distance): the albedo in sRGB (a cut-out's mips keeping its coverage at `cutoff`), normal and
+ /// surface maps as linear data.
+-fn tvt_image(w: u32, h: u32, px: &[u8], role: Role, cutoff: f32) -> Image {
++fn tvt_image(w: u32, h: u32, px: &[u8], role: Role, cutoff: f32, own: &[&[u8]]) -> Image {
+     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+     let mut data = px.to_vec();
+     let (mut cw, mut ch, mut levels) = (w as usize, h as usize, 1u32);
+     let mut prev = px.to_vec();
+     let cover = (role == Role::Cutout).then(|| coverage(px, cutoff));
++    // Patch 0037: an albedo's own levels (TVT flag 8, BG3's shader at each level's density), whole chains only.
++    let own = if matches!(role, Role::Albedo | Role::Cutout) && own.len() + 1 == mip_count(w, h) as usize { own } else { &[] };
+     while cw > 1 || ch > 1 {
+-        let (next, nw, nh) = if role == Role::Normal { normal_mip(&prev, cw, ch) } else { box_mip(&prev, cw, ch) };
++        let (next, nw, nh) = match own.get(levels as usize - 1) {
++            Some(level) => (level.to_vec(), (cw / 2).max(1), (ch / 2).max(1)),
++            None if role == Role::Normal => normal_mip(&prev, cw, ch),
++            None => box_mip(&prev, cw, ch),
++        };
+         match cover {
+             Some(c) => {
+                 let mut kept = next.clone();
+@@ -1421,6 +1490,32 @@
+     image
+ }
+ 
++/// The levels of a full mip chain from `w` x `h` down to 1x1.
++pub(crate) fn mip_count(w: u32, h: u32) -> u32 {
++    32 - w.max(h).max(1).leading_zeros()
++}
++
++/// Patch 0037: a `.tvt`'s own lower mip levels (flag [`TVT_MIPS`]): `max(1, size >> k)` RGBA8 rows each, after
++/// level 0; empty without the flag or when the file is short.
++pub(crate) fn decode_tvt_mips(b: &[u8]) -> Vec<&[u8]> {
++    let Some((w, h, flags, _)) = decode_tvt(b) else { return Vec::new() };
++    if flags & TVT_MIPS == 0 {
++        return Vec::new();
++    }
++    let mut out = Vec::new();
++    let mut at = 16 + w as usize * h as usize * 4;
++    let (mut lw, mut lh) = (w as usize, h as usize);
++    while lw > 1 || lh > 1 {
++        lw = (lw / 2).max(1);
++        lh = (lh / 2).max(1);
++        let n = lw * lh * 4;
++        let Some(level) = b.get(at..at + n) else { return Vec::new() };
++        out.push(level);
++        at += n;
++    }
++    out
++}
++
+ /// Decodes a `.tvt` texture (`TVT1`, width, height, flags; RGBA8 rows).
+ pub(crate) fn decode_tvt(b: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
+     if b.get(0..4)? != b"TVT1" {
+@@ -1433,7 +1528,9 @@
+ }
+ 
+ /// One `tavtex.txt` line: `<mesh key> <albedo> <flags> [<normal or -> <surface or ->]`; an albedo
+-/// of `-` (or flag 2) hides the mesh (BG3's VFX parts).
++/// of `-` (or flag 2) hides the mesh (BG3's VFX parts). Patch 0037: `key:value` tokens after the five columns
++/// (others, such as 0036's `cut:`, are read elsewhere): `model:` BG3's shading model, `extra:` the extra map,
++/// `detail:<file>,<tiling>` the skin's detail normal map, `profile:` its diffusion profile (12 numbers).
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) struct TexLine {
+     pub(crate) key: u64,
+@@ -1441,6 +1538,10 @@
+     pub(crate) flags: u32,
+     pub(crate) normal: Option<String>,
+     pub(crate) surface: Option<String>,
++    pub(crate) model: Option<f32>,
++    pub(crate) extra: Option<String>,
++    pub(crate) detail: Option<(String, f32)>,
++    pub(crate) profile: Option<[f32; 12]>,
+ }
+ 
+ pub(crate) fn parse_tex_line(line: &str) -> Option<TexLine> {
+@@ -1448,16 +1549,49 @@
+     if f.len() < 3 {
+         return None;
+     }
+-    let file = |i: usize| f.get(i).filter(|s| **s != "-").map(|s| s.to_string());
++    let file = |i: usize| f.get(i).filter(|s| **s != "-" && !s.contains(':')).map(|s| s.to_string());
++    let token = |name: &str| f.iter().skip(3).find_map(|t| t.strip_prefix(name).and_then(|v| v.strip_prefix(':')));
++    let detail = token("detail").and_then(|v| {
++        let (file, tiling) = v.rsplit_once(',')?;
++        Some((file.to_string(), tiling.parse::<f32>().ok().filter(|t| t.is_finite() && *t > 0.0)?))
++    });
++    let profile = token("profile").and_then(|v| {
++        let n: Vec<f32> = v.split(',').filter_map(|x| x.parse::<f32>().ok()).collect();
++        <[f32; 12]>::try_from(n).ok()
++    });
+     Some(TexLine {
+         key: u64::from_str_radix(f[0], 16).ok()?,
+         albedo: file(1),
+         flags: f[2].parse().ok()?,
+         normal: file(3),
+         surface: file(4),
++        model: token("model").and_then(|v| v.parse::<f32>().ok()),
++        extra: token("extra").filter(|v| *v != "-").map(str::to_string),
++        detail,
++        profile,
+     })
+ }
+ 
++/// Patch 0037: a material's BG3 shading lanes (`WowModelExt::tav_a`..`tav_d`, `wow_model.wgsl` `tav_bg3`), from
++/// its `tavtex.txt` line: the model (−1, patch 0006's law, without `model:` or with `WOW_BG3_TAV_SHADE=wow`), the
++/// detail map's tiling, the debug view, which maps it has, and the skin's diffusion profile.
++pub(crate) fn tav_lanes(t: &TexLine, bg3_shade: bool, debug: u32, has: (bool, bool, bool, bool)) -> [Vec4; 4] {
++    let model = match t.model {
++        Some(m) if bg3_shade => m,
++        _ => -1.0,
++    };
++    let (normal, detail, extra, surface) = has;
++    let flags = u32::from(normal) | u32::from(detail) << 1 | u32::from(extra) << 2 | u32::from(surface) << 3;
++    // A missing profile: BG3's default (Engine's DiffusionProfile: lobes 0.75 and 1.3, mix 0.85, no scatter).
++    let p = t.profile.unwrap_or([0.75, 1.3, 0.85, 0.0, 1.0, 1.0, 1.0, 0.0, 20.0, 1.0, 1.0, 1.0]);
++    [
++        Vec4::new(model, t.detail.as_ref().map_or(0.0, |d| d.1), debug as f32, flags as f32),
++        Vec4::new(p[0], p[1], p[2], p[3]),
++        Vec4::new(p[4], p[5], p[6], p[7]),
++        Vec4::new(p[9], p[10], p[11], p[8]),
++    ]
++}
++
+ impl TexLine {
+     pub(crate) fn hidden(&self) -> bool {
+         self.flags & TVT_HIDDEN != 0 || self.albedo.is_none()
+@@ -1521,7 +1655,7 @@
+         let (w, h, flags, px) = decode_tvt(&raw)?;
+         // Normal and surface maps are linear data (flag 4); an albedo is sRGB.
+         let mismatch = matches!(role, Role::Normal | Role::Data) != (flags & TVT_LINEAR != 0);
+-        Some((tvt_image(w, h, px, role, cutoff), mismatch))
++        Some((tvt_image(w, h, px, role, cutoff, &decode_tvt_mips(&raw)), mismatch))
+     });
+     jobs.insert(k, task);
+     Tex::Pending
+@@ -1529,7 +1663,9 @@
+ 
+ /// Her material for one set of maps: the WoW model material she always had (lit, two-sided, scene
+ /// fog, the entity lane), whose base also carries BG3's normal map and the surface map as
+-/// occlusion and metallic-roughness (glTF layout), marked for `WOW_TAV_SURFACE`.
++/// occlusion and metallic-roughness (glTF layout), marked for `WOW_TAV_SURFACE`. Patch 0037: with BG3's
++/// lighting (`lanes[0].x >= 0`) the occlusion slot holds the skin's detail normal map and the emissive slot the
++/// extra map, which `wow_model.wgsl` samples itself; `lanes` are `WowModelExt::tav_a`..`tav_d` ([`tav_lanes`]).
+ #[allow(clippy::too_many_arguments)]
+ fn tav_material(
+     cache: &mut MaterialCache,
+@@ -1543,6 +1679,9 @@
+     spec: f32,
+     cutoff: f32,
+     two_sided: bool,
++    extra: Option<Handle<Image>>,
++    detail: Option<Handle<Image>>,
++    lanes: [Vec4; 4],
+ ) -> Handle<WowModelMaterial> {
+     let plain = model_material(
+         cache,
+@@ -1579,17 +1718,53 @@
+     }
+     m.base.normal_map_texture = normal;
+     m.base.flip_normal_map_y = flip_y;
+-    m.base.occlusion_texture = surface.clone();
++    let bg3 = lanes[0].x >= 0.0;
++    m.base.occlusion_texture = if bg3 { detail } else { surface.clone() };
+     m.base.metallic_roughness_texture = surface;
++    if bg3 {
++        m.base.emissive_texture = extra;
++    }
+     // With a surface map these scale its G and B; without one, a plain dielectric.
+     m.base.perceptual_roughness = if has_surface { 1.0 } else { 0.6 };
+     m.base.metallic = if has_surface { 1.0 } else { 0.0 };
+     m.base.reflectance = spec;
+     let markers = m.extension.clutter_fade.z as u32 | benilla_assets::materials::TAV_SURFACE_MARKER;
+     m.extension.clutter_fade.z = markers as f32;
++    m.extension.tav_a = lanes[0];
++    m.extension.tav_b = lanes[1];
++    m.extension.tav_c = lanes[2];
++    m.extension.tav_d = lanes[3];
+     materials.add(m)
+ }
+ 
++/// Patch 0037: the debug view (`<tav dir>/tavdebug`, 0 to 10; [`TavDebug`]) set on every material she wears, when
++/// the file changes (looked at every 60 frames).
++fn tav_debug_view(mut d: ResMut<TavDraw>, mut materials: ResMut<Assets<WowModelMaterial>>) {
++    if d.frame % 60 != 45 {
++        return;
++    }
++    let path = d.dir.join("tavdebug");
++    let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
++    if stamp == d.debug.stamp {
++        return;
++    }
++    d.debug.stamp = stamp;
++    let view = std::fs::read_to_string(&path).ok().and_then(|t| t.trim().parse::<u32>().ok()).unwrap_or(0).min(10);
++    if view == d.debug.view {
++        return;
++    }
++    d.debug.view = view;
++    let mut n = 0;
++    for h in d.surface_mats.values() {
++        if let Some(m) = materials.get_mut(h) {
++            // WoW's law (`tav_a.x` < 0) reads only whether a view is on (no highlight).
++            m.extension.tav_a.z = view as f32;
++            n += 1;
++        }
++    }
++    info!("wowbg3 tav: debug view {view} on {n} materials (tavdebug: 1 albedo, 2 normal, 3 rough/metal/occl, 4 specular, 5 diffuse, 6 extra, 7 lit, 8 WoW's law, 9 base colour, 10 constant; no highlight)");
++}
++
+ /// Puts the baked maps (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested where the
+ /// material cuts out (hair, fur, lace), hidden where WoW cannot draw it (tear lines, lash shadows,
+ /// BG3's VFX parts). Patch 0034: maps decode off the main thread ([`load_tvt`]); while any is pending
+@@ -1633,7 +1808,10 @@
+         return; // the baker has not caught up with this plan yet
+     }
+     let (mut applied, mut hidden, mut mapped, mut pending) = (0, 0, 0, 0);
+-    let TavDraw { dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, .. } =
++    let TavDraw {
++        dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, bg3_shade,
++        gamma_out, debug, ..
++    } =
+         &mut *d;
+     let dir: &Path = dir.as_path();
+     // A map's cache name: the file and its modification time.
+@@ -1662,8 +1840,21 @@
+         // Patch 0035: BG3 culls this material's back faces.
+         let one_sided = *sides && t.flags & TVT_ONE_SIDED != 0;
+         let (normal, surface) = (t.normal.clone().filter(|_| *maps), t.surface.clone().filter(|_| *maps));
+-        let key: LookKey =
+-            (version(&albedo), normal.as_deref().map(version), surface.as_deref().map(version), alpha_test, one_sided);
++        // Patch 0037: the extra and detail maps and BG3's lanes (with BG3's lighting only).
++        let bg3 = *maps && *bg3_shade && t.model.is_some();
++        let extra = t.extra.clone().filter(|_| bg3);
++        let detail = t.detail.clone().filter(|_| bg3);
++        let lane_text = if bg3 { format!("{:?} {:?} {:?}", t.model, t.profile, detail.as_ref().map(|d| d.1)) } else { String::new() };
++        let key: LookKey = (
++            version(&albedo),
++            normal.as_deref().map(version),
++            surface.as_deref().map(version),
++            alpha_test,
++            one_sided,
++            extra.as_deref().map(version),
++            detail.as_ref().map(|(f, _)| version(f)),
++            lane_text,
++        );
+         let material = match surface_mats.get(&key) {
+             Some(h) => h.clone(),
+             None => {
+@@ -1677,7 +1868,20 @@
+                     .as_deref()
+                     .zip(key.2.as_deref())
+                     .map(|(f, k)| load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, f, k, Role::Data, *cutoff));
+-                if matches!(a, Tex::Pending) || matches!(n, Some(Tex::Pending)) || matches!(s, Some(Tex::Pending)) {
++                let x = extra
++                    .as_deref()
++                    .zip(key.5.as_deref())
++                    .map(|(f, k)| load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, f, k, Role::Data, *cutoff));
++                let dt = detail
++                    .as_ref()
++                    .zip(key.6.as_deref())
++                    .map(|((f, _), k)| load_tvt(textures, tex_jobs, tex_failed, &mut images, dir, f, k, Role::Normal, *cutoff));
++                if matches!(a, Tex::Pending)
++                    || matches!(n, Some(Tex::Pending))
++                    || matches!(s, Some(Tex::Pending))
++                    || matches!(x, Some(Tex::Pending))
++                    || matches!(dt, Some(Tex::Pending))
++                {
+                     pending += 1;
+                     continue;
+                 }
+@@ -1690,8 +1894,20 @@
+                     Some(Tex::Ready(h)) => Some(h),
+                     _ => None,
+                 };
++                let x = match x {
++                    Some(Tex::Ready(h)) => Some(h),
++                    _ => None,
++                };
++                let dt = match dt {
++                    Some(Tex::Ready(h)) => Some(h),
++                    _ => None,
++                };
++                let mut lanes = tav_lanes(&t, bg3, debug.view, (n.is_some(), dt.is_some(), x.is_some(), s.is_some()));
++                if *gamma_out {
++                    lanes[0].w += 16.0; // `wow_model.wgsl`: flag 16, sRGB-encoded output
++                }
+                 let h = if *maps {
+-                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided)
++                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided, x, dt, lanes)
+                 } else {
+                     model_material(
+                         cache,
+@@ -2681,6 +2897,22 @@
+         let l = parse_tex_line("42 /c/d.tvt 0").expect("parses");
+         assert_eq!((l.normal, l.surface), (None, None));
+         assert!(parse_tex_line("zz /c/d.tvt 0").is_none());
++        // Patch 0037's tokens, beside 0036's cut (in any order after the columns).
++        let l = parse_tex_line(
++            "43 /c/e.tvt 16 /c/e-n.tvt /c/e-s.tvt cut:3,4 model:3 extra:/c/e-x.tvt detail:/c/d-d.tvt,40 \
++             profile:0.75,1.3,0.85,28,1,0.208,0.076,0,60,1,0.673,0.673",
++        )
++        .expect("parses");
++        assert_eq!((l.model, l.extra.as_deref()), (Some(3.0), Some("/c/e-x.tvt")));
++        assert_eq!(l.detail, Some(("/c/d-d.tvt".to_string(), 40.0)));
++        assert_eq!(l.profile.map(|p| (p[3], p[8])), Some((28.0, 60.0)));
++        let lanes = tav_lanes(&l, true, 2, (true, true, true, true));
++        assert_eq!(lanes[0], Vec4::new(3.0, 40.0, 2.0, 15.0));
++        assert_eq!((lanes[2].w, lanes[3].w), (0.0, 60.0));
++        // Without `model:` (an older bake) or with WOW_BG3_TAV_SHADE=wow: patch 0006's law.
++        assert_eq!(tav_lanes(&parse_tex_line("42 /c/d.tvt 0").unwrap(), true, 0, (false, false, false, false))[0].x, -1.0);
++        assert_eq!(tav_lanes(&l, false, 0, (true, true, true, true))[0].x, -1.0);
++        assert_eq!(parse_tex_line("44 /c/f.tvt 0 - - model:0").unwrap().normal, None);
+         // A linear 2x1 map.
+         let mut b = b"TVT1".to_vec();
+         for v in [2u32, 1, TVT_LINEAR] {
+@@ -2693,6 +2925,30 @@
+     }
+ 
+     #[test]
++    fn uses_the_bakes_own_mips() {
++        // A 4x2 albedo with flag 8 and its 2x1 and 1x1 levels: those levels are uploaded, not box averages.
++        let mut b = b"TVT1".to_vec();
++        for v in [4u32, 2, TVT_MIPS] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&[200u8; 4 * 2 * 4]);
++        b.extend_from_slice(&[10u8; 2 * 4]);
++        b.extend_from_slice(&[20u8; 4]);
++        let own = decode_tvt_mips(&b);
++        assert_eq!(own.len(), 2);
++        assert_eq!(mip_count(4, 2), 3);
++        let (w, h, _, px) = decode_tvt(&b).unwrap();
++        let img = tvt_image(w, h, px, Role::Albedo, 0.5, &own);
++        assert_eq!(img.texture_descriptor.mip_level_count, 3);
++        let data = img.data.as_ref().unwrap();
++        assert_eq!((data[32], data[40]), (10, 20));
++        // Normal maps keep their own renormalised mips; a short chain is ignored.
++        assert!(decode_tvt_mips(&b[..b.len() - 1]).is_empty());
++        let img = tvt_image(w, h, px, Role::Normal, 0.5, &own);
++        assert_ne!(img.data.as_ref().unwrap()[32], 10);
++    }
++
++    #[test]
+     fn renormalises_normal_mips() {
+         // Two texels tilted ±45° about Y average to straight up, at full length.
+         let enc = |v: Vec3| [((v.x * 0.5 + 0.5) * 255.0).round() as u8, ((v.y * 0.5 + 0.5) * 255.0).round() as u8, ((v.z * 0.5 + 0.5) * 255.0).round() as u8, 255];
+@@ -2882,13 +3138,13 @@
+         assert_eq!(coverage(&mip, 0.878), 0.0, "thinned by the box filter");
+         keep_coverage(&mut mip, 0.5, 0.878);
+         assert!(coverage(&mip, 0.878) >= 0.5, "coverage restored");
+-        let img = tvt_image(4, 4, &px, Role::Cutout, 0.878);
++        let img = tvt_image(4, 4, &px, Role::Cutout, 0.878, &[]);
+         let data = img.data.as_ref().expect("pixels");
+         assert_eq!(img.texture_descriptor.mip_level_count, 3);
+         assert!(coverage(&data[64..80], 0.878) >= 0.5, "the stored mip too");
+         // An opaque cut-out stays opaque in every mip: coverage is only ever restored, never cut.
+         let solid: Vec<u8> = (0..16).flat_map(|_| [10, 20, 30, 255]).collect();
+-        let img = tvt_image(4, 4, &solid, Role::Cutout, 0.5);
++        let img = tvt_image(4, 4, &solid, Role::Cutout, 0.5, &[]);
+         assert!(img.data.as_ref().unwrap().chunks_exact(4).all(|t| t[3] == 255));
+         assert_eq!((alpha_key(0.5), alpha_key(0.8784314)), (128, 224), "the GPU's own test");
+     }
+--- a/crates/benilla-assets/src/materials.rs
++++ b/crates/benilla-assets/src/materials.rs
+@@ -37,6 +37,8 @@
+ /// `clutter_fade.z` marker bit 14 (WOW-BG3 local fork, patch 0006): a surface of BG3's character
+ /// (`wowbg3_tav`), which `wow_model.wgsl` lights with the base material's normal, occlusion and
+ /// metallic-roughness maps (`WOW_TAV_SURFACE`) under the same WoW light; a `WowModelKey` axis.
++/// Since patch 0037 it shades BG3's G-buffer values the way BG3's lighting does (the `tav_*`
++/// lanes below say how), with WoW's sun, ambient and fog as the light.
+ pub const TAV_SURFACE_MARKER: u32 = 1 << 14;
+ 
+ /// `StandardMaterial` plus the per-tile layer-blend extension.
+@@ -123,6 +125,22 @@
+     /// tint, `z` = the texture-transform affine, `w` = the UI tile's cell clip.
+     #[uniform(100)]
+     pub anim_slots: Vec4,
++    /// WOW-BG3 (local fork, patch 0037): a BG3 figure's material ([`TAV_SURFACE_MARKER`]; zero on
++    /// every WoW material). `x` = BG3's shading model (0 standard, 3 skin, 5 hair; −1 the WoW law
++    /// of patch 0006), `y` = the detail normal map's tiling (0 none), `z` = the debug view, `w` =
++    /// flags (1 normal map, 2 detail normal, 4 extra map, 8 surface map, 16 sRGB-encoded output).
++    #[uniform(100)]
++    pub tav_a: Vec4,
++    /// A skin's diffusion profile: `x`, `y` = the two specular lobes' roughness scales, `z` = their
++    /// mix, `w` = the scatter distance.
++    #[uniform(100)]
++    pub tav_b: Vec4,
++    /// A skin's diffusion profile: `xyz` = the scatter colour, `w` = the thickness remap's bottom.
++    #[uniform(100)]
++    pub tav_c: Vec4,
++    /// A skin's diffusion profile: `xyz` = the transmission tint, `w` = the thickness remap's top.
++    #[uniform(100)]
++    pub tav_d: Vec4,
+     /// The shared global light (`lighting::global_light`), updated in place once a frame; the
+     /// vertex stage reads its point-light table, since Bevy's clusterable lights are fragment-only.
+     #[storage(90, read_only, buffer, visibility(vertex, fragment))]
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -11,6 +11,11 @@
+ // WOW-BG3 (local fork, patch 0006): `WOW_TAV_SURFACE` (`clutter_fade.z` bit 14) lights BG3's
+ // character (wowbg3_tav) with her own surface maps under the same WoW light: the normal-mapped
+ // normal, occlusion on the ambient term and a restrained GGX highlight of the sun.
++// Patch 0037: BG3's G-buffer values (base colour, normal, roughness, specular, metalness, occlusion,
++// skin and hair data, baked by tavtex.py with BG3's own material shaders) are shaded the way BG3's
++// lighting shades them (`Shaders/Vulkan/ClusteredLighting/*.bshd`: Frostbite's GGX, the dual-lobe
++// skin, UE4's hair), in linear light, with WoW's sun, ambient, point lights and fog as the light
++// (`tav_bg3`); `tav_a.x < 0` keeps patch 0006's law.
+ 
+ #import bevy_pbr::{
+     pbr_fragment::pbr_input_from_standard_material,
+@@ -47,6 +52,16 @@
+     // Rows of `wow_light.matanim`, 0 = identity: x = UV scroll, y = tint, z = texture-transform
+     // affine, w = the UI tile's cell clip.
+     anim_slots: vec4<f32>,
++    // WOW-BG3 (local fork, patch 0037), BG3's figures only (zero elsewhere; `WowModelExt::tav_*`):
++    // tav_a: x = BG3's shading model (0 standard, 3 skin, 5 hair; < 0 the WoW law of patch 0006),
++    //   y = the detail normal map's tiling, z = the debug view, w = flags (1 normal map, 2 detail
++    //   normal map, 4 extra map, 8 surface map, 16 sRGB-encoded output); tav_b: a skin's two specular lobes' roughness scales, their mix,
++    //   the scatter distance; tav_c: the scatter colour, the thickness remap's bottom; tav_d: the
++    //   transmission tint, the thickness remap's top.
++    tav_a: vec4<f32>,
++    tav_b: vec4<f32>,
++    tav_c: vec4<f32>,
++    tav_d: vec4<f32>,
+ };
+ @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
+ 
+@@ -525,6 +540,303 @@
+     let F = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - vh, 5.0);
+     return D * vis * F * nl;
+ }
++
++// ---- Patch 0037: BG3's lighting of its G-buffer, with WoW's light ------------------------------
++// Units, as patch 0006's law draws her (measured, `tavdebug` 9 and 10): her albedo is sampled
++// linear (sRGB texture) and what this pass writes reaches the frame sRGB-encoded (plus FFXGlow's
++// add), so the output is linear radiance. WoW's `lit` for a normal n is the irradiance as an albedo
++// multiplier (BG3's `irradiance / π`): a plain diffuse surface shows exactly patch 0006's
++// `albedo × lit`; the sun's part is `lit(n) − ambient`, and BG3's BRDFs take the sun's radiance as
++// π × that at n = L.
++const TAV_PI: f32 = 3.14159265;
++
++// What a figure's fragment needs from its maps, fetched where derivatives are defined.
++struct TavFetch {
++    // The shading normal (normal map and detail, flipped toward the viewer on back faces), the
++    // geometric normal (flipped alike) and BG3's hair direction (world).
++    n: vec3<f32>,
++    ng: vec3<f32>,
++    hair_t: vec3<f32>,
++    // Roughness after BG3's specular antialiasing, specular level, metalness (a hair's backlit),
++    // occlusion; the extra map (a skin's profile data, a hair's scatter in .w).
++    rough: f32,
++    spec: f32,
++    metal: f32,
++    ao: f32,
++    extra: vec4<f32>,
++};
++
++// sRGB to linear: a debug view's value, which the frame's encode then shows as it is.
++fn tav_lin(c: vec3<f32>) -> vec3<f32> {
++    let x = max(c, vec3<f32>(0.0));
++    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
++}
++
++// Linear to sRGB (flag 16, `WOW_BG3_TAV_OUT=gamma`).
++fn tav_srgb(c: vec3<f32>) -> vec3<f32> {
++    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
++    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));
++}
++
++// WoW's light on an entity M2 for the normal n (the fragment's `lit_exterior`, the multiplier patch
++// 0006 puts on her albedo): the `Model2.bls` lobe at the entity's intensity when the sun is on,
++// else the FFP N·L.
++fn tav_wow_lit(n: vec3<f32>, L: vec3<f32>, intensity: f32, doodad: bool) -> vec3<f32> {
++    if (!doodad) {
++        return clamp(wow_light.light_ambient.rgb + wow_light.light_diffuse.rgb * max(dot(n, L), 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
++    }
++    let quad = vec4<f32>(n.x * n.y, n.y * n.z, n.z * n.z, n.x * n.z);
++    let x2y2 = n.x * n.x - n.y * n.y;
++    let sun_dc = wow_light.grade.yzw * intensity;
++    let lobe = vec3<f32>(
++        wow_light.sh_c10_r.w + sun_dc.x
++            + intensity * (dot(wow_light.sh_c10_r.xyz, n) + dot(wow_light.sh_c13_r, quad) + wow_light.sh_c16.x * x2y2),
++        wow_light.sh_c10_g.w + sun_dc.y
++            + intensity * (dot(wow_light.sh_c10_g.xyz, n) + dot(wow_light.sh_c13_g, quad) + wow_light.sh_c16.y * x2y2),
++        wow_light.sh_c10_b.w + sun_dc.z
++            + intensity * (dot(wow_light.sh_c10_b.xyz, n) + dot(wow_light.sh_c13_b, quad) + wow_light.sh_c16.z * x2y2),
++    );
++    return clamp(lobe, vec3<f32>(0.0), vec3<f32>(1.0));
++}
++
++// WoW's ambient alone (the lobe's DC without the sun's bands, or the FFP ambient).
++fn tav_wow_ambient(doodad: bool) -> vec3<f32> {
++    return clamp(
++        select(
++            wow_light.light_ambient.rgb,
++            vec3<f32>(wow_light.sh_c10_r.w, wow_light.sh_c10_g.w, wow_light.sh_c10_b.w),
++            doodad,
++        ),
++        vec3<f32>(0.0),
++        vec3<f32>(1.0),
++    );
++}
++
++// The light BG3's specular sees from the sun: its direction moved onto the sun's disc (0.0046 rad)
++// toward BG3's reflection vector, exactly as `ClusteredLighting` does (`reflect(V, N)`).
++fn tav_sun_disc(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>) -> vec3<f32> {
++    let R = reflect(V, N);
++    let d = dot(L, R);
++    let s = R - L * d;
++    let disc = normalize(L * 0.99998945 + s * inverseSqrt(max(dot(s, s), 1e-12)) * 0.0045900648);
++    return select(R, disc, d < 0.99998945);
++}
++
++// BG3's GGX of the sun (Frostbite's), times N·L: Schlick's Fresnel, the height-correlated Smith
++// visibility with alpha ((r + 1) / 2)², and the distribution with alpha² `a2_a`, or two lobes
++// mixed (`ClusteredLighting` model 3, the skin's dual specular).
++fn tav_spec_sun(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, r: f32, f0: vec3<f32>, a2_a: f32, a2_b: f32, lobe_mix: f32) -> vec3<f32> {
++    let Ld = tav_sun_disc(N, V, L);
++    let H = normalize(V + Ld);
++    let noh = clamp(dot(N, H), 0.0, 1.0);
++    let nold = clamp(dot(N, Ld), 0.0, 1.0);
++    let nov = max(dot(N, V), 1e-5);
++    let ldoh = clamp(dot(Ld, H), 0.0, 1.0);
++    let k = (r + 1.0) * 0.5;
++    let k2 = k * k;
++    let vis = 0.5 / (nold * sqrt(nov * nov * (1.0 - k2) + k2) + nov * sqrt(nold * nold * (1.0 - k2) + k2));
++    let F = f0 + (vec3<f32>(1.0) - f0) * pow(max(1.0 - ldoh, 1e-4), 5.0);
++    let da = noh * noh * (a2_a - 1.0) + 1.0;
++    let db = noh * noh * (a2_b - 1.0) + 1.0;
++    let D = mix(a2_a / (TAV_PI * da * da), a2_b / (TAV_PI * db * db), lobe_mix);
++    return F * (vis * D * clamp(dot(N, L), 0.0, 1.0));
++}
++
++// The split-sum environment BRDF (Karis' analytic fit of the lookup table BG3 samples).
++fn tav_env_brdf(f0: vec3<f32>, r: f32, nov: f32) -> vec3<f32> {
++    let rr = r * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
++    let a004 = min(rr.x * rr.x, exp2(-9.28 * nov)) * rr.x + rr.y;
++    let ab = vec2<f32>(-1.04, 1.04) * a004 + rr.zw;
++    return f0 * ab.x + ab.y;
++}
++
++fn tav_fresnel_hair(x: f32) -> f32 {
++    return 0.95347941 * pow(max(abs(x), 1e-4), 5.0) + 0.046520568;
++}
++
++// BG3's hair (`ClusteredLighting` model 5, UE4's Marschner hair): R, TT and TRT lobes of the sun
++// along the strand T, without N·L; `backlit` scales TT and the back-lit R (G-buffer metalness).
++fn tav_hair_spec(T: vec3<f32>, V: vec3<f32>, L: vec3<f32>, albedo: vec3<f32>, r: f32, backlit: f32) -> vec3<f32> {
++    let sl = clamp(dot(T, L), -1.0, 1.0);
++    let sv = clamp(dot(T, V), -1.0, 1.0);
++    // cos(½|asin(sv) − asin(sl)|) through the half-angle identity (no asin or cos per fragment).
++    let cos_d = sqrt(max(1.0 - sv * sv, 0.0)) * sqrt(max(1.0 - sl * sl, 0.0)) + sv * sl;
++    let cos_td = max(sqrt(clamp(0.5 + 0.5 * cos_d, 0.0, 1.0)), 1e-3);
++    let lp = L - T * sl;
++    let vp = V - T * sv;
++    let cos_phi = dot(lp, vp) * inverseSqrt(dot(lp, lp) * dot(vp, vp) + 1e-4);
++    let cos_half_phi = sqrt(clamp(0.5 * cos_phi + 0.5, 0.0, 1.0));
++    let r2 = r * r;
++    let B = vec3<f32>(r2 * 1.4142135 * cos_half_phi, r2 * 0.5, r2 * 2.0);
++    let shift = -0.13988569 * (0.99755102 * cos_half_phi * sqrt(max(1.0 - sv * sv, 0.0)) - 0.069942847 * sv);
++    let x = max(abs(vec3<f32>(sl + sv) - vec3<f32>(shift, 0.035, 0.14)), vec3<f32>(1e-4));
++    let Mp = exp(-0.5 * x * x / (B * B)) / (B * 2.5066283);
++    let vol = dot(V, L);
++    let lobe_r = 0.25 * cos_half_phi * tav_fresnel_hair(1.0 - sqrt(clamp(0.5 * vol + 0.5, 0.0, 1.0)))
++        * mix(1.0, backlit, clamp(-vol, 0.0, 1.0)) * Mp.x;
++    let alb = max(abs(albedo), vec3<f32>(1e-4));
++    let a = 1.0 / (0.36 * cos_td + 1.19 / cos_td);
++    let h = cos_half_phi * (1.0 + a * (0.6 - 0.8 * cos_phi));
++    let f_tt = tav_fresnel_hair(1.0 - cos_td * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
++    let ha = max(abs(h * a), 1e-4);
++    let lobe_tt = pow(alb, vec3<f32>(0.5 * sqrt(max(1.0 - ha * ha, 0.0)) / cos_td))
++        * (exp(-3.65 * cos_phi - 3.98) * pow(max(abs(1.0 - f_tt), 1e-4), 2.0)) * backlit * Mp.y;
++    let f_trt = tav_fresnel_hair(1.0 - 0.5 * cos_td);
++    let lobe_trt = pow(alb, vec3<f32>(0.8 / cos_td))
++        * (exp(17.0 * cos_phi - 16.78) * pow(max(abs(1.0 - f_trt), 1e-4), 2.0) * f_trt) * Mp.z;
++    return vec3<f32>(lobe_r) + lobe_tt + lobe_trt;
++}
++
++// BG3's hair diffuse of the sun (UE4's): sqrt(albedo) / π, a wrapped N·L mixed with the
++// Kajiya-Kay term, times the scatter (G-buffer extra .w) and the colour toward full saturation in
++// shadow (`shadow` 1 = lit).
++fn tav_hair_diffuse(T: vec3<f32>, N: vec3<f32>, L: vec3<f32>, albedo: vec3<f32>, scatter: f32, shadow: f32) -> vec3<f32> {
++    let lum = max(dot(albedo, vec3<f32>(0.3, 0.59, 0.11)), 1e-4);
++    let tint = pow(max(abs(albedo / lum), vec3<f32>(1e-4)), vec3<f32>(1.0 - shadow * shadow));
++    let kk = mix(clamp((dot(N, L) + 1.0) * 0.25, 0.0, 1.0), 1.0 - abs(dot(T, L)), 0.33);
++    return sqrt(max(albedo, vec3<f32>(0.0))) * ((1.0 / TAV_PI) * kk * scatter) * tint;
++}
++
++// A figure's fragment fetch (before any non-uniform branch: every sample takes implicit
++// derivatives): base and detail normal, BG3's hair direction, BG3's specular antialiasing.
++fn tav_fetch(uv: vec2<f32>, world_normal: vec3<f32>, world_tangent: vec4<f32>, is_front: bool) -> TavFetch {
++    var f: TavFetch;
++    let flags = u32(max(m.tav_a.w, 0.0));
++    let surf = textureSample(pbr_bindings::metallic_roughness_texture, pbr_bindings::metallic_roughness_sampler, uv);
++    let nmap = textureSample(pbr_bindings::normal_map_texture, pbr_bindings::normal_map_sampler, uv);
++    let detail = textureSample(pbr_bindings::occlusion_texture, pbr_bindings::occlusion_sampler, uv * max(m.tav_a.y, 1.0));
++    f.extra = textureSample(pbr_bindings::emissive_texture, pbr_bindings::emissive_sampler, uv);
++    let side = select(-1.0, 1.0, is_front);
++    let ng0 = wow_normalize(world_normal);
++    let tw = world_tangent.xyz;
++    let bw = world_tangent.w * cross(world_normal, tw);
++    // The normal map: BG3's own shading normal in the mesh's (+U, +V, N) frame; its alpha the detail
++    // map's strength (BG3's skin: 0.5 (1 − max of its cancel mask's R and B), stored × 2).
++    var nt = vec3<f32>(0.0, 0.0, 1.0);
++    if ((flags & 1u) != 0u) {
++        nt = nmap.rgb * 2.0 - vec3<f32>(1.0);
++    }
++    if ((flags & 2u) != 0u) {
++        let d = normalize(detail.rgb * 2.0 - vec3<f32>(1.0));
++        nt = nt + vec3<f32>(d.xy, 0.0) * (nmap.a * 0.5);
++    }
++    f.n = wow_normalize(nt.x * tw + nt.y * bw + nt.z * world_normal) * side;
++    f.ng = ng0 * side;
++    // BG3's hair runs along its frame's Y axis (−V; Bevy's B is +V), tilted toward the normal by
++    // the hair map's shift: the extra map holds that direction in the (+U, +V, N) frame.
++    var ht = -bw;
++    if ((flags & 4u) != 0u && m.tav_a.x > 4.5) {
++        let e = f.extra.rgb * 2.0 - vec3<f32>(1.0);
++        ht = e.x * tw + e.y * bw + e.z * world_normal;
++    }
++    f.hair_t = wow_normalize(ht);
++    // BG3's specular antialiasing (`ClusteredLighting`): r' = sqrt(max(r, 0.09)² + min(the normal's
++    // screen variance, 0.18)).
++    let dn = dpdx(f.n);
++    let dm = dpdy(f.n);
++    let variance = dot(dn, dn) + dot(dm, dm);
++    // The surface map: R occlusion, G roughness, B metalness (a hair's backlit), A specular level;
++    // without one (flag 8 clear) a plain dielectric.
++    let has_surf = (flags & 8u) != 0u;
++    let r0 = max(select(0.6, surf.g, has_surf), 0.09);
++    f.rough = sqrt(clamp(r0 * r0 + min(variance, 0.18), 0.0, 1.0));
++    f.spec = select(0.5, surf.a, has_surf);
++    f.metal = select(0.0, surf.b, has_surf);
++    f.ao = select(1.0, surf.r, has_surf);
++    return f;
++}
++
++// BG3's lighting of one figure fragment under WoW's light; linear radiance (or a debug view).
++fn tav_bg3(
++    f: TavFetch,
++    albedo: vec3<f32>,
++    P: vec3<f32>,
++    L: vec3<f32>,
++    intensity: f32,
++    doodad: bool,
++    point_g: vec3<f32>,
++) -> vec3<f32> {
++    let model = m.tav_a.x;
++    let V = normalize(view.world_position.xyz - P);
++    let N = f.n;
++    let nov = max(dot(N, V), 1e-5);
++    let sun_on = select(0.0, 1.0, wow_light.light_sun.w > 0.5 || !doodad);
++    // WoW's light: ambient alone, the whole lit at N, the sun's peak (its part at N = L), the point
++    // lights. The environment BG3 reflects (its prefiltered probe, which holds no sun: the sun is the
++    // analytic lobe) is WoW's ambient.
++    let e_amb = tav_wow_ambient(doodad);
++    let sun = max(tav_wow_lit(L, L, intensity, doodad) - e_amb, vec3<f32>(0.0)) * sun_on;
++    let e_point = point_g;
++    var diffuse = vec3<f32>(0.0);
++    var specular = vec3<f32>(0.0);
++    if (model > 4.5) {
++        // Hair (model 5): BG3's ambient is its environment on both sides (0.3 at N, 0.7 at −N);
++        // WoW's ambient has no side, so it is the plain ambient (with occlusion).
++        let ht = f.hair_t;
++        diffuse = albedo * (e_amb * f.ao + e_point);
++        specular = e_amb * tav_env_brdf(vec3<f32>(0.16 * f.spec * f.spec), f.rough, nov) * f.ao;
++        if (sun_on > 0.5) {
++            diffuse += TAV_PI * sun * tav_hair_diffuse(ht, N, L, albedo, f.extra.a, intensity);
++            specular += TAV_PI * sun * tav_hair_spec(ht, V, L, albedo, f.rough, f.metal);
++        }
++    } else {
++        let metal = clamp(f.metal, 0.0, 1.0);
++        let diff_col = albedo * (1.0 - metal);
++        let f0 = mix(vec3<f32>(0.16 * f.spec * f.spec), albedo, metal);
++        var a2_a = pow(f.rough, 4.0);
++        var a2_b = a2_a;
++        var lobe_mix = 0.0;
++        let e_n = tav_wow_lit(N, L, intensity, doodad);
++        var e_diff = e_n;
++        if (model > 2.5) {
++            // Skin (model 3): the diffusion profile's two specular lobes (roughness scales of the raw
++            // roughness, at least 0.09, mixed toward the plain lobe by metalness as BG3 does), and
++            // the light diffused under the skin: BG3 blurs the lit skin on screen per colour by the
++            // profile; here each colour sees the normal map that much flattened toward the mesh's
++            // normal (the red farthest), the profile's scatter colour × distance deciding how much.
++            let r_raw = max(f.rough, 0.09);
++            let ra = max(clamp(m.tav_b.x * r_raw, 0.0, 1.0), 0.09);
++            let rb = max(clamp(m.tav_b.y * r_raw, 0.0, 1.0), 0.09);
++            let rr = f.rough * f.rough;
++            a2_a = pow(mix(ra * ra, rr, metal), 2.0);
++            a2_b = pow(mix(rb * rb, rr, metal), 2.0);
++            lobe_mix = m.tav_b.z;
++            // (The light at the mesh's normal mixed in per colour: WoW's lobe is smooth in the normal.)
++            let w = clamp(m.tav_c.xyz * (min(m.tav_b.w, 30.0) / 30.0) * 0.75, vec3<f32>(0.0), vec3<f32>(0.85));
++            e_diff = mix(e_n, tav_wow_lit(f.ng, L, intensity, doodad), w);
++        }
++        diffuse = diff_col * (max(e_diff - (1.0 - f.ao) * e_amb, vec3<f32>(0.0)) + e_point);
++        if (model > 2.5 && f.extra.a > 0.0) {
++            // BG3's thin-object transmission (the profile's, where the skin's extra map marks it:
++            // ears, fingers): the sun from behind through the thickness the map's B remaps, scaled
++            // by its G, tinted by the profile.
++            let thick = m.tav_c.w + (m.tav_d.w - m.tav_c.w) * f.extra.b;
++            let s = max(m.tav_c.xyz * 0.096609399 * (m.tav_b.w * f.extra.g), vec3<f32>(1e-4));
++            let t = exp2(-0.48089835 * thick / s);
++            let back = clamp((0.25881907 - dot(N, L)) * 0.63106394, 0.0, 1.0);
++            diffuse = diffuse + diff_col * m.tav_d.xyz * (t * (t * t + vec3<f32>(3.0))) * sun * (back * intensity);
++        }
++        specular = TAV_PI * sun * tav_spec_sun(N, V, L, f.rough, f0, a2_a, a2_b, lobe_mix)
++            + e_amb * tav_env_brdf(f0, f.rough, nov) * f.ao;
++    }
++    let dbg = u32(max(m.tav_a.z, 0.0));
++    if (dbg == 1u) {
++        return albedo;
++    } else if (dbg == 2u) {
++        let nv = (view.view_from_world * vec4<f32>(N, 0.0)).xyz;
++        return tav_lin(nv * 0.5 + vec3<f32>(0.5));
++    } else if (dbg == 3u) {
++        return tav_lin(vec3<f32>(f.rough, f.metal, f.ao));
++    } else if (dbg == 4u) {
++        return specular;
++    } else if (dbg == 5u) {
++        return diffuse;
++    } else if (dbg == 6u) {
++        return tav_lin(f.extra.rgb);
++    }
++    // 0, or 7: the lit figure (7 without WoW's highlight, in the fragment; 8 is WoW's law there).
++    return diffuse + specular;
++}
+ #endif
+ 
+ @fragment
+@@ -594,6 +906,20 @@
+ #endif
+     var pbr_input = pbr_input_from_standard_material(vo, is_front);
+     var base_color = pbr_input.material.base_color;
++#ifdef WOW_TAV_SURFACE
++    // Patch 0037: a figure's maps, fetched here where every sample still has its derivatives.
++#ifdef VERTEX_UVS_A
++    let tav_uv = vo.uv;
++#else
++    let tav_uv = vec2<f32>(0.0);
++#endif
++#ifdef VERTEX_TANGENTS
++    let tav_tangent = in.world_tangent;
++#else
++    let tav_tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
++#endif
++    let tav_f = tav_fetch(tav_uv, in.world_normal, tav_tangent, is_front);
++#endif
+     // WMO MOCV alpha is lighting data (the TRANS lerp, the INT glow mask), and the reference's WMO
+     // output alpha is tex.a alone. Bevy folds the vertex alpha into base_color, so re-sample the
+     // texel alpha: dividing the fold back out loses everything where MOCV.a ≈ 0.
+@@ -802,7 +1128,10 @@
+         vec3<f32>(wow_light.sh_c10_r.w, wow_light.sh_c10_g.w, wow_light.sh_c10_b.w),
+         use_doodad_shade,
+     );
+-    lit = max(lit - (1.0 - pbr_input.diffuse_occlusion.r) * tav_ambient, vec3<f32>(0.0));
++    // Patch 0037: BG3's figures carry their occlusion in the surface map's R (`tav_fetch`; Bevy's
++    // occlusion slot holds the detail normal map there).
++    let tav_occlusion = select(pbr_input.diffuse_occlusion.r, tav_f.ao, m.tav_a.x > -0.5);
++    lit = max(lit - (1.0 - tav_occlusion) * tav_ambient, vec3<f32>(0.0));
+ #endif
+     // Gamma-space albedo: lighting runs on the authored byte values. `m.tint` plus its mat-anim
+     // delta is the animated M2Color tint.
+@@ -827,7 +1156,14 @@
+     // (`0x614576`-`0x6145bd`), added to the batch colour inside the final clamp, lit or unlit
+     // (`c29`). Sampled live, where the reference holds the value sampled when the highlight
+     // began: a unit's tag has no slot to hold a colour, and the ambient moves slowly.
+-    let highlight = select(vec3<f32>(0.0), wow_light.light_ambient.rgb, highlighted);
++    var highlight = select(vec3<f32>(0.0), wow_light.light_ambient.rgb, highlighted);
++#ifdef WOW_TAV_SURFACE
++    // Patch 0037: every `tavdebug` view (1 to 8) leaves the highlight out (captures to set beside BG3's
++    // frame, which has none; the harness's pointer rests on the hero).
++    if (m.tav_a.z > 0.5) {
++        highlight = vec3<f32>(0.0);
++    }
++#endif
+     // The FFP combine: the light sum (lit, point lights, emission) clamps first and the texture
+     // modulates it, `tex × clamp(C·sum + emission)`, with C the GL_COLOR_MATERIAL colour (MOCV on
+     // WMO, the body tint on M2). The WMO branch divides Bevy's MOCV fold back out, guarded; a dim
+@@ -892,7 +1228,9 @@
+     // G and B through the base material): the sun colour at the entity's lit or shaded intensity,
+     // Fresnel from 4% (dielectric) to the albedo (metal), a metal's diffuse halved since nothing
+     // here reflects an environment. Its strength is the base material's `reflectance`.
+-    {
++    // Patch 0037: only with `tav_a.x < 0` (`WOW_BG3_TAV_SHADE=wow`) or `tavdebug` 8 (A/B); else BG3's
++    // lighting below.
++    if (m.tav_a.x < -0.5 || (m.tav_a.z > 7.5 && m.tav_a.z < 8.5)) {
+         let metal = clamp(pbr_input.material.metallic, 0.0, 1.0);
+         let rough = clamp(pbr_input.material.perceptual_roughness, 0.08, 1.0);
+         let V = normalize(view.world_position.xyz - in.world_position.xyz);
+@@ -901,6 +1239,26 @@
+         let spec = tav_ggx(n_lit, V, L, rough, f0) * wow_light.light_diffuse.rgb
+             * (intensity * sun_on * pbr_input.material.reflectance.x);
+         lit_rgb = lit_rgb * (1.0 - 0.5 * metal) + min(spec, vec3<f32>(1.0));
++    } else {
++        // BG3's lighting of the figure's G-buffer values with WoW's light (linear), back to the
++        // gamma WoW's frame holds; the target highlight as WoW adds it, to the light the texel
++        // modulates (`tex × clamp(sum + highlight)`), so on the gamma albedo. Fog follows below.
++        // Linear radiance like the law above writes (see the units under `tav_bg3`); the target
++        // highlight as WoW adds it, to the light the texel modulates. Fog follows below.
++        var tav_rgb = tav_bg3(tav_f, base.rgb, in.world_position.xyz, L, intensity, use_doodad_shade, point_diffuse)
++            + base.rgb * highlight;
++        if ((u32(max(m.tav_a.w, 0.0)) & 16u) != 0u) {
++            // `WOW_BG3_TAV_OUT=gamma`: the units of WoW's own gamma-space models instead.
++            tav_rgb = tav_srgb(tav_rgb);
++        }
++        lit_rgb = clamp(tav_rgb, vec3<f32>(0.0), vec3<f32>(1.0));
++        // `tavdebug` 9: the base colour as sampled; 10: a constant (0.25, 0.5, 0.75), the frame's own
++        // transfer (FFXGlow's combine) measured on her pixels.
++        if (m.tav_a.z > 9.5 && m.tav_a.z < 10.5) {
++            lit_rgb = vec3<f32>(0.25, 0.5, 0.75);
++        } else if (m.tav_a.z > 8.5 && m.tav_a.z < 9.5) {
++            lit_rgb = base.rgb;
++        }
+     }
+ #endif
+     var rgb = select(lit_rgb, unlit_rgb, is_emissive);
+--- a/crates/benilla-assets/src/world_assets/mod.rs
++++ b/crates/benilla-assets/src/world_assets/mod.rs
+@@ -559,6 +559,12 @@
+                 tint: Vec4::ONE, // clutter has no animated M2Color tint and is not a WMO batch
+                 sidn: Vec4::ZERO, // clutter is never SIDN/WINDOW glass (WMO-only)
+                 anim_slots: Vec4::ZERO,
++                // WOW-BG3 (local fork, patch 0037): BG3's figures' material lanes (`WOW_TAV_SURFACE`);
++                // zero (unused) on every WoW material.
++                tav_a: Vec4::ZERO,
++                tav_b: Vec4::ZERO,
++                tav_c: Vec4::ZERO,
++                tav_d: Vec4::ZERO,
+                 light_buf: self.shared_light.clone(),
+             },
+         });
+--- a/crates/benilla-world/src/model_render.rs
++++ b/crates/benilla-world/src/model_render.rs
+@@ -316,6 +316,12 @@
+                 },
+                 // Zero until a sampler registers this material and bakes its table slot in once.
+                 anim_slots: Vec4::ZERO,
++                // WOW-BG3 (local fork, patch 0037): BG3's figures' material lanes (`WOW_TAV_SURFACE`);
++                // zero (unused) on every WoW material.
++                tav_a: Vec4::ZERO,
++                tav_b: Vec4::ZERO,
++                tav_c: Vec4::ZERO,
++                tav_d: Vec4::ZERO,
+                 light_buf: light.clone(),
+             },
+         },
+@@ -435,6 +441,12 @@
+                 tint: Vec4::new(1.0, 1.0, 1.0, 0.0),
+                 sidn: Vec4::ZERO,
+                 anim_slots: Vec4::ZERO,
++                // WOW-BG3 (local fork, patch 0037): BG3's figures' material lanes (`WOW_TAV_SURFACE`);
++                // zero (unused) on every WoW material.
++                tav_a: Vec4::ZERO,
++                tav_b: Vec4::ZERO,
++                tav_c: Vec4::ZERO,
++                tav_d: Vec4::ZERO,
+                 light_buf: light.clone(),
+             },
+         },

@@ -1,0 +1,30 @@
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -66,6 +66,8 @@
+ const MIRROR_RANGE: f32 = 40.0;
+ /// Yards per second for a mob model along BG3's path.
+ const MOB_SPEED: f32 = 7.0;
++/// Mobs one pull takes (bridge and server take up to 50 per encounter).
++const MAX_PULL: usize = 50;
+ /// Seconds between two attacks played on one mob.
+ const STRIKE_GAP: f32 = 0.9;
+ /// Frames a mob from an ended fight is not pulled again by its aggro (without the server's hold the server keeps it
+@@ -714,7 +716,7 @@
+             .filter_map(|&g| {
+                 unit_of(g).map(|(_, s, tf)| unit_json(g, bevy_to_wow(tf.translation), s, &name_of(s)))
+             })
+-            .take(8)
++            .take(MAX_PULL)
+             .collect()
+     };
+     if !list.is_empty() {
+@@ -728,7 +730,7 @@
+         if let Err(e) = write_atomic(&f.dir.join("pull.json"), &body) {
+             say(&mut chat, format!("Cannot start a BG3 fight: {e}"));
+         } else {
+-            for &g in pull.iter().take(8) {
++            for &g in pull.iter().take(MAX_PULL) {
+                 if let Some((_, _, tf)) = unit_of(g) {
+                     f.hold(g, tf.translation);
+                     f.asked.insert(g);

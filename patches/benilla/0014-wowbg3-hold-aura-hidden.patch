@@ -1,0 +1,31 @@
+diff --git a/crates/benilla-app/src/creature_anim/spell_visual.rs b/crates/benilla-app/src/creature_anim/spell_visual.rs
+index bc2b91f6..780dc81a 100644
+--- a/crates/benilla-app/src/creature_anim/spell_visual.rs
++++ b/crates/benilla-app/src/creature_anim/spell_visual.rs
+@@ -959,6 +959,16 @@ pub(super) fn route_cast_visuals(
+     channel_cache.retain(|e, _| units.contains(*e));
+ }
+ 
++/// WOW-BG3 (`WOW_BG3_M5`): the server holds a BG3-run fight's mobs with the GM Freeze aura 9454
++/// (`SPELL_AURA_MOD_STUN`, see AI Context/m5-server-handoff.md), whose SpellVisual 87 is Sleep's:
++/// its state kit drew Zzz over every held mob. The hold is bookkeeping, not a
++/// WoW effect, so its state kit is never armed.
++fn wowbg3_hidden_state(spell_id: u32) -> bool {
++    const WOWBG3_HOLD_AURA: u32 = 9454;
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    spell_id == WOWBG3_HOLD_AURA && *ON.get_or_init(|| std::env::var_os("WOW_BG3_M5").is_some())
++}
++
+ /// The reference's aura watch span (`0x604d00`, registered at `0x604226`): from
+ /// `FIELD_UNIT_AURA`, 54 dwords, the 48 slot ids and the 6 packed flag words.
+ const AURA_WATCH_BASE: u16 = benilla_protocol::field::FIELD_UNIT_AURA;
+@@ -1034,6 +1044,9 @@ pub(crate) fn arm_aura_state_fx(
+                 next.push(spell_id); // still armed
+                 continue;
+             }
++            if wowbg3_hidden_state(spell_id) {
++                continue; // WOW-BG3: the server's fight hold, never shown
++            }
+             let Some(kit) = resolve_kit(spells, &visuals.0, spell_id, |s| s.state, || None) else {
+                 continue; // no state kit
+             };

@@ -1,0 +1,221 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 126e6c9..5a8ad71 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -88,6 +88,7 @@ namespace
+     size_t const AREA_MAX_SPOTS = 8;                        // positions per hold
+     size_t const AREA_MAX_MOBS = 400;                       // per hold
+     uint32 const AREA_MS       = 60 * MINUTE * IN_MILLISECONDS;   // a hold not renewed lets go
++    float const PACK_RANGE     = 15.0f;                     // 0015: yards a pack mate sees a held ally from
+ 
+     struct Mob
+     {
+@@ -1448,6 +1449,86 @@ namespace
+     // Held areas of players who left, to thaw at the next tick (logout may run while maps update).
+     std::vector<Release> g_thawLater;
+ 
++    // ---- 0015: pack aggro ----
++    // Goal: mobs of the same pack join a fight when they see an ally in it, not
++    // only when they see the party. WoW's own assistance runs when a mob starts its attack
++    // (Unit::Attack -> Creature::CallAssistance), which a mob held for a BG3 fight never does, so
++    // its pack stood by. Each tick (world thread, no map updates) every creature that WoW would let
++    // answer a call for help (Creature::CanAssistTo: same faction template, the faction's
++    // respond-to-call-for-help flag, alive, not in combat, not stunned, not evading, ...), within
++    // PACK_RANGE of a living mob of a running encounter and with that mob in its line of sight
++    // (MaNGOS::AnyAssistCreatureInRangeCheck), attacks the living party member nearest to it. Its
++    // combat start (OnCreatureEnterCombat) holds it at once as an add of the encounter
++    // (`WOWBG3 mob ENC GUID ... aggro`), which the client joins to the BG3 fight. Creatures friendly
++    // to that member never come (a provoked town NPC's neighbours, 0006), nor do held ones.
++    void PackAssist()
++    {
++        struct Want
++        {
++            ObjectGuid player;
++            std::string enc;
++            uint32 map;
++            uint32 instance;
++            std::vector<ObjectGuid> mobs;
++        };
++        std::vector<Want> wants;
++        {
++            ReadLock lock(g_lock);
++            for (auto const& kv : g_fighters)
++            {
++                Encounter const* e = kv.second.active.get();
++                if (!e || !e->Alive() || e->mobs.size() >= MAX_MOBS)
++                    continue;
++                Want w{ kv.first, e->id, e->map, e->instance, {} };
++                for (Mob const& m : e->mobs)
++                    if (!m.killed)
++                        w.mobs.push_back(m.guid);
++                wants.push_back(std::move(w));
++            }
++        }
++        for (Want const& w : wants)
++        {
++            Player* p = ObjectAccessor::FindPlayer(w.player);
++            if (!p || !p->IsInWorld() || p->GetMapId() != w.map || p->GetInstanceId() != w.instance)
++                continue;
++            std::vector<Player*> party;
++            LivingMembers(p, party);
++            if (party.empty())
++                continue;
++            for (ObjectGuid g : w.mobs)
++            {
++                Creature* held = FindMob(w.map, w.instance, g, p);
++                if (!held || !held->IsAlive() || !held->IsInWorld())
++                    continue;
++                Player* near = nullptr;                     // the member the held mob fights (nearest)
++                for (Player* m : party)
++                    if (!near || held->GetDistance(m) < held->GetDistance(near))
++                        near = m;
++                std::list<Creature*> found;
++                MaNGOS::AnyAssistCreatureInRangeCheck check(held, near, PACK_RANGE);
++                MaNGOS::CreatureListSearcher<MaNGOS::AnyAssistCreatureInRangeCheck> searcher(found, check);
++                Cell::VisitGridObjects(held, searcher, PACK_RANGE);
++                for (Creature* c : found)
++                {
++                    if (!c->AI() || c->IsInCombat() || IsHeld(c))
++                        continue;
++                    Player* victim = nullptr;
++                    for (Player* m : party)
++                        if (!victim || c->GetDistance(m) < c->GetDistance(victim))
++                            victim = m;
++                    if (!victim || c->IsFriendlyTo(victim) || !victim->IsTargetableBy(c))
++                        continue;
++                    sLog.Out(LOG_BASIC, LOG_LVL_DETAIL, "WOWBG3: %s pack: %s joins %s's fight %s (sees %s)",
++                        p->GetName(), Hex(c->GetObjectGuid()).c_str(), victim->GetName(), w.enc.c_str(),
++                        Hex(g).c_str());
++                    c->AI()->AttackStart(victim);
++                    if (IsHeld(c))
++                        Say(p, "WOWBG3 pack " + w.enc + " " + Hex(c->GetObjectGuid()) + " sees " + Hex(g));
++                }
++            }
++        }
++    }
++
+     // ---- 0010: BG3 death rules ----
+     std::mutex g_bodyLock;
+     std::unordered_set<uint64> g_keepBody;                  // died through `health ... 0`, until revived
+@@ -1807,6 +1888,8 @@ void Update(uint32 diff)
+         return;
+     g_tickTimer = 0;
+ 
++    PackAssist();                                           // 0015: packs join their held allies
++
+     // 0010: held areas of players who left, and areas not renewed for an hour.
+     {
+         std::vector<Release> thaw;
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+index 769a301..47287c1 100644
+--- a/src/game/WowBg3Party.cpp
++++ b/src/game/WowBg3Party.cpp
+@@ -37,6 +37,7 @@
+ #include "MapManager.h"
+ #include "MoveMap.h"
+ #include "MoveSpline.h"
++#include "MotionMaster.h"
+ #include "ObjectAccessor.h"
+ #include "ObjectMgr.h"
+ #include "Player.h"
+@@ -606,6 +607,45 @@ namespace
+         out.Add(Fmt("WOWBG3 move %s ok %u %.2f %.2f %.2f %s", a[2].c_str(), s.map, s.x, s.y, s.z, near ? "near" : "far"));
+     }
+ 
++    // 0015: walk NAME X Y Z MAP SECONDS. A party bot on that
++    // map within WALK_RANGE of the point runs there in a straight line (a server spline, no path
++    // finding) at the speed that takes SECONDS, facing its way, so it moves smoothly with its BG3
++    // member instead of jumping with `move` (a teleport): `WOWBG3 walk NAME ok MAP X Y Z SPEED`.
++    // Farther, another map or a busy bot: `refused far|map|...`, and the client falls back to `move`.
++    float const WALK_RANGE = 40.0f;
++
++    void Walk(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 walk " + a[2] + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        if (m == owner)
++            return out.Add(head + "refused self");
++        float x, y, z, secs;
++        uint32 map;
++        if (!ParseFloat(a[3], x) || !ParseFloat(a[4], y) || !ParseFloat(a[5], z) || !ParseUInt(a[6], map, 10000) ||
++            !ParseFloat(a[7], secs) || !(secs > 0.0f) || secs > 60.0f || !MapManager::IsValidMapCoord(map, x, y, z))
++            return out.Add(head + "refused badpos");
++        if (m->GetMapId() != map)
++            return out.Add(head + "refused map");
++        if (!m->IsAlive())
++            return out.Add(head + "refused dead");
++        if (m->IsTaxiFlying())
++            return out.Add(head + "refused taxi");
++        if (m->IsBeingTeleported())
++            return out.Add(head + "refused busy");
++        float const dx = x - m->GetPositionX(), dy = y - m->GetPositionY();
++        float const dist = std::sqrt(dx * dx + dy * dy + (z - m->GetPositionZ()) * (z - m->GetPositionZ()));
++        if (dist > WALK_RANGE)
++            return out.Add(Fmt("WOWBG3 walk %s refused far %.1f", a[2].c_str(), dist));
++        float const o = (dx * dx + dy * dy > 0.0025f) ? std::atan2(dy, dx) : m->GetOrientation();
++        float const speed = std::min(std::max(dist / secs, 0.5f), 50.0f);
++        m->MonsterMoveWithSpeed(x, y, z, o, speed, MOVE_RUN_MODE);
++        out.Add(Fmt("WOWBG3 walk %s ok %u %.2f %.2f %.2f %.2f", a[2].c_str(), map, x, y, z, speed));
++    }
++
+     // ---- Far Sight ----
+ 
+     std::mutex g_viewLock;
+@@ -1060,6 +1100,30 @@ Player* LivingMember(Player const* owner)
+     return nullptr;
+ }
+ 
++void LivingMembers(Player* owner, std::vector<Player*>& out)
++{
++    if (!owner || !owner->IsInWorld())
++        return;
++    if (owner->IsAlive())
++        out.push_back(owner);
++    if (!AnyBots())
++        return;
++    std::vector<ObjectGuid> mine;
++    {
++        ReadLock lock(g_botLock);
++        for (Bot const& b : g_bots)
++            if (b.owner == owner->GetObjectGuid() && b.state == BotState::Online)
++                mine.push_back(b.guid);
++    }
++    for (ObjectGuid g : mine)
++    {
++        Player* m = ObjectAccessor::FindPlayer(g);
++        if (m && m->IsInWorld() && m->IsAlive() && m->GetMapId() == owner->GetMapId() &&
++            m->GetInstanceId() == owner->GetInstanceId())
++            out.push_back(m);
++    }
++}
++
+ Player* FindMember(Player* owner, std::string const& name, char const*& why)
+ {
+     return Member(owner, name, why);
+@@ -1133,6 +1197,8 @@ bool ExecuteParty(Player* p, std::vector<std::string> const& a, std::vector<std:
+         BotList(p, out);
+     else if (verb == "move" && a.size() >= 6 && a.size() <= 8)
+         Move(p, a, out);
++    else if (verb == "walk" && a.size() == 8)
++        Walk(p, a, out);
+     else if (verb == "view" && a.size() == 3)
+         View(p, a[2], out);
+     else if (verb == "near" && (a.size() == 3 || a.size() == 4))
+diff --git a/src/game/WowBg3Party.h b/src/game/WowBg3Party.h
+index b57ff9a..bffdf11 100644
+--- a/src/game/WowBg3Party.h
++++ b/src/game/WowBg3Party.h
+@@ -66,6 +66,10 @@ namespace WowBg3
+     // A living online bot of `owner` on the owner's map and instance (any thread), else nullptr.
+     Player* LivingMember(Player const* owner);
+ 
++    // 0015: the owner (when alive) and its living online bots on the owner's map and instance
++    // (world thread).
++    void LivingMembers(Player* owner, std::vector<Player*>& out);
++
+     // True when `p` or one of its online bots is within `range` of `target` (same map).
+     bool NearParty(Player* p, WorldObject const* target, float range);
+ 

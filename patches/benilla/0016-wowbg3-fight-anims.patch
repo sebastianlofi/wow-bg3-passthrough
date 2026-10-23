@@ -1,0 +1,147 @@
+diff --git a/crates/benilla-app/src/creature_anim/driver.rs b/crates/benilla-app/src/creature_anim/driver.rs
+index 80bf98bd..097a90b5 100644
+--- a/crates/benilla-app/src/creature_anim/driver.rs
++++ b/crates/benilla-app/src/creature_anim/driver.rs
+@@ -493,6 +493,15 @@ pub(super) fn drive_animations(
+         // Nothing chosen yet: a corpse streamed in settles on its end pose.
+         let first = drv.gait.is_none() && drv.mode == Mode::Gait;
+         let mut mv = unify(movement, remote, spline, creature_swimming, move_modes);
++        // WOW-BG3: a held fight mob walks where BG3 moves its stand-in; the server holds it still.
++        if let Some(walk) = crate::wowbg3_fight::held_motion(entity) {
++            mv.flags &= !move_flags::ANY_MOVE;
++            mv.speed = 0.0;
++            if let Some(speed) = walk {
++                mv.flags |= move_flags::FORWARD;
++                mv.speed = speed;
++            }
++        }
+         // A unit without a controller poses from its `UNIT_FIELD_BYTES_1` stand-state byte; our own
+         // avatar's controller overlays its in-flight request.
+         if movement.is_none() {
+@@ -1161,6 +1170,26 @@ pub(super) fn drive_animations(
+         // The anim half of the `WOW_MOVE_TRACE` trace: one line whenever the traced unit's settled
+         // state changes, both slots included. `base=` is the resolved clip bone 0 holds (`?` for a
+         // node with no clip record); `+fade` marks a fade running.
++        // WOW-BG3: held fight mobs log their settled animation (mode, gait, clip, one-shot) on
++        // every change, so a harness run shows they walk, swing and flinch.
++        let wowbg3_held = crate::wowbg3_fight::held_motion(entity).is_some();
++        if wowbg3_held {
++            let base = tr
++                .get_main_animation()
++                .and_then(|n| anims.clips.iter().find(|c| c.node == n))
++                .map_or_else(|| "?".to_string(), |c| c.anim_id.to_string());
++            let state = format!(
++                "mode={:?} gait={:?} base={base} special={:?} upper={:?}",
++                drv.mode,
++                drv.gait,
++                special,
++                drv.overlay.map(|ov| ov.id),
++            );
++            if anim_trace_last.get(&entity) != Some(&state) {
++                info!("wowbg3 anim: {entity} {state}");
++                anim_trace_last.insert(entity, state);
++            }
++        }
+         if traced && benilla_assets::trace::enabled() {
+             let base = tr
+                 .get_main_animation()
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -201,6 +201,23 @@
+     /// (hit, damage) per BG3 attack, played once the model stands at the end of its path.
+     strikes: VecDeque<(bool, u32)>,
+     since: f32,
++    /// Hit points and max last seen (`actor` line); a drop is a wound the model flinches at.
++    hp: Option<(u32, u32)>,
++    wounds: VecDeque<u32>,
++    /// Seconds the walk animation keeps playing after the model last moved, and at what speed:
++    /// the live position comes in steps (about 3 a second), so the model reaches each one early.
++    walk_left: f32,
++    walk_speed: f32,
++}
++
++/// World mode (fight mobs slid without walking): each held model's motion this
++/// frame, `Some(speed)` while it walks (yd/s), `None` while it stands. The animation driver reads
++/// it in place of the server's movement (the server holds the mob still).
++static WALKERS: LazyLock<Mutex<HashMap<Entity, Option<f32>>>> = LazyLock::new(Default::default);
++
++/// A held fight mob's motion ([`WALKERS`]): None when the entity is not held.
++pub(crate) fn held_motion(entity: Entity) -> Option<Option<f32>> {
++    WALKERS.lock().ok()?.get(&entity).copied()
+ }
+ 
+ #[derive(Resource)]
+@@ -851,9 +868,18 @@
+             h.id = id.clone();
+         }
+     }
+-    for (id, _, _, pos) in &t.actors {
++    for (id, hp, max_hp, pos) in &t.actors {
+         if let Some(h) = by_id.get(id).and_then(|g| f.held.get_mut(g)) {
+             h.goal = Some(wow_to_bevy(*pos));
++            // Hurt in BG3 (Tav's attacks reach WoW only as HP): the model flinches. A kill is the
++            // server's death animation instead.
++            // Same scale only: an actor's numbers switch from WoW's to BG3's once BG3 reports them.
++            if let Some((prev, prev_max)) = h.hp {
++                if prev_max == *max_hp && *hp < prev && *hp > 0 {
++                    h.wounds.push_back(prev - hp);
++                }
++            }
++            h.hp = Some((*hp, *max_hp));
+         }
+     }
+     // Paths and attacks in the bridge's order: (seq, is a strike, index).
+@@ -1017,8 +1043,14 @@
+     mut trace_t: Local<f32>,
+ ) {
+     if f.held.is_empty() {
++        if let Ok(mut w) = WALKERS.lock() {
++            if !w.is_empty() {
++                w.clear();
++            }
++        }
+         return;
+     }
++    let mut walkers: HashMap<Entity, Option<f32>> = HashMap::new();
+     let dt = time.delta_secs();
+     let victim = me.single().ok();
+     // Desktop test 2 (models lag or never move): every 2 s one line per held mob.
+@@ -1073,6 +1105,27 @@
+         }
+         h.at = Some(moved);
+         let walking = !h.track.is_empty() || h.goal.is_some_and(|g| g.distance(moved) > 0.05);
++        let speed = if dt > 0.0 { moved.distance(at) / dt } else { 0.0 };
++        if walking && speed > 0.2 {
++            h.walk_left = 0.45;
++            h.walk_speed = speed;
++        } else {
++            h.walk_left = (h.walk_left - dt).max(0.0);
++        }
++        walkers.insert(entity, (h.walk_left > 0.0).then_some(h.walk_speed));
++        if let (Some(me), Some(damage)) = (victim, h.wounds.pop_front()) {
++            // Tav's hit, shown as a hit on the WoW model: its flinch, blood and sounds.
++            info!("wowbg3 fight: {} (unit={entity}) flinches ({damage})", h.id);
++            swings.write(SwingMessage {
++                attacker: me,
++                victim: Some(entity),
++                hit_info: HIT_NORMAL,
++                victim_state: 1,
++                damage,
++                displayed: false,
++                seq: play_seq.next(),
++            });
++        }
+         if !walking && h.since >= STRIKE_GAP {
+             if let Some((hit, damage)) = h.strikes.pop_front() {
+                 h.since = 0.0;
+@@ -1100,6 +1153,9 @@
+         }
+         tf.translation = moved;
+     }
++    if let Ok(mut w) = WALKERS.lock() {
++        *w = walkers;
++    }
+     if trace {
+         for (guid, h) in &f.held {
+             if !seen.contains(guid) {

@@ -1,0 +1,508 @@
+diff --git a/src/game/Objects/Object.cpp b/src/game/Objects/Object.cpp
+index 57d91fb..d169443 100644
+--- a/src/game/Objects/Object.cpp
++++ b/src/game/Objects/Object.cpp
+@@ -55,6 +55,7 @@
+ #include "MovementBroadcaster.h"
+ #include "PlayerBroadcaster.h"
+ #include "Utilities/Random.h"
++#include "WowBg3Fights.h"
+ 
+ ////////////////////////////////////////////////////////////
+ // Methods of class MovementInfo
+@@ -821,6 +822,8 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
+                     uint32 faction = m_uint32Values[index];
+                     if (forceFriendly)
+                         faction = target->GetFactionTemplateId();
++                    // WOW-BG3: an NPC this player provoked in BG3 looks hostile to them only.
++                    faction = WowBg3::ShownFaction(this, target, faction);
+ 
+                     *data << uint32(faction);
+                 }
+@@ -3616,6 +3619,11 @@ ReputationRank WorldObject::GetReactionTo(WorldObject const* target) const
+         static_cast<Unit const*>(this)->GetCharmerOrOwnerOrOwnGuid() == static_cast<Unit const*>(target)->GetCharmerOrOwnerOrOwnGuid())
+         return REP_FRIENDLY;
+ 
++    // WOW-BG3: an NPC a player provoked in BG3 (attacked though friendly) and that player are
++    // enemies while the BG3 fight holds it.
++    if (WowBg3::IsProvokedPair(this, target))
++        return REP_HOSTILE;
++
+     Player const* selfPlayerOwner = GetAffectingPlayer();
+     Player const* targetPlayerOwner = target->GetAffectingPlayer();
+ 
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 620d71b..6d4c58b 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -46,12 +46,14 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace WowBg3
+@@ -68,6 +70,8 @@ namespace
+     uint32 const MAX_FIGHT_MS  = 30 * MINUTE * IN_MILLISECONDS;
+     uint32 const TICK_MS       = IN_MILLISECONDS;
+     size_t const CLOSED_KEPT   = 64;                        // finished encounter ids kept per player
++    size_t const MAX_PROVOKED  = 64;                        // provoked NPCs at once, every player together
++    uint32 const SHOWN_HOSTILE = 168;                       // FactionTemplate "Enemy": hostile to players only
+ 
+     struct Mob
+     {
+@@ -86,6 +90,7 @@ namespace
+         uint32 instance = 0;
+         uint32 started = 0;
+         uint32 last = 0;
++        bool provoked = false;                              // has an NPC the player provoked (begin/join `!GUID`)
+         std::vector<Mob> mobs;
+ 
+         Mob* Find(ObjectGuid guid)
+@@ -157,6 +162,14 @@ namespace
+     std::atomic<uint32> g_armedCount(0);
+     std::atomic<uint32> g_sightCount(0);
+     thread_local uint32 t_bridgeDamage = 0;                 // inside `.wowbg3 hp`
++
++    // Provoked NPCs (patch 0006): creature -> the player it turned on. The arrays are a lock-free copy
++    // (raw guids, 0 = free slot) for WorldObject::GetReactionTo, which runs everywhere and often.
++    std::unordered_map<ObjectGuid, ObjectGuid> g_provoked;
++    std::atomic<uint64> g_provCreature[MAX_PROVOKED];
++    std::atomic<uint64> g_provPlayer[MAX_PROVOKED];
++    std::atomic<uint32> g_provokedCount(0);
++    std::unordered_set<ObjectGuid> g_lifted;               // provoked NPCs whose immunity to players we lifted
+     uint32 g_tickTimer = 0;
+ 
+     typedef std::unique_lock<std::shared_timed_mutex> WriteLock;
+@@ -168,10 +181,94 @@ namespace
+         if (g_held.emplace(mob, player).second)
+             ++g_heldCount;
+     }
++    // Callers hold the write lock. False if another player provoked it or the table is full.
++    bool Provoke(ObjectGuid mob, ObjectGuid player)
++    {
++        auto it = g_provoked.find(mob);
++        if (it != g_provoked.end())
++            return it->second == player;
++        for (size_t i = 0; i < MAX_PROVOKED; ++i)
++        {
++            if (g_provCreature[i].load(std::memory_order_relaxed))
++                continue;
++            g_provPlayer[i].store(player.GetRawValue(), std::memory_order_relaxed);
++            g_provCreature[i].store(mob.GetRawValue(), std::memory_order_release);
++            g_provoked.emplace(mob, player);
++            ++g_provokedCount;
++            return true;
++        }
++        return false;
++    }
++    // Callers hold the write lock. Its client is told the real faction again by Thaw or RefreshFaction.
++    void Unprovoke(ObjectGuid mob)
++    {
++        if (!g_provoked.erase(mob))
++            return;
++        uint64 const raw = mob.GetRawValue();
++        for (size_t i = 0; i < MAX_PROVOKED; ++i)
++        {
++            if (g_provCreature[i].load(std::memory_order_relaxed) == raw)
++            {
++                g_provCreature[i].store(0, std::memory_order_release);
++                g_provPlayer[i].store(0, std::memory_order_relaxed);
++            }
++        }
++        --g_provokedCount;
++    }
++    // How many NPCs this player provoked (callers hold a lock).
++    size_t Provoked(ObjectGuid player)
++    {
++        size_t n = 0;
++        for (auto const& kv : g_provoked)
++            if (kv.second == player)
++                ++n;
++        return n;
++    }
++    // A mob no fight holds is nobody's provoked NPC any more (it dies, goes home or back to WoW).
+     void Unhold(ObjectGuid mob)
+     {
+         if (g_held.erase(mob))
+             --g_heldCount;
++        Unprovoke(mob);
++    }
++    // Lock-free: someone provoked this creature.
++    bool ProvokedAny(ObjectGuid mob)
++    {
++        if (!g_provokedCount.load(std::memory_order_relaxed))
++            return false;
++        uint64 const raw = mob.GetRawValue();
++        for (size_t i = 0; i < MAX_PROVOKED; ++i)
++            if (g_provCreature[i].load(std::memory_order_acquire) == raw)
++                return true;
++        return false;
++    }
++    // Provoked (lock released): WoW's town NPCs carry "immune to players" (static flag
++    // IMMUNE_TO_PC); like WoW's own scripted NPCs that turn on a player, it goes while it fights.
++    void LiftImmunity(Creature* c)
++    {
++        if (!c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER))
++            return;
++        c->RemoveFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER);
++        WriteLock lock(g_lock);
++        g_lifted.insert(c->GetObjectGuid());
++    }
++    // No longer provoked (or never; lock released): the faction field again, so each client near
++    // it hears what ShownFaction says now, and the immunity to players LiftImmunity took, back.
++    void RefreshFaction(Creature* c)
++    {
++        if (!c || !c->IsInWorld())
++            return;
++        c->ForceValuesUpdateAtIndex(UNIT_FIELD_FACTIONTEMPLATE);
++        ObjectGuid const guid = c->GetObjectGuid();
++        if (ProvokedAny(guid))
++            return;
++        bool lifted = false;
++        {
++            WriteLock lock(g_lock);
++            lifted = g_lifted.erase(guid) != 0;
++        }
++        if (lifted && !c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER))
++            c->SetFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER);
+     }
+     void SetArmed(Fighter& f, bool armed)
+     {
+@@ -291,6 +388,7 @@ namespace
+     // Let a mob go that is no longer held: back to its spawn (evade) or on with the WoW fight.
+     void Thaw(Creature* c, bool evade)
+     {
++        RefreshFaction(c);                                  // a provoked NPC is friendly again
+         if (!c || !c->IsAlive())
+             return;
+         c->RemoveAurasDueToSpell(FREEZE_SPELL);
+@@ -407,6 +505,7 @@ namespace
+                 }
+             }
+         }
++        RefreshFaction(c);
+         Say(c->GetMap()->GetPlayer(owner), "WOWBG3 release " + enc + " " + Hex(guid) + " immune");
+     }
+ 
+@@ -484,6 +583,10 @@ namespace
+     // begin <enc> <guids>: hold these mobs (all or none) as a new encounter.
+     // join <enc> <guids>: add more mobs to the running encounter.
+     // <guids> is a comma list of 16-digit hex guids and/or `pending` (every unclaimed aggro hold).
++    // `!GUID` (patch 0006): an NPC WoW's factions keep friendly (or neutral and unattackable) to
++    // the player, which the player attacked in BG3 (BG3's own flow made it temporarily hostile).
++    // It turns on this player, and only them, while this fight holds it (IsProvokedPair; their
++    // client is shown it hostile, ShownFaction); everything else about it stays WoW's.
+     void Claim(Player* p, std::string const& enc, std::string const& list, bool join, Out& out)
+     {
+         std::string const verb = join ? "join" : "begin";
+@@ -495,6 +598,7 @@ namespace
+         uint32 const map = p->GetMapId();
+         uint32 const instance = p->GetInstanceId();
+         std::vector<ObjectGuid> guids;
++        std::vector<ObjectGuid> provokes;                   // `!GUID` items
+         std::vector<ObjectGuid> resend;                     // begin retried after a lost reply
+         {
+             WriteLock lock(g_lock);
+@@ -525,9 +629,12 @@ namespace
+                         continue;
+                     }
+                     ObjectGuid g;
+-                    if (!ParseGuid(item, g))
++                    bool const provoke = item.size() > 1 && item[0] == '!';
++                    if (!ParseGuid(provoke ? item.substr(1) : item, g))
+                         return out.Add(head + "refused badguid " + item);
+                     guids.push_back(g);
++                    if (provoke)
++                        provokes.push_back(g);
+                 }
+                 // no duplicates
+                 std::vector<ObjectGuid> unique;
+@@ -578,12 +685,49 @@ namespace
+             return;
+         }
+ 
++        // Provoked NPCs first, so CheckMob sees them hostile. One WoW already lets the player
++        // attack needs nothing; one nobody may hit at all (not selectable, not attackable: spirit
++        // healers and the like) stays `friendly` there.
++        std::vector<Creature*> provokedNow;
++        auto unprovokeAll = [&provokedNow]()
++        {
++            {
++                WriteLock lock(g_lock);
++                for (Creature* c : provokedNow)
++                    Unprovoke(c->GetObjectGuid());
++            }
++            for (Creature* c : provokedNow)
++                RefreshFaction(c);
++        };
++        for (ObjectGuid g : provokes)
++        {
++            Creature* c = p->GetMap()->GetCreature(g);
++            if (!c || !c->IsInWorld() || !c->IsAlive() || c->IsPet() || c->IsTotem() ||
++                !c->GetCharmerOrOwnerGuid().IsEmpty() || p->IsValidAttackTarget(c))
++                continue;
++            bool ok = false;
++            {
++                WriteLock lock(g_lock);
++                ok = Provoke(g, pg);
++            }
++            if (!ok)
++            {
++                unprovokeAll();
++                return out.Add(head + "refused provoked " + Hex(g));
++            }
++            provokedNow.push_back(c);
++            LiftImmunity(c);
++        }
++
+         std::vector<Creature*> mobs;
+         for (ObjectGuid g : guids)
+         {
+             Creature* c = p->GetMap()->GetCreature(g);
+             if (char const* why = CheckMob(p, c, true))
++            {
++                unprovokeAll();
+                 return out.Add(head + "refused " + why + " " + Hex(g));
++            }
+             mobs.push_back(c);
+         }
+ 
+@@ -603,6 +747,8 @@ namespace
+                 f.active->started = now;
+             }
+             f.active->last = now;
++            if (!provokedNow.empty())
++                f.active->provoked = true;
+             for (ObjectGuid g : guids)
+             {
+                 if (f.FindPending(g))
+@@ -682,10 +828,18 @@ namespace
+             return out.Add(head + "refused immune " + Hex(failed->GetObjectGuid()));
+         }
+ 
++        // The provoker's client sees each provoked NPC hostile from now on (WoW's "Enemy").
++        for (Creature* c : provokedNow)
++            RefreshFaction(c);
++
+         for (Creature* c : mobs)
+         {
+             // Tap it for the player and make sure both are in combat (a pull the
+-            // client kept off the wire has not reached the server yet).
++            // client kept off the wire has not reached the server yet). For a
++            // provoked NPC this runs WoW's own reactions to a fight with it: its
++            // aggro text and scripts, a creature group that aggroes together
++            // (those turn on the player too and join as adds, OnCreatureEnterCombat),
++            // a civilian's call for guards (who only come for the other faction).
+             if (!c->HasLootRecipient())
+                 c->SetLootRecipient(p);
+             c->AddThreat(p);
+@@ -786,6 +940,7 @@ namespace
+                         m->killed = true;
+                 Unhold(g);
+             }
++            RefreshFaction(c);                              // a provoked NPC's corpse: its own faction again
+             return out.Add(head + "killed 0 " + std::to_string(maxHealth));
+         }
+         out.Add(head + "ok " + std::to_string(c->GetHealth()) + " " + std::to_string(maxHealth));
+@@ -1002,7 +1157,7 @@ namespace
+             uint32 total = f && f->active ? uint32(f->active->mobs.size()) : 0;
+             line = "WOWBG3 status " + enc + " " + std::to_string(alive) + " " + std::to_string(total - alive) + " " +
+                 std::to_string(f ? f->pending.size() : 0) + " armed " + (f && f->armed ? "1" : "0") +
+-                " sight " + (f && f->sight ? "1" : "0");
++                " sight " + (f && f->sight ? "1" : "0") + " provoked " + std::to_string(Provoked(p->GetObjectGuid()));
+             if (f)
+                 for (Mob const& m : f->pending)
+                     pending.push_back(m.guid);
+@@ -1056,6 +1211,39 @@ bool IsHeld(Unit const* unit)
+     return g_held.find(unit->GetObjectGuid()) != g_held.end();
+ }
+ 
++namespace
++{
++    // `creature` is provoked by `other`'s player (lock-free, see g_provCreature).
++    bool ProvokedBy(WorldObject const* creature, WorldObject const* other)
++    {
++        if (creature->GetTypeId() != TYPEID_UNIT)
++            return false;
++        Player const* player = other->GetAffectingPlayer();
++        if (!player)
++            return false;
++        uint64 const c = creature->GetObjectGuid().GetRawValue();
++        uint64 const pl = player->GetObjectGuid().GetRawValue();
++        for (size_t i = 0; i < MAX_PROVOKED; ++i)
++            if (g_provCreature[i].load(std::memory_order_acquire) == c)
++                return g_provPlayer[i].load(std::memory_order_relaxed) == pl;
++        return false;
++    }
++}
++
++bool IsProvokedPair(WorldObject const* self, WorldObject const* target)
++{
++    if (!g_provokedCount.load(std::memory_order_relaxed) || !self || !target)
++        return false;
++    return ProvokedBy(self, target) || ProvokedBy(target, self);
++}
++
++uint32 ShownFaction(Object const* object, Player const* target, uint32 faction)
++{
++    if (!g_provokedCount.load(std::memory_order_relaxed) || !object || !target || object->GetTypeId() != TYPEID_UNIT)
++        return faction;
++    return ProvokedBy(static_cast<WorldObject const*>(object), target) ? SHOWN_HOSTILE : faction;
++}
++
+ bool BlocksDamage(Unit const* victim)
+ {
+     return t_bridgeDamage == 0 && IsHeld(victim);
+@@ -1103,42 +1291,79 @@ void OnCreatureEnterCombat(Creature* creature, Unit* enemy)
+     Player* p = enemy->GetCharmerOrOwnerPlayerOrPlayerItself();
+     if (!p || !p->IsInWorld() || !p->IsAlive())
+         return;
+-    if (CheckMob(p, creature, false))
+-        return;
+-
+     ObjectGuid const guid = creature->GetObjectGuid();
+     ObjectGuid const pg = p->GetObjectGuid();
+-    uint32 const now = WorldTimer::getMSTime();
+-    WriteLock lock(g_lock);
+-    if (g_held.find(guid) != g_held.end())
+-        return;
+-    auto it = g_fighters.find(pg);
+-    if (it == g_fighters.end())
+-        return;
+-    Fighter& f = it->second;
+-
+-    Mob m;
+-    m.guid = guid;
+-    m.map = creature->GetMapId();
+-    m.instance = creature->GetInstanceId();
+-    m.since = now;
+-    if (f.active && f.active->Alive() && f.active->map == m.map && f.active->instance == m.instance)
++
++    // Patch 0006: a creature WoW keeps friendly to the player enters combat with them while
++    // they fight an NPC they provoked: WoW's own linked rules pulled it in (a creature group
++    // that aggroes together, a script). It turns on the player as well and joins as an add.
++    // Guards, call for help and assistance never do here: WoW lets them only attack someone
++    // they are not friendly to.
++    bool joiner = false;
++    if (char const* why = CheckMob(p, creature, false))
+     {
+-        // An add: it joins the running BG3 fight.
+-        if (f.active->Find(guid) || f.active->mobs.size() >= MAX_MOBS)
++        if (std::strcmp(why, "friendly") != 0 || !g_provokedCount.load(std::memory_order_relaxed) ||
++            !p->IsWithinDistInMap(creature, CLAIM_RANGE))
++            return;
++        {
++            WriteLock lock(g_lock);
++            auto f = g_fighters.find(pg);
++            Encounter const* e = f != g_fighters.end() ? f->second.active.get() : nullptr;
++            if (!e || !e->provoked || !e->Alive() || e->map != creature->GetMapId() ||
++                e->instance != creature->GetInstanceId() || g_held.count(guid) || !Provoke(guid, pg))
++                return;
++        }
++        joiner = true;
++        LiftImmunity(creature);
++        if (CheckMob(p, creature, false))
++        {
++            {
++                WriteLock lock(g_lock);
++                Unprovoke(guid);
++            }
++            RefreshFaction(creature);
+             return;
+-        f.active->mobs.push_back(m);
++        }
+     }
+-    else if (f.armed)
++
++    // Held as an add or a pending hold, or (a joiner that could not be) provoked no longer.
++    uint32 const now = WorldTimer::getMSTime();
++    bool held = false;
+     {
+-        if (f.FindPending(guid) || f.pending.size() >= MAX_MOBS)
+-            return;
+-        f.pending.push_back(m);
++        WriteLock lock(g_lock);
++        auto it = g_fighters.find(pg);
++        if (g_held.find(guid) == g_held.end() && it != g_fighters.end())
++        {
++            Fighter& f = it->second;
++            Mob m;
++            m.guid = guid;
++            m.map = creature->GetMapId();
++            m.instance = creature->GetInstanceId();
++            m.since = now;
++            if (f.active && f.active->Alive() && f.active->map == m.map && f.active->instance == m.instance)
++            {
++                // An add: it joins the running BG3 fight.
++                if (!f.active->Find(guid) && f.active->mobs.size() < MAX_MOBS)
++                {
++                    f.active->mobs.push_back(m);
++                    held = true;
++                }
++            }
++            else if (f.armed && !joiner && !f.FindPending(guid) && f.pending.size() < MAX_MOBS)
++            {
++                f.pending.push_back(m);
++                held = true;
++            }
++        }
++        if (held)
++            Hold(guid, pg);
++        else if (joiner)
++            Unprovoke(guid);
+     }
+-    else
++    if (joiner)
++        RefreshFaction(creature);                           // hostile to the player now, or not after all
++    if (!held)
+         return;
+-    Hold(guid, pg);
+-    lock.unlock();
+ 
+     // Stun now, inside the combat start, so the AI's aggro reaction (and any
+     // swing or cast later in this update) finds the mob already frozen.
+diff --git a/src/game/WowBg3Fights.h b/src/game/WowBg3Fights.h
+index 8f875d8..9ae259f 100644
+--- a/src/game/WowBg3Fights.h
++++ b/src/game/WowBg3Fights.h
+@@ -30,8 +30,10 @@
+ #include <string>
+ 
+ class Creature;
++class Object;
+ class Player;
+ class Unit;
++class WorldObject;
+ class WorldSession;
+ 
+ namespace WowBg3
+@@ -60,6 +62,20 @@ namespace WowBg3
+     // links and assistance still start fights (and holds) as usual.
+     bool SuppressesSightAggro(Creature const* creature, Unit const* moving);
+ 
++    // WorldObject::GetReactionTo (any thread): true when one of the two is a
++    // creature the other's player provoked: an NPC WoW's factions keep friendly
++    // (or neutral and unattackable) to that player, which the player attacked in
++    // BG3 (`begin`/`join` with `!GUID`), or which WoW's own linked rules pulled
++    // into such a fight. Hostile both ways, for that player and their pets only,
++    // while its fight holds it. Lock-free, cheap when nothing is provoked.
++    bool IsProvokedPair(WorldObject const* self, WorldObject const* target);
++
++    // Object::BuildValuesUpdate, UNIT_FIELD_FACTIONTEMPLATE: the faction template
++    // `target`'s client is told for `object`. WoW's "Enemy" (168, hostile to
++    // players only; WoW's own friendly NPCs that turn on a player use it) for a
++    // creature that player provoked, else `faction`.
++    uint32 ShownFaction(Object const* object, Player const* target, uint32 faction);
++
+     // WorldSession::HandleChatMessageOpcode: true if `text` was a `.wowbg3`
+     // command. It is then queued for the world thread and never said aloud.
+     bool HandleChat(WorldSession* session, std::string const& text);

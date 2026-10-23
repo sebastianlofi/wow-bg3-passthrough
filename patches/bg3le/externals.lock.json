@@ -1,0 +1,53 @@
+{
+  "git": {
+    "glm": {
+      "url": "https://github.com/g-truc/glm.git",
+      "ref": "refs/tags/1.0.3",
+      "commit": "8d1fd52e5ab5590e2c81768ace50c72bae28f2ed"
+    },
+    "imgui": {
+      "url": "https://github.com/Norbyte/imgui.git",
+      "ref": "HEAD",
+      "commit": "f0e177b80ed7525cf60fdbd552cebb7c58f8320f"
+    },
+    "lua": {
+      "url": "https://github.com/Norbyte/lua-dos.git",
+      "ref": "HEAD",
+      "commit": "4fff4e19954f927a0478055306dadaf71bba02b2"
+    },
+    "rapidjson": {
+      "url": "https://github.com/Tencent/rapidjson.git",
+      "ref": "HEAD",
+      "commit": "24b5e7a8b27f42fa16b96fc70aade9106cf7102f"
+    },
+    "tinycrypt": {
+      "url": "https://github.com/intel/tinycrypt.git",
+      "ref": "HEAD",
+      "commit": "cf24c907a61c01bc2c4e1ee0ae24457c27a840a2"
+    },
+    "Vulkan": {
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+      "ref": "refs/tags/vulkan-sdk-1.4.357.0",
+      "commit": "e3b1eec08173d6b825cd3ac88c885a63b621504a"
+    },
+    "optick": {
+      "url": "https://github.com/Norbyte/optick.git",
+      "ref": "HEAD",
+      "commit": "a84a9ac6b23a4cf4ab21ac3d98e05aa475dab34c"
+    },
+    "abseil": {
+      "url": "https://github.com/abseil/abseil-cpp.git",
+      "ref": "refs/tags/20260817.0",
+      "commit": "2065f4ded0558c6f89fee67c8e5228feb4eb960e"
+    },
+    "protobuf": {
+      "url": "https://github.com/protocolbuffers/protobuf.git",
+      "ref": "refs/tags/v36.1",
+      "commit": "f377bfefc5e2cfab68b816903c25b23e091c439d"
+    }
+  },
+  "noesis": {
+    "url": "https://bg3se-updates.norbyte.dev/Stuff/NoesisGUI-NativeSDK-win-3.1.7-Indie.zip",
+    "sha256": "0a23696db368dd8e9fe9ccacc628d4b168c76060ba503cf4e0ec1c0de9528c2a"
+  }
+}

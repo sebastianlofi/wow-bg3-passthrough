@@ -1,0 +1,15 @@
+# Build outputs, downloads and toolchains (release/build-env.sh: WOWBG3_BUILD)
+/build/
+target/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Game files never go into this repository
+*.MPQ
+*.mpq
+*.pak
+*.exe
+*.dll
+*.so
+*.so.*

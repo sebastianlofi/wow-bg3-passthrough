@@ -1,0 +1,51 @@
+WOW-BG3 benilla patch 0065: a figure's textures sharper (a negative mip bias).
+
+- benilla-assets wow_model.wgsl: a figure's maps (WOW_TAV_SURFACE: normal, surface, detail, extra) are
+  sampled TAV_LOD_BIAS (-0.6) mips sharper, and its colour by the ratio of a sample that sharp to the
+  plain one (clamped 0.5 to 2, so Bevy's factor and vertex colour stay). At BG3's camera distance the
+  default mips read soft beside BG3's own render of the same character (a playtest report).
+
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -123,6 +123,10 @@
+ 
+ // The detail-doodad pass's stage-0 `D3DSAMP_MIPMAPLODBIAS = +0.25` (`0x6813f4`).
+ const DETAIL_DOODAD_LOD_BIAS: f32 = 0.25;
++// WOW-BG3 (patch 0065): a figure's maps (BG3's characters, `WOW_TAV_SURFACE`) are sampled this many mips
++// sharper than WoW's own art. At BG3's camera distance the trilinear, anisotropic default picked mips
++// that read soft beside BG3's own render of the same character (a playtest report: "a bit too soft").
++const TAV_LOD_BIAS: f32 = -0.6;
+ 
+ // Bevy's `VertexOutput` (same fields, locations and defs; no tangents, morphs or visibility
+ // ranges) plus our interpolants; the fragment rebuilds a `VertexOutput` from it.
+@@ -718,10 +722,11 @@
+ fn tav_fetch(uv: vec2<f32>, world_normal: vec3<f32>, world_tangent: vec4<f32>, is_front: bool) -> TavFetch {
+     var f: TavFetch;
+     let flags = u32(max(m.tav_a.w, 0.0));
+-    let surf = textureSample(pbr_bindings::metallic_roughness_texture, pbr_bindings::metallic_roughness_sampler, uv);
+-    let nmap = textureSample(pbr_bindings::normal_map_texture, pbr_bindings::normal_map_sampler, uv);
+-    let detail = textureSample(pbr_bindings::occlusion_texture, pbr_bindings::occlusion_sampler, uv * max(m.tav_a.y, 1.0));
+-    f.extra = textureSample(pbr_bindings::emissive_texture, pbr_bindings::emissive_sampler, uv);
++    let bias = view.mip_bias + TAV_LOD_BIAS;
++    let surf = textureSampleBias(pbr_bindings::metallic_roughness_texture, pbr_bindings::metallic_roughness_sampler, uv, bias);
++    let nmap = textureSampleBias(pbr_bindings::normal_map_texture, pbr_bindings::normal_map_sampler, uv, bias);
++    let detail = textureSampleBias(pbr_bindings::occlusion_texture, pbr_bindings::occlusion_sampler, uv * max(m.tav_a.y, 1.0), bias);
++    f.extra = textureSampleBias(pbr_bindings::emissive_texture, pbr_bindings::emissive_sampler, uv, bias);
+     let side = select(-1.0, 1.0, is_front);
+     let ng0 = wow_normalize(world_normal);
+     let tw = world_tangent.xyz;
+@@ -938,6 +943,14 @@
+     let tav_tangent = vec4<f32>(1.0, 0.0, 0.0, 1.0);
+ #endif
+     let tav_f = tav_fetch(tav_uv, in.world_normal, tav_tangent, is_front);
++    // Patch 0065: the colour as sharp as the maps: Bevy's own sample (with its factor and vertex colour)
++    // scaled by the sharper sample over the plain one at the same uv.
++    {
++        let plain = textureSampleBias(pbr_bindings::base_color_texture, pbr_bindings::base_color_sampler, tav_uv, view.mip_bias);
++        let sharp = textureSampleBias(pbr_bindings::base_color_texture, pbr_bindings::base_color_sampler, tav_uv, view.mip_bias + TAV_LOD_BIAS);
++        let ratio = clamp(sharp.rgb / max(plain.rgb, vec3<f32>(1.0 / 255.0)), vec3<f32>(0.5), vec3<f32>(2.0));
++        base_color = vec4<f32>(base_color.rgb * ratio, base_color.a);
++    }
+ #endif
+     // WMO MOCV alpha is lighting data (the TRANS lerp, the INT glow mask), and the reference's WMO
+     // output alpha is tex.a alone. Bevy folds the vertex alpha into base_color, so re-sample the

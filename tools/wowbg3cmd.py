@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""wowbg3cmd.py: the WOW-BG3 test and party commands, one code for the PC tools and for WoW's chat.
+party.sh, tele.sh, faction.sh and server/tools/xprate.sh run this file;
+link/tools/wowbg3-chatcmd.py runs the same functions for `/wowbg3 ...` typed in WoW's chat (benilla 0053).
+
+One verb each, no domain word in front:
+  wowbg3cmd.py list | add NAME | remove NAME                     the party
+  wowbg3cmd.py pool | respec NAME              BG3 levels from the WoW levels
+  wowbg3cmd.py tp PLACE | tp ZONE X Y | tp X Y | where | find TEXT
+  wowbg3cmd.py faction [horde|alliance|own]
+  wowbg3cmd.py refill           HP, spell slots, rage... back to full (test helper)
+  wowbg3cmd.py level N          the hero's WoW level (test helper, 1 to 60, also down)
+  wowbg3cmd.py xprate [N]       the server's XP rate (kill, elite kill, quest, exploration); no N: show
+  wowbg3cmd.py help
+  --json on any party verb: the mod's whole answer
+
+Where things are (each from the environment, else harness A's place on the PC):
+  WOWBG3_IO      BG3's Script Extender/wow-bg3 folder      (A: bg3/private/home/...)
+  WOWBG3_LINK    the link folder benilla writes             (WOWBG3_IO/link)
+  WOW_CHAR       the hero's WoW character                   (else the one online on a WOW-BG3 account)
+  WOW_BG3_SERVER a portable server folder (harness B, the release), its var/ in WOWBG3_SERVER_VAR
+                 (else FOLDER/var); unset: the Docker test server (wow-bg3-mangosd-1, wow-bg3-database-1)
+Python 3.9, standard library only (it runs in Steam's sniper runtime in the release).
+"""
+import json
+import os
+import re
+import shlex
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import wowserver  # noqa: E402
+
+ROOT = HERE.parent.parent  # the repo on the PC; WOW-BG3/tools in the release
+A_IO = (str(ROOT) + "/bg3/private/home/.local/share/Larian Studios/Baldur's Gate 3/"
+        "Script Extender/wow-bg3")
+DOCKER_CONF = (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/config/mangosd.conf'
+DOCKER_CONF_INSIDE = '/opt/vmangos/config/mangosd.conf'
+DOCKER_DBC = (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/storage/mangosd/extracted-data/5875/dbc'
+DOCKER_DB = 'wow-bg3-database-1'
+DOCKER_WORLD = 'wow-bg3-mangosd-1'
+TEST_ACCOUNT = 'WOWBG3TEST'
+PLAYTHROUGH = re.compile(r'WB3P[A-Z0-9]{8}')  # one hidden WoW account per playthrough (wowaccount.py)
+XP_KEYS = r'Rate\.XP\.(Kill|Kill\.Elite|Quest|Explore)'  # also an ERE for grep
+SETTINGS_HINT = 'setting debug_commands = 1 in WOW-BG3/settings.conf'
+
+
+class CmdError(Exception):
+    """A message for the user; the PC tools exit 1 with it."""
+
+
+class Usage(CmdError):
+    """Wrong words; the PC tools exit 2."""
+
+
+class Ctx:
+    """Where a command runs and where its lines go. out(line, error) prints one answer line."""
+
+    def __init__(self, io=None, link=None, char=None, debug=True, out=None, chat=False):
+        self.io = Path(io or os.environ.get('WOWBG3_IO') or A_IO)
+        self.link = Path(link or os.environ.get('WOWBG3_LINK') or self.io / 'link')
+        self.char = char or os.environ.get('WOW_CHAR') or None
+        self.debug = debug
+        self.chat = chat  # WoW's chat: shorter lists
+        self.out = out or (lambda line, error=False: print(line, file=sys.stderr if error else sys.stdout, flush=True))
+
+    def say(self, line=''):
+        self.out(line, False)
+
+
+def atomic_write(path, text):
+    tmp = Path(str(path) + '.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- the WoW server (test or portable)
+
+def server_dir():
+    p = os.environ.get('WOW_BG3_SERVER')
+    return Path(p) if p else None
+
+
+def server_var():
+    p = server_dir()
+    if p is None:
+        return None
+    v = os.environ.get('WOWBG3_SERVER_VAR')
+    return Path(v) if v else p / 'var'
+
+
+def sql(query, db=''):
+    """One query, tab separated rows without a header."""
+    p = server_dir()
+    if p is None:
+        cmd = ['sudo', '-n', 'docker', 'exec', '-i', DOCKER_DB, 'sh', '-c',
+               'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -B %s' % db]
+        env = None
+    else:
+        v = server_var()
+        sec = dict(l.split('=', 1) for l in (v / 'secrets.env').read_text().split() if '=' in l)
+        cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % (v / 'run/mariadb.sock'), '-uroot', '-N', '-B'] + ([db] if db else [])
+        env = dict(os.environ, LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_PWD=sec['ROOT_PASS'])
+    r = subprocess.run(cmd, input=query, capture_output=True, text=True, env=env)
+    if r.returncode:
+        raise CmdError('database: %s' % (r.stderr.strip()[-200:] or r.returncode))
+    return r.stdout
+
+
+def console(line, seconds=2.5):
+    """One line to mangosd's console (wowserver.py: Docker attach, or the portable server's pipe)."""
+    return wowserver.console(line, seconds)
+
+
+def dbc_dir():
+    v = server_var()
+    return str(v / 'data/5875/dbc') if v else DOCKER_DBC
+
+
+def name_ok(name):
+    if not re.fullmatch(r'[A-Za-z]{2,12}', name or ''):
+        raise CmdError('a WoW character name, letters only')
+    return name
+
+
+def wow_bg3_accounts():
+    """The WoW accounts WOW-BG3 makes its characters on: the default account (the test account on the
+    harnesses) and every playthrough account wowaccount.py made, one per New Game (its accounts.json)."""
+    out = {TEST_ACCOUNT}
+    try:
+        import wowaccount
+        d = str(wowaccount.default_user() or '')
+        if re.fullmatch(r'[A-Za-z0-9_]{2,32}', d):
+            out.add(d.upper())
+        out.update(str(u).upper() for u in (wowaccount.load().get('Accounts') or {}))
+    except Exception:  # noqa: BLE001  (no registry reachable here: the names below still hold)
+        pass
+    return out
+
+
+def is_wow_bg3_account(user):
+    """Whether that account is one of WOW-BG3's. A playthrough account counts by its own name too, so a
+    registry this tool cannot read does not lock the commands out."""
+    u = str(user or '').upper()
+    return bool(u) and (u in wow_bg3_accounts() or PLAYTHROUGH.fullmatch(u) is not None)
+
+
+def online_characters():
+    """[(character, account)] for every WoW character online now."""
+    out = []
+    for line in sql("select c.name, a.username from characters c join realmd.account a on a.id = c.account "
+                    "where c.online = 1;", 'characters').splitlines():
+        p = line.split('\t')
+        if len(p) == 2:
+            out.append((p[0], p[1]))
+    return out
+
+
+def own_character(name):
+    """The account that owns NAME, refused when it is not one of WOW-BG3's: never change a WoW character
+    that is not WOW-BG3's (every playthrough has a hidden account of its own, wowaccount.py)."""
+    rows = sql("select a.username from characters c join realmd.account a on a.id = c.account "
+               "where c.name = '%s';" % name_ok(name), 'characters').split()
+    if not rows:
+        raise CmdError('no WoW character %s' % name)
+    if not is_wow_bg3_account(rows[0]):
+        raise CmdError('%s is on account %s, which is not one of WOW-BG3\'s (the default account, or the '
+                       'account made for a playthrough)' % (name, rows[0]))
+    return rows[0]
+
+
+def hero(ctx):
+    """The hero's WoW character: WOW_CHAR (the chat helper passes the typing character), else the one
+    online character on a WOW-BG3 account (wowlevel.py's rule)."""
+    if ctx.char:
+        return name_ok(ctx.char)
+    ours = [c for c, a in online_characters() if is_wow_bg3_account(a)]
+    if len(ours) != 1:
+        raise CmdError('name the WoW character (WOW_CHAR; online on a WOW-BG3 account: %s)' % (', '.join(ours) or 'none'))
+    return ours[0]
+
+
+def wow_level(name):
+    """(level, online); an online character is written to the database first (saveall)."""
+    q = "select level, online from characters where name = '%s';" % name_ok(name)
+    row = sql(q, 'characters').split()
+    if not row:
+        raise CmdError('no WoW character %s' % name)
+    if row[1] == '1':
+        console('saveall', 1.5)
+        time.sleep(0.5)
+        row = sql(q, 'characters').split()
+    return int(row[0]), row[1] == '1'
+
+
+def wow_progress(name):
+    """(XP into this WoW level, XP the next level needs) from WoW's own numbers (characters.xp and the
+    server's player_xp_for_level); (0, 0) at the last level or when the table is not there."""
+    try:
+        row = sql("select c.xp, coalesce((select p.xp_for_next_level from mangos.player_xp_for_level p "
+                  "where p.lvl = c.level), 0) from characters.characters c where c.name = '%s';"
+                  % name_ok(name)).split()
+        xp, nxt = int(row[0]), int(row[1])
+    except Exception:  # noqa: BLE001  (an old server without the table: no percent, the level still works)
+        return 0, 0
+    return (max(0, min(xp, nxt)), nxt) if nxt > 0 else (0, 0)
+
+
+def write_level(ctx, name, level, online):
+    """wow-bg3/wow-level.json, what Progression.lua reads (wowlevel.py once): the level, and how far into
+    it WoW's XP stands (Percent, 0 to 99.9; BG3 shows it in its own XP bar)."""
+    xp, nxt = wow_progress(name)
+    body = {'Character': name, 'Level': level, 'Online': online, 'Xp': xp, 'XpNext': nxt,
+            'Percent': min(round(100.0 * xp / nxt, 1), 99.9) if nxt > 0 else 0.0,
+            'Seq': int(time.time() * 1000)}
+    atomic_write(ctx.io / 'wow-level.json', json.dumps(body))
+    return body
+
+
+# ---------------------------------------------------------------- party (Party.lua through party-command.json)
+
+PARTY_ACTIONS = {'list': 'List', 'add': 'Add', 'remove': 'Remove', 'refill': 'Refill', 'pool': 'Pool',
+                 'respec': 'Reset'}
+PARTY_HELP = [
+    'list - the party and where they are',
+    'add NAME - recruit (shadowheart, astarion, laezel, wyll, karlach, gale, jaheira, minsc, halsin, minthara)',
+    'remove NAME - dismiss (it keeps its BG3 levels; they stay spent until a respec)',
+    'pool - your WoW level, party slots, BG3 level-ups left',
+    'respec NAME - Withers\' respec: back to BG3 level 1, its level-ups back to the pool',
+]
+# The two level words, said once and reused: nobody should have to guess which game a level belongs to.
+LEVEL_HINT = ('"level" is your WoW level: each one from 5 on earns one BG3 level-up, which BG3\'s own Level Up '
+              'button offers on every party member with room (level whichever you want); "pool" shows what is left')
+
+
+def party_usage():
+    return '\n'.join(PARTY_HELP + ['refill - HP, spell slots, rage... back to full (test command)'])
+
+
+def party(ctx, args, as_json=False):
+    action = args[0].lower() if args else ''
+    if action not in PARTY_ACTIONS:
+        raise Usage(party_usage())
+    name = args[1] if len(args) > 1 else ''
+    if action not in ('list', 'refill', 'pool') and not name:
+        raise Usage('%s NAME (e.g. hero, shadowheart, astarion)' % action)
+    count = 1
+    if action in ('add', 'pool'):
+        # The WoW level the mod counts with, fresh from the server first (quiet: the mod keeps the last
+        # one it had when the server is not there).
+        try:
+            n = hero(ctx)
+            write_level(ctx, n, *wow_level(n))
+            time.sleep(0.6)
+        except Exception:  # noqa: BLE001
+            pass
+    io = ctx.io
+    try:
+        run = json.load(open(io / 'm3-server.json'))['RunId']
+    except (OSError, ValueError, KeyError):
+        raise CmdError('%s: no BG3 run with the mod (wow-bg3/m3-server.json)' % action)
+    # Party.lua rewrites party.json at least every 300 ticks while a game runs: without a fresh one for
+    # this run, BG3 is not running (or sits in its menu, or is loading), and nothing would answer.
+    try:
+        live = json.load(open(io / 'party.json')).get('RunId') == run and time.time() - os.stat(io / 'party.json').st_mtime < 40
+    except (OSError, ValueError):
+        live = False
+    if not live:
+        raise CmdError('%s: BG3 is not running a game with the mod (no fresh wow-bg3/party.json)' % action)
+    path = io / 'party-command.json'
+    try:
+        old = json.load(open(path))
+        seq = old.get('Sequence', 0) if old.get('RunId') == run else 0
+    except (OSError, ValueError):
+        seq = 0
+    seq += 1
+    atomic_write(path, json.dumps({'RunId': run, 'Sequence': seq, 'Action': PARTY_ACTIONS[action], 'Name': name,
+                                   'Count': count}))
+    res = None
+    for _ in range(240):
+        time.sleep(0.25)
+        try:
+            r = json.load(open(io / 'party-result.json'))
+        except (OSError, ValueError):
+            continue
+        if r.get('RunId') == run and r.get('Sequence') == seq:
+            res = r
+            break
+    if res is None:
+        raise CmdError('%s: no answer from the mod in 60 s (is BG3 running a game with the mod?)' % action)
+    if as_json:
+        ctx.say(json.dumps(res, indent=1))
+        if not res.get('OK'):
+            raise CmdError('')
+        return
+    if not res.get('OK'):
+        raise CmdError('%s: %s' % (action, res.get('Value')))
+    v = res.get('Value') or {}
+    say = ctx.say
+
+    def members(party_):
+        for m in party_ or []:
+            state = 'dead' if m.get('Dead') else ('downed' if m.get('Downed') else '%s/%s HP' % (m.get('Hp'), m.get('MaxHp')))
+            p = m.get('Pos') or []
+            where = ' at %.0f %.0f %.0f' % tuple(p) if len(p) == 3 else ''
+            say('  %s%s: %s, %s%s%s' % (m.get('Name'), ' (hero)' if m.get('Hero') else '', state, m.get('Region'),
+                                        where, ', in combat' if m.get('InCombat') else ''))
+
+    def show_pool(p):
+        pct = p.get('WowPercent')
+        say('WoW level %s%s: %s party slot%s (party of %s), level-ups earned %s, given %s, left %s' % (
+            p.get('WowLevel'), '' if pct is None else ' (%g%% into it)' % pct,
+            p.get('Slots'), '' if p.get('Slots') == 1 else 's', p.get('PartySize'), p.get('Earned'),
+            p.get('Spent'), p.get('Available')))
+        for m in p.get('Members') or []:
+            up = (m.get('Available') or 0) - (m.get('Level') or 0)
+            say('  %s%s: BG3 level %s, %s level-up%s given, XP %s%s' % (
+                m.get('Name'), ' (hero)' if m.get('Hero') else '', m.get('Level'), m.get('LevelUps'),
+                '' if m.get('LevelUps') == 1 else 's', m.get('Xp'),
+                (', %d waiting: BG3\'s Level Up button' % up) if up > 0 else ''))
+        for m in p.get('Others') or []:
+            say('  %s (not in the party): %s level-up%s given' % (m.get('Name'), m.get('LevelUps'),
+                                                                 '' if m.get('LevelUps') == 1 else 's'))
+        say('  BG3 XP table ends at level %s; cap %s (WoW 64)%s' % (
+            p.get('MaxXpLevel'), p.get('GrantCap'),
+            '' if p.get('XpOff') else '; BG3\'s own XP is NOT off yet'))
+
+    if action == 'pool':
+        show_pool(v)
+    elif action == 'respec':
+        say('%s: %s' % (v.get('Name'), v.get('Respec')))
+        show_pool(v.get('Pool') or {})
+    elif action == 'refill':
+        for m in v.get('Refilled') or []:
+            say('%s%s: HP %s -> %s/%s' % (m.get('Name'), ' (hero)' if m.get('Hero') else '', m.get('HpBefore'),
+                                         m.get('Hp'), m.get('MaxHp')))
+            say('  was under max: ' + (', '.join(m.get('LowBefore') or []) or 'nothing'))
+            if m.get('TopUp'):
+                say('  topped up after BG3\'s restore: ' + ', '.join(m['TopUp']))
+            if m.get('LowAfter'):
+                say('  still under max: ' + ', '.join(m['LowAfter']))
+    elif action == 'list':
+        say('Party (BG3 limit %s%s):' % (v.get('MaxPartySize'), ', full' if v.get('Full') else ''))
+        members(v.get('Party'))
+        say('Companions this tool knows:')
+        for k in v.get('Known') or []:
+            say('  %-11s %s, %s%s%s' % (k.get('Key'), k.get('Name'), k.get('Region'), ', in the party' if k.get('InParty') else '',
+                                        ', dead' if k.get('Dead') else ''))
+    else:
+        say('%s %s' % (v.get('Added') or v.get('Removed'), 'joined the party' if action == 'add' else 'left the party'))
+        for s in v.get('Steps') or []:
+            say('  - ' + s)
+        say('Party now:')
+        members(v.get('Party'))
+
+
+# -------------------------------------------------- tp, where, find (the world bridge's world-move.json)
+
+CONT = {0: 'Eastern Kingdoms', 1: 'Kalimdor'}  # the continents world mode cuts ground from
+TELE_USAGE = 'tp ZONE X Y | tp X Y | tp PLACE | where | find TEXT (X and Y from 0 to 100)'
+
+
+def cont(m):
+    return CONT.get(m, 'map %d (not in world mode)' % m)
+
+
+def wdbc(name):
+    b = open(os.path.join(dbc_dir(), name), 'rb').read()
+    magic, n, f, rs, ss = struct.unpack_from('<4s4I', b, 0)
+    assert magic == b'WDBC', name
+    strs = b[20 + n * rs:]
+
+    def text(o):
+        return strs[o:strs.find(b'\0', o)].decode('utf-8', 'replace')
+    return [(struct.unpack_from('<%dI' % f, b, 20 + i * rs), struct.unpack_from('<%df' % f, b, 20 + i * rs), text)
+            for i in range(n)]
+
+
+def zones():
+    """AreaTable.dbc (1.12): id, map, parent zone, enUS name at field 11."""
+    return [{'id': i[0], 'map': i[1], 'parent': i[2], 'name': t(i[11])} for i, _, t in wdbc('AreaTable.dbc')]
+
+
+def maps():
+    """WorldMapArea.dbc (1.12): id, map, area, name, then the map's edges in world yards: left (+y),
+    right (-y), top (+x), bottom (-x)."""
+    return [{'map': i[1], 'area': i[2], 'name': t(i[3]), 'left': f[4], 'right': f[5], 'top': f[6], 'bottom': f[7]}
+            for i, f, t in wdbc('WorldMapArea.dbc') if i[2]]
+
+
+def to_world(m, mx, my):
+    # As the server's Zone2MapCoordinates: map X runs along world y (left to right), map Y along world x.
+    return m['top'] + my * (m['bottom'] - m['top']) / 100.0, m['left'] + mx * (m['right'] - m['left']) / 100.0
+
+
+def to_map(m, x, y):
+    return (y - m['left']) * 100.0 / (m['right'] - m['left']), (x - m['top']) * 100.0 / (m['bottom'] - m['top'])
+
+
+def find_zone(text):
+    t = text.lower()
+    zs = [z for z in zones() if z['name']]
+    for test in (lambda z: z['name'].lower() == t, lambda z: z['name'].lower().startswith(t), lambda z: t in z['name'].lower()):
+        hits = [z for z in zs if test(z)]
+        if hits:
+            hits.sort(key=lambda z: (z['parent'] != 0, z['map'] not in CONT, z['name']))  # zones before subzones
+            return hits[0]
+    return None
+
+
+def map_of(zone):
+    area = zone['parent'] or zone['id']  # a subzone uses its zone's map, as in game
+    for m in maps():
+        if m['area'] == area:
+            return m
+    return None
+
+
+def tele(ctx, args):
+    if not args:
+        raise Usage(TELE_USAGE)
+    link, io = ctx.link, ctx.io
+
+    def player():
+        return struct.unpack_from('<3f', open(link / 'camera.bin', 'rb').read(), 72)
+
+    def player_map():
+        return struct.unpack_from('<I', open(link / 'camera.bin', 'rb').read(), 84)[0]
+
+    def here():
+        x, y, _ = player()
+        pm = player_map()
+        inside = [m for m in maps() if m['map'] == pm and m['bottom'] <= x <= m['top'] and m['right'] <= y <= m['left']]
+        inside.sort(key=lambda m: (m['top'] - m['bottom']) * (m['left'] - m['right']))
+        return (inside[0] if inside else None), x, y
+
+    cache = {}
+
+    def all_places():
+        if 'p' not in cache:
+            out = []
+            rows = sql('SELECT name, map, position_x, position_y, position_z FROM game_tele WHERE map IN (0, 1) ORDER BY name;', 'mangos')
+            for line in rows.splitlines():
+                p = line.split('\t')
+                if len(p) == 5:
+                    out.append((p[0], int(p[1]), float(p[2]), float(p[3]), float(p[4])))
+            cache['p'] = out
+        return cache['p']
+
+    def places(text=''):
+        """Named places (game_tele) on both continents: the exact name, else names containing text."""
+        t = text.lower()
+        out = all_places()
+        exact = [q for q in out if q[0].lower() == t]
+        return exact or [q for q in out if t in q[0].lower()]
+
+    def num(s):
+        try:
+            v = float(s)
+        except ValueError:
+            return None
+        return v if 0.0 <= v <= 100.0 else None
+
+    if args[0] == 'find':
+        text = ' '.join(args[1:]).lower()
+        cap = 10 if ctx.chat else None
+        zs = [z for z in zones() if text in z['name'].lower()]
+        ctx.say('Zones (tp ZONE X Y):')
+        for z in zs[:cap]:
+            ctx.say('  %-28s %s%s' % (z['name'], cont(z['map']), '' if not z['parent'] else ', in zone %d' % z['parent']))
+        if cap and len(zs) > cap:
+            ctx.say('  ... %d more' % (len(zs) - cap))
+        cap = 15 if ctx.chat else 60
+        ps = places(text)
+        ctx.say('Named places (tp PLACE):')
+        for name, m, *_ in ps[:cap]:
+            ctx.say('  %-28s %s' % (name, cont(m)))
+        if ctx.chat and len(ps) > cap:
+            ctx.say('  ... %d more' % (len(ps) - cap))
+        return
+    if args[0] == 'where':
+        try:
+            m, x, y = here()
+        except OSError:
+            raise CmdError('where: no WoW position yet (link/camera.bin)')
+        if not m:
+            raise CmdError('WoW %.1f %.1f: on no zone map of %s' % (x, y, cont(player_map())))
+        mx, my = to_map(m, x, y)
+        ctx.say('%s %.1f %.1f (WoW %.1f %.1f, %s)' % (m['name'], mx, my, x, y, cont(m['map'])))
+        return
+
+    z = None
+    if len(args) == 1:
+        hits = places(args[0])
+        if not hits:
+            raise CmdError('tp: no named place like %r (find TEXT lists them)' % args[0])
+        name, mapid, x, y, z = hits[0]
+        if mapid not in CONT:
+            raise CmdError('tp: %s is on %s; world mode has Eastern Kingdoms and Kalimdor' % (name, cont(mapid)))
+        what = name
+    elif len(args) == 2 and num(args[0]) is not None and num(args[1]) is not None:
+        m, _, _ = here()
+        if not m:
+            raise CmdError('tp: you are on no zone map; name the zone (tp ZONE X Y)')
+        x, y = to_world(m, num(args[0]), num(args[1]))
+        mapid = m['map']
+        what = '%s %s %s' % (m['name'], args[0], args[1])
+    elif len(args) >= 3 and num(args[-2]) is not None and num(args[-1]) is not None:
+        zone = find_zone(' '.join(args[:-2]))
+        if not zone:
+            raise CmdError('tp: no zone like %r (find TEXT lists them)' % ' '.join(args[:-2]))
+        if zone['map'] not in CONT:
+            raise CmdError('tp: %s is on %s; world mode has Eastern Kingdoms and Kalimdor' % (zone['name'], cont(zone['map'])))
+        mapid = zone['map']
+        m = map_of(zone)
+        if not m:
+            raise CmdError('tp: %s has no map in WoW' % zone['name'])
+        x, y = to_world(m, num(args[-2]), num(args[-1]))
+        what = '%s %s %s' % (zone['name'], args[-2], args[-1])
+    else:
+        raise Usage(TELE_USAGE)
+
+    # World mode must run, and not in a fight.
+    try:
+        run = json.load(open(io / 'm3-client.json'))['RunId']
+        w = json.load(open(link / 'world.json'))
+        active = w.get('Active') and time.time() - os.stat(link / 'tav.bin').st_mtime < 5
+    except (OSError, ValueError, KeyError):
+        active = False
+    if not active:
+        raise CmdError('tp: world mode is not running')
+    raw = open(link / 'tav.bin', 'rb').read()
+    if len(raw) >= 44 and struct.unpack_from('<I', raw, 36)[0] & 1:
+        raise CmdError('tp: not during a BG3 fight')
+
+    path = io / 'world-move.json'
+    try:
+        old = json.load(open(path))
+        seq = old.get('Seq', 0) if old.get('RunId') == run else 0
+    except (OSError, ValueError):
+        seq = 0
+    seq += 1
+    body = {'RunId': run, 'Seq': seq, 'Wow': [x, y, z], 'What': what, 'Map': mapid}
+    cross = mapid != player_map()
+    if cross:
+        # The other continent: WoW's character goes first to the named place there nearest the point
+        # (a server teleport; world-console.py takes names of letters and digits only).
+        char = ctx.char
+        if not char:
+            rows = sql('SELECT name FROM characters WHERE online = 1 LIMIT 1;', 'characters').split()
+            char = rows[0] if rows else ''
+        if not char:
+            raise CmdError('tp: no online WoW character found (for the server teleport to %s)' % cont(mapid))
+        via = [q for q in places() if q[1] == mapid and q[0].isalnum()]
+        if not via:
+            raise CmdError('tp: no named place on %s to go through' % cont(mapid))
+        via.sort(key=lambda q: (q[2] - x) ** 2 + (q[3] - y) ** 2)
+        body.update(Char=char, Via=via[0][0])
+    atomic_write(path, json.dumps(body))
+    ctx.say('moving to %s (WoW %.1f %.1f, %s%s)...' % (what, x, y, cont(mapid), ', through %s' % body['Via'] if cross else ''))
+    res = None
+    for _ in range(600 if cross else 240):
+        time.sleep(0.5)
+        try:
+            r = json.load(open(io / 'world-move-result.json'))
+        except (OSError, ValueError):
+            continue
+        if r.get('RunId') == run and r.get('Seq') == seq:
+            res = r
+            break
+    if not res:
+        raise CmdError('tp: no answer from the world bridge in time (see its log)')
+    if not res.get('OK'):
+        raise CmdError('tp: ' + str(res.get('Value')))
+    # benilla puts WoW's character on the hero within a few seconds.
+    for _ in range(30):
+        time.sleep(0.5)
+        px, py, pz = player()
+        if player_map() == mapid and ((px - x) ** 2 + (py - y) ** 2) ** 0.5 < 15.0:
+            ctx.say('there: WoW %.1f %.1f %.1f' % (px, py, pz))
+            return
+    px, py, _ = player()
+    raise CmdError('tp: world mode moved, but WoW\'s character is still %.0f yd away (dead in WoW? a dead '
+                   'character is not moved: revive it, then try again)' % (((px - x) ** 2 + (py - y) ** 2) ** 0.5))
+
+
+# ---------------------------------------------------------------- faction (the fight bridge's faction.txt)
+
+def faction(ctx, args):
+    f = ctx.link / 'faction.txt'
+    if not args:
+        try:
+            parts = f.read_text().split()
+            ctx.say(parts[1] if len(parts) > 1 else 'own')
+        except OSError:
+            ctx.say('own')
+        return
+    side = args[0].lower()
+    if side not in ('horde', 'alliance', 'own') or len(args) > 1:
+        raise Usage('faction horde | alliance | own (own: back to your race\'s side); faction: what is set now')
+    ctx.link.mkdir(parents=True, exist_ok=True)
+    cmd = ctx.link / 'server-cmd.txt'
+
+    def sent():
+        n = 0
+        try:
+            for line in cmd.read_text(errors='replace').splitlines():
+                if '.wowbg3 faction ' in line:
+                    try:
+                        n = int(line.split()[0])
+                    except (ValueError, IndexError):
+                        pass
+        except OSError:
+            pass
+        return n
+    before = sent()
+    try:
+        seq = int(f.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        seq = 0
+    atomic_write(f, '%d %s\n' % (seq + 1, side))
+    if os.environ.get('FACTION_NOWAIT'):
+        ctx.say('saved (%s)' % side)
+        return
+    # The bridge passes it on within a second while it runs (its line in server-cmd.txt).
+    for _ in range(20):
+        if sent() > before:
+            ctx.say('sent: your WoW character now counts as %s' % side)
+            return
+        time.sleep(0.5)
+    ctx.say('saved (%s): the bridge sends it when world mode runs' % side)
+
+
+# ---------------------------------------------------------------- level (test helper)
+
+def level(ctx, args, wow_bg3_only=False):
+    if len(args) != 1 or not args[0].isdigit() or not 1 <= int(args[0]) <= 60:
+        raise Usage('level N (1 to 60, also down): your WoW level, not a BG3 one; ' + LEVEL_HINT)
+    name = hero(ctx)
+    if wow_bg3_only:
+        own_character(name)  # a character of this playthrough's own account, or of the default account
+    out = console('character level %s %d' % (name, int(args[0])))
+    lvl, online = wow_level(name)
+    ctx.say('%s: WoW level %d%s' % (name, lvl, '' if lvl == int(args[0]) else ' (asked %s; console said: %s)' % (args[0], out.strip()[-200:])))
+    if (ctx.io / 'wow-level.json').exists():
+        write_level(ctx, name, lvl, online)
+
+
+# ---------------------------------------------------------------- xp rate (test helper)
+
+def xp_conf():
+    v = server_var()
+    return v / 'etc/mangosd.conf' if v else Path(DOCKER_CONF)
+
+
+def xp_seen():
+    """The rate lines the server reads."""
+    if server_dir() is None:
+        r = subprocess.run(['sudo', '-n', 'docker', 'exec', DOCKER_WORLD, 'grep', '-E', '^%s *=' % XP_KEYS, DOCKER_CONF_INSIDE],
+                           capture_output=True, text=True)
+        text = r.stdout
+    else:
+        text = xp_conf().read_text()
+    return [m.group(0) for m in re.finditer(r'^%s *=.*$' % XP_KEYS, text, re.M)]
+
+
+def xp(ctx, args):
+    """Kill, elite kill, quest and exploration XP times N, in the server's own config, then `reload config`
+    (no restart, nobody kicked). The Docker test server's file is a single-file bind mount: it is written in
+    place (same inode), a copy first to #recycle_bin/xprate-TIME/. The portable server's var/etc/mangosd.conf
+    is the player's own; its first state is kept once as mangosd.conf.before-xp."""
+    if not args:
+        ctx.say('server sees:')
+        for line in xp_seen():
+            ctx.say(line)
+        return
+    n = args[0]
+    if len(args) > 1 or not re.fullmatch(r'[0-9]{1,3}(\.[0-9]+)?', n) or float(n) <= 0:
+        raise Usage('xprate N: a number, e.g. 20 or 1 (1 = normal); xprate: show')
+    conf = xp_conf()
+    if server_dir() is None:
+        old = subprocess.run(['sudo', '-n', 'cat', str(conf)], capture_output=True, text=True, check=True).stdout
+        new = re.sub(r'^(%s) *=.*$' % XP_KEYS, lambda m: 'Rate.XP.%s = %s' % (m.group(2), n), old, flags=re.M)
+        keep = ROOT / '#recycle_bin' / ('xprate-' + time.strftime('%Y%m%d-%H%M%S'))
+        keep.mkdir(parents=True, exist_ok=True)
+        (keep / 'mangosd.conf').write_text(old)
+        (keep / 'mangosd.conf.new').write_text(new)
+        subprocess.run(['sudo', '-n', 'tee', str(conf)], input=new, capture_output=True, text=True, check=True)
+    else:
+        old = conf.read_text()
+        new = re.sub(r'^(%s) *=.*$' % XP_KEYS, lambda m: 'Rate.XP.%s = %s' % (m.group(2), n), old, flags=re.M)
+        first = conf.with_name('mangosd.conf.before-xp')
+        if not first.exists():
+            first.write_text(old)
+        with open(conf, 'r+') as fh:  # in place, as the Docker one
+            fh.write(new)
+            fh.truncate()
+    seen = xp_seen()
+    ctx.say('server sees:')
+    for line in seen:
+        ctx.say(line)
+    if len(seen) != 4 or any(not re.search(r'= *%s$' % re.escape(n), l) for l in seen):
+        raise CmdError('the server still sees other values: not reloaded')
+    out = console('reload config', 2)
+    ok = [l for l in out.splitlines() if re.search(r'reloaded|Re-Loading', l)]
+    ctx.say(ok[-1].strip() if ok else 'reload config sent')
+    ctx.say('XP rate now %sx (kill, elite kill, quest, exploration)' % n)
+
+
+# ---------------------------------------------------------------- chat dispatch
+
+# One verb each, no domain word in front and no second name for anything.
+VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'level', 'xprate')
+TEST_ONLY = ('tp', 'where', 'find', 'faction', 'refill', 'level', 'xprate')
+
+
+def verb_of(words):
+    """One command line, split into words, as (verb, arguments)."""
+    if not words:
+        return 'help', []
+    verb, rest = words[0].lower(), words[1:]
+    if verb == 'help':
+        return 'help', rest
+    if verb not in VERBS:
+        raise Usage('unknown command %r; "help" lists them' % words[0])
+    return verb, rest
+
+
+def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
+    """One command whose verb is known and whose gate has passed."""
+    if verb in PARTY_ACTIONS:
+        party(ctx, [verb] + args, as_json)
+    elif verb == 'tp':
+        tele(ctx, args)
+    elif verb in ('where', 'find'):
+        tele(ctx, [verb] + args)
+    elif verb == 'faction':
+        faction(ctx, args)
+    elif verb == 'level':
+        level(ctx, args, wow_bg3_only=wow_bg3_only)
+    else:
+        xp(ctx, args)
+
+
+def help_lines(debug):
+    out = ['commands (type them in WoW\'s chat), one word each:']
+    out += ['/wowbg3 ' + l for l in PARTY_HELP]
+    out.append('/wowbg3 help - this list')
+    if debug:
+        out += ['test commands:',
+                '/wowbg3 refill - HP, spell slots, rage... back to full',
+                '/wowbg3 tp PLACE | tp ZONE X Y | tp X Y - move on the WoW map (X Y from 0 to 100)',
+                '/wowbg3 where | find TEXT - where you are; search places',
+                '/wowbg3 faction horde | alliance | own - your WoW side (faction: what is set)',
+                '/wowbg3 level N - set your WoW level, 1 to 60 (WoW, not BG3: it fills the pool)',
+                '/wowbg3 xprate N - the server\'s XP rate (1 normal); xprate: show']
+    else:
+        out.append('test commands (tp, where, find, faction, refill, level, xprate) are off: %s turns '
+                   'them on' % SETTINGS_HINT)
+    out.append(LEVEL_HINT)
+    return out
+
+
+def run(ctx, text):
+    """One chat line (the words after /wowbg3)."""
+    try:
+        words = shlex.split(text)
+    except ValueError:
+        words = text.split()
+    verb, args = verb_of(words)
+    if verb == 'help':
+        for l in help_lines(ctx.debug):
+            ctx.say(l)
+        return
+    if verb in TEST_ONLY and not ctx.debug:
+        raise CmdError('"%s" is a test command and test commands are off (%s)' % (verb, SETTINGS_HINT))
+    do(ctx, verb, args)
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__)
+        return 2
+    ctx = Ctx()
+    as_json = '--json' in argv
+    try:
+        verb, args = verb_of([a for a in argv if a != '--json'])
+        if verb == 'help':
+            for l in help_lines(True):
+                print(l)
+        else:
+            do(ctx, verb, args, as_json, wow_bg3_only=True)
+    except Usage as e:
+        print(e, file=sys.stderr)
+        return 2
+    except CmdError as e:
+        if str(e):
+            print(e, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

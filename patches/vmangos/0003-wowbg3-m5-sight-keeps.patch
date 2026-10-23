@@ -1,0 +1,135 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index a40a580..a33dcbb 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -107,6 +107,7 @@ namespace
+     {
+         bool armed = false;
+         bool sight = false;                                     // BG3 decides proximity aggro (`arm sight`)
++        bool sightAlive = false;                                // seen alive since sight mode went on
+         std::unique_ptr<Encounter> active;
+         std::vector<Mob> pending;
+         std::deque<std::string> closed;
+@@ -442,16 +443,28 @@ namespace
+         void Add(std::string const& s) { lines.push_back(s); }
+     };
+ 
+-    // arm: hold mobs that enter combat with the player; sight: BG3 also decides
+-    // proximity aggro (hostile mobs no longer notice the player by themselves).
+-    void Arm(Player* p, bool armed, bool sight, Out& out)
++    // arm: hold mobs that enter combat with the player. sight (1 on, 0 off, -1 keep):
++    // BG3 also decides proximity aggro (hostile mobs no longer notice the player by
++    // themselves). A plain `arm` keeps sight mode as it is; only `arm nosight`,
++    // `disarm`, logout and a death end it.
++    void Arm(Player* p, bool armed, int sight, Out& out)
+     {
+         std::vector<Release> releases;
++        bool sightNow = false;
+         {
+             WriteLock lock(g_lock);
+             Fighter& f = g_fighters[p->GetObjectGuid()];
+             SetArmed(f, armed);
+-            SetSight(f, armed && sight);
++            if (!armed || sight == 0)
++                SetSight(f, false);
++            else if (sight > 0)
++            {
++                SetSight(f, true);
++                // Sent while dead (a ghost), it waits for the resurrection instead of
++                // being ended by the death it follows.
++                f.sightAlive = p->IsAlive();
++            }
++            sightNow = f.sight;
+             if (!armed)
+             {
+                 for (Mob const& m : f.pending)
+@@ -463,7 +476,7 @@ namespace
+             }
+         }
+         ApplyReleases(releases);
+-        out.Add(!armed ? "WOWBG3 armed 0" : sight ? "WOWBG3 armed 1 sight" : "WOWBG3 armed 1");
++        out.Add(!armed ? "WOWBG3 armed 0" : sightNow ? "WOWBG3 armed 1 sight" : "WOWBG3 armed 1");
+     }
+ 
+     // begin <enc> <guids>: hold these mobs (all or none) as a new encounter.
+@@ -946,10 +959,10 @@ namespace
+         std::vector<std::string> a = Split(text, ' ');
+         std::string const verb = a.size() > 1 ? a[1] : "";
+         Out out;
+-        if (verb == "arm" && (a.size() == 2 || (a.size() == 3 && a[2] == "sight")))
+-            Arm(p, true, a.size() == 3, out);
++        if (verb == "arm" && (a.size() == 2 || (a.size() == 3 && (a[2] == "sight" || a[2] == "nosight"))))
++            Arm(p, true, a.size() == 2 ? -1 : a[2] == "sight" ? 1 : 0, out);
+         else if (verb == "disarm" && a.size() == 2)
+-            Arm(p, false, false, out);
++            Arm(p, false, 0, out);
+         else if (verb == "status" && a.size() == 2)
+             Status(p, out);
+         else if ((verb == "begin" || verb == "join") && a.size() == 4 && ValidId(a[2]))
+@@ -1153,35 +1166,50 @@ void Update(uint32 diff)
+         return;
+     g_tickTimer = 0;
+ 
+-    // Death ends sight mode (normal WoW aggro again until the client sends `arm sight`).
++    // A death ends sight mode (normal WoW aggro again until the client sends `arm
++    // sight`, which it may do at once, while dead: that waits for the resurrection).
+     if (g_sightCount.load(std::memory_order_relaxed))
+     {
+-        std::vector<ObjectGuid> sighted;
++        std::vector<std::pair<ObjectGuid, bool>> sighted;   // player, seen alive since sight went on
+         {
+             ReadLock lock(g_lock);
+             for (auto const& kv : g_fighters)
+                 if (kv.second.sight)
+-                    sighted.push_back(kv.first);
++                    sighted.push_back({ kv.first, kv.second.sightAlive });
+         }
+         std::vector<Player*> died;
+-        for (ObjectGuid g : sighted)
+-            if (Player* p = ObjectAccessor::FindPlayer(g))
+-                if (!p->IsAlive())
+-                    died.push_back(p);
+-        if (!died.empty())
++        std::vector<ObjectGuid> alive;
++        for (auto const& sg : sighted)
+         {
++            Player* p = ObjectAccessor::FindPlayer(sg.first);
++            if (!p)
++                continue;
++            if (p->IsAlive())
+             {
+-                WriteLock lock(g_lock);
+-                for (Player* p : died)
+-                {
+-                    auto it = g_fighters.find(p->GetObjectGuid());
+-                    if (it != g_fighters.end())
+-                        SetSight(it->second, false);
+-                }
++                if (!sg.second)
++                    alive.push_back(sg.first);
++            }
++            else if (sg.second)
++                died.push_back(p);
++        }
++        if (!died.empty() || !alive.empty())
++        {
++            WriteLock lock(g_lock);
++            for (ObjectGuid g : alive)
++            {
++                auto it = g_fighters.find(g);
++                if (it != g_fighters.end() && it->second.sight)
++                    it->second.sightAlive = true;
+             }
+             for (Player* p : died)
+-                Say(p, "WOWBG3 sight 0 died");
++            {
++                auto it = g_fighters.find(p->GetObjectGuid());
++                if (it != g_fighters.end())
++                    SetSight(it->second, false);
++            }
+         }
++        for (Player* p : died)
++            Say(p, "WOWBG3 sight 0 died");
+     }
+ 
+     struct Check

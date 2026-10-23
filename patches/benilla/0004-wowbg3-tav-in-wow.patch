@@ -1,0 +1,819 @@
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 0c76c03..af4dc2b 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -191,6 +191,7 @@ mod wowbg3;
+ mod wowbg3_fight;
+ mod wowbg3_frames;
+ mod wowbg3_lead;
++mod wowbg3_tav;
+ 
+ use bevy::prelude::*;
+ 
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index 94cb1a0..25146b4 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -35,6 +35,8 @@ impl Plugin for WowBg3Plugin {
+         // World mode: BG3 leads the camera, WoW frames go to BG3's compositor.
+         crate::wowbg3_lead::build(app, PathBuf::from(&dir));
+         crate::wowbg3_frames::build(app);
++        // Tav drawn inside WoW from BG3's copied meshes and poses.
++        crate::wowbg3_tav::build(app);
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 14d605a..568bb61 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -50,6 +50,14 @@ pub(crate) fn depth_offset() -> f32 {
+     f32::from_bits(DEPTH_OFFSET.load(Ordering::Relaxed))
+ }
+ 
++/// The ground lock's current offset (yards, Bevy +Y), as f32 bits: `wowbg3_tav` lowers Tav by it
++/// with the camera, so her feet meet WoW's ground.
++static GROUND_LOCK: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) fn ground_lock() -> f32 {
++    f32::from_bits(GROUND_LOCK.load(Ordering::Relaxed))
++}
++
+ /// True in lead mode: the own character is drawn and voiced by BG3, not by benilla.
+ pub(crate) fn hide_self() -> bool {
+     HIDE_SELF.load(Ordering::Relaxed)
+@@ -357,6 +365,7 @@ fn follow_bg3(
+         _ => t.lock,
+     };
+     t.lock += (want - t.lock) * 0.1;
++    GROUND_LOCK.store(t.lock.to_bits(), Ordering::Relaxed);
+     eye.y -= t.lock;
+     // Ground clearance (see the module notes): toward Tav's chest, at most 90% of the way.
+     if let Some(tav) = t.tav {
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+new file mode 100644
+index 0000000..8c4295d
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -0,0 +1,761 @@
++//! WOW-BG3 (local fork): Tav drawn inside WoW. Goal: the character's 3D
++//! model and animation show in WoW proper, lit and fogged like the world around her, the way
++//! SkyCraft copies its geometry into the other engine instead of reprojecting pixels.
++//!
++//! BG3's capture layer (`bg3/capture/wowbg3_capture.c`, "Tav geometry copy") copies Tav's meshes
++//! off the GPU once (`tavmesh.bin`) and her bone palettes and object transforms every frame
++//! (`tavpose.bin`), into `$WOW_BG3_TAV_DIR` (default `/tmp/wowbg3/tav`). Here each mesh becomes a
++//! WoW model-material mesh (the entity lane: ground shade, sun, fog), skinned on the CPU every
++//! pose: `v = Σ wᵢ·Pᵢ·[p, 1]` with the palette's 3×4 rows, then the object's world transform
++//! (BG3 metres), then world mode's mapping into WoW (`WorldMode.lua`: mirrored, yards), then
++//! Bevy's axes. The ground lock (`wowbg3_lead`) lowers her with the camera, so her feet meet WoW's
++//! ground. Untextured for now: a clay figure in WoW's light.
++//!
++//! File layouts are documented in the layer; every record is decoded defensively (a short or
++//! foreign file is ignored).
++
++use std::path::PathBuf;
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
++
++use benilla_assets::coords::wow_to_bevy;
++use benilla_assets::materials::WowModelMaterial;
++use benilla_formats::{FogPolicy, ModelBlend};
++use benilla_world::model_render::{model_material, MaterialCache, ShadeSel};
++use bevy::asset::RenderAssetUsages;
++use bevy::camera::visibility::NoFrustumCulling;
++use bevy::mesh::{Indices, MeshTag, PrimitiveTopology};
++use bevy::prelude::*;
++
++/// Metres to the yard (world mode's scale, `WorldMode.lua`).
++const YD: f32 = 0.9144;
++/// A pose older than this hides Tav (BG3 stopped writing them: world mode off or BG3 gone).
++const STALE_SECS: f64 = 1.0;
++
++/// One mesh as copied: bind-pose positions and normals (model space, metres), uv0, skin.
++pub(crate) struct TavMesh {
++    pub(crate) key: u64,
++    pub(crate) kind: u32,
++    /// Which of Tav's visuals it belongs to (0 the root, then attachments in order); for logs.
++    pub(crate) part: u32,
++    pub(crate) pos: Vec<Vec3>,
++    pub(crate) nrm: Vec<Vec3>,
++    pub(crate) uv: Vec<[f32; 2]>,
++    pub(crate) weights: Vec<[f32; 4]>,
++    pub(crate) bones: Vec<[u8; 4]>,
++    pub(crate) idx: Vec<u32>,
++    /// A rigid mesh riding a skinned sibling (the elf ears on the head): whose palette its
++    /// borrowed weights index. See [`borrow_skin`].
++    pub(crate) skin_from: Option<u64>,
++}
++
++pub(crate) struct MeshFile {
++    pub(crate) seq: u32,
++    pub(crate) centre: [f32; 3],
++    pub(crate) wow: [f32; 3],
++    pub(crate) meshes: Vec<TavMesh>,
++}
++
++pub(crate) struct PoseRec {
++    pub(crate) key: u64,
++    pub(crate) flags: u32,
++    /// Quat xyzw, translate xyz, scale xyz.
++    pub(crate) world: [f32; 10],
++    pub(crate) palette: Vec<[f32; 12]>,
++}
++
++pub(crate) struct PoseFile {
++    pub(crate) seq: u32,
++    pub(crate) frame: u32,
++    pub(crate) time: f64,
++    pub(crate) recs: Vec<PoseRec>,
++}
++
++fn u32_at(b: &[u8], o: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
++}
++fn u64_at(b: &[u8], o: usize) -> Option<u64> {
++    Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?))
++}
++fn f32_at(b: &[u8], o: usize) -> Option<f32> {
++    Some(f32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?))
++}
++
++/// The three axes of a unit quaternion's rotation (columns X, Y, Z).
++fn quat_axes(q: [f32; 4]) -> [Vec3; 3] {
++    let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt().max(1e-6);
++    let (x, y, z, w) = (q[0] / l, q[1] / l, q[2] / l, q[3] / l);
++    [
++        Vec3::new(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)),
++        Vec3::new(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)),
++        Vec3::new(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)),
++    ]
++}
++
++/// The normal each qtangent encodes. Which axis of the frame is the normal (and its sign) is
++/// settled per mesh by agreement with the faces, not assumed.
++fn qtangent_normals(pos: &[Vec3], qt: &[[f32; 4]], idx: &[u32]) -> Vec<Vec3> {
++    let axes: Vec<[Vec3; 3]> = qt.iter().map(|q| quat_axes(*q)).collect();
++    let mut face = vec![Vec3::ZERO; pos.len()];
++    for t in idx.chunks_exact(3) {
++        let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
++        if a >= pos.len() || b >= pos.len() || c >= pos.len() {
++            continue;
++        }
++        let n = (pos[b] - pos[a]).cross(pos[c] - pos[a]);
++        face[a] += n;
++        face[b] += n;
++        face[c] += n;
++    }
++    let mut score = [0.0f32; 3];
++    let mut sign = [0.0f32; 3];
++    for (ax, f) in axes.iter().zip(&face) {
++        let f = f.normalize_or_zero();
++        for k in 0..3 {
++            let d = ax[k].dot(f);
++            score[k] += d.abs();
++            sign[k] += d;
++        }
++    }
++    let k = (0..3).max_by(|a, b| score[*a].total_cmp(&score[*b])).unwrap_or(2);
++    let s = if sign[k] < 0.0 { -1.0 } else { 1.0 };
++    axes.iter().map(|ax| ax[k] * s).collect()
++}
++
++fn half(bits: u16) -> f32 {
++    let s = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
++    let e = ((bits >> 10) & 0x1f) as i32;
++    let m = (bits & 0x3ff) as f32;
++    s * match e {
++        0 => m * 2f32.powi(-24),
++        31 => f32::INFINITY,
++        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
++    }
++}
++
++/// Decodes `tavmesh.bin`.
++pub(crate) fn decode_mesh(b: &[u8]) -> Option<MeshFile> {
++    if b.get(0..4)? != b"TVM1" || u32_at(b, 4)? != 1 {
++        return None;
++    }
++    let seq = u32_at(b, 8)?;
++    let n = u32_at(b, 12)? as usize;
++    if n > 256 {
++        return None;
++    }
++    let f3 = |o| -> Option<[f32; 3]> { Some([f32_at(b, o)?, f32_at(b, o + 4)?, f32_at(b, o + 8)?]) };
++    let (centre, wow) = (f3(16)?, f3(28)?);
++    let mut at = 40 + 64 * n;
++    let mut meshes = Vec::with_capacity(n);
++    for i in 0..n {
++        let h = 40 + 64 * i;
++        let key = u64_at(b, h)?;
++        let u: Vec<u32> = (0..12).map(|k| u32_at(b, h + 8 + 4 * k)).collect::<Option<_>>()?;
++        let (kind, part, vc, ic, isz, vs, uvoff, stride) =
++            (u[0], u[1], u[2] as usize, u[3] as usize, u[4] as usize, u[5] as usize, u[6] as usize, u[7] as usize);
++        let sizes = [u[8] as usize, u[9] as usize, u[10] as usize, u[11] as usize];
++        let mut blob = [&b[0..0]; 4];
++        for k in 0..4 {
++            blob[k] = b.get(at..at + sizes[k])?;
++            at += sizes[k];
++        }
++        let (src, skin, vb, ib) = (blob[0], blob[1], blob[2], blob[3]);
++        if stride < 20 || src.len() < vc * stride || ib.len() < ic * isz || ic % 3 != 0 || uvoff + 4 > vs {
++            return None;
++        }
++        let mut pos = Vec::with_capacity(vc);
++        let mut qt = Vec::with_capacity(vc);
++        for v in 0..vc {
++            let o = v * stride;
++            pos.push(Vec3::new(f32_at(src, o)?, f32_at(src, o + 4)?, f32_at(src, o + 8)?));
++            let q = |k: usize| i16::from_le_bytes([src[o + 12 + 2 * k], src[o + 13 + 2 * k]]) as f32 / 32767.0;
++            qt.push([q(0), q(1), q(2), q(3)]);
++        }
++        // The uv lives in the stream-0 vertex: its own buffer when skinned, the source when rigid.
++        let (uvsrc, uvstride) = if kind == 0 { (vb, vs) } else { (src, stride) };
++        if uvsrc.len() < vc * uvstride {
++            return None;
++        }
++        let uv = (0..vc)
++            .map(|v| {
++                let o = v * uvstride + uvoff;
++                let h = |k: usize| half(u16::from_le_bytes([uvsrc[o + 2 * k], uvsrc[o + 1 + 2 * k]]));
++                [h(0), h(1)]
++            })
++            .collect();
++        let (mut weights, mut bones) = (Vec::new(), Vec::new());
++        if kind == 0 {
++            if skin.len() < vc * 8 {
++                return None;
++            }
++            for v in 0..vc {
++                let s = &skin[v * 8..v * 8 + 8];
++                weights.push([s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0, s[3] as f32 / 255.0]);
++                bones.push([s[4], s[5], s[6], s[7]]);
++            }
++        }
++        let idx: Vec<u32> = (0..ic)
++            .map(|k| {
++                if isz == 2 {
++                    u16::from_le_bytes([ib[2 * k], ib[2 * k + 1]]) as u32
++                } else {
++                    u32::from_le_bytes(ib[4 * k..4 * k + 4].try_into().unwrap())
++                }
++            })
++            .collect();
++        if idx.iter().any(|i| *i as usize >= vc) {
++            return None;
++        }
++        let nrm = qtangent_normals(&pos, &qt, &idx);
++        meshes.push(TavMesh { key, kind, part, pos, nrm, uv, weights, bones, idx, skin_from: None });
++    }
++    borrow_skin(&mut meshes);
++    Some(MeshFile { seq, centre, wow, meshes })
++}
++
++/// A rigid mesh in a visual that also has skinned meshes (the elf ears in the head visual) is
++/// placed by BG3 with the visual's root transform but moves with a bone; it takes the skin of the
++/// nearest vertex of the visual's largest skinned mesh (same model space), and that mesh's
++/// palette. A rigid mesh alone in its visual (the greataxe) keeps its own world transform.
++fn borrow_skin(meshes: &mut [TavMesh]) {
++    for i in 0..meshes.len() {
++        if meshes[i].kind != 1 {
++            continue;
++        }
++        let part = meshes[i].part;
++        let Some(j) = (0..meshes.len())
++            .filter(|j| meshes[*j].kind == 0 && meshes[*j].part == part)
++            .max_by_key(|j| meshes[*j].pos.len())
++        else {
++            continue;
++        };
++        let (src_key, src_pos, src_w, src_b) =
++            (meshes[j].key, meshes[j].pos.clone(), meshes[j].weights.clone(), meshes[j].bones.clone());
++        let m = &mut meshes[i];
++        m.weights.clear();
++        m.bones.clear();
++        for p in &m.pos {
++            let k = (0..src_pos.len())
++                .min_by(|a, b| src_pos[*a].distance_squared(*p).total_cmp(&src_pos[*b].distance_squared(*p)))
++                .unwrap_or(0);
++            m.weights.push(src_w[k]);
++            m.bones.push(src_b[k]);
++        }
++        m.skin_from = Some(src_key);
++    }
++}
++
++/// Decodes `tavpose.bin`.
++pub(crate) fn decode_pose(b: &[u8]) -> Option<PoseFile> {
++    if b.get(0..4)? != b"TVP1" {
++        return None;
++    }
++    let (seq, frame, n) = (u32_at(b, 4)?, u32_at(b, 8)?, u32_at(b, 12)? as usize);
++    let time = f64::from_le_bytes(b.get(16..24)?.try_into().ok()?);
++    if n > 256 {
++        return None;
++    }
++    let mut at = 24;
++    let mut recs = Vec::with_capacity(n);
++    for _ in 0..n {
++        let key = u64_at(b, at)?;
++        let bones = u32_at(b, at + 8)? as usize;
++        let flags = u32_at(b, at + 12)?;
++        if bones > 512 {
++            return None;
++        }
++        let mut world = [0.0; 10];
++        for (k, w) in world.iter_mut().enumerate() {
++            *w = f32_at(b, at + 16 + 4 * k)?;
++        }
++        let mut palette = Vec::with_capacity(bones);
++        for j in 0..bones {
++            let mut m = [0.0; 12];
++            for (k, v) in m.iter_mut().enumerate() {
++                *v = f32_at(b, at + 56 + 48 * j + 4 * k)?;
++            }
++            palette.push(m);
++        }
++        recs.push(PoseRec { key, flags, world, palette });
++        at += 56 + 48 * bones;
++    }
++    Some(PoseFile { seq, frame, time, recs })
++}
++
++/// BG3 world (metres) to WoW world (yards), world mode's mirrored mapping (`WorldMode.lua` toWow).
++pub(crate) fn bg3_to_wow(p: Vec3, centre: [f32; 3], wow: [f32; 3]) -> [f32; 3] {
++    [wow[0] - (p.z - centre[2]) / YD, wow[1] + (p.x - centre[0]) / YD, wow[2] + (p.y - centre[1]) / YD]
++}
++
++/// The same mapping for a direction (no translation, no scale: unit stays unit).
++fn bg3_dir_to_bevy(d: Vec3) -> Vec3 {
++    wow_to_bevy([-d.z, d.x, d.y]) - wow_to_bevy([0.0, 0.0, 0.0])
++}
++
++/// Skins one mesh into BG3 world space: positions and normals.
++pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut Vec<Vec3>) {
++    pos.clear();
++    nrm.clear();
++    let q = Quat::from_xyzw(p.world[0], p.world[1], p.world[2], p.world[3]).normalize();
++    let t = Vec3::new(p.world[4], p.world[5], p.world[6]);
++    let s = Vec3::new(p.world[7], p.world[8], p.world[9]);
++    let s = if s.is_finite() && s.length_squared() > 1e-8 { s } else { Vec3::ONE };
++    let skinned = !m.weights.is_empty() && !p.palette.is_empty();
++    for v in 0..m.pos.len() {
++        let (mut lp, mut ln) = (m.pos[v], m.nrm[v]);
++        if skinned {
++            let (mut sp, mut sn) = (Vec3::ZERO, Vec3::ZERO);
++            for k in 0..4 {
++                let w = m.weights[v][k];
++                if w <= 0.0 {
++                    continue;
++                }
++                let b = &p.palette[(m.bones[v][k] as usize).min(p.palette.len() - 1)];
++                let r0 = Vec3::new(b[0], b[1], b[2]);
++                let r1 = Vec3::new(b[4], b[5], b[6]);
++                let r2 = Vec3::new(b[8], b[9], b[10]);
++                sp += w * Vec3::new(r0.dot(lp) + b[3], r1.dot(lp) + b[7], r2.dot(lp) + b[11]);
++                sn += w * Vec3::new(r0.dot(ln), r1.dot(ln), r2.dot(ln));
++            }
++            lp = sp;
++            ln = sn;
++        }
++        pos.push(q * (lp * s) + t);
++        nrm.push((q * (ln / s)).normalize_or_zero());
++    }
++}
++
++struct Part {
++    key: u64,
++    entity: Entity,
++    mesh: Handle<Mesh>,
++}
++
++#[derive(Resource)]
++struct TavDraw {
++    dir: PathBuf,
++    frame: u64,
++    mesh_mtime: Option<SystemTime>,
++    file: Option<MeshFile>,
++    root: Option<Entity>,
++    parts: Vec<Part>,
++    last_pose: u32,
++    last_pose_at: Option<Instant>,
++    cache: MaterialCache,
++    material: Option<Handle<WowModelMaterial>>,
++    scratch: (Vec<Vec3>, Vec<Vec3>),
++    logged: u64,
++    /// `tavtex.txt` (link/tools/tavtex.py): its stamp, and the textures loaded so far by file.
++    tex_stamp: Option<(SystemTime, u32)>,
++    textures: std::collections::HashMap<String, (Handle<Image>, u32)>,
++}
++
++pub(crate) fn build(app: &mut App) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let dir = std::env::var_os("WOW_BG3_TAV_DIR").map_or_else(|| PathBuf::from("/tmp/wowbg3/tav"), PathBuf::from);
++    info!("wowbg3 tav: drawing BG3's character from {dir:?}");
++    app.insert_resource(TavDraw {
++        dir,
++        frame: 0,
++        mesh_mtime: None,
++        file: None,
++        root: None,
++        parts: Vec::new(),
++        last_pose: 0,
++        last_pose_at: None,
++        cache: MaterialCache::default(),
++        material: None,
++        scratch: (Vec::new(), Vec::new()),
++        logged: 0,
++        tex_stamp: None,
++        textures: std::collections::HashMap::new(),
++    })
++    .add_systems(Update, (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes)));
++}
++
++fn load_meshes(
++    mut commands: Commands,
++    mut d: ResMut<TavDraw>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<WowModelMaterial>>,
++    light: Option<Res<benilla_world::lighting::SharedLightBuffer>>,
++) {
++    d.frame += 1;
++    if d.frame % 30 != 1 {
++        return;
++    }
++    let path = d.dir.join("tavmesh.bin");
++    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
++    if d.mesh_mtime == Some(mtime) {
++        return;
++    }
++    let Some(light) = light else { return };
++    let Ok(raw) = std::fs::read(&path) else { return };
++    d.mesh_mtime = Some(mtime);
++    let Some(file) = decode_mesh(&raw) else {
++        warn!("wowbg3 tav: {path:?} did not decode");
++        return;
++    };
++    // Rebuild: the old figure goes, the new one comes up hidden until its first pose.
++    if let Some(root) = d.root.take() {
++        commands.entity(root).despawn();
++    }
++    d.parts.clear();
++    let material = d.material.clone().unwrap_or_else(|| {
++        let TavDraw { cache, .. } = &mut *d;
++        model_material(
++            cache,
++            &mut materials,
++            None,
++            ModelBlend::Opaque,
++            true, // two-sided: BG3's winding through the mirrored mapping is not trusted yet
++            false,
++            false,
++            false,
++            false,
++            false,
++            false,
++            false,
++            FogPolicy::Scene,
++            false,
++            ShadeSel::Lit,
++            0,
++            None,
++            None,
++            None,
++            None,
++            false,
++            false,
++            &light.0,
++            None,
++        )
++    });
++    d.material = Some(material.clone());
++    let root = commands
++        .spawn((
++            Name::new("wowbg3 Tav"),
++            Transform::default(),
++            Visibility::Hidden,
++            benilla_world::entity_shade::GroundShade::default(),
++        ))
++        .id();
++    let mut parts = Vec::new();
++    for m in &file.meshes {
++        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
++        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; m.pos.len()]);
++        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; m.pos.len()]);
++        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uv.clone());
++        mesh.insert_indices(Indices::U32(m.idx.clone()));
++        let handle = meshes.add(mesh);
++        let entity = commands.spawn((
++                Mesh3d(handle.clone()),
++                MeshMaterial3d(material.clone()),
++                MeshTag(0),
++                Transform::default(),
++                NoFrustumCulling,
++                ChildOf(root),
++            )).id();
++        parts.push(Part { key: m.key, entity, mesh: handle });
++    }
++    info!(
++        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals",
++        file.seq,
++        file.meshes.len(),
++        file.meshes.iter().map(|m| m.pos.len()).sum::<usize>(),
++        file.meshes.iter().map(|m| m.part).max().map_or(0, |p| p + 1)
++    );
++    d.parts = parts;
++    d.tex_stamp = None; // new meshes: apply the textures again
++    d.root = Some(root);
++    d.file = Some(file);
++    d.last_pose = 0;
++}
++
++/// A baked texture as a mipmapped, anisotropically filtered image (sharp up close, calm at a
++/// distance). Mips are 2x2 box averages of the sRGB bytes.
++fn tav_image(w: u32, h: u32, px: &[u8]) -> Image {
++    use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
++    let mut data = px.to_vec();
++    let (mut cw, mut ch, mut levels) = (w as usize, h as usize, 1u32);
++    let mut prev = px.to_vec();
++    while cw > 1 || ch > 1 {
++        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
++        let mut next = vec![0u8; nw * nh * 4];
++        for y in 0..nh {
++            for x in 0..nw {
++                for c in 0..4 {
++                    let at = |xx: usize, yy: usize| prev[((yy.min(ch - 1)) * cw + xx.min(cw - 1)) * 4 + c] as u32;
++                    let s = at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1);
++                    next[(y * nw + x) * 4 + c] = ((s + 2) / 4) as u8;
++                }
++            }
++        }
++        data.extend_from_slice(&next);
++        prev = next;
++        cw = nw;
++        ch = nh;
++        levels += 1;
++    }
++    let mut image = Image::new(
++        bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
++        bevy::render::render_resource::TextureDimension::D2,
++        px.to_vec(),
++        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
++        RenderAssetUsages::RENDER_WORLD,
++    );
++    image.data = Some(data);
++    image.texture_descriptor.mip_level_count = levels;
++    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
++        address_mode_u: ImageAddressMode::Repeat,
++        address_mode_v: ImageAddressMode::Repeat,
++        mag_filter: ImageFilterMode::Linear,
++        min_filter: ImageFilterMode::Linear,
++        mipmap_filter: ImageFilterMode::Linear,
++        anisotropy_clamp: 8,
++        ..default()
++    });
++    image
++}
++
++/// Decodes a `.tvt` texture (`TVT1`, width, height, flags; RGBA8 sRGB rows).
++pub(crate) fn decode_tvt(b: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
++    if b.get(0..4)? != b"TVT1" {
++        return None;
++    }
++    let (w, h, flags) = (u32_at(b, 4)?, u32_at(b, 8)?, u32_at(b, 12)?);
++    let n = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
++    (w > 0 && h > 0 && w <= 8192 && h <= 8192).then_some(())?;
++    Some((w, h, flags, b.get(16..16 + n)?))
++}
++
++/// Puts the baked textures (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested
++/// where the material cuts out (hair, fur, lace), hidden where WoW cannot draw it (tear lines,
++/// lash shadows).
++fn load_textures(
++    mut commands: Commands,
++    mut d: ResMut<TavDraw>,
++    mut images: ResMut<Assets<Image>>,
++    mut materials: ResMut<Assets<WowModelMaterial>>,
++    light: Option<Res<benilla_world::lighting::SharedLightBuffer>>,
++) {
++    if d.frame % 30 != 15 || d.root.is_none() {
++        return;
++    }
++    let Some(light) = light else { return };
++    let path = d.dir.join("tavtex.txt");
++    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
++    let Some(seq) = d.file.as_ref().map(|f| f.seq) else { return };
++    if d.tex_stamp == Some((mtime, seq)) {
++        return;
++    }
++    let Ok(text) = std::fs::read_to_string(&path) else { return };
++    let mut lines = text.lines();
++    let head: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
++    if head.len() < 3 || head[0] != "TAVTEX" || head[2].parse::<u32>().ok() != Some(seq) {
++        return; // the baker has not caught up with this plan yet
++    }
++    d.tex_stamp = Some((mtime, seq));
++    let mut applied = 0;
++    for line in lines {
++        let f: Vec<&str> = line.split_whitespace().collect();
++        if f.len() < 3 {
++            continue;
++        }
++        let (Ok(key), Ok(flags)) = (u64::from_str_radix(f[0], 16), f[2].parse::<u32>()) else { continue };
++        let Some(part) = d.parts.iter().find(|p| p.key == key).map(|p| p.entity) else { continue };
++        if flags & 2 != 0 {
++            commands.entity(part).insert(Visibility::Hidden);
++            continue;
++        }
++        let file = f[1].to_string();
++        if !d.textures.contains_key(&file) {
++            let Ok(raw) = std::fs::read(d.dir.join(&file)) else { continue };
++            let Some((w, h, fl, px)) = decode_tvt(&raw) else { continue };
++            let image = tav_image(w, h, px);
++            let handle = images.add(image);
++            d.textures.insert(file.clone(), (handle, fl));
++        }
++        let (handle, _) = d.textures[&file].clone();
++        let TavDraw { cache, .. } = &mut *d;
++        let material = model_material(
++            cache,
++            &mut materials,
++            Some(handle),
++            if flags & 1 != 0 { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
++            true,
++            false,
++            false,
++            false,
++            false,
++            false,
++            false,
++            false,
++            FogPolicy::Scene,
++            false,
++            ShadeSel::Lit,
++            0,
++            None,
++            None,
++            None,
++            None,
++            false,
++            false,
++            &light.0,
++            None,
++        );
++        commands.entity(part).insert((MeshMaterial3d(material), Visibility::Inherited));
++        applied += 1;
++    }
++    info!("wowbg3 tav: textures for plan {seq} on {applied} meshes");
++}
++
++fn apply_pose(
++    mut d: ResMut<TavDraw>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut roots: Query<(&mut Transform, &mut Visibility)>,
++) {
++    let Some(root) = d.root else { return };
++    let raw = std::fs::read(d.dir.join("tavpose.bin")).ok();
++    let pose = raw.as_deref().and_then(decode_pose);
++    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64());
++    let seq_ok = |p: &PoseFile| d.file.as_ref().is_some_and(|f| f.seq == p.seq) && !p.recs.is_empty();
++    let fresh = pose.as_ref().is_some_and(|p| seq_ok(p) && (now - p.time).abs() < STALE_SECS);
++    let Ok((mut tf, mut vis)) = roots.get_mut(root) else { return };
++    if !fresh {
++        if *vis != Visibility::Hidden && d.last_pose_at.is_none_or(|t| t.elapsed().as_secs_f32() > 0.5) {
++            *vis = Visibility::Hidden;
++        }
++        return;
++    }
++    let pose = pose.unwrap();
++    if pose.frame == d.last_pose {
++        return;
++    }
++    d.last_pose = pose.frame;
++    d.last_pose_at = Some(Instant::now());
++    let TavDraw { file, parts, scratch, logged, .. } = &mut *d;
++    let Some(file) = file.as_ref() else { return };
++    // Her root: the first mesh's object origin, mapped; the ground lock lowers her with the camera.
++    let Some(anchor) = pose.recs.iter().find(|r| r.flags & 1 != 0) else { return };
++    let origin = wow_to_bevy(bg3_to_wow(Vec3::new(anchor.world[4], anchor.world[5], anchor.world[6]), file.centre, file.wow))
++        - Vec3::Y * crate::wowbg3_lead::ground_lock();
++    tf.translation = origin;
++    tf.rotation = Quat::IDENTITY;
++    if *vis != Visibility::Inherited {
++        *vis = Visibility::Inherited;
++    }
++    let (pos, nrm) = scratch;
++    for (m, part) in file.meshes.iter().zip(parts.iter()) {
++        debug_assert_eq!(m.key, part.key);
++        let want = m.skin_from.unwrap_or(m.key);
++        let Some(rec) = pose.recs.iter().find(|r| r.key == want && r.flags & 1 != 0) else { continue };
++        if !m.weights.is_empty() && rec.palette.is_empty() {
++            continue;
++        }
++        pose_mesh(m, rec, pos, nrm);
++        let lift = Vec3::Y * crate::wowbg3_lead::ground_lock();
++        let p: Vec<[f32; 3]> = pos
++            .iter()
++            .map(|v| (wow_to_bevy(bg3_to_wow(*v, file.centre, file.wow)) - lift - origin).to_array())
++            .collect();
++        let n: Vec<[f32; 3]> = nrm.iter().map(|v| bg3_dir_to_bevy(*v).normalize_or_zero().to_array()).collect();
++        if let Some(mesh) = meshes.get_mut(&part.mesh) {
++            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
++            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
++        }
++    }
++    *logged += 1;
++    if *logged % 600 == 1 {
++        info!("wowbg3 tav: pose {} at {origin:?}", pose.frame);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mesh_file() -> Vec<u8> {
++        // One skinned triangle, 3 vertices, 1 bone.
++        let mut b = Vec::new();
++        b.extend_from_slice(b"TVM1");
++        for v in [1u32, 7, 1] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        for v in [0.0f32, 10.0, 0.0, -8900.0, -20.0, 100.0] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&42u64.to_le_bytes());
++        for v in [0u32, 3, 3, 3, 2, 4, 0, 20, 60, 24, 12, 6] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&[0u8; 8]);
++        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
++            for v in p {
++                b.extend_from_slice(&v.to_le_bytes());
++            }
++            for q in [0i16, 0, 0, 32767] {
++                b.extend_from_slice(&q.to_le_bytes());
++            }
++        }
++        for _ in 0..3 {
++            b.extend_from_slice(&[255, 0, 0, 0, 0, 0, 0, 0]);
++        }
++        for _ in 0..3 {
++            b.extend_from_slice(&[0x00, 0x38, 0x00, 0x3c]); // uv (0.5, 1.0)
++        }
++        for i in [0u16, 1, 2] {
++            b.extend_from_slice(&i.to_le_bytes());
++        }
++        b
++    }
++
++    #[test]
++    fn decodes_and_skins() {
++        let f = decode_mesh(&mesh_file()).expect("decodes");
++        assert_eq!((f.seq, f.meshes.len()), (7, 1));
++        let m = &f.meshes[0];
++        assert_eq!(m.uv[0], [0.5, 1.0]);
++        // Face normal of the triangle is +Z; the qtangent's Z axis agrees.
++        assert!((m.nrm[0] - Vec3::Z).length() < 1e-4);
++        // Palette: translate by (0, 2, 0); world: identity quat, translate (5, 0, 0).
++        let rec = PoseRec {
++            key: 42,
++            flags: 1,
++            world: [0.0, 0.0, 0.0, 1.0, 5.0, 0.0, 0.0, 1.0, 1.0, 1.0],
++            palette: vec![[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.0]],
++        };
++        let (mut p, mut n) = (Vec::new(), Vec::new());
++        pose_mesh(m, &rec, &mut p, &mut n);
++        assert!((p[1] - Vec3::new(6.0, 2.0, 0.0)).length() < 1e-3);
++        let mut bad = mesh_file();
++        bad.truncate(bad.len() - 1);
++        assert!(decode_mesh(&bad).is_none());
++    }
++
++    #[test]
++    fn maps_like_world_mode() {
++        // WorldMode.lua toWow: BG3 one metre +x from the centre is one yard-ish +y in WoW.
++        let w = bg3_to_wow(Vec3::new(1.0, 10.0, 0.0), [0.0, 10.0, 0.0], [100.0, 200.0, 30.0]);
++        assert!((w[0] - 100.0).abs() < 1e-4 && (w[1] - (200.0 + 1.0 / YD)).abs() < 1e-4 && (w[2] - 30.0).abs() < 1e-4);
++    }
++
++    #[test]
++    fn decodes_pose() {
++        let mut b = Vec::new();
++        b.extend_from_slice(b"TVP1");
++        for v in [7u32, 3, 1] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&1.5f64.to_le_bytes());
++        b.extend_from_slice(&42u64.to_le_bytes());
++        b.extend_from_slice(&1u32.to_le_bytes());
++        b.extend_from_slice(&1u32.to_le_bytes());
++        for _ in 0..22 {
++            b.extend_from_slice(&1.0f32.to_le_bytes());
++        }
++        let p = decode_pose(&b).expect("decodes");
++        assert_eq!((p.seq, p.frame, p.recs.len(), p.recs[0].palette.len()), (7, 3, 1, 1));
++        assert!(decode_pose(&b[..b.len() - 4]).is_none());
++    }
++}

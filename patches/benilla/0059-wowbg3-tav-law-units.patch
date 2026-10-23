@@ -1,0 +1,163 @@
+WOW-BG3 benilla patch 0059: a figure waiting for its maps is lit in WoW's units (beta item 10, part of 9).
+
+- Patch 0052 took WoW's light to linear for BG3's own lighting of a figure (flag 32), because WoW's
+  models multiply a gamma-space texel by `lit` while her albedo is sampled linear. The other half was
+  left as it was: patch 0006's law (`tav_a.x < 0` in `wow_model.wgsl`), which every mesh is drawn by
+  until tavtex has baked its G-buffer maps, and which `WOW_BG3_TAV_SHADE=wow` uses for all of them.
+  There her linear albedo stands in for the gamma byte WoW's law multiplies, so a mesh shows
+  `albedo_linear x lit` where it should show `srgb(albedo) x lit`: 2 to 4 times too dark, and most of
+  that in the dark channels, so the figure is too dark and too saturated as well.
+- That is what the 0.1.0 playtest showed (item 10, "clothes and parts of the model (Gale's
+  face very dark) take a long time to get WoW's lighting", and item 9's "new companions especially"):
+  his own logs show the state lasting tens of seconds. tavtex.log of his cold 12:52 session: the
+  first plan had 6 of 40 meshes baked, 13 of 40 after 26 s, 40 of 40 after 56 s, with 23 G-buffer
+  maps still to go, and benilla's own log says "34 meshes had no maps after 12 s: drawn untextured".
+  A mesh's look therefore walks four states: hidden, untextured, albedo under the law (too dark),
+  and BG3's lighting. This patch makes the third state agree with the fourth in brightness.
+- `wow_model.wgsl`: flag 64 (set with flag 16) takes her albedo to gamma for the law path, so it
+  writes `srgb(albedo) x lit`, the units of WoW's own models and of flag 32's result. A `tavdebug`
+  view keeps the old value, so captures beside BG3's frame stay comparable with the earlier runs.
+- `wowbg3_tav.rs`: `WOW_BG3_TAV_LAW=linear` turns flag 64 off (the look before this patch), with a
+  log line for the choice, and the maps line now counts the meshes still drawn by the law
+  ("N by patch 0006's law: no G-buffer maps baked yet"), which measures how long the state lasts.
+- Not touched: BG3's own lighting (flag 32), the bake times themselves (tavtex), and the 12 s
+  untextured fallback.
+
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -136,7 +136,10 @@
+ //! mesh (rollback). Units: as patch 0006, her albedo is sampled linear and the pass writes linear radiance, which
+ //! world mode's frame shows sRGB-encoded (measured: a written 0.25/0.5/0.75 arrives as 147/212/255 with FFXGlow);
+ //! `WOW_BG3_TAV_OUT=gamma` writes it sRGB-encoded instead, the units of WoW's own gamma-space models, should the
+-//! frame come to show the pass's values as they are. A file `tavdebug` in the Tav directory holding 1 to 6 shows
++//! frame come to show the pass's values as they are (what world mode runs). Patch 0059: the law path takes her
++//! albedo to gamma there too (flag 64, `WOW_BG3_TAV_LAW=linear` turns it off), as patch 0052 took WoW's light to
++//! linear under BG3's lighting; without it a mesh waiting for its G-buffer maps showed a linear albedo as the
++//! gamma byte, 2 to 4 times too dark. A file `tavdebug` in the Tav directory holding 1 to 6 shows
+ //! albedo, view-space normal, roughness/metalness/occlusion, specular, diffuse or the extra map, 7 the lit figure,
+ //! 8 patch 0006's law (A/B without a restart), 9 the base colour as sampled, 10 a constant (0.25, 0.5, 0.75) (the
+ //! frame's transfer); every view leaves WoW's mouseover highlight out (captures beside BG3's frame) ([`TavDebug`]).
+@@ -895,6 +898,12 @@
+     gamma_light: bool,
+     /// The start's choice (`WOW_BG3_TAV_LIGHT`); `<tav dir>/tavlight` overrides it at run time.
+     gamma_light_env: bool,
++    /// Patch 0059: with `gamma_out`, the law path (a mesh whose G-buffer maps are not baked yet, or
++    /// `WOW_BG3_TAV_SHADE=wow`) takes her linear albedo to gamma before WoW's gamma-space `lit`
++    /// (flag 64, `wow_model.wgsl`), so it writes `srgb(albedo) × lit` as flag 32 does under BG3's
++    /// lighting. `WOW_BG3_TAV_LAW=linear`: as before, a linear albedo as the gamma byte (2 to 4
++    /// times too dark while a figure waits for its maps).
++    gamma_law: bool,
+     debug: TavDebug,
+ }
+ 
+@@ -950,6 +959,8 @@
+     let bg3_shade = std::env::var("WOW_BG3_TAV_SHADE").map_or(true, |v| v.trim() != "wow");
+     let gamma_out = std::env::var("WOW_BG3_TAV_OUT").is_ok_and(|v| v.trim() == "gamma");
+     let gamma_light = gamma_out && !std::env::var("WOW_BG3_TAV_LIGHT").is_ok_and(|v| v.trim() == "linear");
++    // Patch 0059.
++    let gamma_law = gamma_out && !std::env::var("WOW_BG3_TAV_LAW").is_ok_and(|v| v.trim() == "linear");
+     info!(
+         "wowbg3 tav: shading {}, out {} (WOW_BG3_TAV_SHADE bg3 or wow, WOW_BG3_TAV_OUT linear or gamma)",
+         if bg3_shade { "BG3's lighting of its G-buffer with WoW's light" } else { "patch 0006's WoW law" },
+@@ -960,6 +971,11 @@
+         if gamma_light { "taken to linear (gamma-space multiplier, as WoW's models use it)" } else { "used as a linear multiplier" }
+     );
+     info!(
++        "wowbg3 tav: patch 0006's law (a mesh without its G-buffer maps, and WOW_BG3_TAV_SHADE=wow) lights {} \
++         (patch 0059; WOW_BG3_TAV_LAW=linear: as before)",
++        if gamma_law { "her albedo taken to gamma, so it writes srgb(albedo) x lit" } else { "her linear albedo as the gamma byte" }
++    );
++    info!(
+         "wowbg3 tav: BG3's vertex-colour cuts {} (WOW_BG3_TAV_CUTS off: none)",
+         if cuts_on { "on" } else { "off" }
+     );
+@@ -1028,6 +1044,7 @@
+         gamma_out,
+         gamma_light,
+         gamma_light_env: gamma_light,
++        gamma_law,
+         debug: TavDebug::default(),
+     })
+     .init_resource::<TavFeet>()
+@@ -1848,9 +1865,11 @@
+         return; // the baker has not caught up with this plan yet
+     }
+     let (mut applied, mut hidden, mut mapped, mut pending) = (0, 0, 0, 0);
++    // Patch 0059: meshes still drawn by patch 0006's law, because their G-buffer maps are not baked yet.
++    let mut lawed = 0;
+     let TavDraw {
+         dir, cache, textures, tex_jobs, tex_failed, looks, surface_mats, parts, spec, flip_y, maps, cutoff, sides, bg3_shade,
+-        gamma_out, gamma_light, debug, ..
++        gamma_out, gamma_light, gamma_law, debug, ..
+     } =
+         &mut *d;
+     let dir: &Path = dir.as_path();
+@@ -1948,6 +1967,10 @@
+                     if *gamma_light {
+                         lanes[0].w += 32.0; // patch 0052: flag 32, WoW's light taken to linear (`tav_light`)
+                     }
++                    if *gamma_law {
++                        // Patch 0059: flag 64, the law path's albedo taken to gamma (`srgb(albedo) × lit`).
++                        lanes[0].w += 64.0;
++                    }
+                 }
+                 let h = if *maps {
+                     tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff, !one_sided, x, dt, lanes)
+@@ -1986,6 +2009,9 @@
+         if key.1.is_some() {
+             mapped += 1;
+         }
++        if !bg3 {
++            lawed += 1;
++        }
+         applied += 1;
+         if part.dressed && matches!(looks.get(&t.key), Some(Look::Shown(h)) if *h == material) {
+             continue; // already wears it
+@@ -1997,7 +2023,10 @@
+     d.tex_more = pending > 0;
+     if pending == 0 {
+         d.tex_stamp = Some((mtime, seq));
+-        info!("wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped), {hidden} hidden");
++        info!(
++            "wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped, \
++             {lawed} by patch 0006's law: no G-buffer maps baked yet), {hidden} hidden"
++        );
+     }
+ }
+ 
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -547,7 +547,9 @@
+ // add), so the output is linear radiance. WoW's `lit` for a normal n is the irradiance as an albedo
+ // multiplier (BG3's `irradiance / π`): a plain diffuse surface shows exactly patch 0006's
+ // `albedo × lit`; the sun's part is `lit(n) − ambient`, and BG3's BRDFs take the sun's radiance as
+-// π × that at n = L.
++// π × that at n = L. Patch 0059: with flag 16 (`WOW_BG3_TAV_OUT=gamma`, what world mode runs) the
++// pass writes gamma instead, so the law path takes her albedo to gamma as well (flag 64 at the
++// albedo below); flag 32 does the same for WoW's light under BG3's lighting (patch 0052).
+ const TAV_PI: f32 = 3.14159265;
+ 
+ // What a figure's fragment needs from its maps, fetched where derivatives are defined.
+@@ -1153,7 +1155,21 @@
+     // Gamma-space albedo: lighting runs on the authored byte values. `m.tint` plus its mat-anim
+     // delta is the animated M2Color tint.
+     let anim_tint = m.tint.rgb + wow_light.matanim[u32(m.anim_slots.y)].xyz;
+-    let albedo = base.rgb * anim_tint;
++    var albedo_texel = base.rgb;
++#ifdef WOW_TAV_SURFACE
++    // Patch 0059: a figure drawn by patch 0006's law (`tav_a.x < 0`: a mesh whose G-buffer maps are
++    // not baked yet, or `WOW_BG3_TAV_SHADE=wow`) has her albedo sampled linear while `lit` below is
++    // a gamma-space multiplier, so with flag 64 (set with flag 16) her albedo goes to gamma first
++    // and the law writes `srgb(albedo) × lit`: the units patch 0052 gave BG3's own lighting
++    // (flag 32) and WoW's own models use. Before, a linear albedo stood in for the gamma byte, 2 to
++    // 4 times too dark, which is what a mesh showed while it waited for its maps (dark clothes and
++    // faces for the 30 to 60 s a cold session bakes them). A debug view keeps the old value, so
++    // `tavdebug` captures stay comparable. `WOW_BG3_TAV_LAW=linear` turns flag 64 off.
++    if (m.tav_a.x < -0.5 && m.tav_a.z < 0.5 && (u32(max(m.tav_a.w, 0.0)) & 64u) != 0u) {
++        albedo_texel = tav_srgb(base.rgb);
++    }
++#endif
++    let albedo = albedo_texel * anim_tint;
+     // An unlit batch replaces the lit path: fullbright, with only the highlight added (below).
+     let is_emissive = m.model_flags.w > 0.5;
+     // SIDN night glow: the emissive × the night fraction (ramping 20:30→21:30, 06:00→07:00), a

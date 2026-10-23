@@ -1,0 +1,40 @@
+# WOW-BG3 launcher: the WoW side, run by the wowbg3-launcher plugin as BG3's child processes.
+# One [section] per child. Values may use {home} (this WOW-BG3 folder), {data}
+# (~/.local/share/wow-bg3), {wow} ({home}/WoW, the player's WoW 1.12.1 files), {io} (BG3's
+# Script Extender/wow-bg3 folder), {link} ({io}/link) and {mods} (BG3's Mods folder).
+#   exec      the program (no shell; one arg per "arg" line)
+#   env       KEY=VALUE for this child only (repeatable)
+#   start     enabled: whenever WOW-BG3 is enabled in the mod manager (from the main menu on)
+#             request: only when the mod's Lua asks (Ext.Plugins.Set("wowbg3-launcher", NAME, 1))
+#             always | never
+#   grace     seconds between SIGTERM and SIGKILL when it is stopped
+#   restarts  automatic restarts after an unexpected exit
+# Every child also gets WOWBG3_HOME, WOWBG3_DATA, WOWBG3_IO, WOWBG3_LINK, WOWBG3_MODS,
+# WOWBG3_WOW and WOWBG3_BG3_PID, no LD_PRELOAD (bg3le stays in BG3) and no Vulkan layer variables.
+# stdout and stderr go to {data}/logs/NAME.log. SIGTERM must stop a child cleanly (the server
+# flushes its database); BG3 closing or crashing sends it.
+
+[server]
+# The portable server (server/ in the WOW-BG3 repository): mangosd, realmd,
+# MariaDB, data generated from {wow} on the first start (a few minutes; the loading screen waits).
+# "run": init on the first start, start, stay in the foreground, stop cleanly on SIGTERM.
+exec = {home}/server/wowbg3-server.sh
+arg = run
+arg = {wow}
+env = WOWBG3_SERVER_VAR={data}/server
+start = enabled
+grace = 30
+restarts = 3
+
+[coord]
+# The release coordinator (tools/wowbg3-coord.py with the runtime's python3):
+# follows BG3's sessions as the harness's lifecycle does (save sync, the hero's WoW character, bots,
+# death), runs benilla offscreen, the world bridge, the fight bridge, the inventory bridge and the chat
+# command handler, and stops them when BG3 closes. Its log: {data}/logs/coord.log.
+# The python shipped in python/ (numpy, Pillow: Tav's textures), else the system's or runtime's python3.
+exec = /bin/sh
+arg = -c
+arg = p="$WOWBG3_HOME/python/bin/python3"; [ -x "$p" ] || p=python3; exec "$p" -u "$WOWBG3_HOME/tools/wowbg3-coord.py"
+start = enabled
+grace = 14
+restarts = 3

@@ -1,0 +1,375 @@
+diff --git a/crates/benilla-app/src/creature_anim/events.rs b/crates/benilla-app/src/creature_anim/events.rs
+--- a/crates/benilla-app/src/creature_anim/events.rs
++++ b/crates/benilla-app/src/creature_anim/events.rs
+@@ -124,7 +124,11 @@
+     anim_data: Option<Res<AnimData>>,
+     names: Res<crate::names::NameCache>,
+     // WOW-BG3 (local fork): the own character is voiced by BG3 in world mode.
+-    own: (Query<(), With<crate::net::Embodied>>, Query<&ChildOf>),
++    // Patch 0050: and the party bots' hidden bodies (`wowbg3_party`), voiced by BG3 too.
++    own: (
++        Query<(), Or<(With<crate::net::Embodied>, With<crate::wowbg3_party::PartyBotBody>)>>,
++        Query<&ChildOf>,
++    ),
+ ) {
+     let catalog = anim_data.as_deref().map(|d| &d.0);
+     let hide_self = crate::wowbg3_lead::hide_self();
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -198,6 +198,7 @@
+ mod wowbg3_lead;
+ mod wowbg3_offscreen;
+ mod wowbg3_pace;
++mod wowbg3_party;
+ mod wowbg3_tav;
+ mod wowbg3_teleport;
+ 
+diff --git a/crates/benilla-app/src/sound/creature.rs b/crates/benilla-app/src/sound/creature.rs
+--- a/crates/benilla-app/src/sound/creature.rs
++++ b/crates/benilla-app/src/sound/creature.rs
+@@ -128,7 +128,13 @@
+ /// unit that streams in dead cries nothing: create edges are suppressed.
+ fn death_vocals(
+     mut edges: MessageReader<FieldChanged>,
+-    units: Query<(&NetEntity, &Transform, Has<crate::net::Embodied>)>,
++    units: Query<(
++        &NetEntity,
++        &Transform,
++        Has<crate::net::Embodied>,
++        // Patch 0050: a party bot's hidden body (`wowbg3_party`).
++        Has<crate::wowbg3_party::PartyBotBody>,
++    )>,
+     voices: Option<Res<CreatureVoices>>,
+     kits: Option<ResMut<SoundKits>>,
+     assets: Option<Res<WorldAssets>>,
+@@ -149,11 +155,11 @@
+         if !died {
+             continue;
+         }
+-        let Ok((net, transform, own)) = units.get(e.entity) else {
++        let Ok((net, transform, own, bot)) = units.get(e.entity) else {
+             continue;
+         };
+         // WOW-BG3 (patch 0045): in world mode the own character's vocals are BG3's.
+-        if own && crate::wowbg3_lead::hide_self() {
++        if (own || bot) && crate::wowbg3_lead::hide_self() {
+             continue;
+         }
+         let Some(voice) = net.display_id.and_then(|d| voices.0.for_display(d)) else {
+@@ -522,7 +528,13 @@
+ /// (`0x605f30`, `0x602d71`) in the 13-70 yd band.
+ fn fall_landing_vocals(
+     mut landings: MessageReader<crate::creature_anim::HardLanding>,
+-    units: Query<(&NetEntity, &Transform, Has<crate::net::Embodied>)>,
++    units: Query<(
++        &NetEntity,
++        &Transform,
++        Has<crate::net::Embodied>,
++        // Patch 0050: a party bot's hidden body (`wowbg3_party`).
++        Has<crate::wowbg3_party::PartyBotBody>,
++    )>,
+     voices: Option<Res<CreatureVoices>>,
+     kits: Option<ResMut<SoundKits>>,
+     assets: Option<Res<WorldAssets>>,
+@@ -541,11 +553,11 @@
+         if l.descent <= crate::creature_anim::HARD_LANDING_DESCENT {
+             continue;
+         }
+-        let Ok((net, transform, own)) = units.get(l.entity) else {
++        let Ok((net, transform, own, bot)) = units.get(l.entity) else {
+             continue;
+         };
+         // WOW-BG3 (patch 0045): in world mode the own character's vocals are BG3's.
+-        if own && crate::wowbg3_lead::hide_self() {
++        if (own || bot) && crate::wowbg3_lead::hide_self() {
+             continue;
+         }
+         let kit = net
+diff --git a/crates/benilla-app/src/wowbg3_party.rs b/crates/benilla-app/src/wowbg3_party.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_party.rs
+@@ -0,0 +1,258 @@
++//! WOW-BG3 (local fork, patch 0050; a playtest: with Shadowheart
++//! recruited, a standing WoW figure was visible, trailing far behind her and teleporting, with no water
++//! ripples). Every party member other than the hero is a server bot character (lifecycle.py `bot add`,
++//! `party-multiplayer-design.md`), so benilla streams it as another player and drew its WoW body
++//! beside BG3's own figure of the companion (`wowbg3_tav`, patch 0033). The fight bridge moves the bot
++//! with the server's `move` verb, a teleport at most once a second once the member is 3 yd away
++//! (`link/src/mirror.rs` `PartyLink`), so that body jumped after her.
++//!
++//! In world mode (`wowbg3_lead::hide_self`) each bot's body is now:
++//! - hidden: its root `Visibility::Hidden` after the exterior election, so its model, name, blob shadow
++//!   and mouse pick all go (each gates on the root's `InheritedVisibility`); its animation sounds and
++//!   vocals are muted as the own body's are (BG3 voices the companion);
++//! - placed every frame on its companion's BG3 figure (the root `wowbg3_tav` stands on WoW's ground at
++//!   the member's mapped place), after the net movers and before WoW's water effects, so the wade
++//!   ripples, wake and step-in foam follow the companion as it walks (water foam reads the unit's
++//!   `Transform`, never its visibility). A bot whose member has no figure (more than 60 m from the
++//!   hero, or not planned yet) keeps the server's place.
++//!
++//! Which bodies: `<io>/party-bots.json` `Bots` (the bot characters online, lifecycle.py) and
++//! `<io>/wowchars.json` `Chars` (member uuid -> WoW name); the figure of a member from the plan
++//! (`link/tavplan.txt`, `F <figure> <uuid>` lines, TavPlan.lua). Read when they change, at most once a
++//! second. Log every 30 s: `wowbg3 party:` (bodies hidden, frames placed on the figure or left to the
++//! server, and how far the server's place was from the figure).
++
++use std::collections::HashMap;
++use std::path::PathBuf;
++use std::time::{Instant, SystemTime};
++
++use benilla_protocol::EntityKind;
++use bevy::prelude::*;
++
++use crate::net::{Guid, NetEntity, SelfPlayer};
++
++/// A party bot's WoW body, hidden in world mode; `figure`: its companion's figure in the plan.
++#[derive(Component, Clone, Copy, Debug, PartialEq)]
++pub(crate) struct PartyBotBody {
++    pub(crate) figure: Option<u32>,
++}
++
++/// A companion's figure root (`wowbg3_tav`, patch 0033): its number in the plan.
++#[derive(Component, Clone, Copy, Debug, PartialEq)]
++pub(crate) struct CompanionFigure(pub(crate) u32);
++
++#[derive(Resource)]
++struct PartyBots {
++    io: PathBuf,
++    link: PathBuf,
++    next_read: Option<Instant>,
++    stamps: [Option<SystemTime>; 3],
++    /// Bot names, lower case -> the figure of their member.
++    bots: HashMap<String, Option<u32>>,
++    log_at: Option<Instant>,
++    placed: u64,
++    unplaced: u64,
++    gap_sum: f64,
++    gap_max: f32,
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let Some(io) = dir.parent().map(PathBuf::from) else { return };
++    if std::env::var("WOW_BG3_BOT_BODIES").is_ok_and(|v| v == "show") {
++        info!("wowbg3 party: WOW_BG3_BOT_BODIES=show, party bots drawn as the server moves them");
++        return;
++    }
++    info!("wowbg3 party: party bots' WoW bodies hidden and placed on their BG3 figures in world mode");
++    app.insert_resource(PartyBots {
++        io,
++        link: dir,
++        next_read: None,
++        stamps: [None; 3],
++        bots: HashMap::new(),
++        log_at: None,
++        placed: 0,
++        unplaced: 0,
++        gap_sum: 0.0,
++        gap_max: 0.0,
++    })
++    .add_systems(
++        Update,
++        (
++            read_party.before(tag_bots),
++            tag_bots,
++            place_bots
++                .after(tag_bots)
++                .after(crate::wowbg3_tav::TavPose)
++                .after(benilla_world::schedule::WorldStage::Net)
++                .before(benilla_world::schedule::WorldStage::Present),
++        ),
++    )
++    .add_systems(
++        PostUpdate,
++        hide_bots
++            .after(benilla_world::exterior_cull::ExteriorCullSet)
++            .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
++    );
++}
++
++/// Every quoted string between the first `open` after `"key"` and its `close` (flat JSON only).
++fn quoted_in(text: &str, key: &str, open: char, close: char) -> Vec<String> {
++    let Some(at) = text.find(&format!("\"{key}\"")) else { return Vec::new() };
++    let rest = &text[at + key.len() + 2..];
++    let Some(start) = rest.find(open) else { return Vec::new() };
++    let Some(len) = rest[start..].find(close) else { return Vec::new() };
++    rest[start + 1..start + len].split('"').skip(1).step_by(2).map(String::from).collect()
++}
++
++/// Bot name (lower case) -> its member's figure, from the three files.
++pub(crate) fn bot_figures(bots_json: &str, chars_json: &str, plan: &str) -> HashMap<String, Option<u32>> {
++    let bots: Vec<String> = quoted_in(bots_json, "Bots", '[', ']').iter().map(|b| b.to_lowercase()).collect();
++    let pairs = quoted_in(chars_json, "Chars", '{', '}');
++    let uuid_of: HashMap<String, String> = pairs
++        .chunks_exact(2)
++        .map(|p| (p[1].to_lowercase(), p[0].to_lowercase()))
++        .collect();
++    let figure_of: HashMap<String, u32> = plan
++        .lines()
++        .filter_map(|l| {
++            let mut f = l.split_whitespace();
++            (f.next()? == "F").then_some(())?;
++            let figure: u32 = f.next()?.parse().ok()?;
++            Some((f.next()?.to_lowercase(), figure))
++        })
++        .filter(|(_, figure)| *figure != 0)
++        .collect();
++    bots.into_iter()
++        .map(|b| {
++            let figure = uuid_of.get(&b).and_then(|u| figure_of.get(u)).copied();
++            (b, figure)
++        })
++        .collect()
++}
++
++fn read_party(mut p: ResMut<PartyBots>) {
++    let now = Instant::now();
++    if p.next_read.is_some_and(|t| now < t) {
++        return;
++    }
++    p.next_read = Some(now + std::time::Duration::from_secs(1));
++    let paths = [p.io.join("party-bots.json"), p.io.join("wowchars.json"), p.link.join("tavplan.txt")];
++    let stamps = paths.clone().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
++    if stamps == p.stamps {
++        return;
++    }
++    p.stamps = stamps;
++    let [a, b, c] = paths.map(|f| std::fs::read_to_string(f).unwrap_or_default());
++    let bots = bot_figures(&a, &b, &c);
++    if bots != p.bots {
++        info!("wowbg3 party: bots and their figures {:?}", bots);
++        p.bots = bots;
++    }
++}
++
++/// Marks the bots' bodies (players by name) while world mode runs; unmarks them otherwise.
++fn tag_bots(
++    mut commands: Commands,
++    p: Res<PartyBots>,
++    names: Res<crate::names::NameCache>,
++    units: Query<(Entity, &Guid, &NetEntity, Option<&PartyBotBody>), Without<SelfPlayer>>,
++) {
++    let on = crate::wowbg3_lead::hide_self();
++    for (e, g, net, had) in &units {
++        let want = if on && net.kind == EntityKind::Player {
++            names
++                .peek(g.0)
++                .and_then(|n| p.bots.get(&n.to_lowercase()))
++                .map(|figure| PartyBotBody { figure: *figure })
++        } else {
++            None
++        };
++        match (had.copied(), want) {
++            (Some(a), Some(b)) if a == b => {}
++            (_, Some(b)) => {
++                commands.entity(e).insert(b);
++            }
++            (Some(_), None) => {
++                commands.entity(e).remove::<PartyBotBody>();
++            }
++            (None, None) => {}
++        }
++    }
++}
++
++/// The bodies on their figures: after the net movers wrote the server's place, before WoW's water
++/// effects read it.
++fn place_bots(
++    mut p: ResMut<PartyBots>,
++    figs: Query<(&CompanionFigure, &Transform, &Visibility), Without<PartyBotBody>>,
++    mut bots: Query<(&PartyBotBody, &mut Transform), Without<CompanionFigure>>,
++) {
++    let mut n = 0;
++    for (b, mut tf) in &mut bots {
++        n += 1;
++        let at = b.figure.and_then(|want| {
++            figs.iter()
++                .find(|(f, _, v)| f.0 == want && **v != Visibility::Hidden)
++                .map(|(_, t, _)| t.translation)
++        });
++        match at {
++            Some(at) => {
++                let gap = tf.translation.distance(at);
++                p.gap_sum += gap as f64;
++                p.gap_max = p.gap_max.max(gap);
++                p.placed += 1;
++                if tf.translation != at {
++                    tf.translation = at;
++                }
++            }
++            None => p.unplaced += 1,
++        }
++    }
++    let now = Instant::now();
++    if p.log_at.is_none_or(|t| now >= t) {
++        p.log_at = Some(now + std::time::Duration::from_secs(30));
++        if n > 0 || p.placed + p.unplaced > 0 {
++            info!(
++                "wowbg3 party: {} bot bodies hidden; {} frames on their BG3 figure (the server's place {:.2} yd from it on average, max {:.2}), {} left to the server (no figure)",
++                n,
++                p.placed,
++                if p.placed > 0 { p.gap_sum / p.placed as f64 } else { 0.0 },
++                p.gap_max,
++                p.unplaced
++            );
++        }
++        p.placed = 0;
++        p.unplaced = 0;
++        p.gap_sum = 0.0;
++        p.gap_max = 0.0;
++    }
++}
++
++/// After the exterior election wrote the roots' verdicts: a bot's body is never drawn.
++fn hide_bots(mut bots: Query<&mut Visibility, With<PartyBotBody>>) {
++    for mut v in &mut bots {
++        if *v != Visibility::Hidden {
++            *v = Visibility::Hidden;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bots_find_their_figures() {
++        let bots = r#"{"Bots": ["Astarion", "Shadowheart"], "Hero": "Test", "Time": 1.0}"#;
++        let chars = r#"{"RunId": "x", "Session": "y", "Chars": {"ad9a-1": "Test", "c7c1-2": "Astarion", "3ed7-3": "Shadowheart"}}"#;
++        let plan = "TAVPLAN 1 4 0 0 0 0 0 0\nF 0 ad9a-1\nM 1 2 3\nF 3 3ed7-3\n";
++        let got = bot_figures(bots, chars, plan);
++        assert_eq!(got.get("shadowheart"), Some(&Some(3)));
++        assert_eq!(got.get("astarion"), Some(&None));
++        assert_eq!(got.get("test"), None);
++        assert!(bot_figures("", "", "").is_empty());
++    }
++}
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -49,6 +49,8 @@
+         crate::wowbg3_cursors::build(app, PathBuf::from(&dir));
+         // Patch 0041: a server teleport in world mode moves BG3's character.
+         crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
++        // Patch 0050: party bots' WoW bodies hidden, placed on their BG3 figures.
++        crate::wowbg3_party::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -1276,6 +1276,8 @@
+                     Transform::default(),
+                     Visibility::Hidden,
+                     benilla_world::entity_shade::GroundShade::default(),
++                    // Patch 0050: the party bot of this companion stands where this root does.
++                    crate::wowbg3_party::CompanionFigure(figure),
+                 ))
+                 .id();
+             Fig { figure, root, lock: 0.0, posed: false, at: Vec3::ZERO }

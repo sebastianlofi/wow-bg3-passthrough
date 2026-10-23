@@ -1,0 +1,522 @@
+diff --git a/crates/benilla-app/src/player/approach.rs b/crates/benilla-app/src/player/approach.rs
+--- a/crates/benilla-app/src/player/approach.rs
++++ b/crates/benilla-app/src/player/approach.rs
+@@ -149,12 +149,6 @@
+         self.goal = None;
+     }
+ 
+-    /// WOW-BG3 (local fork): a walk to an object's verb (talk, loot, use, skin) is in flight, which
+-    /// world mode's follow of BG3's character must not cancel (`wowbg3_lead`).
+-    pub(crate) fn toward_object(&self) -> bool {
+-        self.goal.as_ref().is_some_and(|g| matches!(g.toward, Toward::Object { .. }))
+-    }
+-
+     #[cfg(test)]
+     pub(crate) fn stop_distance(&self) -> Option<f32> {
+         self.goal.as_ref().map(|g| g.stop)
+diff --git a/crates/benilla-app/src/target/click.rs b/crates/benilla-app/src/target/click.rs
+--- a/crates/benilla-app/src/target/click.rs
++++ b/crates/benilla-app/src/target/click.rs
+@@ -283,6 +283,20 @@
+         let Ok(at) = self.places.get(target).map(|t| t.translation) else {
+             return false;
+         };
++        // WOW-BG3 (local fork, patch 0019): in world mode the own (hidden) body never walks by
++        // itself. BG3's character runs there instead (an errand, `wowbg3_lead`), and the verb
++        // runs once the body, following her, is within the verb's own reach.
++        if crate::wowbg3_lead::errands_on() {
++            use crate::player::{ApproachVerb, Subject};
++            let reach = match (verb, subject) {
++                (ApproachVerb::Talk, _) => cursor_mode::SERVICE_RANGE_SQ.sqrt(),
++                (ApproachVerb::Loot, Subject::Corpse) => cursor_mode::CORPSE_INTERACT_RANGE_SQ.sqrt(),
++                (ApproachVerb::Loot, _) => self.melee_reach(target),
++                // Use and Skin stop at a fraction of their range.
++                _ => stop / crate::player::RANGE_STOP_FRACTION,
++            };
++            return crate::wowbg3_lead::request_errand(verb, guid, at, reach);
++        }
+         let started = self.auto.start(verb, guid, subject, at, stop);
+         self.feedback.walked(started)
+     }
+@@ -887,8 +901,13 @@
+                     dispatch.auto.face(at);
+                 }
+                 Some(MeleeApproach::Walk { at, stop }) => {
+-                    let started = dispatch.auto.walk_into_melee(at, stop);
+-                    dispatch.feedback.walked(started);
++                    // WOW-BG3 (local fork, patch 0019): in world mode the own (hidden) body never
++                    // runs into melee by itself; BG3's character fights (the swing becomes a BG3
++                    // attack, `wowbg3_fight::intercept_swing`).
++                    if !crate::wowbg3_lead::errands_on() {
++                        let started = dispatch.auto.walk_into_melee(at, stop);
++                        dispatch.feedback.walked(started);
++                    }
+                 }
+                 None => {}
+             }
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -54,6 +54,39 @@
+ use benilla_world::view::WorldCamera;
+ 
+ pub(crate) const HEADER: usize = 64;
++
++/// Patch 0019: a rect of the frame (x, y, w, h as fractions from the
++/// top left) whose depth is written as the near plane (reverse-Z 1.0), so the compositor's "BG3
++/// scene nearer" test never lets BG3's scene (Tav) cover WoW there: WoW's world map shown inside
++/// BG3's map frame (`wowbg3_lead`, `bg3ui.bin`).
++static NEAR_RECT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
++
++pub(crate) fn set_near_rect(rect: Option<[f32; 4]>) {
++    if let Ok(mut r) = NEAR_RECT.lock() {
++        *r = rect;
++    }
++}
++
++/// Writes the near plane over [`NEAR_RECT`] in a slot file's depth rows (at `at`, `dbpr` bytes a
++/// row, `len` bytes in all, `width` texels wide); true when there is nothing to do or it worked.
++#[cfg(unix)]
++fn write_near_rect(f: &std::fs::File, at: usize, dbpr: usize, len: usize, width: usize) -> bool {
++    use std::os::unix::fs::FileExt;
++    let Some([x, y, w, h]) = NEAR_RECT.lock().ok().and_then(|r| *r) else { return true };
++    if dbpr == 0 {
++        return true;
++    }
++    let rows = len / dbpr;
++    let width = width.min(dbpr / 4);
++    let px = |v: f32, n: usize| ((v.clamp(0.0, 1.0) * n as f32).round() as usize).min(n);
++    let (x0, x1) = (px(x, width), px(x + w, width));
++    let (y0, y1) = (px(y, rows), px(y + h, rows));
++    if x1 <= x0 || y1 <= y0 {
++        return true;
++    }
++    let row: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), x1 - x0).flatten().collect();
++    (y0..y1).all(|r| f.write_all_at(&row, (at + r * dbpr + x0 * 4) as u64).is_ok())
++}
+ /// Readback buffer pairs in flight: the frame being copied, one waiting for the GPU, one being
+ /// written.
+ const SLOTS: usize = 3;
+@@ -523,9 +556,12 @@
+                 torn[56..60].copy_from_slice(&0u32.to_le_bytes());
+                 // seq2 = 0 while the rows change, the real seq once they are whole.
+                 let mut whole = job.header;
++                let dbpr = u32::from_le_bytes(job.header[24..28].try_into().unwrap()) as usize;
++                let width = u32::from_le_bytes(job.header[8..12].try_into().unwrap()) as usize;
+                 let written = f.write_all_at(&torn, 0).is_ok()
+                     && f.write_all_at(&cbytes, HEADER as u64).is_ok()
+-                    && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok();
++                    && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok()
++                    && write_near_rect(f, HEADER + cbytes.len(), dbpr, dbytes.len(), width);
+                 tag_header(&mut whole, &job.tag, crate::wowbg3_pace::mono_seconds());
+                 ok = written && f.write_all_at(&whole, 0).is_ok();
+                 drop(cbytes);
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -43,16 +43,35 @@
+ //! window width, height as f32, left clicks, right clicks u32, seq again), which carries BG3's
+ //! right clicks too: a new right click over a WoW unit, corpse or object is WoW's right click on
+ //! it (talk, vendor, quests, loot), over WoW's UI a right click there; elsewhere BG3's own.
+-//! Out of reach, the own (hidden) body walks there (Click to Move's walk, always on in world
+-//! mode) and holds at the NPC while the walk or the window it opened lasts, unless BG3's
+-//! character goes more than 20 yd away. `WOW_BG3_INPUT=<file>` reads another input file (tests).
++//! `WOW_BG3_INPUT=<file>` reads another input file (tests).
++//!
++//! Patch 0019 (merchants and bodies used from far away): the own
++//! (hidden) body never walks by itself, it only follows BG3's character. Click to Move's option
++//! stays on, so a dispatcher (`target/click.rs`) out of reach of an NPC, body or object takes its
++//! walk leg, which in world mode asks for an errand instead of walking the body: benilla writes
++//! `tavgo.bin` (`TGO1`, seq, target guid lo, hi u32, the target's WoW xyz, how far short of it to
++//! stop (yd) f32, flags u32: 1 go, 2 stop BG3's character, seq again; 40 bytes), `WorldMode.lua`
++//! runs BG3's character there, and once the body, following her, is within the verb's reach the
++//! verb runs (`Approach::arrived`, Click to Move's arrival). A new BG3 click, BG3 combat, 15 s or
++//! the target gone ends it. An enemy out of melee is not walked to either (BG3 fights). The NPC's
++//! window closes by WoW's own walk-away check when she leaves (no hold at the NPC any more).
++//! `wowhover.bin` flags bit 4: the unit under the pointer is a mirrored mob, whose BG3
++//! stand-in takes the click; WoW's cursor kind for it still follows, so BG3 shows the sword.
++//!
++//! Patch 0019 (the map): `bg3ui.bin` (`BUI1`, seq, map mode u32: 0 closed, 1 inside
++//! BG3's map frame, 2 the whole screen; the rect x, y, w, h f32 as fractions of BG3's window from
++//! the top left; seq again; 32 bytes), written by BG3's `WowUi.lua` while its map panel is open,
++//! runs the layout addon's `WowBg3Layout_Map(mode, x, y, w, h)` (WoW's world map drawn into that
++//! rect) and has the frame export write WoW's depth there as the near plane
++//! (`wowbg3_frames::set_near_rect`), so the compositor never lets BG3's scene (Tav) cover WoW's map.
+ 
+ use std::fs::File;
+ use std::path::PathBuf;
+-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
+ use std::time::Instant;
+ 
+-use benilla_assets::coords::wow_to_bevy;
++use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
+ use benilla_world::view::WorldCamera;
+ use bevy::camera::Projection;
+ use bevy::prelude::*;
+@@ -115,6 +134,190 @@
+     HIDE_SELF.load(Ordering::Relaxed)
+ }
+ 
++// ── Errands (patch 0019, see the module notes) ──
++
++/// What a dispatcher asks BG3's character to bring the own body near.
++#[derive(Clone, Copy, Debug)]
++struct ErrandAsk {
++    verb: crate::player::ApproachVerb,
++    guid: u64,
++    /// The target where the click found it (Bevy).
++    at: Vec3,
++    /// The verb's own reach (yd, centre to centre, as the dispatchers measure).
++    reach: f32,
++}
++
++static ERRAND_ASK: Mutex<Option<ErrandAsk>> = Mutex::new(None);
++/// A new BG3 click ends the errand in flight (BG3's own move, or a new errand, takes over).
++static ERRAND_CANCEL: AtomicBool = AtomicBool::new(false);
++/// BG3's character is in a BG3 combat (`tav.bin` flags bit 1).
++static TAV_COMBAT: AtomicBool = AtomicBool::new(false);
++/// When the last new `tav.bin` record came ([`clock_ms`]; 0: never).
++static TAV_SEEN_MS: AtomicU64 = AtomicU64::new(0);
++
++fn clock_ms() -> u64 {
++    static START: OnceLock<Instant> = OnceLock::new();
++    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
++}
++
++/// How long an errand may take before it is given up (s).
++const ERRAND_SECONDS: f32 = 15.0;
++/// The body counts as in reach this far inside the verb's range (yd): the server measures from
++/// where it last heard the body was.
++const ERRAND_MARGIN: f32 = 0.3;
++/// `tavgo.bin` flags.
++const ERRAND_GO: u32 = 1;
++const ERRAND_STOP_TAV: u32 = 2;
++
++/// World mode's errands replace Click to Move's walks of the own body (`target/click.rs`).
++pub(crate) fn errands_on() -> bool {
++    HIDE_SELF.load(Ordering::Relaxed)
++}
++
++/// Patch 0019: a dispatcher's out-of-reach leg in world mode. BG3's character is asked to run to
++/// the target; the verb runs once the own body, following her, is within `reach`. False when
++/// there is nobody to ask (no `tav.bin` for 2 s: world mode not running) or she is in a BG3
++/// combat: the dispatcher then answers as with Click to Move off (nothing, or WoW's too far).
++pub(crate) fn request_errand(verb: crate::player::ApproachVerb, guid: u64, at: Vec3, reach: f32) -> bool {
++    let seen = TAV_SEEN_MS.load(Ordering::Relaxed);
++    let why = if seen == 0 || clock_ms().saturating_sub(seen) > 2000 {
++        Some("no BG3 character to send")
++    } else if TAV_COMBAT.load(Ordering::Relaxed) {
++        Some("BG3's character is in combat")
++    } else {
++        None
++    };
++    if let Some(why) = why {
++        info!("wowbg3 errand: {verb:?} at {guid:#x} refused: {why}");
++        return false;
++    }
++    if let Ok(mut a) = ERRAND_ASK.lock() {
++        *a = Some(ErrandAsk { verb, guid, at, reach });
++    }
++    true
++}
++
++/// Where she stops short of the target (yd): well inside the verb's reach, with room for the
++/// body's trail behind her (it re-arms its walk once she is 1.5 yd ahead).
++fn errand_stop(reach: f32) -> f32 {
++    (reach * 0.4).clamp(1.0, 2.0)
++}
++
++#[derive(Resource)]
++struct Errands {
++    path: PathBuf,
++    seq: u32,
++    live: Option<LiveErrand>,
++}
++
++#[derive(Clone, Copy)]
++struct LiveErrand {
++    ask: ErrandAsk,
++    since: Instant,
++    /// Where `tavgo.bin` last sent her (the target then, Bevy).
++    sent: Vec3,
++}
++
++impl Errands {
++    fn write(&mut self, flags: u32, guid: u64, at: Vec3, stop: f32) {
++        self.seq = self.seq.wrapping_add(1).max(1);
++        let w = bevy_to_wow(at);
++        let mut rec = [0u8; 40];
++        rec[0..4].copy_from_slice(b"TGO1");
++        rec[4..8].copy_from_slice(&self.seq.to_le_bytes());
++        rec[8..12].copy_from_slice(&(guid as u32).to_le_bytes());
++        rec[12..16].copy_from_slice(&((guid >> 32) as u32).to_le_bytes());
++        for (i, v) in [w[0], w[1], w[2], stop].iter().enumerate() {
++            rec[16 + 4 * i..20 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        rec[32..36].copy_from_slice(&flags.to_le_bytes());
++        rec[36..40].copy_from_slice(&self.seq.to_le_bytes());
++        let tmp = self.path.with_extension("tmp");
++        if std::fs::write(&tmp, rec).is_ok() {
++            let _ = std::fs::rename(&tmp, &self.path);
++        }
++    }
++
++    fn end(&mut self, why: &str, stop_tav: bool) {
++        if let Some(live) = self.live.take() {
++            info!("wowbg3 errand: {:?} at {:#x} ends: {why}", live.ask.verb, live.ask.guid);
++            let flags = if stop_tav { ERRAND_STOP_TAV } else { 0 };
++            self.write(flags, live.ask.guid, live.sent, 0.0);
++        }
++    }
++}
++
++fn run_errands(
++    mut e: ResMut<Errands>,
++    mut approach: ResMut<crate::player::Approach>,
++    player: Res<crate::player::Player>,
++    index: Res<crate::net::GuidIndex>,
++    places: Query<(&Transform, Option<&crate::net::ObjectStore>)>,
++) {
++    let ask = ERRAND_ASK.lock().ok().and_then(|mut a| a.take());
++    if let Some(ask) = ask {
++        // A new errand replaces the one in flight; the click that asked for it is no cancel.
++        ERRAND_CANCEL.store(false, Ordering::Relaxed);
++        info!(
++            "wowbg3 errand: {:?} at {:#x}, {:.1} yd from the body (reach {:.2}): BG3's character runs there",
++            ask.verb,
++            ask.guid,
++            ask.at.distance(player.pos),
++            ask.reach
++        );
++        e.write(ERRAND_GO, ask.guid, ask.at, errand_stop(ask.reach));
++        e.live = Some(LiveErrand { ask, since: Instant::now(), sent: ask.at });
++        return;
++    }
++    if ERRAND_CANCEL.swap(false, Ordering::Relaxed) {
++        // BG3 ignores the player's own clicks while the errand's Osiris move runs, so she is
++        // stopped (WorldMode.lua already stops her at the press; this is the fallback).
++        e.end("a new BG3 click", true);
++        return;
++    }
++    let Some(live) = e.live else { return };
++    let ask = live.ask;
++    if TAV_COMBAT.load(Ordering::Relaxed) {
++        e.end("BG3 combat", true);
++        return;
++    }
++    if live.since.elapsed().as_secs_f32() > ERRAND_SECONDS {
++        e.end("not in reach after 15 s", true);
++        return;
++    }
++    let Some((tf, store)) = index.0.get(&ask.guid).and_then(|en| places.get(*en).ok()) else {
++        e.end("the target is gone", true);
++        return;
++    };
++    let talk = matches!(ask.verb, crate::player::ApproachVerb::Talk);
++    if talk && store.is_some_and(|s| s.0.unit_health().unwrap_or(1) == 0) {
++        e.end("the NPC died", true);
++        return;
++    }
++    let at = tf.translation;
++    let d = at.distance(player.pos);
++    if d <= (ask.reach - ERRAND_MARGIN).max(0.5) {
++        info!(
++            "wowbg3 errand: {:?} at {:#x}: the body is {d:.2} yd away, in reach after {:.1} s",
++            ask.verb,
++            ask.guid,
++            live.since.elapsed().as_secs_f32()
++        );
++        // Click to Move's arrival: `act_on_arrival` runs the verb once the body stands still.
++        approach.arrived = Some((ask.verb, ask.guid));
++        e.live = None;
++        e.write(0, ask.guid, at, 0.0);
++        return;
++    }
++    if at.distance(live.sent) > 1.5 {
++        // The target walked on (a wandering NPC): send her after it.
++        e.write(ERRAND_GO, ask.guid, at, errand_stop(ask.reach));
++        if let Some(l) = e.live.as_mut() {
++            l.sent = at;
++        }
++    }
++}
++
+ #[derive(Resource)]
+ struct TavFollow {
+     path: PathBuf,
+@@ -158,6 +361,11 @@
+         return;
+     }
+     t.last_seq = seq;
++    // Patch 0019: a fresh record (an errand has someone to ask) and her BG3 combat (flags bit 1).
++    TAV_SEEN_MS.store(clock_ms(), Ordering::Relaxed);
++    if let Some(f) = raw.get(36..40) {
++        TAV_COMBAT.store(u32::from_le_bytes(f.try_into().unwrap()) & 1 != 0, Ordering::Relaxed);
++    }
+     let at = wow_to_bevy(wow);
+     // Tav walking is the player at the keyboard too (WoW's idle clock).
+     if t.tav.is_some_and(|p| p.distance(at) > 0.3) {
+@@ -175,28 +383,74 @@
+     }
+ }
+ 
+-/// How far BG3's character may get from the own body before an interaction walk or an open NPC
+-/// window stops holding the body there (yd).
+-const INTERACT_LEASH: f32 = 20.0;
++// ── The map link (patch 0019, see the module notes) ──
+ 
+-fn walk_after_tav(
+-    mut t: ResMut<TavFollow>,
+-    mut auto: crate::player::AutoMove,
+-    open: Option<Res<crate::ui_session::InteractNpc>>,
+-    player: Res<crate::player::Player>,
+-) {
+-    // World mode (patch 0007): BG3's character is what the player steers, so the own (hidden) body
+-    // walks to the NPC, body or object a BG3 click interacts with, as Click to Move would.
++#[derive(Resource)]
++struct UiLink {
++    path: PathBuf,
++    frame: u64,
++    last_seq: u32,
++    /// The mode and rect last handed to the addon.
++    shown: Option<(u32, [f32; 4])>,
++}
++
++/// Decodes `bg3ui.bin`: (seq, mode, rect); `None` when torn, foreign or out of range.
++pub(crate) fn decode_ui(rec: &[u8]) -> Option<(u32, u32, [f32; 4])> {
++    if rec.len() < 32 || &rec[0..4] != b"BUI1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let (seq, mode) = (u(4), u(8));
++    let rect = [f(12), f(16), f(20), f(24)];
++    let fits = rect.iter().all(|v| v.is_finite() && (-0.01..=1.01).contains(v));
++    (seq != 0 && seq == u(28) && mode <= 2 && fits).then_some((seq, mode, rect))
++}
++
++fn forward_ui(mut u: ResMut<UiLink>, script: Option<NonSend<benilla_ui::script::UiScript>>) {
++    u.frame += 1;
++    if u.frame % 6 != 0 {
++        return;
++    }
++    let Some(script) = script else { return };
++    let Ok(raw) = std::fs::read(&u.path) else { return };
++    let Some((seq, mode, rect)) = decode_ui(&raw) else { return };
++    if seq == u.last_seq {
++        return;
++    }
++    u.last_seq = seq;
++    let want = (mode != 0).then_some((mode, rect));
++    let changed = match (u.shown, want) {
++        (None, None) => false,
++        (Some((m0, r0)), Some((m1, r1))) => {
++            m0 != m1 || r0.iter().zip(r1.iter()).any(|(a, b)| (a - b).abs() > 0.002)
++        }
++        _ => true,
++    };
++    if !changed {
++        return;
++    }
++    let [x, y, w, h] = if mode == 2 { [0.0, 0.0, 1.0, 1.0] } else { rect };
++    let chunk = format!(
++        "if WowBg3Layout_Map then WowBg3Layout_Map({mode}, {x:.4}, {y:.4}, {w:.4}, {h:.4}) end"
++    );
++    match script.run(&chunk) {
++        Ok(()) => info!("wowbg3 map: mode {mode}, rect {x:.3} {y:.3} {w:.3} {h:.3}"),
++        Err(e) => warn!("wowbg3 map: {e}"),
++    }
++    crate::wowbg3_frames::set_near_rect((mode != 0).then_some([x, y, w, h]));
++    u.shown = want;
++}
++
++fn walk_after_tav(mut t: ResMut<TavFollow>, mut auto: crate::player::AutoMove) {
++    // World mode (patch 0007): BG3's character is what the player steers. Click to Move's option
++    // stays on, so the dispatchers take their out-of-reach leg, which patch 0019 turns into an
++    // errand for BG3's character; the own (hidden) body only ever follows her (patch 0019: no
++    // hold at an NPC any more, WoW's own walk-away check closes its window when she leaves).
+     if !auto.approach.enabled {
+         auto.approach.enabled = true;
+     }
+     let Some(at) = t.walk_to.take() else { return };
+-    // That walk, and the window it opens, hold the body there until Tav has gone on.
+-    let away = Vec2::new(at.x - player.pos.x, at.z - player.pos.z).length();
+-    let window_open = open.is_some_and(|o| o.0.is_some());
+-    if (auto.approach.toward_object() || window_open) && away < INTERACT_LEASH {
+-        return;
+-    }
+     auto.walk_to_ground_bg3(at);
+ }
+ 
+@@ -327,7 +581,14 @@
+     // to click (patch 0009, `mirrored.txt`).
+     let unit = hovered.corpse.is_some()
+         || (hovered.target.is_some() && crate::wowbg3_fight::claims_hover(hovered.guid));
+-    let flags = u32::from(over_ui.0) | (u32::from(unit || object.target.is_some()) << 1);
++    // Patch 0019: flag 4, a mirrored mob is under the pointer (its stand-in takes the
++    // click; BG3 shows WoW's cursor for it).
++    let mirrored = hovered.corpse.is_none()
++        && hovered.target.is_some()
++        && !crate::wowbg3_fight::claims_hover(hovered.guid);
++    let flags = u32::from(over_ui.0)
++        | (u32::from(unit || object.target.is_some()) << 1)
++        | (u32::from(mirrored) << 2);
+     // Patch 0009: WoW's cursor kind and its grayed state follow (BG3 shows its closest cursor).
+     let kind = crate::wowbg3_fight::cursor_code(world_cursor.kind);
+     let key = flags | (kind << 8) | (u32::from(world_cursor.unable) << 16);
+@@ -361,6 +622,11 @@
+     let new_right = link.right_clicks.zip(input.right).is_some_and(|(a, b)| a != b);
+     link.clicks = Some(input.left);
+     link.right_clicks = input.right;
++    // Patch 0019: any new BG3 click ends an errand in flight (a click that asks for a new one
++    // replaces it a frame or two later).
++    if new_left || new_right {
++        ERRAND_CANCEL.store(true, Ordering::Relaxed);
++    }
+     if !(new_left || new_right) || link.release.is_some() {
+         return;
+     }
+@@ -415,7 +681,18 @@
+         lock: 0.0,
+         want: 0.0,
+     })
+-    .add_systems(Update, (read_tav, walk_after_tav.after(read_tav), keep_ground_lock.after(read_tav)))
++    .insert_resource(Errands { path: dir.join("tavgo.bin"), seq: 0, live: None })
++    .insert_resource(UiLink { path: dir.join("bg3ui.bin"), frame: 0, last_seq: 0, shown: None })
++    .add_systems(
++        Update,
++        (
++            read_tav,
++            forward_ui,
++            run_errands.after(read_tav),
++            walk_after_tav.after(read_tav),
++            keep_ground_lock.after(read_tav),
++        ),
++    )
+     .add_systems(
+         PostUpdate,
+         hide_own_model.before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+@@ -647,6 +924,21 @@
+     }
+ 
+     #[test]
++    fn decodes_ui() {
++        let mut rec = [0u8; 32];
++        rec[0..4].copy_from_slice(b"BUI1");
++        rec[4..8].copy_from_slice(&5u32.to_le_bytes());
++        rec[8..12].copy_from_slice(&1u32.to_le_bytes());
++        for (i, v) in [0.1f32, 0.2, 0.5, 0.6].iter().enumerate() {
++            rec[12 + 4 * i..16 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        rec[28..32].copy_from_slice(&5u32.to_le_bytes());
++        assert_eq!(decode_ui(&rec), Some((5, 1, [0.1, 0.2, 0.5, 0.6])));
++        rec[28..32].copy_from_slice(&6u32.to_le_bytes());
++        assert_eq!(decode_ui(&rec), None);
++    }
++
++    #[test]
+     fn decodes_tav() {
+         let mut rec = [0u8; 44];
+         rec[0..4].copy_from_slice(b"TAV1");

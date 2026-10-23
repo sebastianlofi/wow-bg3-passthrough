@@ -1,0 +1,111 @@
+# WOW-BG3
+
+Play vanilla World of Warcraft (1.12.1) as the world of a new Baldur's Gate 3 game.
+Your BG3 characters walk WoW's world; fights against WoW's mobs are BG3 fights;
+BG3 saves keep the WoW side too.
+
+Linux only, native BG3 from Steam (not the Windows version under Proton).
+Tested on AMD graphics (RADV) only so far.
+
+## What you need
+
+- Baldur's Gate 3, native Linux build, from Steam.
+- Your own World of Warcraft 1.12.1 client (build 5875, English).
+  WOW-BG3 contains no Blizzard files. It reads your client's `Data/` folder
+  to build what the local WoW server needs, on your machine.
+- About 10 GB free disk space for the generated server data.
+
+Everything else is in this download: the Linux Script Extender (bg3le, with
+WOW-BG3's patches), the local WoW server, the WoW engine (benilla) and the tools.
+
+Optional, not included: a level-cap mod, for BG3 levels past 12:
+Expansion Level 13-20 (Configurable) and 5e Spells, from mod.io or Nexus.
+
+## Install
+
+1. Open BG3's Mods folder:
+   `~/.local/share/Larian Studios/Baldur's Gate 3/Mods`
+2. Copy `WOW-BG3.pak` and the `WOW-BG3` folder from this download into it.
+   They sit side by side: `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/`.
+3. Copy your WoW 1.12.1 client files into `Mods/WOW-BG3/WoW/`,
+   so that `Mods/WOW-BG3/WoW/Data/` exists.
+4. Install the Script Extender, once (Steam closed; it offers to close Steam):
+
+   ```
+   python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py"
+   ```
+
+   It copies bg3le to `~/.local/share/bg3le` and adds it to BG3's Steam launch
+   options, the same way bg3le's own installer does. If you already use bg3le,
+   this replaces its library with WOW-BG3's build (bg3le plus our patches: it
+   still runs your other Script Extender mods). Undo: the same command with
+   `--uninstall`.
+
+   It works the other way too: installing or updating stock bg3le after this
+   puts its own library back in `~/.local/share/bg3le` and WOW-BG3 stops
+   working. Run the command above again to put WOW-BG3's build back.
+
+## Play
+
+1. Start BG3 from Steam.
+2. Mod Manager: enable WOW-BG3.
+   The local WoW server starts in the background now; nothing is online.
+   The very first time it builds its data from your WoW files (a few minutes);
+   a New Game started meanwhile keeps its loading screen up until it is done.
+3. New Game. Make or pick a character and start.
+   The loading screen stays up until the WoW side is ready, then you are in
+   the WoW start zone of your character's race.
+
+The first start takes a few minutes: the WoW server's data and the first
+movement maps are built from your WoW files while BG3's loading screen waits.
+Later starts and loads take under a minute.
+
+World mode only happens in games started with WOW-BG3 enabled.
+Saves you made before installing it stay normal BG3; loading one with WOW-BG3
+enabled says so in a message box (OK to close, the game goes on as plain BG3).
+
+Saving and loading work as in BG3. Loading an older save also takes the WoW
+character back to where it was in that save.
+
+## Where things are
+
+- Server data, database, save snapshots, logs: `~/.local/share/wow-bg3/`
+- Logs of the WoW side: `~/.local/share/wow-bg3/logs/`
+- bg3le's own logs: `~/.local/share/bg3le/logs/`
+- What the plugin is doing: `~/.local/share/wow-bg3/run/launcher.json`
+- What the WoW side is doing: `~/.local/share/wow-bg3/logs/coord.log`
+- Settings: `Mods/WOW-BG3/settings.conf` (WoW's sound, view distance, the test
+  commands of `/wowbg3` in WoW's chat). Read when BG3 starts.
+  This beta ships `debug_commands = 1`, so every `/wowbg3` command typed in
+  WoW's chat works, the test ones included: `refill`, `tp`, `where`, `find`,
+  `faction`, `level` and `xprate`. Set it to 0 to leave only `help`, the party
+  commands (`list`, `add`, `remove`, `pool`, `respec`) and `chat`.
+
+## Remove
+
+Disable WOW-BG3 in the Mod Manager, then delete `Mods/WOW-BG3.pak` and
+`Mods/WOW-BG3/`. To drop the WoW server data and snapshots too, delete
+`~/.local/share/wow-bg3/`. World-mode saves need the mod to load properly.
+
+## When something goes wrong
+
+- The loading screen waits at most two minutes for the WoW side. If it gives
+  up, look at `~/.local/share/wow-bg3/logs/` and bg3le's newest log.
+- Report a bug with those logs and `launcher.json` from the `run` folder.
+- The WoW side runs where Steam runs BG3, with the Python that comes in
+  `WOW-BG3/python/`. Nothing else to install.
+- Nothing happens any more after you installed or updated stock bg3le (its own
+  installer, or a mod manager that ships it): it replaced WOW-BG3's patched
+  build. Run WOW-BG3's `bg3le/install.py` again, with Steam closed.
+
+## Licences
+
+WOW-BG3's own code: see `LICENSE` in the WOW-BG3 repository. The programs WOW-BG3
+bundles keep their own licences: the WoW server (vmangos, GPL-2.0), its database
+(MariaDB, GPL-2.0), the WoW client engine (benilla, MIT or Apache-2.0), bg3le (MIT;
+its Script Extender part is MIT with the Commons Clause, so it may not be sold),
+Python with its packages, and the libraries they use. `THIRD-PARTY-NOTICES.md` says
+which is which; the full texts are in `WOW-BG3/LICENSES/`. The source of every GPL,
+LGPL and MPL part is in `WOW-BG3-<version>-sources.tar.gz` next to this download.
+World of Warcraft and Baldur's Gate 3 belong to their owners; this mod is not made
+or endorsed by Blizzard or Larian.

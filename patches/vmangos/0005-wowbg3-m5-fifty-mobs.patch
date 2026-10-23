@@ -1,0 +1,13 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 8790e16..620d71b 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -59,7 +59,7 @@ namespace WowBg3
+ namespace
+ {
+     uint32 const FREEZE_SPELL  = 9454;                      // GM "Freeze": stun aura without duration
+-    size_t const MAX_MOBS      = 8;                         // per encounter, and pending per player
++    size_t const MAX_MOBS      = 50;                        // per encounter, and pending per player
+     float const CLAIM_RANGE    = 50.0f;                     // yards, begin and join
+     float const DAMAGE_RANGE   = 100.0f;                    // yards, hp
+     float const PLACE_RANGE    = 60.0f;                     // yards, pos (from the owner)

@@ -1,0 +1,5 @@
+{
+  "RequiredVersion": 32,
+  "ModTable": "WOWBG3Harness",
+  "FeatureFlags": ["Lua"]
+}

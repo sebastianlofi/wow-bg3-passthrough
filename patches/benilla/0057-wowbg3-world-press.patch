@@ -1,0 +1,68 @@
+WOW-BG3 benilla patch 0057: a click in world mode counts as a world press.
+
+- player/camera.rs, `cursor_in_viewport`: it asked the window for an OS cursor and answered false
+  without one. Offscreen in world mode there is never one, so `world_press` was always false, a press
+  never armed the click test, `WorldRightClick` was never written, and `act_on_right_click` returned
+  at once. That is why looting a corpse and talking to a quest giver stopped working: WoW's pick was
+  right (it reported the unit and "WoW's to click"), BG3 forwarded the click, benilla injected it as
+  WoW's right click, and then nothing happened.
+- It now falls back to BG3's forwarded pointer through `target::hover_probe::pointer`, the same
+  pointer the picks and the UI feed already use (patches 0003 and 0007), taken to physical pixels for
+  the viewport test. With an OS cursor nothing changes.
+- A test covers all three cases: no cursor and no forwarded pointer (outside), a forwarded pointer in
+  the viewport (inside), and a forwarded pointer outside it (outside).
+
+--- a/crates/benilla-app/src/player/camera.rs
++++ b/crates/benilla-app/src/player/camera.rs
+@@ -1464,7 +1464,16 @@
+ 
+ /// True if the OS pointer is over the world camera's viewport (the whole window when it has none).
+ fn cursor_in_viewport(window: &Window, camera: &Camera) -> bool {
+-    let Some(cursor) = window.physical_cursor_position() else {
++    // WOW-BG3 (local fork, patch 0057): in world mode benilla runs offscreen, so this window has no
++    // OS cursor and BG3's forwarded pointer is the pointer, exactly as it is for the picks (patches
++    // 0003 and 0007). Without it `physical_cursor_position` is always None here, no press ever
++    // counts as a world press, the click test is never armed, `WorldRightClick` is never written and
++    // the right-click dispatcher never runs: no looting a corpse and no talking to a quest giver,
++    // however well the pick and the forwarding work. `pointer` is in the window's logical cursor
++    // space, which the viewport rectangle below is not, so it is taken to physical pixels first.
++    let Some(cursor) = window.physical_cursor_position().or_else(|| {
++        crate::target::hover_probe::pointer(window).map(|p| p * window.scale_factor())
++    }) else {
+         return false;
+     };
+     match &camera.viewport {
+@@ -1533,6 +1542,33 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    /// WOW-BG3 (patch 0057): offscreen in world mode this window never has an OS cursor, and BG3's
++    /// forwarded pointer is the pointer. `cursor_in_viewport` gates `world_press`, which is what lets
++    /// a press arm the click test at all, so without the fallback no click ever reaches the
++    /// right-click dispatcher: a corpse is never looted and a quest giver is never talked to.
++    #[test]
++    fn an_offscreen_press_with_bg3s_pointer_is_a_world_press() {
++        use bevy::camera::{Camera, Viewport};
++        let window = bevy::window::Window::default();
++        assert!(window.physical_cursor_position().is_none(), "the test window has no OS cursor");
++        let camera = Camera {
++            viewport: Some(Viewport {
++                physical_position: bevy::math::UVec2::ZERO,
++                physical_size: bevy::math::UVec2::new(1280, 720),
++                ..Default::default()
++            }),
++            ..Default::default()
++        };
++        let set = crate::target::hover_probe::set_external;
++        set(None);
++        assert!(!super::cursor_in_viewport(&window, &camera), "no OS cursor and no forwarded pointer");
++        set(Some(bevy::math::Vec2::new(640.0, 360.0)));
++        assert!(super::cursor_in_viewport(&window, &camera), "BG3's pointer stands in for the OS cursor");
++        set(Some(bevy::math::Vec2::new(5000.0, 360.0)));
++        assert!(!super::cursor_in_viewport(&window, &camera), "a forwarded pointer outside the viewport is outside");
++        set(None);
++    }
++
+     use super::super::camera_channel::CHANNEL_EPS;
+     use super::*;
+     use benilla_assets::BillboardInfo;

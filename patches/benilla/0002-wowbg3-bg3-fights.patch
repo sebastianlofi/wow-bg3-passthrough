@@ -1,0 +1,582 @@
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -188,6 +188,7 @@
+ mod world_state_ui;
+ // WOW-BG3 fork: the link to the hidden BG3 (camera stream).
+ mod wowbg3;
++mod wowbg3_fight;
+ 
+ use bevy::prelude::*;
+ 
+--- a/crates/benilla-app/src/net/io.rs
++++ b/crates/benilla-app/src/net/io.rs
+@@ -1486,6 +1486,8 @@
+                     } => w.pet_spell_autocast(pet_guid, spell_id, enabled),
+                     ClientCommand::PetAbandon { pet_guid } => w.pet_abandon(pet_guid),
+                     ClientCommand::PetRename { pet_guid, name } => w.pet_rename(pet_guid, &name),
++                    // WOW-BG3 (local fork): a swing at a Young Wolf starts a BG3 fight instead.
++                    ClientCommand::AttackSwing { guid } if crate::wowbg3_fight::intercept_swing(guid) => Ok(()),
+                     ClientCommand::AttackSwing { guid } => w.attack_swing(guid),
+                     ClientCommand::AttackStop => w.attack_stop(),
+                     ClientCommand::SetSheathed { state } => w.set_sheathed(state),
+--- a/crates/benilla-app/src/player/approach.rs
++++ b/crates/benilla-app/src/player/approach.rs
+@@ -230,6 +230,13 @@
+         self.arm(Toward::Ground(anchor), at, GROUND_STOP).is_ok()
+     }
+ 
++    /// WOW-BG3 (local fork): walk to the ground point BG3 moved the character to in a BG3 fight,
++    /// whatever the Click to Move option says.
++    pub(crate) fn walk_to_ground_bg3(&mut self, at: Vec3) -> bool {
++        let anchor = self.anchor(at);
++        self.arm(Toward::Ground(anchor), at, GROUND_STOP).is_ok()
++    }
++
+     /// `0x610100`, the right-click on the sky (`0x492dca`), along the press's ray.
+     pub(crate) fn walk_toward_sky(&mut self, ray: Vec3) -> bool {
+         let dir = ray.normalize_or_zero();
+--- a/crates/benilla-app/src/target/click.rs
++++ b/crates/benilla-app/src/target/click.rs
+@@ -678,7 +678,10 @@
+     if press.hovered.any().is_none() && !press.hovered.refused && press.object.target.is_none() {
+         match (press.occlusion.point, press.occlusion.ray) {
+             (Some(at), _) => {
+-                dispatch.auto.walk_to_ground(at);
++                // WOW-BG3 (local fork): during a BG3 fight the click asks BG3 to move there.
++                if !crate::wowbg3_fight::intercept_ground_click(at) {
++                    dispatch.auto.walk_to_ground(at);
++                }
+             }
+             (None, Some(ray)) if !payload_held.0 => {
+                 dispatch.auto.walk_toward_sky(*ray);
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -30,6 +30,8 @@
+             return;
+         };
+         info!("wowbg3: streaming the world camera to {:?}", dir);
++        // Fights: Young Wolf pulls become BG3 fights (`wowbg3_fight`).
++        crate::wowbg3_fight::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -0,0 +1,517 @@
++//! WOW-BG3 fights (local fork, not upstream benilla).
++//! Attacking a Young Wolf (creature 299) no longer starts a WoW fight: the swing stays off the
++//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `link/src/bridge.rs`),
++//! which sets up the fight in the hidden BG3. While it runs, BG3 decides everything:
++//! - on your turn, a right-click on the ground asks BG3 to move there (BG3 paths it on WoW
++//!   ground; the character then walks to where BG3 put it), a right-click on the wolf asks for
++//!   a melee attack, F9 casts Fire Bolt at it, F10 ends the turn and F11 leaves the fight;
++//! - the wolf's model plays BG3's moves (its server position is ignored until the fight ends),
++//!   and BG3's turns, hits and hit points appear in the chat frame as system lines.
++//! There is no server freeze yet: the real wolf may wander or aggro meanwhile.
++//!
++//! `WOW_BG3_AUTOFIGHT=1` (harness tests only): ten seconds in the world, the nearest Young Wolf
++//! within reach is pulled as if attacked, and each of your turns plays itself (first turn: a
++//! two-yard move toward the wolf; every turn: Fire Bolt, then end turn; after four turns: leave).
++//!
++//! Files in `$WOW_BG3_LINK_DIR`: `pull.json` and `input.json` are written here, `fight.txt`
++//! (plain lines, see `Fight::text` in the bridge) is read every few frames.
++
++use std::collections::{HashSet, VecDeque};
++use std::path::{Path, PathBuf};
++use std::sync::{LazyLock, Mutex};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
++use bevy::prelude::*;
++
++use crate::net::{Guid, ObjectStore, SelfPlayer};
++use crate::player::{AutoMove, Player};
++use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
++
++const YOUNG_WOLF: u32 = 299;
++/// Yards: the stand-in must land inside the 40 m arena cut around the hero.
++const PULL_RANGE: f32 = 18.0;
++/// Yards per second for the wolf model along BG3's path.
++const WOLF_SPEED: f32 = 7.0;
++const HELP: &str = "Your turn: right-click the ground to move, right-click the wolf to attack, \
++                    F9 Fire Bolt, F10 end turn, F11 leave the fight";
++
++enum Event {
++    Swing(u64),
++    Ground(Vec3),
++}
++
++#[derive(Default)]
++struct Shared {
++    enabled: bool,
++    active: bool,
++    wolves: HashSet<u64>,
++    events: VecDeque<Event>,
++}
++
++static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
++
++/// The network thread asks this for every `CMSG_ATTACKSWING`; true keeps it off the wire
++/// (a swing at a Young Wolf starts or continues a BG3 fight instead).
++pub(crate) fn intercept_swing(guid: u64) -> bool {
++    let Ok(mut s) = SHARED.lock() else {
++        return false;
++    };
++    if !s.enabled || !s.wolves.contains(&guid) {
++        return false;
++    }
++    s.events.push_back(Event::Swing(guid));
++    true
++}
++
++/// A right-click on the ground: during a BG3 fight it becomes a BG3 move request.
++pub(crate) fn intercept_ground_click(at: Vec3) -> bool {
++    let Ok(mut s) = SHARED.lock() else {
++        return false;
++    };
++    if !s.active {
++        return false;
++    }
++    s.events.push_back(Event::Ground(at));
++    true
++}
++
++#[derive(Resource)]
++struct Fight {
++    dir: PathBuf,
++    seq: u64,
++    text_seq: Option<u64>,
++    state: String,
++    your_turn: bool,
++    printed: u64,
++    anim_seen: u64,
++    wolf: Option<u64>,
++    wolf_track: VecDeque<Vec3>,
++    wolf_at: Option<Vec3>,
++    walk_to: Option<Vec3>,
++    frame: u64,
++    started: bool,
++    pulled_at: u64,
++    /// `WOW_BG3_AUTOFIGHT` progress.
++    auto: Option<Auto>,
++    turn: u64,
++    help_turn: u64,
++    in_world_at: Option<u64>,
++}
++
++/// One parsed `fight.txt`.
++#[derive(Debug, Default, PartialEq)]
++pub(crate) struct FightText {
++    pub(crate) seq: u64,
++    pub(crate) state: String,
++    pub(crate) your_turn: bool,
++    pub(crate) turn: u64,
++    /// id, hp, max hp, WoW position
++    pub(crate) actors: Vec<(String, u32, u32, [f32; 3])>,
++    /// seq, actor, kind, spell, target, WoW path
++    pub(crate) anims: Vec<(u64, String, String, String, String, Vec<[f32; 3]>)>,
++    pub(crate) log: Vec<(u64, String)>,
++    pub(crate) outcome: Option<String>,
++}
++
++pub(crate) fn parse_fight(text: &str) -> FightText {
++    let mut f = FightText::default();
++    for line in text.lines() {
++        let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
++        let mut w = rest.split_whitespace();
++        match key {
++            "seq" => f.seq = rest.trim().parse().unwrap_or(0),
++            "state" => f.state = rest.trim().to_string(),
++            "your_turn" => f.your_turn = rest.trim() == "1",
++            "turn" => f.turn = rest.trim().parse().unwrap_or(0),
++            "outcome" => f.outcome = Some(rest.trim().to_string()),
++            "log" => {
++                let (n, t) = rest.split_once(' ').unwrap_or((rest, ""));
++                if let Ok(n) = n.parse() {
++                    f.log.push((n, t.to_string()));
++                }
++            }
++            "actor" => {
++                let id = w.next().unwrap_or("").to_string();
++                let v: Vec<f32> = w.filter_map(|x| x.parse().ok()).collect();
++                if v.len() == 5 {
++                    f.actors.push((id, v[0] as u32, v[1] as u32, [v[2], v[3], v[4]]));
++                }
++            }
++            "anim" => {
++                let seq = w.next().and_then(|x| x.parse().ok()).unwrap_or(0);
++                let mut s = || w.next().unwrap_or("none").to_string();
++                let (actor, kind, spell, target) = (s(), s(), s(), s());
++                let v: Vec<f32> = w.filter_map(|x| x.parse().ok()).collect();
++                let path = v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
++                f.anims.push((seq, actor, kind, spell, target, path));
++            }
++            _ => {}
++        }
++    }
++    f
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    info!("wowbg3: BG3 fights through {:?}", dir);
++    app.insert_resource(Fight {
++        dir,
++        seq: 0,
++        text_seq: None,
++        state: String::new(),
++        your_turn: false,
++        printed: 0,
++        anim_seen: 0,
++        wolf: None,
++        wolf_track: VecDeque::new(),
++        wolf_at: None,
++        walk_to: None,
++        frame: 0,
++        started: false,
++        pulled_at: 0,
++        auto: std::env::var_os("WOW_BG3_AUTOFIGHT").map(|_| Auto::default()),
++        turn: 0,
++        help_turn: 0,
++        in_world_at: None,
++    })
++    .add_systems(Update, (fight_tick, fight_walk.after(fight_tick)))
++    .add_systems(
++        PostUpdate,
++        fight_hold_wolf.before(bevy::transform::TransformSystems::Propagate),
++    );
++}
++
++fn say(chat: &mut Option<ResMut<ChatLog>>, line: String) {
++    info!("wowbg3 fight: {line}");
++    if let Some(c) = chat.as_deref_mut() {
++        c.push_event(ChatEvent::text_only(ChatEventKind::System, format!("[BG3] {line}")));
++    }
++}
++
++fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
++    let tmp = path.with_extension("tmp");
++    std::fs::write(&tmp, text)?;
++    std::fs::rename(&tmp, path)
++}
++
++impl Fight {
++    fn next_seq(&mut self) -> u64 {
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_or(0, |d| d.as_millis() as u64);
++        self.seq = now.max(self.seq + 1);
++        self.seq
++    }
++    fn active(&self) -> bool {
++        self.wolf.is_some()
++    }
++    fn input(&mut self, kind: &str, target: Option<[f32; 3]>, spell: &str) {
++        let seq = self.next_seq();
++        let target = target.map_or("null".to_string(), |t| format!("[{},{},{}]", t[0], t[1], t[2]));
++        let body = format!(r#"{{"seq":{seq},"kind":"{kind}","target":{target},"spell":"{spell}"}}"#);
++        if let Err(e) = write_atomic(&self.dir.join("input.json"), &body) {
++            warn!("wowbg3 fight: cannot write input: {e}");
++        }
++    }
++    fn release(&mut self) {
++        self.wolf = None;
++        self.wolf_track.clear();
++        self.wolf_at = None;
++        self.your_turn = false;
++        self.help_turn = 0;
++        if let Ok(mut s) = SHARED.lock() {
++            s.active = false;
++        }
++    }
++}
++
++fn unit_json(guid: u64, pos: [f32; 3], store: Option<&ObjectStore>) -> String {
++    let max = store.and_then(|s| s.0.unit_max_health()).unwrap_or(1).max(1);
++    let hp = store.and_then(|s| s.0.unit_health()).unwrap_or(max).min(max);
++    format!(
++        r#""guid":"{guid:016x}","pos":[{},{},{}],"hp":{hp},"max_hp":{max}"#,
++        pos[0], pos[1], pos[2]
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++fn fight_tick(
++    mut f: ResMut<Fight>,
++    keys: Res<ButtonInput<KeyCode>>,
++    player: Res<Player>,
++    me: Query<(&Guid, &ObjectStore), With<SelfPlayer>>,
++    units: Query<(&Guid, &ObjectStore, &Transform), Without<SelfPlayer>>,
++    mut chat: Option<ResMut<ChatLog>>,
++) {
++    f.frame += 1;
++    if f.frame % 30 == 1 {
++        let wolves: HashSet<u64> = units
++            .iter()
++            .filter(|(_, s, _)| s.0.object_entry() == Some(YOUNG_WOLF) && s.0.unit_health().unwrap_or(0) > 0)
++            .map(|(g, _, _)| g.0)
++            .collect();
++        if let Ok(mut s) = SHARED.lock() {
++            s.enabled = player.active;
++            s.wolves = wolves;
++        }
++    }
++    if player.active && f.in_world_at.is_none() {
++        f.in_world_at = Some(f.frame);
++    }
++    autofight(&mut f, &player, &units);
++    let events: Vec<Event> = SHARED.lock().map(|mut s| s.events.drain(..).collect()).unwrap_or_default();
++    for e in events {
++        match e {
++            Event::Swing(guid) if !f.active() => {
++                let Some((_, store, tf)) = units.iter().find(|(g, _, _)| g.0 == guid) else {
++                    continue;
++                };
++                let distance = player.pos.distance(tf.translation);
++                if distance > PULL_RANGE {
++                    say(&mut chat, format!("The wolf is {distance:.0} yards away; get within {PULL_RANGE:.0} yards for a BG3 fight"));
++                    continue;
++                }
++                let Ok((my_guid, my_store)) = me.single() else {
++                    continue;
++                };
++                let seq = f.next_seq();
++                let body = format!(
++                    r#"{{"seq":{seq},"map":0,"hero":{{{}}},"enemy":{{{},"entry":{YOUNG_WOLF},"name":"Young Wolf"}}}}"#,
++                    unit_json(my_guid.0, bevy_to_wow(player.pos), Some(my_store)),
++                    unit_json(guid, bevy_to_wow(tf.translation), Some(store)),
++                );
++                if let Err(e) = write_atomic(&f.dir.join("pull.json"), &body) {
++                    say(&mut chat, format!("Cannot start a BG3 fight: {e}"));
++                    continue;
++                }
++                f.wolf = Some(guid);
++                f.wolf_at = Some(tf.translation);
++                f.started = false;
++                f.pulled_at = f.frame;
++                if let Ok(mut s) = SHARED.lock() {
++                    s.active = true;
++                }
++                say(&mut chat, "Young Wolf pulled into a BG3 fight; BG3 is setting it up".into());
++            }
++            Event::Swing(guid) if Some(guid) == f.wolf => {
++                if f.your_turn {
++                    f.input("cast", None, "Attack");
++                } else {
++                    say(&mut chat, "Not your turn".into());
++                }
++            }
++            Event::Swing(_) => {}
++            Event::Ground(at) => {
++                if f.your_turn {
++                    f.input("move", Some(bevy_to_wow(at)), "");
++                } else {
++                    say(&mut chat, "Not your turn".into());
++                }
++            }
++        }
++    }
++    if f.active() {
++        if keys.just_pressed(KeyCode::F11) {
++            f.input("leave", None, "");
++        } else if keys.just_pressed(KeyCode::F9) || keys.just_pressed(KeyCode::F10) {
++            if !f.your_turn {
++                say(&mut chat, "Not your turn".into());
++            } else if keys.just_pressed(KeyCode::F9) {
++                f.input("cast", None, "FireBolt");
++            } else {
++                f.input("end_turn", None, "");
++            }
++        }
++    }
++    if f.active() && !f.started && f.frame - f.pulled_at > 1800 {
++        say(&mut chat, "The BG3 bridge did not answer; is it running?".into());
++        f.release();
++    }
++    if f.frame % 3 != 0 {
++        return;
++    }
++    let Ok(text) = std::fs::read_to_string(f.dir.join("fight.txt")) else {
++        return;
++    };
++    let t = parse_fight(&text);
++    if Some(t.seq) == f.text_seq && t.state == f.state {
++        return;
++    }
++    let previous = f.text_seq.unwrap_or(0);
++    if f.text_seq.is_none() {
++        // Whatever the bridge wrote before we started is old news.
++        f.printed = t.log.iter().map(|l| l.0).max().unwrap_or(0);
++        f.anim_seen = t.anims.iter().map(|a| a.0).max().unwrap_or(0);
++    } else if t.seq == 0 || t.seq < previous || previous == 0 {
++        f.printed = 0;
++        f.anim_seen = 0;
++    }
++    f.text_seq = Some(t.seq);
++    f.state = t.state.clone();
++    for (n, line) in &t.log {
++        if *n > f.printed {
++            f.printed = *n;
++            if f.active() {
++                say(&mut chat, line.clone());
++            }
++        }
++    }
++    if !f.active() {
++        return;
++    }
++    for (seq, actor, kind, _spell, _target, path) in &t.anims {
++        if *seq <= f.anim_seen {
++            continue;
++        }
++        f.anim_seen = *seq;
++        if actor == "hero" && kind == "move" {
++            if let Some(last) = path.last() {
++                f.walk_to = Some(wow_to_bevy(*last));
++            }
++        } else if actor == "wolf" {
++            f.wolf_track = path.iter().map(|p| wow_to_bevy(*p)).collect();
++        }
++    }
++    // The help once per turn of yours (your_turn also drops while an action is outstanding).
++    if t.your_turn && t.turn != f.help_turn {
++        f.help_turn = t.turn;
++        say(&mut chat, HELP.into());
++    }
++    f.your_turn = t.your_turn;
++    f.turn = t.turn;
++    if matches!(t.state.as_str(), "starting" | "active" | "finished" | "cleaning") {
++        f.started = true;
++    }
++    let over = matches!(t.state.as_str(), "done" | "failed" | "idle");
++    if over && (f.started || t.state == "failed") {
++        info!("wowbg3 fight: over ({}, outcome {:?})", t.state, t.outcome);
++        f.release();
++    }
++}
++
++/// `WOW_BG3_AUTOFIGHT`: the inputs a player would give, for harness runs.
++fn autofight(f: &mut Fight, player: &Player, units: &Query<(&Guid, &ObjectStore, &Transform), Without<SelfPlayer>>) {
++    let Some(mut a) = f.auto else {
++        return;
++    };
++    let push = |e: Event| {
++        if let Ok(mut s) = SHARED.lock() {
++            s.events.push_back(e);
++        }
++    };
++    if !f.active() {
++        let ready = f.in_world_at.is_some_and(|at| f.frame > at + 600) && !a.pulled && f.frame >= a.next;
++        if ready && SHARED.lock().map(|s| s.enabled).unwrap_or(false) {
++            let nearest = units
++                .iter()
++                .filter(|(_, s, _)| s.0.object_entry() == Some(YOUNG_WOLF) && s.0.unit_health().unwrap_or(0) > 0)
++                .map(|(g, _, tf)| (g.0, player.pos.distance(tf.translation)))
++                .filter(|(_, d)| *d <= PULL_RANGE)
++                .min_by(|x, y| x.1.total_cmp(&y.1));
++            if let Some((guid, d)) = nearest {
++                info!("wowbg3 autofight: pulling Young Wolf {guid:#x} at {d:.1} yd");
++                push(Event::Swing(guid));
++                a.pulled = true;
++            }
++            a.next = f.frame + 600;
++        }
++        f.auto = Some(a);
++        return;
++    }
++    if !f.your_turn || f.frame < a.next {
++        return;
++    }
++    if f.turn != a.turn {
++        a.turn = f.turn;
++        a.turns += 1;
++        a.step = 0;
++    }
++    a.next = f.frame + 240;
++    if a.turns > 4 {
++        if a.step == 0 {
++            f.input("leave", None, "");
++            a.step = 99;
++        }
++    } else {
++        let plan: &[&str] = if a.turns == 1 { &["move", "cast", "end"] } else { &["cast", "end"] };
++        match plan.get(a.step as usize).copied().unwrap_or("end") {
++            "move" => {
++                if let Some(wolf) = f.wolf_at {
++                    let dir = (wolf - player.pos).normalize_or_zero();
++                    push(Event::Ground(player.pos + dir * 2.0));
++                }
++            }
++            "cast" => f.input("cast", None, "FireBolt"),
++            _ => f.input("end_turn", None, ""),
++        }
++        a.step += 1;
++    }
++    f.auto = Some(a);
++}
++
++#[derive(Clone, Copy, Default)]
++struct Auto {
++    pulled: bool,
++    turns: u32,
++    turn: u64,
++    step: u32,
++    next: u64,
++}
++
++fn fight_walk(mut f: ResMut<Fight>, mut auto: AutoMove) {
++    if let Some(at) = f.walk_to.take() {
++        auto.walk_to_ground_bg3(at);
++    }
++}
++
++/// The wolf's model follows BG3's path and stays where BG3 put it, whatever the server says.
++fn fight_hold_wolf(time: Res<Time>, mut f: ResMut<Fight>, mut units: Query<(&Guid, &mut Transform), Without<SelfPlayer>>) {
++    let Some(guid) = f.wolf else {
++        return;
++    };
++    if let Some(next) = f.wolf_track.front().copied() {
++        let at = f.wolf_at.unwrap_or(next);
++        let step = WOLF_SPEED * time.delta_secs();
++        let d = next - at;
++        if d.length() <= step {
++            f.wolf_at = Some(next);
++            f.wolf_track.pop_front();
++        } else {
++            f.wolf_at = Some(at + d.normalize() * step);
++        }
++    }
++    let Some(at) = f.wolf_at else {
++        return;
++    };
++    for (g, mut tf) in &mut units {
++        if g.0 == guid {
++            let d = at - tf.translation;
++            if Vec2::new(d.x, d.z).length() > 0.05 {
++                tf.look_to(Vec3::new(d.x, 0.0, d.z), Vec3::Y);
++            }
++            tf.translation = at;
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_the_bridge_lines() {
++        let t = parse_fight(
++            "seq 7\nstate active\nyour_turn 1\nactor hero 9 14 -8949.9 -132.5 83.5\n\
++             actor wolf 6 11 -8945 -132 83\nanim 3 wolf cast Target_Bite_Wolf hero -8946 -132 83 -8947 -132 83\n\
++             anim 4 hero cast FireBolt wolf\nlog 5 Turn 4: your turn\noutcome victory\n",
++        );
++        assert_eq!(t.seq, 7);
++        assert!(t.your_turn);
++        assert_eq!(t.actors[1].0, "wolf");
++        assert_eq!(t.actors[1].1, 6);
++        assert_eq!(t.anims[0].5.len(), 2);
++        assert!(t.anims[1].5.is_empty());
++        assert_eq!(t.log, vec![(5, "Turn 4: your turn".to_string())]);
++        assert_eq!(t.outcome.as_deref(), Some("victory"));
++    }
++}

@@ -1,0 +1,113 @@
+diff --git a/src/sdl_forward.cpp b/src/sdl_forward.cpp
+index 08b977f..35576cf 100644
+--- a/src/sdl_forward.cpp
++++ b/src/sdl_forward.cpp
+@@ -73,6 +73,13 @@ std::mutex g_inject_mutex;
+ std::deque<SDL_Event> g_injected;
+ std::atomic<bool> g_have_injected{false};
+ 
++// WOW-BG3 harness pointer input. The warp is applied on the event thread at the
++// next SDL_PollEvent, so the real pointer moves exactly as a player's would.
++std::atomic<SDL_Window*> g_window{nullptr};
++std::atomic<bool> g_warp_pending{false};
++std::atomic<int> g_warp_x{0};
++std::atomic<int> g_warp_y{0};
++
+ bool take_injected(SDL_Event* event) {
+     if (!g_have_injected.load(std::memory_order_acquire)) return false;
+     std::lock_guard<std::mutex> lock(g_inject_mutex);
+@@ -136,6 +143,7 @@ extern "C" SDL_Window* SDL_CreateWindow(char const* title, int x, int y,
+     if (next == nullptr) return nullptr;
+ 
+     SDL_Window* window = next(title, x, y, w, h, flags);
++    if (window != nullptr) g_window.store(window, std::memory_order_release);
+ 
+     if (window != nullptr && bg3le::imgui_overlay_wanted()) {
+         bg3le::logf("sdl: window %p, %dx%d", (void*)window, w, h);
+@@ -150,6 +158,12 @@ extern "C" int SDL_PollEvent(SDL_Event* event) {
+     if (next == nullptr) return 0;
+     // Native plugins start with the game's event loop, once the engine is up.
+     bg3le::plugins_load();
++    if (g_warp_pending.exchange(false, std::memory_order_acq_rel)) {
++        using WarpFn = void (*)(SDL_Window*, int, int);
++        static const WarpFn warp = real<WarpFn>("SDL_WarpMouseInWindow");
++        SDL_Window* window = g_window.load(std::memory_order_acquire);
++        if (warp != nullptr && window != nullptr) warp(window, g_warp_x.load(), g_warp_y.load());
++    }
+     if (event != nullptr && take_injected(event)) return 1;
+ 
+     int result = bg3le::imgui_overlay_wanted()
+@@ -176,6 +190,43 @@ extern "C" void bg3le_sdl_inject_key(bool down, int scancode, int modifiers) {
+     g_have_injected.store(true, std::memory_order_release);
+ }
+ 
++// WOW-BG3 harness mouse input, queued like the key events above.
++// kind 0: warp the real pointer to (x, y) and queue the matching motion event.
++// kind 1: queue a button press or release at (x, y).
++extern "C" void bg3le_sdl_inject_mouse(int kind, int button, bool down, int x, int y) {
++    if (x < 0 || y < 0 || x > 16384 || y > 16384) return;
++    using IdFn = Uint32 (*)(SDL_Window*);
++    static const IdFn window_id = real<IdFn>("SDL_GetWindowID");
++    SDL_Window* window = g_window.load(std::memory_order_acquire);
++    const Uint32 id = (window != nullptr && window_id != nullptr) ? window_id(window) : 0;
++    SDL_Event evt;
++    std::memset(&evt, 0, sizeof(evt));
++    if (kind == 0) {
++        g_warp_x.store(x);
++        g_warp_y.store(y);
++        g_warp_pending.store(true, std::memory_order_release);
++        evt.type = SDL_MOUSEMOTION;
++        evt.motion.timestamp = SDL_GetTicks();
++        evt.motion.windowID = id;
++        evt.motion.x = x;
++        evt.motion.y = y;
++    } else if (kind == 1 && button >= 1 && button <= 3) {
++        evt.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
++        evt.button.timestamp = SDL_GetTicks();
++        evt.button.windowID = id;
++        evt.button.button = (Uint8)button;
++        evt.button.state = down ? SDL_PRESSED : SDL_RELEASED;
++        evt.button.clicks = 1;
++        evt.button.x = x;
++        evt.button.y = y;
++    } else {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(g_inject_mutex);
++    g_injected.push_back(evt);
++    g_have_injected.store(true, std::memory_order_release);
++}
++
+ extern "C" SDL_bool SDL_IsTextInputActive(void) {
+     using Fn = SDL_bool (*)(void);
+     static const Fn next = real<Fn>("SDL_IsTextInputActive");
+diff --git a/src/lua_host.cpp b/src/lua_host.cpp
+index 99147d3..3a8ce18 100644
+--- a/src/lua_host.cpp
++++ b/src/lua_host.cpp
+@@ -710,6 +710,16 @@ int l_inject_key(lua_State* L) {
+     return 0;
+ }
+ 
++// Ext._Internal.InjectMouse(kind, button, down, x, y) -- src/sdl_forward.cpp,
++// WOW-BG3 harness only: pointer warp/motion (kind 0) or one button edge (kind 1).
++extern "C" void bg3le_sdl_inject_mouse(int kind, int button, bool down, int x, int y);
++int l_inject_mouse(lua_State* L) {
++    bg3le_sdl_inject_mouse((int)luaL_checkinteger(L, 1), (int)luaL_checkinteger(L, 2),
++                           lua_toboolean(L, 3) != 0, (int)luaL_checkinteger(L, 4),
++                           (int)luaL_checkinteger(L, 5));
++    return 0;
++}
++
+ int l_has_other_context(lua_State* L) {
+     lua_State* other = (L == g_client_lua) ? g_server_lua : g_client_lua;
+     lua_pushboolean(L, other != nullptr ? 1 : 0);
+@@ -8019,6 +8029,8 @@ void build_state(bool client) {
+     lua_setfield(g_lua, -2, "NetForceRemote");
+     lua_pushcfunction(g_lua, l_inject_key);
+     lua_setfield(g_lua, -2, "InjectKey");
++    lua_pushcfunction(g_lua, l_inject_mouse);
++    lua_setfield(g_lua, -2, "InjectMouse");
+     lua_pushcfunction(g_lua, l_audio);
+     lua_setfield(g_lua, -2, "Audio");
+     lua_pushcfunction(g_lua, l_enum_count);

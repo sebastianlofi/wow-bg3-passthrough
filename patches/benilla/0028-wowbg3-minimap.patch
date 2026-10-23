@@ -1,0 +1,304 @@
+diff --git a/crates/benilla-app/src/minimap/mod.rs b/crates/benilla-app/src/minimap/mod.rs
+--- a/crates/benilla-app/src/minimap/mod.rs
++++ b/crates/benilla-app/src/minimap/mod.rs
+@@ -17,6 +17,8 @@
+ /// The minimap ping, engine-owned and pinned to a world point.
+ mod ping;
+ pub(crate) use ping::MinimapPing;
++/// WOW-BG3 (local fork): WoW's minimap art round the player for BG3's minimap (`wowbg3.rs`).
++mod wowbg3;
+ 
+ use std::collections::HashMap;
+ 
+@@ -870,6 +872,9 @@
+             .init_resource::<MinimapInside>()
+             .init_resource::<MinimapPing>()
+             .init_resource::<composite::MinimapComposite>()
++            // WOW-BG3: off unless world mode's link dir is set.
++            .init_resource::<wowbg3::WowBg3Minimap>()
++            .add_systems(Update, wowbg3::drive)
+             .add_systems(Startup, setup_minimap.after(AssetSet::Open))
+             .add_systems(Startup, composite::setup_composite)
+             .add_systems(
+diff --git a/crates/benilla-app/src/minimap/wowbg3.rs b/crates/benilla-app/src/minimap/wowbg3.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/minimap/wowbg3.rs
+@@ -0,0 +1,277 @@
++//! WOW-BG3 (local fork, not upstream benilla): WoW's minimap imagery for
++//! BG3's minimap. In world mode BG3's HUD is the game's and its minimap stays (by design),
++//! drawn by BG3 itself; the mod adds a layer in world metres to BG3's map template (`WowUi.lua`,
++//! under the map control's own projection, above the level's map and below BG3's markers) that
++//! shows the image written here: WoW's own minimap art (the ADT tiles, `map<X>_<Y>.blp` through
++//! `md5translate.trs`; outdoor art only) of the 3 x 3 tiles round the player, north up and west
++//! left as WoW draws them, unauthored tiles (open sea) transparent, as
++//! `$WOW_BG3_LINK_DIR/minimap/mm-<slot>.dds` (uncompressed BGRA8; four slots in turn, so the folder
++//! never grows), and `minimap.json`, where it lies: `X0..X1` south to north and `Y0..Y1` east to west
++//! in WoW yards (tile edges), with this run's stamp and the image's sequence number, which BG3's side
++//! puts in the image's URI so a reused slot is never taken for the image it held before. A new image
++//! is written off-thread when the player enters another tile or map, so the player's tile is always
++//! the middle one. Off unless `WOW_BG3_LINK_DIR` and `WOW_BG3_LEAD` are set. Logs `wowbg3 minimap:`
++//! lines.
++
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++use bevy::prelude::*;
++
++use benilla_assets::coords::bevy_to_wow;
++use benilla_assets::{LockRecover, MapCatalogRes, WorldAssets};
++use benilla_formats::{tile_to_world, world_to_tile};
++use benilla_world::world_map::CurrentMap;
++
++use crate::player::Player;
++
++use super::MinimapAssets;
++
++/// Tiles on each side of the player's: 3 x 3 tiles (1600 yd), so BG3's view, a few hundred metres
++/// at most, stays inside the image until the player's tile changes.
++const RADIUS: u32 = 1;
++/// A minimap tile's edge in the image (WoW's tiles are 256²).
++const TILE_PX: u32 = 256;
++/// A failed export is tried again after this long (wall seconds).
++const RETRY_AFTER: f64 = 10.0;
++/// Image files used in turn: the one BG3 shows is never the one being written.
++const SLOTS: u32 = 4;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++struct Key {
++    map: u32,
++    tx: u32,
++    ty: u32,
++}
++
++struct Done {
++    key: Key,
++    result: Result<(String, usize, u32), String>,
++    ms: f64,
++}
++
++#[derive(Resource)]
++pub(super) struct WowBg3Minimap {
++    dir: Option<PathBuf>,
++    /// This run's stamp (unix seconds at start), in minimap.json with each image's sequence number.
++    run: u64,
++    seq: u32,
++    shown: Option<Key>,
++    busy: bool,
++    failed_at: f64,
++    done: Arc<Mutex<Option<Done>>>,
++}
++
++impl Default for WowBg3Minimap {
++    fn default() -> Self {
++        let dir = std::env::var_os("WOW_BG3_LEAD")
++            .and(std::env::var_os("WOW_BG3_LINK_DIR"))
++            .map(PathBuf::from);
++        if let Some(d) = &dir {
++            let _ = std::fs::create_dir_all(d.join("minimap"));
++            info!("wowbg3 minimap: writing WoW's minimap round the player to {:?}", d.join("minimap"));
++        }
++        let run = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_secs())
++            .unwrap_or(0);
++        Self {
++            dir,
++            run,
++            seq: 0,
++            shown: None,
++            busy: false,
++            failed_at: f64::NEG_INFINITY,
++            done: Arc::new(Mutex::new(None)),
++        }
++    }
++}
++
++/// Every frame: takes a finished export and starts one when the player's tile or map is not the
++/// one shown.
++pub(super) fn drive(
++    mut st: ResMut<WowBg3Minimap>,
++    assets: Option<Res<MinimapAssets>>,
++    world: Option<Res<WorldAssets>>,
++    map: Option<Res<CurrentMap>>,
++    catalog: Option<Res<MapCatalogRes>>,
++    player: Res<Player>,
++    time: Res<Time<bevy::time::Real>>,
++) {
++    let Some(dir) = st.dir.clone() else {
++        return;
++    };
++    let now = time.elapsed_secs_f64();
++    let finished = st.done.lock().ok().and_then(|mut d| d.take());
++    if let Some(d) = finished {
++        st.busy = false;
++        match d.result {
++            Ok((file, bytes, tiles)) => {
++                info!(
++                    "wowbg3 minimap: {file} written ({bytes} bytes, {tiles} tiles, map {} tile {},{}, {:.1} ms off-thread)",
++                    d.key.map, d.key.tx, d.key.ty, d.ms
++                );
++                st.shown = Some(d.key);
++            }
++            Err(e) => {
++                warn!("wowbg3 minimap: export failed: {e}");
++                st.failed_at = now;
++            }
++        }
++    }
++    if st.busy || now - st.failed_at < RETRY_AFTER {
++        return;
++    }
++    let (Some(assets), Some(world), Some(map), Some(catalog)) = (assets, world, map, catalog) else {
++        return;
++    };
++    let Some(map_dir) = catalog.0.directory(map.0) else {
++        return;
++    };
++    // Not before the server has placed us (the player sits at the origin until then).
++    if player.pos == Vec3::ZERO {
++        return;
++    }
++    let wow = bevy_to_wow(player.pos);
++    let (tx, ty) = world_to_tile(wow[0], wow[1]);
++    let key = Key { map: map.0, tx, ty };
++    if st.shown == Some(key) {
++        return;
++    }
++    let (tx0, ty0) = (tx.saturating_sub(RADIUS), ty.saturating_sub(RADIUS));
++    let (tx1, ty1) = ((tx + RADIUS).min(63), (ty + RADIUS).min(63));
++    let (cols, rows) = (tx1 - tx0 + 1, ty1 - ty0 + 1);
++    // Row by row from the north, west to east: tile x grows eastward, tile y southward.
++    let mut names = Vec::with_capacity((cols * rows) as usize);
++    for row in ty0..=ty1 {
++        for col in tx0..=tx1 {
++            names.push(
++                assets
++                    .translate
++                    .tile(map_dir, col, row)
++                    .map(|h| format!("textures\\Minimap\\{h}")),
++            );
++        }
++    }
++    // The image's north-west corner is tile (tx0, ty0)'s, its south-east the next tile's past (tx1, ty1).
++    let (north, west) = tile_to_world(tx0, ty0);
++    let (south, east) = tile_to_world(tx1 + 1, ty1 + 1);
++    st.seq += 1;
++    let file = format!("mm-{}.dds", st.seq % SLOTS);
++    let (seq, run) = (st.seq, st.run);
++    let chain = world.chain.clone();
++    let done = st.done.clone();
++    st.busy = true;
++    let spawned = std::thread::Builder::new()
++        .name("wowbg3-minimap".into())
++        .spawn(move || {
++            let t0 = std::time::Instant::now();
++            let result = export(&chain, &names, cols, rows, &dir, &file, (run, seq), key.map, [south, north, east, west]);
++            let ms = t0.elapsed().as_secs_f64() * 1000.0;
++            if let Ok(mut d) = done.lock() {
++                *d = Some(Done { key, result, ms });
++            }
++        });
++    if let Err(e) = spawned {
++        warn!("wowbg3 minimap: no export thread: {e}");
++        st.busy = false;
++        st.failed_at = now;
++    }
++}
++
++/// The legacy DDS header of an uncompressed `w` x `h` BGRA8 image (A8R8G8B8, one level).
++fn dds_header(w: u32, h: u32) -> Vec<u8> {
++    let mut v = Vec::with_capacity(128);
++    let mut put = |x: u32| v.extend_from_slice(&x.to_le_bytes());
++    put(u32::from_le_bytes(*b"DDS "));
++    // Size, flags (caps, height, width, pitch, pixel format), height, width, pitch, depth, levels.
++    for x in [124, 0x100F, h, w, w * 4, 0, 1] {
++        put(x);
++    }
++    for _ in 0..11 {
++        put(0);
++    }
++    // Pixel format: RGB with alpha, 32 bits, A8R8G8B8 masks.
++    for x in [32, 0x41, 0, 32, 0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0xFF00_0000] {
++        put(x);
++    }
++    // Caps: texture.
++    for x in [0x1000, 0, 0, 0, 0] {
++        put(x);
++    }
++    v
++}
++
++fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
++    let tmp = path.with_extension("tmp");
++    std::fs::write(&tmp, bytes).map_err(|e| format!("{tmp:?}: {e}"))?;
++    std::fs::rename(&tmp, path).map_err(|e| format!("{path:?}: {e}"))
++}
++
++/// Reads and decodes the tiles, writes the image and then `minimap.json`; (file, bytes, tiles).
++#[allow(clippy::too_many_arguments)]
++fn export(
++    chain: &Arc<Mutex<benilla_formats::Chain>>,
++    names: &[Option<String>],
++    cols: u32,
++    rows: u32,
++    dir: &Path,
++    file: &str,
++    (run, seq): (u64, u32),
++    map: u32,
++    [x0, x1, y0, y1]: [f32; 4],
++) -> Result<(String, usize, u32), String> {
++    let (w, h) = (cols * TILE_PX, rows * TILE_PX);
++    let mut out = dds_header(w, h);
++    let head = out.len();
++    out.resize(head + (w * h * 4) as usize, 0); // transparent black where no art was authored
++    let px = &mut out[head..];
++    let mut tiles = 0;
++    for (i, name) in names.iter().enumerate() {
++        let Some(name) = name else {
++            continue;
++        };
++        let read = {
++            let mut c = chain.lock_recover();
++            c.read_file(name)
++        };
++        let bytes = match read {
++            Ok(b) => b,
++            Err(e) => {
++                warn!("wowbg3 minimap: {name}: {e:#}");
++                continue;
++            }
++        };
++        let (tw, th, rgba) = match benilla_formats::blp_to_rgba(&bytes) {
++            Ok(v) => v,
++            Err(e) => {
++                warn!("wowbg3 minimap: {name}: {e:#}");
++                continue;
++            }
++        };
++        if tw == 0 || th == 0 {
++            continue;
++        }
++        let (col, row) = (i as u32 % cols, i as u32 / cols);
++        for y in 0..TILE_PX {
++            let sy = y * th / TILE_PX;
++            for x in 0..TILE_PX {
++                let sx = x * tw / TILE_PX;
++                let s = ((sy * tw + sx) * 4) as usize;
++                let d = (((row * TILE_PX + y) * w + col * TILE_PX + x) * 4) as usize;
++                px[d] = rgba[s + 2];
++                px[d + 1] = rgba[s + 1];
++                px[d + 2] = rgba[s];
++                px[d + 3] = 255;
++            }
++        }
++        tiles += 1;
++    }
++    let bytes = out.len();
++    write_atomic(&dir.join("minimap").join(file), &out)?;
++    let json = format!(
++        "{{\"Run\":{run},\"Seq\":{seq},\"File\":\"{file}\",\"Map\":{map},\"X0\":{x0:.3},\"X1\":{x1:.3},\"Y0\":{y0:.3},\"Y1\":{y1:.3},\"Width\":{w},\"Height\":{h},\"Tiles\":{tiles}}}\n"
++    );
++    write_atomic(&dir.join("minimap.json"), json.as_bytes())?;
++    Ok((file.to_string(), bytes, tiles))
++}

@@ -1,0 +1,75 @@
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -25,6 +25,12 @@
+ //! depth. Anything wgpu cannot take (or a missing file) skips that draw, logged once. BG3's fog
+ //! volume (special key 3) is bound empty, (0, 0, 0, 1); its froxel light grid (key 5) is one
+ //! constant light, `WOW_BG3_FX_LIGHT` (default 32, which BG3's shaders scale to 1).
++//!
++//! Patch 0044 (the faint pink smoke over Tav in Lacerate's glow phase): without
++//! `WOW_BG3_FX_LIGHT` the light grid is WoW's own light at that moment, every frame: 32 x (ambient
++//! + half the sun's diffuse) of the world's lighting (`WowLighting`), per channel. Lit effects
++//! (Lacerate's smoke) were lit by a constant 1.0, brighter than WoW's daylight and the same at
++//! night; now they take the scene's light as BG3's grid gives them its level's.
+ //!
+ //! Patch 0020 ("distortion" while Lacerate is prepared): BG3's projected
+ //! decals (the draws that read the G-buffer normal, special key 6) rebuild their surface from the
+@@ -115,8 +121,25 @@
+ /// Patch 0026: receiver triangles per frame at most.
+ const RECV_MAX_TRIS: usize = 200_000;
+ 
++/// Patch 0044: the light grid's texel (BG3's scale, 32 = 1.0) from WoW's lighting, set by
++/// [`track_wow_light`]; `None` keeps the constant (`WOW_BG3_FX_LIGHT`).
++static WOW_LIGHT: std::sync::Mutex<Option<[f32; 3]>> = std::sync::Mutex::new(None);
++
++/// Patch 0044: WoW's light of this frame for the light grid: ambient plus half the diffuse (the
++/// sun's light averaged over a volume's directions), in BG3's grid scale.
++fn track_wow_light(lighting: Option<Res<benilla_world::lighting::WowLighting>>) {
++    let Some(l) = lighting else { return };
++    let rgb = [0, 1, 2].map(|i| 32.0 * (l.ambient[i] + 0.5 * l.diffuse[i]).clamp(0.0, 4.0));
++    if let Ok(mut w) = WOW_LIGHT.lock() {
++        *w = Some(rgb);
++    }
++}
++
+ pub(crate) fn build(app: &mut App) {
+     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<crate::wowbg3_tav::TavFeet>::default());
++    if std::env::var("WOW_BG3_FX_LIGHT").map_or(true, |v| v.trim().is_empty()) {
++        app.add_systems(Last, track_wow_light);
++    }
+     // Patch 0026: WoW's decal receivers under BG3's projected decals, gathered after the frame is
+     // picked (`wowbg3_fx::read_fx`, PostUpdate) and the camera and ground lock are set.
+     app.init_resource::<FxReceivers>()
+@@ -470,6 +493,8 @@
+     neutral: HashMap<(wgpu::TextureViewDimension, Scalar), wgpu::TextureView>,
+     /// A 1x1x1 light grid of (light, light, light, 1).
+     light3d: wgpu::TextureView,
++    /// Patch 0044: its texture, rewritten each frame with WoW's light.
++    light_tex: wgpu::Texture,
+     /// Special key 6 (patch 0012): BG3's G-buffer normal as projected decals read it, one texel
+     /// per frame: WoW's ground taken as level, its normal in the camera's axes, encoded as BG3's.
+     normal_tex: wgpu::Texture,
+@@ -906,6 +931,7 @@
+                 linear_clamp,
+                 neutral,
+                 light3d,
++                light_tex,
+                 normal_tex,
+                 normal,
+                 storage_dummy: HashMap::new(),
+@@ -2381,6 +2407,16 @@
+                 queue.write_buffer(&ready.arena, b0 as u64 + 112, bytemuck::cast_slice(&row3));
+             }
+         }
++        // Patch 0044: special key 5 lit with WoW's light of this moment (unless WOW_BG3_FX_LIGHT).
++        if let Some(rgb) = WOW_LIGHT.lock().ok().and_then(|l| *l) {
++            let h = |x: f32| half::f16::from_f32(x).to_bits();
++            queue.write_texture(
++                base.light_tex.as_image_copy(),
++                bytemuck::cast_slice::<u16, u8>(&[h(rgb[0]), h(rgb[1]), h(rgb[2]), half::f16::ONE.to_bits()]),
++                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
++                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
++            );
++        }
+         // Special key 6: WoW's ground as level, its normal in the camera's axes.
+         let n = Vec3::new(c.right.y, c.up.y, c.fwd.y);
+         let e = encode_normal(n);

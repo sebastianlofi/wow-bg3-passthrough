@@ -1,0 +1,98 @@
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -63,6 +63,16 @@
+ //! with the body's state (0 alive, 1 dead, 2 ghost), which `Mirrors.lua` mirrors onto BG3's
+ //! character (a WoW resurrection resurrects her).
+ //!
++//! Patch 0027 (friendly NPCs get stand-ins too): `mobs.txt` also
++//! lists the friendly NPCs WoW does not let the player attack (vendors, quest givers, guards,
++//! villagers), its REACTION field 2 (1 hostile, 0 neutral as before); `wowmobs.bin` streams them
++//! with the rest. A mirrored friendly NPC stays WoW's to click (`claims_hover`): talk, trade,
++//! quests and loot keep WoW's own path (errands, patch 0019). BG3 takes such a click only for an
++//! attack: `WorldMode.lua` leaves it to BG3 when BG3's own cursor over the stand-in is an attack
++//! (Ctrl held, BG3's way to attack someone who is not hostile, or an aimed attack or spell). Once
++//! the server turns the NPC on the player (server patch 0006), it is attackable here as well and
++//! a mirrored mob like any other.
++//!
+ //! Files in `$WOW_BG3_LINK_DIR`: `pull.json`, `join.json`, `input.json`, `server-events.txt`,
+ //! `mobs.txt` and `wowmobs.bin` are written here, `fight.txt` (plain lines, see `Fight::text` in the bridge), `server-cmd.txt`,
+ //! `standins.bin` and `strikes.bin` are read.
+@@ -187,9 +197,14 @@
+ }
+ 
+ /// The pointer link (`wowbg3_lead.rs`) asks this for the unit under BG3's cursor: a mirrored mob
+-/// is BG3's to click (its stand-in), not WoW's.
++/// is BG3's to click (its stand-in), not WoW's. Patch 0027: a mirrored friendly NPC (one WoW does
++/// not let you attack) stays WoW's; BG3 keeps such a click only for an attack (`WorldMode.lua`).
+ pub(crate) fn claims_hover(guid: Option<u64>) -> bool {
+-    guid.is_none_or(|g| !SHARED.lock().is_ok_and(|s| s.mirrored.contains(&g)))
++    guid.is_none_or(|g| {
++        !SHARED
++            .lock()
++            .is_ok_and(|s| s.mirrored.contains(&g) && s.attackable.contains(&g))
++    })
+ }
+ 
+ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
+@@ -851,6 +866,28 @@
+     Some(ring_reaction(factions, reps, Some(store), Some(me)) < NEUTRAL)
+ }
+ 
++/// `UNIT_FIELD_FLAGS` bit 25: not selectable (script triggers and the like; never mirrored).
++const NOT_SELECTABLE: u32 = 1 << 25;
++
++/// Patch 0027: `mobs.txt`'s REACTION for a creature: 1 hostile, 0 neutral (both attackable, as
++/// before), 2 a friendly NPC WoW does not let the player attack. None: a player, a player's pet,
++/// a dead or unselectable creature.
++fn reaction(
++    store: &ObjectStore,
++    me: &ObjectStore,
++    factions: Option<&Factions>,
++    reps: &Reputations,
++) -> Option<u8> {
++    let f = &store.0;
++    if f.object_type() == Some(ObjectType::Player)
++        || f.unit_health().unwrap_or(0) == 0
++        || f.unit_flags() & (PLAYER_CONTROLLED | NOT_SELECTABLE) != 0
++    {
++        return None;
++    }
++    Some(fightable(store, me, factions, reps).map_or(2, u8::from))
++}
++
+ /// What one scan of the world found (every 30 frames).
+ struct Scan {
+     /// Attackable creatures: guid, entity position, hostile, creature entry.
+@@ -928,7 +965,7 @@
+             if player.pos.distance(tf.translation) > MIRROR_RANGE {
+                 continue;
+             }
+-            let Some(hostile) = fightable(store, my_store, factions.as_deref(), reps) else {
++            let Some(reaction) = reaction(store, my_store, factions.as_deref(), reps) else {
+                 continue;
+             };
+             near.insert(g.0);
+@@ -941,7 +978,7 @@
+                 g.0,
+                 s.object_entry().unwrap_or(0),
+                 s.unit_level().unwrap_or(0),
+-                u8::from(hostile),
++                reaction,
+                 w[0],
+                 w[1],
+                 w[2],
+@@ -1827,9 +1864,13 @@
+     fn mirrored_mobs_are_not_claimed_for_wow() {
+         if let Ok(mut s) = SHARED.lock() {
+             s.mirrored.insert(0xf130000000012b01);
++            s.attackable.insert(0xf130000000012b01);
++            // Patch 0027: a mirrored friendly NPC (not attackable in WoW) stays WoW's.
++            s.mirrored.insert(0xf130000000013c01);
+         }
+         assert!(!claims_hover(Some(0xf130000000012b01)));
+         assert!(claims_hover(Some(0xf130000000012b02)));
++        assert!(claims_hover(Some(0xf130000000013c01)));
+         assert!(claims_hover(None));
+     }
+ 

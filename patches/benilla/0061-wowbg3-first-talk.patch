@@ -1,0 +1,33 @@
+WOW-BG3 benilla patch 0061: BG3's first Talk of a session reaches WoW.
+
+- target/click.rs, act_on_bg3_use: the first read of `link/wowuse.bin` took whatever it found for history, so
+  when the file did not exist yet the first record written (BG3's first Talk in that session, Interact.lua)
+  was dropped: in the 0.1.0 playtest the right-click menu's Talk failed exactly like that, and
+  a test run reproduced it (Interact Talk 1, no `wowbg3 use` line). A missing file now counts as
+  no history (`last = Some(0)`; a record's seq is never 0), and a record already there at the first read
+  stays history, as before.
+
+--- a/crates/benilla-app/src/target/click.rs
++++ b/crates/benilla-app/src/target/click.rs
+@@ -1050,7 +1050,20 @@
+     if link.frame % 3 != 0 {
+         return;
+     }
+-    let Some((seq, guid, verb)) = std::fs::read(&link.path).ok().and_then(|b| decode_use(&b)) else {
++    // WOW-BG3 (patch 0061): no file at all is no history, so the first record written after that is
++    // BG3's first Talk and runs. Before, the first read took whatever it found for history, and when
++    // the file did not exist yet that was the session's first Talk, which never reached WoW. `Some(0)`
++    // marks it (a record's seq is never 0).
++    let bytes = match std::fs::read(&link.path) {
++        Ok(b) => b,
++        Err(_) => {
++            if link.last.is_none() {
++                link.last = Some(0);
++            }
++            return;
++        }
++    };
++    let Some((seq, guid, verb)) = decode_use(&bytes) else {
+         return;
+     };
+     let first = link.last.is_none();

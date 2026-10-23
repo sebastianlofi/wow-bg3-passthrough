@@ -1,0 +1,31 @@
+--- a/crates/benilla-app/src/cinematic.rs
++++ b/crates/benilla-app/src/cinematic.rs
+@@ -272,6 +272,16 @@
+     }
+ }
+ 
++/// WOW-BG3 (local fork, patch 0049): no WoW cinematic in WOW-BG3. A new
++/// WoW character's first login triggers its race intro (a camera fly-by with narration), which in
++/// WOW-BG3 played over BG3's character after a New Game. It is acked at once, as a skip is, so the
++/// server's copy of the flying camera ends too (module doc: unacked, objects stay despawned).
++/// On whenever `$WOW_BG3_LINK_DIR` is set (benilla runs for WOW-BG3), as the other wowbg3 modules.
++fn wowbg3_no_cinematics() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("WOW_BG3_LINK_DIR").is_some())
++}
++
+ /// Latch a triggered cinematic (or ack it immediately, if it names nothing we can play).
+ fn take_trigger(
+     mut triggered: MessageReader<CinematicTriggeredMessage>,
+@@ -281,6 +291,11 @@
+ ) {
+     for msg in triggered.read() {
+         let id = msg.cinematic_id;
++        if wowbg3_no_cinematics() {
++            info!("cinematic: {id} skipped (WOW-BG3: no WoW intro over BG3's character); acked");
++            ack(net.as_deref());
++            continue;
++        }
+         let playable = catalog
+             .as_deref()
+             .is_some_and(|c| !c.0.shots(id).is_empty());

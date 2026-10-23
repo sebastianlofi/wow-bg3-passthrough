@@ -1,0 +1,182 @@
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -15,13 +15,21 @@
+ //! hidden (the first-person fade at alpha 0) and its animation sounds are muted (BG3 draws and
+ //! voices the character instead).
+ //!
+-//! Ground lock: BG3's arena floor and WoW's terrain disagree by up to a few yards in height, so
+-//! the camera is lowered by Tav's height above the WoW character (eased, at most 4 yd, only
+-//! while the two stand together): Tav's feet then meet WoW's ground in the composite.
++//! Ground lock (patch 0011): what is left between Tav's feet and WoW's ground under her. BG3's
++//! floor is WoW's own ground (`wow_arena.py`: the terrain mesh as WoW draws it,
++//! model floors), so the lock is a few centimetres: Tav's height above the ground WoW's own body
++//! would stand on under her (terrain, building floors, bridges: the walking collision's down ray),
++//! when that is within 0.75 yd, else nothing, eased. It lowers Tav (`wowbg3_tav`) and the camera
++//! with her. (It used to be Tav's height above the WoW character, which trails her by a yard or
++//! more: on slopes that sank her by up to half a yard, and by 2.4 yd where it trailed 8 yd.)
+ //!
+-//! Ground clearance: BG3's camera knows nothing of WoW's hills and can sit inside one. Then the
+-//! eye slides toward Tav along its line of sight until it clears WoW's terrain (what WoW's own
++//! Ground clearance: BG3's camera knows nothing of WoW's hills and can sit inside one. Since patch
++//! 0011 the wowbg3 plugin moves BG3's own eye out of WoW's terrain and buildings before BG3 draws
++//! and streams that eye here with flag 1 (BGC1 flags at 52), which is kept as it is, so both views
++//! stay the same. For an eye without the flag (no WoW ground there for the plugin, an older plugin)
++//! the eye slides toward Tav along its line of sight until it clears WoW's terrain (what WoW's own
+ //! camera collision does); Tav stays where she was on screen, the world around her zooms a bit.
++//! `wowbg3 ground:` log lines count both cases.
+ //!
+ //! Pointer (clicks on WoW's people and things go to WoW): `bg3input.bin` (written by
+ //! `WorldMode.lua`: `BGI1`, seq, cursor x, y and BG3's window width, height as f32, left clicks
+@@ -62,6 +70,15 @@
+ /// with the camera, so her feet meet WoW's ground.
+ static GROUND_LOCK: AtomicU32 = AtomicU32::new(0);
+ 
++/// Frames in which benilla's own ground clearance moved WoW's eye (one the plugin could not test).
++static CLEARANCE_FIRED: AtomicU32 = AtomicU32::new(0);
++
++/// Frames in which the plugin's eye was nearer WoW's terrain than 0.6 yd and was kept (BG3's own).
++static PLUGIN_KEPT: AtomicU32 = AtomicU32::new(0);
++
++/// How far Tav may stand above or below WoW's ground under her for the lock to take it up (yd).
++const LOCK_REACH: f32 = 0.75;
++
+ pub(crate) fn ground_lock() -> f32 {
+     f32::from_bits(GROUND_LOCK.load(Ordering::Relaxed))
+ }
+@@ -110,6 +127,8 @@
+     tav: Option<Vec3>,
+     /// The ground lock's eased offset (yards, Bevy +Y up).
+     lock: f32,
++    /// What the lock eases toward (`keep_ground_lock`, patch 0011).
++    want: f32,
+ }
+ 
+ /// Decodes `tav.bin`: (seq, WoW position).
+@@ -207,6 +226,8 @@
+     pub(crate) forward: [f32; 3],
+     pub(crate) up: [f32; 3],
+     pub(crate) fovy: f32,
++    /// Patch 0011: the record's flags at 52 (1: the plugin's eye clearance tested this eye).
++    pub(crate) flags: u32,
+ }
+ 
+ /// Decodes one record; `None` when it is torn, not ours or not finite.
+@@ -225,6 +246,7 @@
+         forward: [f(20), f(24), f(28)],
+         up: [f(32), f(36), f(40)],
+         fovy: f(44),
++        flags: u(52),
+     };
+     let all = pose.eye.iter().chain(&pose.forward).chain(&pose.up).chain([&pose.fovy]);
+     if all.clone().any(|v| !v.is_finite()) || !(0.05..3.0).contains(&pose.fovy) {
+@@ -381,8 +403,9 @@
+         frame: 0,
+         tav: None,
+         lock: 0.0,
++        want: 0.0,
+     })
+-    .add_systems(Update, (read_tav, walk_after_tav.after(read_tav)))
++    .add_systems(Update, (read_tav, walk_after_tav.after(read_tav), keep_ground_lock.after(read_tav)))
+     .add_systems(
+         PostUpdate,
+         hide_own_model.before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+@@ -402,6 +425,43 @@
+     );
+ }
+ 
++/// WoW's ground under Tav (Bevy y, yards): the walking collision's floor within the lock's reach,
++/// else the terrain.
++fn ground_under(
++    collide: &benilla_world::collision::WorldCollision,
++    world: &benilla_world::world_point::WorldPoint,
++    tav: Vec3,
++) -> Option<f32> {
++    let origin = tav + Vec3::Y * LOCK_REACH;
++    collide
++        .ray_body(origin, Dir3::NEG_Y, 2.0 * LOCK_REACH)
++        .map(|h| origin.y - h.distance)
++        .or_else(|| world.terrain_height_under(tav))
++}
++
++/// Ground lock target (see the module notes, patch 0011); `follow_bg3` eases toward it.
++fn keep_ground_lock(
++    mut t: ResMut<TavFollow>,
++    collide: benilla_world::collision::WorldCollision,
++    world: benilla_world::world_point::WorldPoint,
++    mut runs: Local<u64>,
++) {
++    let Some(tav) = t.tav else { return };
++    t.want = match ground_under(&collide, &world, tav) {
++        Some(g) if (tav.y - g).abs() < LOCK_REACH => tav.y - g,
++        _ => 0.0,
++    };
++    *runs += 1;
++    if *runs % 600 == 1 {
++        info!(
++            "wowbg3 ground: lock {:.2} yd, benilla's clearance moved the eye in {} frames so far, kept the plugin's in {} under 0.6 yd",
++            t.lock,
++            CLEARANCE_FIRED.load(Ordering::Relaxed),
++            PLUGIN_KEPT.load(Ordering::Relaxed)
++        );
++    }
++}
++
+ fn follow_bg3(
+     mut s: ResMut<LeadStream>,
+     mut t: ResMut<TavFollow>,
+@@ -447,24 +507,44 @@
+         return;
+     };
+     let mut eye = wow_to_bevy(pose.eye);
+-    // Ground lock (see the module notes).
+-    let want = match t.tav {
+-        Some(tav) if player.active && Vec2::new(tav.x - player.pos.x, tav.z - player.pos.z).length() < 3.0 => {
+-            (tav.y - player.pos.y).clamp(-4.0, 4.0)
+-        }
+-        _ => t.lock,
+-    };
+-    t.lock += (want - t.lock) * 0.1;
++    // Ground lock (see the module notes; `keep_ground_lock` sets its target).
++    let want = if player.active { t.want } else { t.lock };
++    t.lock += (want - t.lock) * 0.25;
+     GROUND_LOCK.store(t.lock.to_bits(), Ordering::Relaxed);
+     eye.y -= t.lock;
+-    // Ground clearance (see the module notes): toward Tav's chest, at most 90% of the way.
++    // Ground clearance (see the module notes): toward Tav's chest, at most 90% of the way, only for
++    // an eye the plugin could not test (BGC1 flag 1, patch 0011): one it tested is BG3's own and
++    // stays, so both views match. The eye is tested as BG3 placed it, before the lock lowered it.
+     if let Some(tav) = t.tav {
+         let target = tav - Vec3::Y * t.lock + Vec3::Y * 1.5;
+-        let clear = |p: Vec3| world.terrain_height_under(p).is_none_or(|g| p.y > g + 0.6);
+-        if !clear(eye) {
++        let raised = t.lock.max(0.0);
++        let clear = |p: Vec3| world.terrain_height_under(p).is_none_or(|g| p.y + raised > g + 0.6);
++        if pose.flags & 1 != 0 {
++            if !clear(eye) {
++                let n = PLUGIN_KEPT.fetch_add(1, Ordering::Relaxed);
++                if n < 10 {
++                    info!(
++                        "wowbg3 ground: kept the plugin's eye {:.2} yd over the terrain (lock {:.2})",
++                        eye.y - world.terrain_height_under(eye).unwrap_or(eye.y),
++                        t.lock
++                    );
++                }
++            }
++        } else if !clear(eye) {
+             for i in 1..=18 {
+                 let p = eye.lerp(target, i as f32 * 0.05);
+                 if clear(p) {
++                    let n = CLEARANCE_FIRED.fetch_add(1, Ordering::Relaxed);
++                    if n < 20 || n % 200 == 0 {
++                        info!(
++                            "wowbg3 ground: clearance moved WoW's eye {:.2} yd (eye {:?}, terrain under it {:?}, Tav {:?}, lock {:.2})",
++                            eye.distance(p),
++                            eye,
++                            world.terrain_height_under(eye),
++                            tav,
++                            t.lock
++                        );
++                    }
+                     eye = p;
+                     break;
+                 }

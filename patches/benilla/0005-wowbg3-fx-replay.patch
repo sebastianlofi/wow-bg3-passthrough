@@ -1,0 +1,4024 @@
+WOW-BG3 benilla patch 0005: BG3's effects replayed inside WoW with BG3's own shaders (on top of
+0001-0004). Capture format: link/benilla/fx-replay-format.md.
+
+- wowbg3_fx.rs: decodes fxframe.bin and loads the recipes, SPIR-V, samplers and textures it
+  names; keeps the last 8 frames and replays the one BG3 drew with the camera record the world
+  camera follows (FXQ1 bg3cam_seq), none while it does not follow BG3's; takes the TAA jitter
+  out of the per-view block (set 0 binding 2).
+- wowbg3_fx_render.rs: replays the draws through wgpu's SPIR-V passthrough over black and over
+  white, then composites them into the world camera's view through BG3's post chain. Special
+  keys: 1 WoW's depth, 2 WoW's colour, 3 (fog volume) empty, 4 WoW's view z / far, 5 (light
+  grid) one constant light (WOW_BG3_FX_LIGHT, default 32 = 1 after BG3's 1/32).
+- wowbg3_lead.rs: camera_seq() (the bg3cam.bin record followed this frame) and a debug knob,
+  WOW_BG3_LEAD_ZOOM (narrows WoW's field of view for close looks; the composite is off then).
+- lib.rs, wowbg3.rs: module and plugin registration.
+
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index af4dc2b..8112930 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -190,6 +190,8 @@ mod world_state_ui;
+ mod wowbg3;
+ mod wowbg3_fight;
+ mod wowbg3_frames;
++mod wowbg3_fx;
++mod wowbg3_fx_render;
+ mod wowbg3_lead;
+ mod wowbg3_tav;
+ 
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index 25146b4..f2e4b95 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -37,6 +37,8 @@ impl Plugin for WowBg3Plugin {
+         crate::wowbg3_frames::build(app);
+         // Tav drawn inside WoW from BG3's copied meshes and poses.
+         crate::wowbg3_tav::build(app);
++        // BG3's own effects replayed inside WoW with BG3's shaders (patch 0005).
++        crate::wowbg3_fx::build(app);
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_fx.rs b/crates/benilla-app/src/wowbg3_fx.rs
+new file mode 100644
+index 0000000..48b507f
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_fx.rs
+@@ -0,0 +1,1606 @@
++//! WOW-BG3 (local fork, patch 0005): BG3's own effects replayed inside WoW.
++//! Spell effects must look exactly as in BG3, drawn into WoW's world, "1:1 like
++//! SkyCraft". The BG3 capture layer (`bg3/capture`, format in `link/benilla/fx-replay-format.md`)
++//! records every effect draw near Tav: `fxframe.bin` each BG3 frame in `$WOW_BG3_TAV_DIR`
++//! (default `/tmp/wowbg3/tav`), and once per key the pipeline recipes, SPIR-V modules, samplers
++//! and textures under `$WOW_BG3_FX_DIR` (default the capture directory's `fx/`).
++//!
++//! This half runs in the main world: it reads and decodes the newest frame, loads and caches
++//! what the frame names (recipes, SPIR-V with its reflection and a Y-flipped vertex variant,
++//! samplers, textures), and hands the lot to the render world as [`FxExtract`]. The render
++//! world (`wowbg3_fx_render`) replays the draws with BG3's own shaders through wgpu's SPIR-V
++//! passthrough and composites them over the world camera's view.
++//!
++//! Y: BG3 draws with a positive Vulkan viewport (clip +Y down) while wgpu flips every viewport
++//! (clip +Y up), so each vertex module is patched to negate `Position.y` before it is stored
++//! ([`flip_position_y`]). Framebuffer positions, winding and `FragCoord` then match BG3's
++//! exactly and BG3's cull mode and front face pass through unchanged.
++//!
++//! TAA: BG3 jitters its projection every frame; [`strip_jitter`] takes that out of the per-view
++//! constants so the replayed effects hold still. Colours: the frame's post block ("FXQ1") gives
++//! BG3's exposure, grading and display LUTs, which the composite uses (`wowbg3_fx_render`).
++//!
++//! Camera: the world camera follows BG3's camera record (`bg3cam.bin`, `wowbg3_lead`), and each
++//! frame's post block names the record BG3 drew it with (`bg3cam_seq`). The last few frames are
++//! kept and the one drawn with the record the camera follows this frame is replayed
++//! ([`pick_frame`]), so the effects stay put on WoW's world while the camera moves.
++//!
++//! A frame older than half a second (BG3 stopped or restarting) draws nothing, and so does every
++//! frame while the world camera does not follow BG3's.
++
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++
++use benilla_world::view::WorldCamera;
++use bevy::prelude::*;
++use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
++use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
++use bevy::render::render_resource::TextureUsages;
++
++/// A frame whose BG3 wall time is older than this draws nothing.
++const STALE_SECS: f64 = 0.5;
++/// How long a missing recipe, module, sampler or texture waits before it is looked for again.
++const RETRY: Duration = Duration::from_secs(2);
++/// Texture bytes read per frame at most (the rest waits for the next frames).
++const TEX_BUDGET: usize = 48 << 20;
++/// Files larger than this are refused.
++const MAX_FILE: u64 = 512 << 20;
++/// Texture keys up to this are BG3's per-frame targets, not files (format doc, "Special keys").
++const SPECIAL_KEYS: u64 = 5;
++/// Decoded frames kept to pair with the camera record ([`pick_frame`]).
++const HISTORY: usize = 8;
++
++// ---------------------------------------------------------------------------------------------
++// Little-endian reader
++
++pub(crate) struct Rd<'a> {
++    b: &'a [u8],
++    o: usize,
++}
++
++impl<'a> Rd<'a> {
++    pub(crate) fn new(b: &'a [u8], o: usize) -> Self {
++        Rd { b, o }
++    }
++    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
++        let s = self.b.get(self.o..self.o.checked_add(n)?)?;
++        self.o += n;
++        Some(s)
++    }
++    fn u32(&mut self) -> Option<u32> {
++        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
++    }
++    fn i32(&mut self) -> Option<i32> {
++        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
++    }
++    fn u64(&mut self) -> Option<u64> {
++        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
++    }
++    fn f32(&mut self) -> Option<f32> {
++        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
++    }
++    fn f64(&mut self) -> Option<f64> {
++        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
++    }
++    fn pad4(&mut self) {
++        self.o = (self.o + 3) & !3;
++    }
++    /// A count, refused above `max`.
++    fn n(&mut self, max: u32) -> Option<usize> {
++        let n = self.u32()?;
++        (n <= max).then_some(n as usize)
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Recipe (`fx/pipe/<key>.bin`, "FXP1")
++
++#[derive(Clone, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct ColorAtt {
++    pub(crate) blend: bool,
++    pub(crate) src_c: u32,
++    pub(crate) dst_c: u32,
++    pub(crate) op_c: u32,
++    pub(crate) src_a: u32,
++    pub(crate) dst_a: u32,
++    pub(crate) op_a: u32,
++    pub(crate) mask: u32,
++    pub(crate) format: u32,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct Stage {
++    /// VkShaderStageFlagBits (1 vertex, 0x10 fragment).
++    pub(crate) stage: u32,
++    pub(crate) spv: u64,
++    pub(crate) entry: String,
++    pub(crate) n_spec: usize,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct VbBinding {
++    pub(crate) binding: u32,
++    pub(crate) stride: u32,
++    /// 0 per vertex, 1 per instance.
++    pub(crate) rate: u32,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct VbAttr {
++    pub(crate) location: u32,
++    pub(crate) binding: u32,
++    pub(crate) format: u32,
++    pub(crate) offset: u32,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct SetSlot {
++    pub(crate) binding: u32,
++    /// VkDescriptorType.
++    pub(crate) ty: u32,
++    pub(crate) count: u32,
++    /// VkShaderStageFlags.
++    pub(crate) stages: u32,
++    pub(crate) n_immutable: usize,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct Recipe {
++    pub(crate) topology: u32,
++    pub(crate) restart: u32,
++    pub(crate) polygon: u32,
++    pub(crate) cull: u32,
++    /// 0 counter-clockwise, 1 clockwise.
++    pub(crate) front: u32,
++    pub(crate) bias_enable: u32,
++    pub(crate) bias_constant: f32,
++    pub(crate) bias_clamp: f32,
++    pub(crate) bias_slope: f32,
++    pub(crate) depth_test: u32,
++    pub(crate) depth_write: u32,
++    pub(crate) depth_compare: u32,
++    pub(crate) color: Vec<ColorAtt>,
++    pub(crate) depth_format: u32,
++    pub(crate) stages: Vec<Stage>,
++    pub(crate) bindings: Vec<VbBinding>,
++    pub(crate) attributes: Vec<VbAttr>,
++    /// Descriptor sets, set index = position.
++    pub(crate) sets: Vec<Vec<SetSlot>>,
++    /// (stages, offset, size).
++    pub(crate) push: Vec<(u32, u32, u32)>,
++    pub(crate) dynamic: Vec<u32>,
++}
++
++pub(crate) fn parse_recipe(b: &[u8]) -> Option<Recipe> {
++    let mut r = Rd::new(b, 0);
++    if r.take(4)? != b"FXP1" || r.u32()? != 1 {
++        return None;
++    }
++    let (topology, restart) = (r.u32()?, r.u32()?);
++    let (polygon, cull, front) = (r.u32()?, r.u32()?, r.u32()?);
++    let (bias_enable, bias_constant, bias_clamp, bias_slope) = (r.u32()?, r.f32()?, r.f32()?, r.f32()?);
++    let (depth_test, depth_write, depth_compare) = (r.u32()?, r.u32()?, r.u32()?);
++    let mut color = Vec::new();
++    for _ in 0..r.n(8)? {
++        let v: Vec<u32> = (0..9).map(|_| r.u32()).collect::<Option<_>>()?;
++        color.push(ColorAtt {
++            blend: v[0] != 0,
++            src_c: v[1],
++            dst_c: v[2],
++            op_c: v[3],
++            src_a: v[4],
++            dst_a: v[5],
++            op_a: v[6],
++            mask: v[7],
++            format: v[8],
++        });
++    }
++    let depth_format = r.u32()?;
++    let mut stages = Vec::new();
++    for _ in 0..r.n(8)? {
++        let stage = r.u32()?;
++        let spv = r.u64()?;
++        let raw = r.take(64)?;
++        let end = raw.iter().position(|c| *c == 0).unwrap_or(64);
++        let entry = String::from_utf8_lossy(&raw[..end]).into_owned();
++        let n_spec = r.n(4096)?;
++        r.take(n_spec * 12)?;
++        let size = r.n(1 << 20)?;
++        r.take(size)?;
++        r.pad4();
++        stages.push(Stage { stage, spv, entry, n_spec });
++    }
++    let mut bindings = Vec::new();
++    for _ in 0..r.n(32)? {
++        bindings.push(VbBinding { binding: r.u32()?, stride: r.u32()?, rate: r.u32()? });
++    }
++    let mut attributes = Vec::new();
++    for _ in 0..r.n(64)? {
++        attributes.push(VbAttr { location: r.u32()?, binding: r.u32()?, format: r.u32()?, offset: r.u32()? });
++    }
++    let mut sets = Vec::new();
++    for _ in 0..r.n(32)? {
++        let mut slots = Vec::new();
++        for _ in 0..r.n(1024)? {
++            let (binding, ty, count, st) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
++            let n_immutable = r.n(1024)?;
++            r.take(n_immutable * 8)?;
++            slots.push(SetSlot { binding, ty, count, stages: st, n_immutable });
++        }
++        sets.push(slots);
++    }
++    let mut push = Vec::new();
++    for _ in 0..r.n(32)? {
++        push.push((r.u32()?, r.u32()?, r.u32()?));
++    }
++    let mut dynamic = Vec::new();
++    if r.o + 4 <= b.len() {
++        for _ in 0..r.n(64)? {
++            dynamic.push(r.u32()?);
++        }
++    }
++    Some(Recipe {
++        topology,
++        restart,
++        polygon,
++        cull,
++        front,
++        bias_enable,
++        bias_constant,
++        bias_clamp,
++        bias_slope,
++        depth_test,
++        depth_write,
++        depth_compare,
++        color,
++        depth_format,
++        stages,
++        bindings,
++        attributes,
++        sets,
++        push,
++        dynamic,
++    })
++}
++
++// ---------------------------------------------------------------------------------------------
++// Frame (`fxframe.bin`, "FXF1")
++
++/// What a descriptor slot of one draw binds.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) enum SlotRes {
++    /// A buffer range in the blob area (dynamic offsets applied).
++    Buffer { blob: u32, size: u32 },
++    /// A texture key, or special 1 (scene depth), 2 (scene colour), 3 (fog volume), 4 (linear
++    /// depth), 5 (light grid).
++    Image(u64),
++    Sampler(u64),
++    Combined(u64, u64),
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct FxSlot {
++    pub(crate) binding: u32,
++    pub(crate) ty: u32,
++    pub(crate) res: SlotRes,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct FxSet {
++    pub(crate) set: u32,
++    pub(crate) slots: Vec<FxSlot>,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct FxVb {
++    pub(crate) binding: u32,
++    pub(crate) blob: u32,
++    pub(crate) size: u32,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct FxDraw {
++    pub(crate) pipe: u64,
++    pub(crate) indexed: bool,
++    pub(crate) count: u32,
++    pub(crate) instances: u32,
++    pub(crate) first: u32,
++    pub(crate) vertex_offset: i32,
++    pub(crate) first_instance: u32,
++    /// 0 none, 1 u16, 2 u32.
++    pub(crate) index_type: u32,
++    pub(crate) index_blob: u32,
++    pub(crate) index_size: u32,
++    pub(crate) vbs: Vec<FxVb>,
++    pub(crate) sets: Vec<FxSet>,
++    pub(crate) push: Vec<u8>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct FxFrame {
++    pub(crate) frame: u32,
++    /// BG3's wall clock (seconds since the Unix epoch).
++    pub(crate) wall: f64,
++    pub(crate) eye: [f32; 3],
++    pub(crate) width: u32,
++    pub(crate) height: u32,
++    pub(crate) draws: Vec<FxDraw>,
++    /// The blob area.
++    pub(crate) blob: Vec<u8>,
++    /// BG3's post chain after the effects pass ("FXQ1"), when the layer sent it.
++    pub(crate) post: Option<FxPost>,
++    /// BG3's per-view constants as found in the blob ([`strip_jitter`]).
++    pub(crate) view: Option<ViewBlock>,
++}
++
++/// BG3's post-processing after the effects (format doc, "Post block").
++#[derive(Clone, Copy, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct FxPost {
++    /// Bits: 1 exposure, 2 bloom_in, 4 bloom_up, 8 grade, 16 display.
++    pub(crate) have: u32,
++    pub(crate) exposure: [f32; 2],
++    pub(crate) bloom_in: [f32; 4],
++    pub(crate) bloom_up: [f32; 4],
++    pub(crate) grade: [f32; 4],
++    pub(crate) grade_lut: u64,
++    pub(crate) grade_sampler: u64,
++    pub(crate) fade: f32,
++    pub(crate) display_lut: u64,
++    pub(crate) display_sampler: u64,
++    /// The sequence of the camera record (`bg3cam.bin`) BG3 drew this frame with; 0 unknown.
++    pub(crate) cam_seq: u32,
++}
++
++pub(crate) fn parse_post(b: &[u8], at: usize) -> Option<FxPost> {
++    let mut r = Rd::new(b, at);
++    if r.take(4)? != b"FXQ1" {
++        return None;
++    }
++    let have = r.u32()?;
++    let exposure = [r.f32()?, r.f32()?];
++    let mut f4 = || -> Option<[f32; 4]> { Some([r.f32()?, r.f32()?, r.f32()?, r.f32()?]) };
++    let (bloom_in, bloom_up, grade) = (f4()?, f4()?, f4()?);
++    let (grade_lut, grade_sampler) = (r.u64()?, r.u64()?);
++    let display = r.take(32)?;
++    let fade = f32::from_le_bytes(display[0..4].try_into().ok()?);
++    let (display_lut, display_sampler) = (r.u64()?, r.u64()?);
++    // Older captures end here.
++    let cam_seq = r.u32().unwrap_or(0);
++    Some(FxPost {
++        have,
++        exposure,
++        bloom_in,
++        bloom_up,
++        grade,
++        grade_lut,
++        grade_sampler,
++        fade,
++        display_lut,
++        display_sampler,
++        cam_seq,
++    })
++}
++
++/// BG3's per-view block (set 0: view, projection, view-projection as column-major 4x4, then
++/// near and far): the projection's depth terms, and the TAA jitter taken out of it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct ViewBlock {
++    /// depth = p22 + p32 / view_z (metres), BG3's reverse-Z.
++    pub(crate) p22: f32,
++    pub(crate) p32: f32,
++    pub(crate) near: f32,
++    pub(crate) far: f32,
++    /// The sub-pixel jitter (clip units) that was removed.
++    pub(crate) jitter: [f32; 2],
++}
++
++/// BG3 runs TAA, so its projection carries a sub-pixel jitter each frame; replayed as is, the
++/// effects would shimmer. BG3's per-view block (set 0 binding 2: view V (+0), projection P (+64)
++/// and camera-relative VP = P·V (+128) as column-major matrices, near and far (+192)), checked
++/// to really be that (P a perspective projection, VP equal to P·V), gets the jitter out of P
++/// and of VP. Each blob is fixed once (`strip` false only finds the block). Returns the block's
++/// terms.
++pub(crate) fn strip_jitter(frame: &mut FxFrame, strip: bool) -> Option<ViewBlock> {
++    let mut seen = HashSet::new();
++    let mut found = None;
++    for d in &frame.draws {
++        for s in d.sets.iter().filter(|s| s.set == 0) {
++            for slot in s.slots.iter().filter(|slot| slot.binding == 2) {
++                let SlotRes::Buffer { blob, size } = slot.res else { continue };
++                if size < 200 || !seen.insert(blob) {
++                    continue;
++                }
++                let Some(bytes) = frame.blob.get_mut(blob as usize..blob as usize + 200) else { continue };
++                if let Some(v) = strip_block(bytes, strip) {
++                    found = Some(v);
++                }
++            }
++        }
++    }
++    found
++}
++
++fn strip_block(b: &mut [u8], strip: bool) -> Option<ViewBlock> {
++    let f = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
++    // m[col][row] at float index base + col * 4 + row
++    let at = |base: usize, c: usize, r: usize| base + c * 4 + r;
++    let (v, p, vp) = (0, 16, 32);
++    let all: Vec<f32> = (0..50).map(|i| f(b, i)).collect();
++    if all.iter().any(|x| !x.is_finite()) {
++        return None;
++    }
++    let pm = |c, r| all[at(p, c, r)];
++    let zero = [(0, 1), (0, 2), (0, 3), (1, 0), (1, 2), (1, 3), (3, 0), (3, 1), (3, 3)];
++    let perspective = zero.iter().all(|&(c, r)| pm(c, r) == 0.0)
++        && pm(2, 3) == 1.0
++        && pm(0, 0) > 0.0
++        && pm(1, 1) > 0.0
++        && pm(3, 2) > 0.0
++        && pm(2, 0).abs() < 0.01
++        && pm(2, 1).abs() < 0.01;
++    if !perspective {
++        return None;
++    }
++    for c in 0..4 {
++        for r in 0..4 {
++            let want: f32 = (0..4).map(|k| pm(k, r) * all[at(v, c, k)]).sum();
++            let got = all[at(vp, c, r)];
++            if (want - got).abs() > 1e-4 * (1.0 + want.abs()) {
++                return None;
++            }
++        }
++    }
++    let (jx, jy) = (pm(2, 0), pm(2, 1));
++    let block = ViewBlock { p22: pm(2, 2), p32: pm(3, 2), near: all[48], far: all[49], jitter: [jx, jy] };
++    if !strip {
++        return Some(block);
++    }
++    let mut put = |i: usize, x: f32| b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
++    put(at(p, 2, 0), 0.0);
++    put(at(p, 2, 1), 0.0);
++    for c in 0..4 {
++        put(at(vp, c, 0), all[at(vp, c, 0)] - jx * all[at(v, c, 2)]);
++        put(at(vp, c, 1), all[at(vp, c, 1)] - jy * all[at(v, c, 2)]);
++    }
++    Some(block)
++}
++
++const BUFFER_TYPES: [u32; 4] = [6, 7, 8, 9];
++
++pub(crate) fn parse_frame(b: &[u8]) -> Option<FxFrame> {
++    let mut r = Rd::new(b, 0);
++    if r.take(4)? != b"FXF1" || r.u32()? != 1 {
++        return None;
++    }
++    let frame = r.u32()?;
++    let n = r.n(1 << 16)?;
++    let wall = r.f64()?;
++    let eye = [r.f32()?, r.f32()?, r.f32()?];
++    let post_offset = r.u32()? as usize;
++    let (width, height, data_off, data_size) = (r.u32()?, r.u32()?, r.u32()? as usize, r.u32()? as usize);
++    if width == 0 || height == 0 || width > 16384 || height > 16384 {
++        return None;
++    }
++    let blob = b.get(data_off..data_off.checked_add(data_size)?)?.to_vec();
++    let mut draws = Vec::with_capacity(n);
++    for _ in 0..n {
++        let pipe = r.u64()?;
++        let (indexed, count, instances, first) = (r.u32()? != 0, r.u32()?, r.u32()?, r.u32()?);
++        let (vertex_offset, first_instance) = (r.i32()?, r.u32()?);
++        let (index_type, index_blob, index_size) = (r.u32()?, r.u32()?, r.u32()?);
++        let mut vbs = Vec::new();
++        for _ in 0..r.n(32)? {
++            vbs.push(FxVb { binding: r.u32()?, blob: r.u32()?, size: r.u32()? });
++        }
++        let mut sets = Vec::new();
++        for _ in 0..r.n(32)? {
++            let set = r.u32()?;
++            let mut slots = Vec::new();
++            for _ in 0..r.n(1024)? {
++                let (binding, ty) = (r.u32()?, r.u32()?);
++                let res = if BUFFER_TYPES.contains(&ty) {
++                    SlotRes::Buffer { blob: r.u32()?, size: r.u32()? }
++                } else if ty == 0 {
++                    SlotRes::Sampler(r.u64()?)
++                } else if ty == 1 {
++                    SlotRes::Combined(r.u64()?, r.u64()?)
++                } else {
++                    SlotRes::Image(r.u64()?)
++                };
++                slots.push(FxSlot { binding, ty, res });
++            }
++            sets.push(FxSet { set, slots });
++        }
++        let push_size = r.n(4096)?;
++        let push = r.take(push_size)?.to_vec();
++        r.pad4();
++        draws.push(FxDraw {
++            pipe,
++            indexed,
++            count,
++            instances,
++            first,
++            vertex_offset,
++            first_instance,
++            index_type,
++            index_blob,
++            index_size,
++            vbs,
++            sets,
++            push,
++        });
++    }
++    let post = if post_offset == 0 { None } else { Some(parse_post(b, post_offset)?) };
++    Some(FxFrame { frame, wall, eye, width, height, draws, blob, post, view: None })
++}
++
++// ---------------------------------------------------------------------------------------------
++// Sampler ("FXS1") and texture ("FXT1")
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++#[allow(dead_code)]
++pub(crate) struct FxSampler {
++    pub(crate) mag: u32,
++    pub(crate) min: u32,
++    pub(crate) mip: u32,
++    pub(crate) address: [u32; 3],
++    pub(crate) lod_bias: f32,
++    pub(crate) aniso: bool,
++    pub(crate) max_aniso: f32,
++    pub(crate) compare: bool,
++    pub(crate) compare_op: u32,
++    pub(crate) min_lod: f32,
++    pub(crate) max_lod: f32,
++    pub(crate) border: u32,
++    pub(crate) unnormalized: bool,
++}
++
++pub(crate) fn parse_sampler(b: &[u8]) -> Option<FxSampler> {
++    let mut r = Rd::new(b, 0);
++    if r.take(4)? != b"FXS1" {
++        return None;
++    }
++    Some(FxSampler {
++        mag: r.u32()?,
++        min: r.u32()?,
++        mip: r.u32()?,
++        address: [r.u32()?, r.u32()?, r.u32()?],
++        lod_bias: r.f32()?,
++        aniso: r.u32()? != 0,
++        max_aniso: r.f32()?,
++        compare: r.u32()? != 0,
++        compare_op: r.u32()?,
++        min_lod: r.f32()?,
++        max_lod: r.f32()?,
++        border: r.u32()?,
++        unnormalized: r.u32()? != 0,
++    })
++}
++
++/// A texture file: header and the raw file (data from [`TexFile::DATA`]).
++#[allow(dead_code)]
++pub(crate) struct TexFile {
++    pub(crate) format: u32,
++    pub(crate) width: u32,
++    pub(crate) height: u32,
++    pub(crate) depth: u32,
++    pub(crate) mips: u32,
++    pub(crate) layers: u32,
++    /// VkImageViewType.
++    pub(crate) view_type: u32,
++    bytes: Vec<u8>,
++}
++
++impl TexFile {
++    pub(crate) const DATA: usize = 32;
++    /// Every mip of every layer, layer-major.
++    pub(crate) fn data(&self) -> &[u8] {
++        &self.bytes[Self::DATA..]
++    }
++}
++
++pub(crate) fn parse_tex(bytes: Vec<u8>) -> Option<TexFile> {
++    let mut r = Rd::new(&bytes, 0);
++    if r.take(4)? != b"FXT1" {
++        return None;
++    }
++    let v: Vec<u32> = (0..7).map(|_| r.u32()).collect::<Option<_>>()?;
++    let ok = v[1] > 0 && v[2] > 0 && v[3] > 0 && v[4] > 0 && v[4] <= 16 && v[5] > 0 && v[5] <= 2048;
++    ok.then_some(TexFile {
++        format: v[0],
++        width: v[1],
++        height: v[2],
++        depth: v[3],
++        mips: v[4],
++        layers: v[5],
++        view_type: v[6],
++        bytes,
++    })
++}
++
++// ---------------------------------------------------------------------------------------------
++// SPIR-V: reflection of the descriptor bindings, and the Y flip of vertex modules
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub(crate) enum Scalar {
++    Float,
++    Uint,
++    Sint,
++}
++
++/// What a module declares at one (set, binding).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum SpvBind {
++    Uniform,
++    Storage,
++    Sampler,
++    /// `dim`: SPIR-V Dim (0 1D, 1 2D, 2 3D, 3 Cube); `storage`: a storage image (Sampled 2);
++    /// `format`: SPIR-V ImageFormat.
++    Image { dim: u32, arrayed: bool, ms: bool, storage: bool, format: u32, scalar: Scalar },
++    Combined,
++    Array,
++    Other,
++}
++
++#[derive(Clone, Debug, Default, PartialEq)]
++pub(crate) struct SpvInfo {
++    pub(crate) bindings: HashMap<(u32, u32), SpvBind>,
++    /// Some `OpImageWrite`.
++    pub(crate) image_write: bool,
++}
++
++/// A module as loaded: its words, reflection, and (for vertex modules) the Y-flipped words.
++pub(crate) struct SpvModule {
++    pub(crate) words: Vec<u32>,
++    pub(crate) info: SpvInfo,
++    pub(crate) flipped: Result<Vec<u32>, &'static str>,
++}
++
++const SPV_MAGIC: u32 = 0x0723_0203;
++
++/// The instructions as (start word, word count); `None` when the stream is malformed.
++fn spv_insts(w: &[u32]) -> Option<Vec<(usize, usize)>> {
++    if w.len() < 5 || w[0] != SPV_MAGIC {
++        return None;
++    }
++    let mut out = Vec::new();
++    let mut i = 5;
++    while i < w.len() {
++        let n = (w[i] >> 16) as usize;
++        if n == 0 || i + n > w.len() {
++            return None;
++        }
++        out.push((i, n));
++        i += n;
++    }
++    Some(out)
++}
++
++pub(crate) fn spv_words(b: &[u8]) -> Option<Vec<u32>> {
++    if b.len() % 4 != 0 || b.len() < 20 {
++        return None;
++    }
++    let w: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
++    (w[0] == SPV_MAGIC).then_some(w)
++}
++
++enum Ty {
++    Int(bool),
++    Image { sampled_type: u32, dim: u32, arrayed: bool, ms: bool, sampled: u32, format: u32 },
++    Sampler,
++    SampledImage,
++    Array,
++    Struct,
++    Pointer(u32),
++    Other,
++}
++
++pub(crate) fn reflect(w: &[u32]) -> Option<SpvInfo> {
++    let insts = spv_insts(w)?;
++    let (mut set, mut binding) = (HashMap::new(), HashMap::new());
++    let mut buffer_block = HashSet::new();
++    let mut types: HashMap<u32, Ty> = HashMap::new();
++    let mut vars = Vec::new();
++    let mut image_write = false;
++    for &(s, n) in &insts {
++        let op = w[s] & 0xffff;
++        let a = &w[s + 1..s + n];
++        match op {
++            // OpDecorate: DescriptorSet 34, Binding 33, BufferBlock 3
++            71 if a.len() >= 3 && a[1] == 34 => {
++                set.insert(a[0], a[2]);
++            }
++            71 if a.len() >= 3 && a[1] == 33 => {
++                binding.insert(a[0], a[2]);
++            }
++            71 if a.len() >= 2 && a[1] == 3 => {
++                buffer_block.insert(a[0]);
++            }
++            21 if a.len() >= 3 => {
++                types.insert(a[0], Ty::Int(a[2] != 0));
++            }
++            25 if a.len() >= 8 => {
++                types.insert(
++                    a[0],
++                    Ty::Image {
++                        sampled_type: a[1],
++                        dim: a[2],
++                        arrayed: a[4] != 0,
++                        ms: a[5] != 0,
++                        sampled: a[6],
++                        format: a[7],
++                    },
++                );
++            }
++            26 if !a.is_empty() => {
++                types.insert(a[0], Ty::Sampler);
++            }
++            27 if !a.is_empty() => {
++                types.insert(a[0], Ty::SampledImage);
++            }
++            28 | 29 if !a.is_empty() => {
++                types.insert(a[0], Ty::Array);
++            }
++            30 if !a.is_empty() => {
++                types.insert(a[0], Ty::Struct);
++            }
++            32 if a.len() >= 3 => {
++                types.insert(a[0], Ty::Pointer(a[2]));
++            }
++            22 | 23 if !a.is_empty() => {
++                types.insert(a[0], Ty::Other);
++            }
++            59 if a.len() >= 3 => vars.push((a[1], a[0], a[2])),
++            99 => image_write = true,
++            _ => {}
++        }
++    }
++    let mut bindings = HashMap::new();
++    for (id, ty, sc) in vars {
++        let (Some(&s), Some(&b)) = (set.get(&id), binding.get(&id)) else { continue };
++        let Some(Ty::Pointer(pointee)) = types.get(&ty) else { continue };
++        let kind = match types.get(pointee) {
++            Some(Ty::Image { sampled_type, dim, arrayed, ms, sampled, format }) => SpvBind::Image {
++                dim: *dim,
++                arrayed: *arrayed,
++                ms: *ms,
++                storage: *sampled == 2,
++                format: *format,
++                scalar: match types.get(sampled_type) {
++                    Some(Ty::Int(true)) => Scalar::Sint,
++                    Some(Ty::Int(false)) => Scalar::Uint,
++                    _ => Scalar::Float,
++                },
++            },
++            Some(Ty::Sampler) => SpvBind::Sampler,
++            Some(Ty::SampledImage) => SpvBind::Combined,
++            Some(Ty::Array) => SpvBind::Array,
++            // StorageBuffer class (12), or Uniform with BufferBlock (DXC's structured buffers)
++            Some(Ty::Struct) if sc == 12 || buffer_block.contains(pointee) => SpvBind::Storage,
++            Some(Ty::Struct) => SpvBind::Uniform,
++            _ => SpvBind::Other,
++        };
++        bindings.insert((s, b), kind);
++    }
++    Some(SpvInfo { bindings, image_write })
++}
++
++/// Negates `Position.y` before every store to it: BG3 (positive Vulkan viewport) writes clip
++/// space with +Y down, wgpu's Vulkan backend always flips the viewport (+Y up). Handles a plain
++/// `BuiltIn Position` output (what DXC emits) and a `gl_PerVertex` block member, whole-vector
++/// stores and stores of the y component through an access chain.
++pub(crate) fn flip_position_y(w: &[u32]) -> Result<Vec<u32>, &'static str> {
++    let insts = spv_insts(w).ok_or("not SPIR-V")?;
++    let mut pos_vars = HashSet::new();
++    let mut pos_member: HashMap<u32, u32> = HashMap::new();
++    let mut vectors: HashMap<u32, (u32, u32)> = HashMap::new();
++    let mut pointers: HashMap<u32, u32> = HashMap::new();
++    let mut structs: HashMap<u32, Vec<u32>> = HashMap::new();
++    let mut consts: HashMap<u32, u32> = HashMap::new();
++    let mut outputs: Vec<(u32, u32)> = Vec::new();
++    for &(s, n) in &insts {
++        let op = w[s] & 0xffff;
++        let a = &w[s + 1..s + n];
++        match op {
++            71 if a.len() >= 3 && a[1] == 11 && a[2] == 0 => {
++                pos_vars.insert(a[0]);
++            }
++            72 if a.len() >= 4 && a[2] == 11 && a[3] == 0 => {
++                pos_member.insert(a[0], a[1]);
++            }
++            23 if a.len() >= 3 => {
++                vectors.insert(a[0], (a[1], a[2]));
++            }
++            30 if !a.is_empty() => {
++                structs.insert(a[0], a[1..].to_vec());
++            }
++            32 if a.len() >= 3 => {
++                pointers.insert(a[0], a[2]);
++            }
++            43 if a.len() >= 3 => {
++                consts.insert(a[1], a[2]);
++            }
++            59 if a.len() >= 3 && a[2] == 3 => outputs.push((a[1], a[0])),
++            _ => {}
++        }
++    }
++    // Pointers to the whole position (vec4 type, float type), and to its y component (float).
++    let mut whole: HashMap<u32, (u32, u32)> = HashMap::new();
++    let mut ycomp: HashMap<u32, u32> = HashMap::new();
++    let mut blocks: HashMap<u32, (u32, u32, u32)> = HashMap::new();
++    for &(var, ptr) in &outputs {
++        let Some(&pointee) = pointers.get(&ptr) else { continue };
++        if pos_vars.contains(&var) {
++            let &(f, n) = vectors.get(&pointee).ok_or("Position is not a vector")?;
++            if n != 4 {
++                return Err("Position is not a vec4");
++            }
++            whole.insert(var, (pointee, f));
++        } else if let Some(&m) = pos_member.get(&pointee) {
++            let vec = *structs.get(&pointee).and_then(|ms| ms.get(m as usize)).ok_or("bad gl_PerVertex")?;
++            let &(f, _) = vectors.get(&vec).ok_or("Position member is not a vector")?;
++            blocks.insert(var, (m, vec, f));
++        }
++    }
++    for &(s, n) in &insts {
++        let op = w[s] & 0xffff;
++        let a = &w[s + 1..s + n];
++        if (op == 65 || op == 66) && a.len() >= 4 {
++            let (rid, base, idx) = (a[1], a[2], &a[3..]);
++            if let Some(&(_, f)) = whole.get(&base) {
++                match idx.len() {
++                    1 => match consts.get(&idx[0]) {
++                        Some(1) => {
++                            ycomp.insert(rid, f);
++                        }
++                        Some(_) => {}
++                        None => return Err("dynamic index into Position"),
++                    },
++                    _ => return Err("deep access into Position"),
++                }
++            } else if let Some(&(m, vec, f)) = blocks.get(&base) {
++                if consts.get(&idx[0]) == Some(&m) {
++                    match idx.len() {
++                        1 => {
++                            whole.insert(rid, (vec, f));
++                        }
++                        2 => match consts.get(&idx[1]) {
++                            Some(1) => {
++                                ycomp.insert(rid, f);
++                            }
++                            Some(_) => {}
++                            None => return Err("dynamic index into Position"),
++                        },
++                        _ => return Err("deep access into Position"),
++                    }
++                } else if consts.get(&idx[0]).is_none() {
++                    return Err("dynamic index into gl_PerVertex");
++                }
++            }
++        } else if op == 63 && a.len() >= 2 && (whole.contains_key(&a[0]) || ycomp.contains_key(&a[0])) {
++            return Err("OpCopyMemory into Position");
++        } else if op == 57 && a.len() >= 3 && a[3..].iter().any(|x| whole.contains_key(x) || blocks.contains_key(x)) {
++            return Err("Position passed to a function");
++        }
++    }
++    let mut bound = w[3];
++    let mut out = Vec::with_capacity(w.len() + 32);
++    out.extend_from_slice(&w[..5]);
++    let mut patched = 0;
++    for &(s, n) in &insts {
++        let op = w[s] & 0xffff;
++        if op == 62 && n >= 3 {
++            let (ptr, val) = (w[s + 1], w[s + 2]);
++            if let Some(&(vec, f)) = whole.get(&ptr) {
++                let (e, neg, ins) = (bound, bound + 1, bound + 2);
++                bound += 3;
++                out.extend_from_slice(&[(5 << 16) | 81, f, e, val, 1]); // OpCompositeExtract
++                out.extend_from_slice(&[(4 << 16) | 127, f, neg, e]); // OpFNegate
++                out.extend_from_slice(&[(6 << 16) | 82, vec, ins, neg, val, 1]); // OpCompositeInsert
++                out.extend_from_slice(&[w[s], ptr, ins]);
++                out.extend_from_slice(&w[s + 3..s + n]);
++                patched += 1;
++                continue;
++            }
++            if let Some(&f) = ycomp.get(&ptr) {
++                let neg = bound;
++                bound += 1;
++                out.extend_from_slice(&[(4 << 16) | 127, f, neg, val]);
++                out.extend_from_slice(&[w[s], ptr, neg]);
++                out.extend_from_slice(&w[s + 3..s + n]);
++                patched += 1;
++                continue;
++            }
++        }
++        out.extend_from_slice(&w[s..s + n]);
++    }
++    if patched == 0 {
++        return Err("no store to Position");
++    }
++    out[3] = bound;
++    Ok(out)
++}
++
++// ---------------------------------------------------------------------------------------------
++// Main world: loading, caching, extraction
++
++/// The frame to replay among the last few (oldest first): the newest one BG3 drew with camera
++/// record `cam` (the one the world camera follows; 0 none), else the newest drawn with an
++/// earlier record, else the newest.
++pub(crate) fn pick_frame(history: &VecDeque<Arc<FxFrame>>, cam: u32) -> Option<Arc<FxFrame>> {
++    let seq = |f: &Arc<FxFrame>| f.post.map_or(0, |p| p.cam_seq);
++    let newest = history.back()?;
++    if cam == 0 || seq(newest) == 0 {
++        return Some(newest.clone());
++    }
++    let matching = history.iter().rev().find(|f| seq(*f) == cam);
++    let earlier = || history.iter().rev().find(|f| seq(*f) != 0 && seq(*f) < cam);
++    Some(matching.or_else(earlier).unwrap_or(newest).clone())
++}
++
++/// The world camera, which replays the effects (render-world query filter).
++#[derive(Component, Clone, Copy, ExtractComponent)]
++pub(crate) struct FxView;
++
++/// Everything one frame needs, as extracted to the render world.
++pub(crate) struct FxFrameSet {
++    pub(crate) frame: Arc<FxFrame>,
++    pub(crate) recipes: HashMap<u64, Arc<Recipe>>,
++    pub(crate) spv: HashMap<u64, Arc<SpvModule>>,
++    pub(crate) samplers: HashMap<u64, Arc<FxSampler>>,
++    pub(crate) textures: HashMap<u64, Arc<TexFile>>,
++    pub(crate) exposure: f32,
++}
++
++#[derive(Resource, Clone, Default, ExtractResource)]
++pub(crate) struct FxExtract {
++    pub(crate) set: Option<Arc<FxFrameSet>>,
++}
++
++enum Slot<T> {
++    Ready(Arc<T>),
++    Missing(Instant),
++    Failed,
++}
++
++#[derive(Resource)]
++struct FxLoader {
++    tav_dir: PathBuf,
++    fx_dir: PathBuf,
++    /// `WOW_BG3_FX_EXPOSURE`, over the frame's own.
++    exposure: Option<f32>,
++    /// Take BG3's TAA jitter out of the view constants (`WOW_BG3_FX_JITTER=keep` leaves it).
++    strip: bool,
++    stamp: Option<(SystemTime, u64)>,
++    /// The last frames read (oldest first) and the one replayed.
++    history: VecDeque<Arc<FxFrame>>,
++    frame: Option<Arc<FxFrame>>,
++    dirty: bool,
++    pending: bool,
++    recipes: HashMap<u64, Slot<Recipe>>,
++    spv: HashMap<u64, Slot<SpvModule>>,
++    samplers: HashMap<u64, Slot<FxSampler>>,
++    textures: HashMap<u64, Slot<TexFile>>,
++    logged: HashSet<String>,
++}
++
++impl FxLoader {
++    fn log_once(&mut self, msg: String) {
++        if self.logged.len() < 4096 && self.logged.insert(msg.clone()) {
++            warn!("wowbg3 fx: {msg}");
++        }
++    }
++}
++
++/// Reads one keyed file into a slot; `None` when it must wait (missing for now).
++fn load_slot<T>(
++    slot: Option<&Slot<T>>,
++    path: PathBuf,
++    parse: impl FnOnce(Vec<u8>) -> Result<T, String>,
++    logged: &mut Vec<String>,
++) -> Slot<T> {
++    if let Some(Slot::Missing(at)) = slot {
++        if at.elapsed() < RETRY {
++            return Slot::Missing(*at);
++        }
++    }
++    match std::fs::metadata(&path) {
++        Ok(m) if m.len() > MAX_FILE => {
++            logged.push(format!("{path:?} is too large ({} bytes)", m.len()));
++            return Slot::Failed;
++        }
++        Ok(_) => {}
++        Err(_) => {
++            logged.push(format!("{path:?} is missing (looked again every {}s)", RETRY.as_secs()));
++            return Slot::Missing(Instant::now());
++        }
++    }
++    match std::fs::read(&path) {
++        Ok(b) => match parse(b) {
++            Ok(v) => Slot::Ready(Arc::new(v)),
++            Err(e) => {
++                logged.push(format!("{path:?}: {e}"));
++                Slot::Failed
++            }
++        },
++        Err(e) => {
++            logged.push(format!("{path:?}: {e}"));
++            Slot::Missing(Instant::now())
++        }
++    }
++}
++
++fn load_spv(b: Vec<u8>) -> Result<SpvModule, String> {
++    let words = spv_words(&b).ok_or("not SPIR-V")?;
++    let info = reflect(&words).ok_or("malformed SPIR-V")?;
++    let flipped = flip_position_y(&words);
++    Ok(SpvModule { words, info, flipped })
++}
++
++/// Resolves one keyed item through its cache: `Some` when ready, and whether it is still pending.
++fn resolve<T>(
++    cache: &mut HashMap<u64, Slot<T>>,
++    key: u64,
++    path: impl FnOnce() -> PathBuf,
++    parse: impl FnOnce(Vec<u8>) -> Result<T, String>,
++    logged: &mut Vec<String>,
++) -> (Option<Arc<T>>, bool) {
++    match cache.get(&key) {
++        Some(Slot::Ready(v)) => return (Some(v.clone()), false),
++        Some(Slot::Failed) => return (None, false),
++        Some(Slot::Missing(at)) if at.elapsed() < RETRY => return (None, true),
++        _ => {}
++    }
++    let slot = load_slot(cache.get(&key), path(), parse, logged);
++    let out = match &slot {
++        Slot::Ready(v) => (Some(v.clone()), false),
++        Slot::Missing(_) => (None, true),
++        Slot::Failed => (None, false),
++    };
++    cache.insert(key, slot);
++    out
++}
++
++fn unix_now() -> f64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64())
++}
++
++fn read_fx(mut l: ResMut<FxLoader>, mut ext: ResMut<FxExtract>) {
++    let path = l.tav_dir.join("fxframe.bin");
++    let stamp = std::fs::metadata(&path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
++    if stamp != l.stamp {
++        l.stamp = stamp;
++        if stamp.is_some() {
++            match std::fs::read(&path).ok().and_then(|b| parse_frame(&b)) {
++                Some(mut f) => {
++                    f.view = strip_jitter(&mut f, l.strip);
++                    if l.history.len() >= HISTORY {
++                        l.history.pop_front();
++                    }
++                    l.history.push_back(Arc::new(f));
++                }
++                None => l.log_once(format!("{path:?} did not decode (skipped)")),
++            }
++        }
++    }
++    // BG3's effects belong in WoW's view only while the world camera follows BG3's camera (BG3's
++    // loading screen and menus draw effects too).
++    let cam = crate::wowbg3_lead::camera_seq();
++    let picked = if cam == 0 { None } else { pick_frame(&l.history, cam) };
++    if picked.as_ref().map(Arc::as_ptr) != l.frame.as_ref().map(Arc::as_ptr) {
++        l.frame = picked;
++        l.dirty = true;
++    }
++    let now = unix_now();
++    let live = l
++        .frame
++        .as_ref()
++        .filter(|f| !f.draws.is_empty() && now - f.wall < STALE_SECS && f.wall - now < 5.0)
++        .cloned();
++    let Some(frame) = live else {
++        if ext.set.is_some() {
++            ext.set = None;
++        }
++        return;
++    };
++    if !l.dirty && !l.pending && ext.set.is_some() {
++        return;
++    }
++    let mut logged = Vec::new();
++    let mut set = FxFrameSet {
++        frame: frame.clone(),
++        recipes: HashMap::new(),
++        spv: HashMap::new(),
++        samplers: HashMap::new(),
++        textures: HashMap::new(),
++        exposure: l
++            .exposure
++            .or_else(|| frame.post.filter(|p| p.have & 1 != 0).map(|p| p.exposure[0] * p.exposure[1]))
++            .filter(|e| e.is_finite() && *e > 0.0)
++            .unwrap_or(1.0),
++    };
++    let mut pending = false;
++    let mut budget = TEX_BUDGET;
++    let fx = l.fx_dir.clone();
++    let FxLoader { recipes, spv, samplers, textures, .. } = &mut *l;
++    for d in &frame.draws {
++        if !set.recipes.contains_key(&d.pipe) {
++            let (rec, wait) = resolve(
++                recipes,
++                d.pipe,
++                || fx.join("pipe").join(format!("{:016x}.bin", d.pipe)),
++                |b| parse_recipe(&b).ok_or_else(|| "recipe did not decode".to_string()),
++                &mut logged,
++            );
++            pending |= wait;
++            let Some(rec) = rec else { continue };
++            for st in &rec.stages {
++                let (m, wait) = resolve(
++                    spv,
++                    st.spv,
++                    || fx.join("spv").join(format!("{:016x}.spv", st.spv)),
++                    load_spv,
++                    &mut logged,
++                );
++                pending |= wait;
++                if let Some(m) = m {
++                    set.spv.insert(st.spv, m);
++                }
++            }
++            set.recipes.insert(d.pipe, rec);
++        }
++        for s in &d.sets {
++            for slot in &s.slots {
++                let (tex, smp) = match slot.res {
++                    SlotRes::Image(t) => (Some(t), None),
++                    SlotRes::Sampler(k) => (None, Some(k)),
++                    SlotRes::Combined(t, k) => (Some(t), Some(k)),
++                    SlotRes::Buffer { .. } => (None, None),
++                };
++                if let Some(k) = smp.filter(|k| !set.samplers.contains_key(k)) {
++                    let (v, wait) = resolve(
++                        samplers,
++                        k,
++                        || fx.join("sampler").join(format!("{k:016x}.bin")),
++                        |b| parse_sampler(&b).ok_or_else(|| "sampler did not decode".to_string()),
++                        &mut logged,
++                    );
++                    pending |= wait;
++                    if let Some(v) = v {
++                        set.samplers.insert(k, v);
++                    }
++                }
++                if let Some(k) = tex.filter(|k| *k > SPECIAL_KEYS && !set.textures.contains_key(k)) {
++                    let ready = matches!(textures.get(&k), Some(Slot::Ready(_)));
++                    if !ready && budget == 0 {
++                        pending = true;
++                        continue;
++                    }
++                    let path = fx.join("tex").join(format!("{k:016x}.bin"));
++                    if !ready {
++                        let size = std::fs::metadata(&path).map_or(0, |m| m.len() as usize);
++                        budget = budget.saturating_sub(size.max(1));
++                    }
++                    let (v, wait) = resolve(
++                        textures,
++                        k,
++                        || path,
++                        |b| parse_tex(b).ok_or_else(|| "texture did not decode".to_string()),
++                        &mut logged,
++                    );
++                    pending |= wait;
++                    if let Some(v) = v {
++                        set.textures.insert(k, v);
++                    }
++                }
++            }
++        }
++    }
++    // BG3's grading and display LUTs (3D textures), for the composite.
++    for k in frame.post.iter().flat_map(|p| [p.grade_lut, p.display_lut]).filter(|k| *k > SPECIAL_KEYS) {
++        let (v, wait) = resolve(
++            textures,
++            k,
++            || fx.join("tex").join(format!("{k:016x}.bin")),
++            |b| parse_tex(b).ok_or_else(|| "texture did not decode".to_string()),
++            &mut logged,
++        );
++        pending |= wait;
++        if let Some(v) = v {
++            set.textures.insert(k, v);
++        }
++    }
++    for m in logged {
++        l.log_once(m);
++    }
++    l.dirty = false;
++    l.pending = pending;
++    ext.set = Some(Arc::new(set));
++}
++
++/// Marks the world camera and lets its depth be sampled (the depth conversion reads it). The
++/// frames export may overwrite the depth usages once at start; this puts the binding back.
++fn arm_fx(mut cam: Query<(Entity, &mut Camera3d, Has<FxView>), With<WorldCamera>>, mut commands: Commands) {
++    let Ok((entity, mut camera, marked)) = cam.single_mut() else { return };
++    let usages = TextureUsages::from_bits_truncate(camera.depth_texture_usages.0);
++    if !usages.contains(TextureUsages::TEXTURE_BINDING) {
++        camera.depth_texture_usages = (usages | TextureUsages::TEXTURE_BINDING | TextureUsages::RENDER_ATTACHMENT).into();
++    }
++    if !marked {
++        commands.entity(entity).insert(FxView);
++    }
++}
++
++pub(crate) fn build(app: &mut App) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let tav_dir = std::env::var_os("WOW_BG3_TAV_DIR").map_or_else(|| PathBuf::from("/tmp/wowbg3/tav"), PathBuf::from);
++    let fx_dir = std::env::var_os("WOW_BG3_FX_DIR")
++        .map_or_else(|| PathBuf::from("/logs/capture/fx"), PathBuf::from);
++    let exposure = std::env::var("WOW_BG3_FX_EXPOSURE")
++        .ok()
++        .and_then(|v| v.trim().parse::<f32>().ok())
++        .filter(|v| v.is_finite() && *v > 0.0);
++    let strip = std::env::var("WOW_BG3_FX_JITTER").map_or(true, |v| v != "keep");
++    info!(
++        "wowbg3 fx: replaying BG3's effects from {tav_dir:?} with {fx_dir:?}, exposure {}, TAA jitter {}",
++        exposure.map_or("from BG3".to_string(), |e| e.to_string()),
++        if strip { "stripped" } else { "kept" }
++    );
++    app.insert_resource(FxLoader {
++        tav_dir,
++        fx_dir,
++        exposure,
++        strip,
++        stamp: None,
++        history: VecDeque::new(),
++        frame: None,
++        dirty: true,
++        pending: false,
++        recipes: HashMap::new(),
++        spv: HashMap::new(),
++        samplers: HashMap::new(),
++        textures: HashMap::new(),
++        logged: HashSet::new(),
++    })
++    .init_resource::<FxExtract>()
++    .add_plugins((ExtractResourcePlugin::<FxExtract>::default(), ExtractComponentPlugin::<FxView>::default()))
++    .add_systems(Update, arm_fx)
++    // After the world camera took BG3's pose (`wowbg3_lead`), so the frame pairs with it.
++    .add_systems(PostUpdate, read_fx.after(bevy::transform::TransformSystems::Propagate));
++    crate::wowbg3_fx_render::build(app);
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++
++    fn put(b: &mut Vec<u8>, v: &[u32]) {
++        for x in v {
++            b.extend_from_slice(&x.to_le_bytes());
++        }
++    }
++
++    /// The HASTE ring's recipe shape (one colour target, 2 stages, 3 vertex bindings, 3 sets).
++    pub(crate) fn recipe_bytes() -> Vec<u8> {
++        let mut b = b"FXP1".to_vec();
++        put(&mut b, &[1, 3, 0, 0, 0, 1, 0]);
++        b.extend_from_slice(&0.0f32.to_le_bytes());
++        b.extend_from_slice(&0.0f32.to_le_bytes());
++        b.extend_from_slice(&0.0f32.to_le_bytes());
++        put(&mut b, &[1, 0, 6]);
++        put(&mut b, &[1, 1, 6, 7, 0, 1, 7, 0, 15, 122]);
++        put(&mut b, &[130, 2]);
++        for (stage, key) in [(1u32, 0xf0d8_d52a_743d_3241u64), (16, 0x2933_f4cc_e044_e78b)] {
++            put(&mut b, &[stage]);
++            b.extend_from_slice(&key.to_le_bytes());
++            let mut entry = [0u8; 64];
++            entry[..4].copy_from_slice(b"main");
++            b.extend_from_slice(&entry);
++            put(&mut b, &[0, 0]);
++        }
++        put(&mut b, &[3, 0, 64, 1, 1, 8, 0, 2, 28, 0]);
++        put(&mut b, &[2, 0, 2, 106, 16, 5, 1, 103, 0]);
++        put(&mut b, &[3]);
++        put(&mut b, &[2, 0, 8, 1, 63, 0, 7, 0, 1, 17, 0]);
++        put(&mut b, &[0]);
++        put(&mut b, &[1, 31, 3, 1, 16, 1]);
++        b.extend_from_slice(&99u64.to_le_bytes());
++        put(&mut b, &[0, 2, 0, 1]);
++        b
++    }
++
++    #[test]
++    fn decodes_recipe() {
++        let r = parse_recipe(&recipe_bytes()).expect("decodes");
++        assert_eq!((r.topology, r.front, r.depth_compare), (3, 1, 6));
++        assert_eq!(r.color.len(), 1);
++        assert!(r.color[0].blend);
++        assert_eq!((r.color[0].src_c, r.color[0].dst_c, r.color[0].format), (6, 7, 122));
++        assert_eq!(r.stages.len(), 2);
++        assert_eq!(r.stages[1].spv, 0x2933_f4cc_e044_e78b);
++        assert_eq!(r.stages[0].entry, "main");
++        assert_eq!(r.bindings[2], VbBinding { binding: 2, stride: 28, rate: 0 });
++        assert_eq!(r.attributes[1], VbAttr { location: 5, binding: 1, format: 103, offset: 0 });
++        assert_eq!(r.sets.len(), 3);
++        assert_eq!(r.sets[0][1].binding, 7);
++        assert!(r.sets[1].is_empty());
++        assert_eq!((r.sets[2][0].binding, r.sets[2][0].ty, r.sets[2][0].n_immutable), (31, 3, 1));
++        assert_eq!(r.dynamic, vec![0, 1]);
++        let full = recipe_bytes();
++        assert!(parse_recipe(&full[..full.len() - 20]).is_none(), "truncated recipe accepted");
++    }
++
++    pub(crate) fn frame_bytes(wall: f64) -> Vec<u8> {
++        let mut d = Vec::new();
++        d.extend_from_slice(&0xe772_e9db_0369_b881u64.to_le_bytes());
++        put(&mut d, &[1, 138, 1, 6]);
++        d.extend_from_slice(&(-4i32).to_le_bytes());
++        put(&mut d, &[0, 1, 512, 276]);
++        put(&mut d, &[1, 2, 0, 1024]);
++        put(&mut d, &[2, 0, 2, 0, 8, 0, 32, 7, 0]);
++        d.extend_from_slice(&77u64.to_le_bytes());
++        put(&mut d, &[2, 2, 5, 2]);
++        d.extend_from_slice(&4u64.to_le_bytes());
++        put(&mut d, &[1, 1]);
++        d.extend_from_slice(&5u64.to_le_bytes());
++        d.extend_from_slice(&6u64.to_le_bytes());
++        put(&mut d, &[6, 0x0403_0201, 0x0005]);
++        let data_off = 56 + d.len() as u32;
++        let mut b = b"FXF1".to_vec();
++        put(&mut b, &[1, 4519, 1]);
++        b.extend_from_slice(&wall.to_le_bytes());
++        for v in [1.0f32, 2.0, 3.0, 0.0] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        put(&mut b, &[1280, 720, data_off, 2048]);
++        assert_eq!(b.len(), 56);
++        b.extend_from_slice(&d);
++        b.extend(std::iter::repeat_n(0xabu8, 2048));
++        b
++    }
++
++    #[test]
++    fn decodes_frame() {
++        let f = parse_frame(&frame_bytes(1.5)).expect("decodes");
++        assert_eq!((f.frame, f.width, f.height, f.wall), (4519, 1280, 720, 1.5));
++        assert_eq!(f.eye, [1.0, 2.0, 3.0]);
++        assert_eq!(f.blob.len(), 2048);
++        let d = &f.draws[0];
++        assert!(d.indexed);
++        assert_eq!((d.count, d.first, d.vertex_offset, d.index_type, d.index_blob, d.index_size), (138, 6, -4, 1, 512, 276));
++        assert_eq!(d.vbs, vec![FxVb { binding: 2, blob: 0, size: 1024 }]);
++        assert_eq!(d.sets[0].slots[0].res, SlotRes::Buffer { blob: 0, size: 32 });
++        assert_eq!(d.sets[0].slots[1].res, SlotRes::Sampler(77));
++        assert_eq!(d.sets[1].set, 2);
++        assert_eq!(d.sets[1].slots[0].res, SlotRes::Image(4));
++        assert_eq!(d.sets[1].slots[1].res, SlotRes::Combined(5, 6));
++        assert_eq!(d.push, vec![1, 2, 3, 4, 5, 0]);
++        let full = frame_bytes(1.5);
++        assert!(parse_frame(&full[..100]).is_none(), "truncated frame accepted");
++    }
++
++    #[test]
++    fn decodes_sampler_and_texture() {
++        let mut b = b"FXS1".to_vec();
++        put(&mut b, &[1, 1, 1, 0, 2, 3]);
++        b.extend_from_slice(&0.0f32.to_le_bytes());
++        put(&mut b, &[1]);
++        b.extend_from_slice(&8.0f32.to_le_bytes());
++        put(&mut b, &[1, 4]);
++        b.extend_from_slice(&(-1000.0f32).to_le_bytes());
++        b.extend_from_slice(&1000.0f32.to_le_bytes());
++        put(&mut b, &[0, 0]);
++        let s = parse_sampler(&b).expect("decodes");
++        assert_eq!((s.address, s.compare, s.compare_op, s.min_lod), ([0, 2, 3], true, 4, -1000.0));
++        let mut t = b"FXT1".to_vec();
++        put(&mut t, &[133, 8, 8, 1, 2, 1, 1]);
++        t.extend_from_slice(&[7u8; 40]);
++        let t = parse_tex(t).expect("decodes");
++        assert_eq!((t.format, t.width, t.mips, t.data().len()), (133, 8, 2, 40));
++    }
++
++    /// A vertex module fragment: `Position` output, a constant, a store.
++    fn vertex_words() -> Vec<u32> {
++        let mut w = vec![SPV_MAGIC, 0x0001_0300, 14, 20, 0];
++        w.extend_from_slice(&[(4 << 16) | 71, 8, 11, 0]); // OpDecorate %8 BuiltIn Position
++        w.extend_from_slice(&[(3 << 16) | 22, 2, 32]); // %2 = OpTypeFloat 32
++        w.extend_from_slice(&[(4 << 16) | 23, 3, 2, 4]); // %3 = OpTypeVector %2 4
++        w.extend_from_slice(&[(4 << 16) | 32, 4, 3, 3]); // %4 = OpTypePointer Output %3
++        w.extend_from_slice(&[(4 << 16) | 59, 4, 8, 3]); // %8 = OpVariable %4 Output
++        w.extend_from_slice(&[(4 << 16) | 59, 4, 9, 3]); // %9 = OpVariable %4 Output (not Position)
++        w.extend_from_slice(&[(3 << 16) | 62, 9, 12]); // OpStore %9 %12
++        w.extend_from_slice(&[(3 << 16) | 62, 8, 12]); // OpStore %8 %12
++        w
++    }
++
++    #[test]
++    fn flips_position_store() {
++        let w = vertex_words();
++        let out = flip_position_y(&w).expect("patches");
++        assert_eq!(out[3], 23, "three new ids");
++        let tail = &out[out.len() - 18..];
++        assert_eq!(tail[..5], [(5 << 16) | 81, 2, 20, 12, 1]);
++        assert_eq!(tail[5..9], [(4 << 16) | 127, 2, 21, 20]);
++        assert_eq!(tail[9..15], [(6 << 16) | 82, 3, 22, 21, 12, 1]);
++        assert_eq!(tail[15..], [(3 << 16) | 62, 8, 22]);
++        // the other output's store is untouched
++        assert_eq!(out[out.len() - 21..out.len() - 18], [(3 << 16) | 62, 9, 12]);
++        let mut no_pos = w.clone();
++        no_pos[6] = 99; // decorate another id
++        assert!(flip_position_y(&no_pos).is_err());
++    }
++
++    #[test]
++    fn decodes_post_block() {
++        let mut b = vec![0u8; 16];
++        b.extend_from_slice(b"FXQ1");
++        put(&mut b, &[0x1f]);
++        for v in [434.4464f32, 0.00230178, 1.0, 0.25, 39.5, 22.5, 1.0, 0.5, 0.6667, 0.6667, 1.0, 0.0, 0.0, 0.0] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&0xd78c_b155_cc1d_8c8fu64.to_le_bytes());
++        b.extend_from_slice(&5u64.to_le_bytes());
++        b.extend_from_slice(&0.25f32.to_le_bytes());
++        put(&mut b, &[0, 0, 0, 1280, 720, 0, 0]);
++        b.extend_from_slice(&0x9a6a_de58_0530_81c6u64.to_le_bytes());
++        b.extend_from_slice(&5u64.to_le_bytes());
++        let p = parse_post(&b, 16).expect("decodes");
++        assert_eq!(p.have, 0x1f);
++        assert!((p.exposure[0] * p.exposure[1] - 1.0).abs() < 1e-3);
++        assert_eq!((p.bloom_in[0], p.grade[0], p.fade), (1.0, 1.0, 0.25));
++        assert_eq!((p.grade_lut, p.display_lut, p.display_sampler), (0xd78c_b155_cc1d_8c8f, 0x9a6a_de58_0530_81c6, 5));
++        assert_eq!(p.cam_seq, 0, "a block without bg3cam_seq");
++        assert!(parse_post(&b, 12).is_none());
++        put(&mut b, &[48213]);
++        assert_eq!(parse_post(&b, 16).expect("decodes with bg3cam_seq").cam_seq, 48213);
++    }
++
++    fn post_seq(cam_seq: u32) -> FxPost {
++        FxPost {
++            have: 0,
++            exposure: [1.0, 1.0],
++            bloom_in: [0.0; 4],
++            bloom_up: [0.0; 4],
++            grade: [0.0; 4],
++            grade_lut: 0,
++            grade_sampler: 0,
++            fade: 0.0,
++            display_lut: 0,
++            display_sampler: 0,
++            cam_seq,
++        }
++    }
++
++    #[test]
++    fn pairs_frames_with_the_camera_record() {
++        let base = parse_frame(&frame_bytes(1.5)).expect("decodes");
++        let hist = |seqs: &[u32]| -> VecDeque<Arc<FxFrame>> {
++            seqs.iter()
++                .enumerate()
++                .map(|(i, &q)| {
++                    let mut f = base.clone();
++                    f.frame = i as u32;
++                    f.post = (q != 0).then(|| post_seq(q));
++                    Arc::new(f)
++                })
++                .collect()
++        };
++        let pick = |h: &VecDeque<Arc<FxFrame>>, cam| pick_frame(h, cam).map(|f| f.frame);
++        assert_eq!(pick(&VecDeque::new(), 5), None);
++        let h = hist(&[10, 11, 12, 12, 13]);
++        assert_eq!(pick(&h, 0), Some(4), "no camera record: the newest");
++        assert_eq!(pick(&h, 11), Some(1), "the frame drawn with the camera's record");
++        assert_eq!(pick(&h, 12), Some(3), "the newest of those");
++        assert_eq!(pick(&h, 15), Some(4), "BG3 behind the camera: the newest earlier one");
++        assert_eq!(pick(&h, 9), Some(4), "nothing that old: the newest");
++        assert_eq!(pick(&hist(&[10, 11, 0]), 10), Some(2), "a frame without the record: the newest");
++    }
++
++    #[test]
++    fn strips_only_the_per_view_block() {
++        let mut f = parse_frame(&frame_bytes(1.5)).expect("decodes");
++        let vb = view_block();
++        f.blob = vec![0; 512];
++        f.blob[..vb.len()].copy_from_slice(&vb);
++        f.blob[256..256 + vb.len()].copy_from_slice(&vb);
++        let size = vb.len() as u32;
++        f.draws[0].sets = vec![FxSet {
++            set: 0,
++            slots: vec![
++                FxSlot { binding: 1, ty: 6, res: SlotRes::Buffer { blob: 0, size } },
++                FxSlot { binding: 2, ty: 6, res: SlotRes::Buffer { blob: 256, size } },
++            ],
++        }];
++        let found = strip_jitter(&mut f, true).expect("found at binding 2");
++        assert!((found.jitter[0] - 0.000390622).abs() < 1e-9);
++        assert_eq!(&f.blob[..vb.len()], &vb[..], "binding 1 left alone");
++        assert_ne!(&f.blob[256..256 + vb.len()], &vb[..], "binding 2 stripped");
++    }
++
++    /// BG3's per-view block as captured (frame 5106): V, jittered P, VP = P·V, near, far.
++    fn view_block() -> Vec<u8> {
++        let v = [
++            [0.422619f32, -0.476457, -0.770962, 0.0],
++            [0.0, 0.850662, -0.525712, 0.0],
++            [0.906308, 0.222176, 0.359506, 0.0],
++            [459.544, 23.2904, 71.4366, 1.0],
++        ];
++        let p = [[1.08055f32, 0.0, 0.0, 0.0], [0.0, 1.92098, 0.0, 0.0], [0.000390622, -0.000462936, -1.00001e-05, 1.0], [0.0, 0.0, 0.100001, 0.0]];
++        let mut vp = [[0.0f32; 4]; 4];
++        for c in 0..4 {
++            for r in 0..4 {
++                vp[c][r] = (0..4).map(|k| p[k][r] * v[c][k]).sum();
++            }
++        }
++        let mut b = Vec::new();
++        for m in [v, p, vp] {
++            for col in m {
++                for x in col {
++                    b.extend_from_slice(&x.to_le_bytes());
++                }
++            }
++        }
++        for x in [0.1f32, 10000.0, 0.0, 0.0, -128.04, 17.74, -447.3, 0.0] {
++            b.extend_from_slice(&x.to_le_bytes());
++        }
++        b
++    }
++
++    #[test]
++    fn strips_taa_jitter() {
++        let mut b = view_block();
++        let mut kept = b.clone();
++        assert_eq!(strip_block(&mut kept, false).expect("found").jitter[0], 0.000390622);
++        assert_eq!(kept, b, "found without stripping");
++        let vb = strip_block(&mut b, true).expect("recognised");
++        assert!((vb.jitter[0] - 0.000390622).abs() < 1e-9 && (vb.jitter[1] + 0.000462936).abs() < 1e-9);
++        assert_eq!((vb.near, vb.far), (0.1, 10000.0));
++        let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
++        assert_eq!((f(16 + 8), f(16 + 9)), (0.0, 0.0));
++        // VP col 0 row 0 without jitter: 1.08055 * 0.422619
++        assert!((f(32) - 1.08055 * 0.422619).abs() < 1e-5);
++        // a second pass finds no jitter left and changes nothing
++        let again = b.clone();
++        assert_eq!(strip_block(&mut b, true).expect("still recognised").jitter, [0.0, 0.0]);
++        assert_eq!(b, again);
++        // not a view block: untouched
++        let mut junk = vec![0u8; 224];
++        assert!(strip_block(&mut junk, true).is_none());
++    }
++
++    #[test]
++    fn reflects_bindings() {
++        let mut w = vec![SPV_MAGIC, 0x0001_0300, 14, 40, 0];
++        w.extend_from_slice(&[(4 << 16) | 71, 10, 34, 2]); // %10 DescriptorSet 2
++        w.extend_from_slice(&[(4 << 16) | 71, 10, 33, 31]); // %10 Binding 31
++        w.extend_from_slice(&[(4 << 16) | 71, 11, 34, 0]);
++        w.extend_from_slice(&[(4 << 16) | 71, 11, 33, 7]);
++        w.extend_from_slice(&[(3 << 16) | 22, 2, 32]); // float
++        w.extend_from_slice(&[(9 << 16) | 25, 5, 2, 1, 2, 0, 0, 2, 3]); // image 2D storage R32f
++        w.extend_from_slice(&[(4 << 16) | 32, 6, 0, 5]); // ptr UniformConstant image
++        w.extend_from_slice(&[(2 << 16) | 26, 7]); // sampler
++        w.extend_from_slice(&[(4 << 16) | 32, 8, 0, 7]);
++        w.extend_from_slice(&[(4 << 16) | 59, 6, 10, 0]);
++        w.extend_from_slice(&[(4 << 16) | 59, 8, 11, 0]);
++        let info = reflect(&w).expect("reflects");
++        assert_eq!(
++            info.bindings[&(2, 31)],
++            SpvBind::Image { dim: 1, arrayed: false, ms: false, storage: true, format: 3, scalar: Scalar::Float }
++        );
++        assert_eq!(info.bindings[&(0, 7)], SpvBind::Sampler);
++        assert!(!info.image_write);
++    }
++}
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+new file mode 100644
+index 0000000..192a5ac
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -0,0 +1,2302 @@
++//! WOW-BG3 (local fork, patch 0005), render world: BG3's effect draws replayed with BG3's
++//! own SPIR-V (wgpu passthrough) and composited over the world camera's view. The main-world
++//! half (`wowbg3_fx`) decodes the capture and loads what it names.
++//!
++//! Per frame, in a command buffer of its own (a validation error there drops the replay, never
++//! the frame), between the main transparent pass and the end of the main pass:
++//! 1. table: BG3's display chain (grading LUT, ACEScc, display LUT) evaluated on grey into a
++//!    1D table, to invert it per channel;
++//! 2. prep: WoW's depth turned into BG3's convention at BG3's extent (reverse-Z, metres from
++//!    BG3's eye: `p22 + p32 / z`, with `z = (near / d + depth offset) * 0.9144` plus a small
++//!    slack for terrain that differs from BG3's floor), BG3's linear depth (special key 4: view z
++//!    over BG3's far plane, which is how BG3's effects read and write it; a sampled and a storage
++//!    copy) and WoW's colour taken back to BG3's scene-linear units (key 2);
++//! 3. the draws, twice with the same blend states: over black (C) and over white (W), so the
++//!    transmittance is T = W - C;
++//! 4. composite (Bevy's encoder, a post-process write of the view target): for WoW's
++//!    display-encoded pixel w, x_w = display⁻¹(w), x = x_w·T + C·exposure,
++//!    out = w + display(x) - display(x_w). Untouched pixels stay exactly WoW's. Without BG3's
++//!    post block the display chain falls back to plain sRGB.
++//!
++//! The draws keep BG3's pipelines: bind group layouts mirror BG3's set layouts with every gap
++//! filled by a dummy sampler (wgpu numbers Vulkan bindings 0..n-1), vertex buffers compacted to
++//! slots in the recipe's binding order, colour into Rgba16Float with alpha left at 1 (BG3's
++//! target has no alpha, so its DST_ALPHA reads 1), depth tested read-only against the converted
++//! depth. Anything wgpu cannot take (or a missing file) skips that draw, logged once. BG3's fog
++//! volume (special key 3) is bound empty, (0, 0, 0, 1); its froxel light grid (key 5) is one
++//! constant light, `WOW_BG3_FX_LIGHT` (default 32, which BG3's shaders scale to 1).
++
++use std::collections::{HashMap, HashSet};
++use std::num::NonZeroU64;
++use std::sync::{Arc, Mutex};
++use std::time::Instant;
++
++use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
++use bevy::ecs::query::QueryItem;
++use bevy::prelude::*;
++use bevy::render::render_graph::{
++    NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
++};
++use bevy::render::render_resource::TextureUsages;
++use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
++use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
++use bevy::render::{Render, RenderApp, RenderSystems};
++
++use crate::wowbg3_fx::{
++    FxDraw, FxExtract, FxFrameSet, FxSampler, FxView, Recipe, Scalar, SlotRes, SpvBind, SpvModule, TexFile,
++};
++
++const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
++const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
++const TABLE_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
++/// Entries of the display-chain table: x = 0, then 2^lo .. 2^hi.
++const TABLE_N: u32 = 1024;
++const TABLE_LO: f32 = -16.0;
++const TABLE_HI: f32 = 8.0;
++const YD: f32 = 0.9144;
++
++pub(crate) fn build(app: &mut App) {
++    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++        warn!("wowbg3 fx: no render app");
++        return;
++    };
++    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
++    let keys = |v: Option<String>| -> HashSet<u64> {
++        v.map(|v| v.split(',').filter_map(|k| u64::from_str_radix(k.trim(), 16).ok()).collect()).unwrap_or_default()
++    };
++    let cfg = FxCfg {
++        // BG3's froxel light grid (special key 5) is replaced by one constant light; BG3's
++        // shaders scale the grid by 1/32, so 32 lights the effects with 1.
++        light: env("WOW_BG3_FX_LIGHT").and_then(|v| v.trim().parse().ok()).filter(|v: &f32| v.is_finite()).unwrap_or(32.0),
++        skip: keys(env("WOW_BG3_FX_SKIP")),
++        only: keys(env("WOW_BG3_FX_ONLY")),
++        show: match env("WOW_BG3_FX_SHOW").as_deref() {
++            Some("c") => 1.0,
++            Some("t") => 2.0,
++            Some("d") => 3.0,
++            Some("r") => 4.0,
++            _ => 0.0,
++        },
++        slack: env("WOW_BG3_FX_DEPTH_SLACK").and_then(|v| v.trim().parse().ok()).filter(|v: &f32| v.is_finite()).unwrap_or(0.1),
++    };
++    info!(
++        "wowbg3 fx: light grid {}, depth slack {} m, skip {:x?}, only {:x?}, show {}",
++        cfg.light, cfg.slack, cfg.skip, cfg.only, cfg.show
++    );
++    render_app
++        .insert_resource(FxGpu { cfg, ..Default::default() })
++        .add_systems(Render, prepare_fx.in_set(RenderSystems::PrepareBindGroups))
++        .add_render_graph_node::<ViewNodeRunner<FxNode>>(Core3d, FxLabel)
++        .add_render_graph_edges(Core3d, (Node3d::MainTransparentPass, FxLabel, Node3d::EndMainPass));
++}
++
++// ---------------------------------------------------------------------------------------------
++// Vulkan to wgpu
++
++fn vk_compare(op: u32) -> wgpu::CompareFunction {
++    use wgpu::CompareFunction as C;
++    match op {
++        0 => C::Never,
++        1 => C::Less,
++        2 => C::Equal,
++        3 => C::LessEqual,
++        4 => C::Greater,
++        5 => C::NotEqual,
++        6 => C::GreaterEqual,
++        _ => C::Always,
++    }
++}
++
++fn vk_blend_factor(f: u32) -> Option<wgpu::BlendFactor> {
++    use wgpu::BlendFactor as B;
++    Some(match f {
++        0 => B::Zero,
++        1 => B::One,
++        2 => B::Src,
++        3 => B::OneMinusSrc,
++        4 => B::Dst,
++        5 => B::OneMinusDst,
++        6 => B::SrcAlpha,
++        7 => B::OneMinusSrcAlpha,
++        8 => B::DstAlpha,
++        9 => B::OneMinusDstAlpha,
++        10 => B::Constant,
++        11 => B::OneMinusConstant,
++        14 => B::SrcAlphaSaturated,
++        15 => B::Src1,
++        16 => B::OneMinusSrc1,
++        17 => B::Src1Alpha,
++        18 => B::OneMinusSrc1Alpha,
++        _ => return None,
++    })
++}
++
++fn vk_blend_op(o: u32) -> Option<wgpu::BlendOperation> {
++    use wgpu::BlendOperation as O;
++    Some(match o {
++        0 => O::Add,
++        1 => O::Subtract,
++        2 => O::ReverseSubtract,
++        3 => O::Min,
++        4 => O::Max,
++        _ => return None,
++    })
++}
++
++fn vk_topology(t: u32) -> Option<wgpu::PrimitiveTopology> {
++    use wgpu::PrimitiveTopology as T;
++    Some(match t {
++        0 => T::PointList,
++        1 => T::LineList,
++        2 => T::LineStrip,
++        3 => T::TriangleList,
++        4 => T::TriangleStrip,
++        _ => return None,
++    })
++}
++
++pub(crate) fn vk_vertex_format(f: u32) -> Option<wgpu::VertexFormat> {
++    use wgpu::VertexFormat as V;
++    Some(match f {
++        9 => V::Unorm8,
++        10 => V::Snorm8,
++        13 => V::Uint8,
++        14 => V::Sint8,
++        16 => V::Unorm8x2,
++        17 => V::Snorm8x2,
++        20 => V::Uint8x2,
++        21 => V::Sint8x2,
++        37 => V::Unorm8x4,
++        38 => V::Snorm8x4,
++        41 => V::Uint8x4,
++        42 => V::Sint8x4,
++        44 => V::Unorm8x4Bgra,
++        64 => V::Unorm10_10_10_2,
++        70 => V::Unorm16,
++        71 => V::Snorm16,
++        74 => V::Uint16,
++        75 => V::Sint16,
++        76 => V::Float16,
++        77 => V::Unorm16x2,
++        78 => V::Snorm16x2,
++        81 => V::Uint16x2,
++        82 => V::Sint16x2,
++        83 => V::Float16x2,
++        91 => V::Unorm16x4,
++        92 => V::Snorm16x4,
++        95 => V::Uint16x4,
++        96 => V::Sint16x4,
++        97 => V::Float16x4,
++        98 => V::Uint32,
++        99 => V::Sint32,
++        100 => V::Float32,
++        101 => V::Uint32x2,
++        102 => V::Sint32x2,
++        103 => V::Float32x2,
++        104 => V::Uint32x3,
++        105 => V::Sint32x3,
++        106 => V::Float32x3,
++        107 => V::Uint32x4,
++        108 => V::Sint32x4,
++        109 => V::Float32x4,
++        _ => return None,
++    })
++}
++
++pub(crate) fn vk_texture_format(f: u32) -> Option<wgpu::TextureFormat> {
++    use wgpu::TextureFormat as T;
++    Some(match f {
++        9 => T::R8Unorm,
++        16 => T::Rg8Unorm,
++        37 => T::Rgba8Unorm,
++        43 => T::Rgba8UnormSrgb,
++        44 => T::Bgra8Unorm,
++        50 => T::Bgra8UnormSrgb,
++        64 => T::Rgb10a2Unorm,
++        70 => T::R16Unorm,
++        76 => T::R16Float,
++        77 => T::Rg16Unorm,
++        83 => T::Rg16Float,
++        91 => T::Rgba16Unorm,
++        97 => T::Rgba16Float,
++        100 => T::R32Float,
++        103 => T::Rg32Float,
++        109 => T::Rgba32Float,
++        122 => T::Rg11b10Ufloat,
++        131 | 133 => T::Bc1RgbaUnorm,
++        132 | 134 => T::Bc1RgbaUnormSrgb,
++        135 => T::Bc2RgbaUnorm,
++        136 => T::Bc2RgbaUnormSrgb,
++        137 => T::Bc3RgbaUnorm,
++        138 => T::Bc3RgbaUnormSrgb,
++        139 => T::Bc4RUnorm,
++        140 => T::Bc4RSnorm,
++        141 => T::Bc5RgUnorm,
++        142 => T::Bc5RgSnorm,
++        143 => T::Bc6hRgbUfloat,
++        144 => T::Bc6hRgbFloat,
++        145 => T::Bc7RgbaUnorm,
++        146 => T::Bc7RgbaUnormSrgb,
++        _ => return None,
++    })
++}
++
++/// SPIR-V ImageFormat of a storage image (0, unknown, taken as R32f: BG3's linear depth).
++fn spv_storage_format(f: u32) -> Option<wgpu::TextureFormat> {
++    use wgpu::TextureFormat as T;
++    Some(match f {
++        0 | 3 => T::R32Float,
++        1 => T::Rgba32Float,
++        2 => T::Rgba16Float,
++        4 => T::Rgba8Unorm,
++        24 => T::R32Sint,
++        33 => T::R32Uint,
++        _ => return None,
++    })
++}
++
++fn view_dim(dim: u32, arrayed: bool) -> Option<wgpu::TextureViewDimension> {
++    use wgpu::TextureViewDimension as D;
++    Some(match (dim, arrayed) {
++        (0, false) => D::D1,
++        (1, false) => D::D2,
++        (1, true) => D::D2Array,
++        (2, false) => D::D3,
++        (3, false) => D::Cube,
++        (3, true) => D::CubeArray,
++        _ => return None,
++    })
++}
++
++fn visibility(stages: u32) -> wgpu::ShaderStages {
++    let mut v = wgpu::ShaderStages::NONE;
++    if stages & 0x1 != 0 {
++        v |= wgpu::ShaderStages::VERTEX;
++    }
++    if stages & 0x10 != 0 {
++        v |= wgpu::ShaderStages::FRAGMENT;
++    }
++    if v.is_empty() {
++        v = wgpu::ShaderStages::FRAGMENT;
++    }
++    v
++}
++
++// ---------------------------------------------------------------------------------------------
++// Draw validation (mirrors wgpu-core's, so a bad range is a skipped draw and not a lost frame)
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct VbSlot {
++    pub(crate) binding: u32,
++    pub(crate) stride: u64,
++    /// The furthest byte one element reads (attribute offset + size).
++    pub(crate) last_stride: u64,
++    pub(crate) instance: bool,
++}
++
++/// (vertex limit, instance limit) for buffers of these sizes, as wgpu-core computes them.
++pub(crate) fn vertex_limits(slots: &[VbSlot], sizes: &[u64]) -> (u64, u64) {
++    let (mut vl, mut il) = (u64::MAX, u64::MAX);
++    for (s, &size) in slots.iter().zip(sizes) {
++        let limit = if size < s.last_stride {
++            0
++        } else if s.stride == 0 {
++            continue;
++        } else {
++            (size - s.last_stride) / s.stride + 1
++        };
++        if s.instance {
++            il = il.min(limit);
++        } else {
++            vl = vl.min(limit);
++        }
++    }
++    (vl, il)
++}
++
++// ---------------------------------------------------------------------------------------------
++// GPU state
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++enum Kind {
++    Ubo,
++    Ssbo,
++    Sampler(bool),
++    Tex { dim: wgpu::TextureViewDimension, scalar: Scalar },
++    Storage { format: wgpu::TextureFormat, dim: wgpu::TextureViewDimension },
++    Dummy,
++}
++
++type BglKey = Vec<(u32, Kind, wgpu::ShaderStages)>;
++/// (recipe, comparison-sampler mask, strip index format)
++type PipeKey = (u64, u64, Option<wgpu::IndexFormat>);
++
++struct Pipe {
++    pipeline: wgpu::RenderPipeline,
++    bgls: Vec<(wgpu::BindGroupLayout, BglKey)>,
++    slots: Vec<VbSlot>,
++    push: Option<(wgpu::ShaderStages, u32)>,
++}
++
++struct GpuTex {
++    dim: wgpu::TextureDimension,
++    width: u32,
++    height: u32,
++    layers: u32,
++    format: wgpu::TextureFormat,
++    tex: wgpu::Texture,
++    views: HashMap<wgpu::TextureViewDimension, Option<wgpu::TextureView>>,
++}
++
++struct Targets {
++    size: (u32, u32),
++    depth: wgpu::TextureView,
++    lin_a: wgpu::TextureView,
++    lin_b: wgpu::TextureView,
++    scene: wgpu::TextureView,
++    c: wgpu::TextureView,
++    w: wgpu::TextureView,
++}
++
++struct Base {
++    arena: wgpu::Buffer,
++    dummy_buf: wgpu::Buffer,
++    dummy_sampler: wgpu::Sampler,
++    linear_clamp: wgpu::Sampler,
++    neutral: HashMap<(wgpu::TextureViewDimension, Scalar), wgpu::TextureView>,
++    /// A 1x1x1 light grid of (light, light, light, 1).
++    light3d: wgpu::TextureView,
++    storage_dummy: HashMap<(wgpu::TextureFormat, wgpu::TextureViewDimension), Option<wgpu::TextureView>>,
++    params: wgpu::Buffer,
++    table: wgpu::TextureView,
++    chain_bgl: wgpu::BindGroupLayout,
++    table_bgl: wgpu::BindGroupLayout,
++    prep_bgl: wgpu::BindGroupLayout,
++    comp_bgl: wgpu::BindGroupLayout,
++    table_pipeline: wgpu::RenderPipeline,
++    prep_pipeline: wgpu::RenderPipeline,
++    comp_layout: wgpu::PipelineLayout,
++    comp_module: wgpu::ShaderModule,
++}
++
++/// What the node needs for one frame.
++struct Ready {
++    arena: wgpu::Buffer,
++    draws: Vec<PreparedDraw>,
++    chain_bg: wgpu::BindGroup,
++    table_bg: wgpu::BindGroup,
++    table_view: wgpu::TextureView,
++    table_pipeline: wgpu::RenderPipeline,
++    prep_pipeline: wgpu::RenderPipeline,
++    prep_bgl: wgpu::BindGroupLayout,
++    comp_bgl: wgpu::BindGroupLayout,
++    composite: wgpu::RenderPipeline,
++    composite_format: wgpu::TextureFormat,
++    depth: wgpu::TextureView,
++    lin_a: wgpu::TextureView,
++    lin_b: wgpu::TextureView,
++    scene: wgpu::TextureView,
++    c: wgpu::TextureView,
++    w: wgpu::TextureView,
++}
++
++struct PreparedDraw {
++    pipeline: wgpu::RenderPipeline,
++    groups: Vec<wgpu::BindGroup>,
++    vbs: Vec<(u64, u64)>,
++    index: Option<(u64, u64, wgpu::IndexFormat)>,
++    count: u32,
++    instances: u32,
++    first: u32,
++    base_vertex: i32,
++    first_instance: u32,
++    push: Option<(wgpu::ShaderStages, Vec<u8>)>,
++}
++
++enum Skip {
++    /// Logged once per distinct message.
++    Once(String),
++    /// Waiting on a file still loading; not logged.
++    Pending,
++    /// Nothing to draw (no instances, culled both faces, a pipeline that failed before).
++    Silent,
++}
++
++#[derive(Default)]
++struct Stats {
++    since: Option<Instant>,
++    frames: u32,
++    replayed: u64,
++    skipped: u64,
++}
++
++/// Knobs from the environment (`build`).
++#[derive(Default)]
++struct FxCfg {
++    /// The light grid's texel value (`WOW_BG3_FX_LIGHT`, special key 5).
++    light: f32,
++    /// Pipes not replayed (`WOW_BG3_FX_SKIP`, hex keys) or the only ones (`WOW_BG3_FX_ONLY`).
++    skip: HashSet<u64>,
++    only: HashSet<u64>,
++    /// Composite shows 1 the effects over black, 2 their transmittance, 3 a diagnosis: red
++    /// negative emission, green emission, blue transmittance off 1, magenta not finite
++    /// (`WOW_BG3_FX_SHOW=c|t|d`); 4 WoW's colour through BG3's display chain and back (`r`).
++    show: f32,
++    /// Metres WoW's surfaces are pushed back for the effects' depth test and soft fade
++    /// (`WOW_BG3_FX_DEPTH_SLACK`): WoW's ground only meets BG3's floor at Tav's feet.
++    slack: f32,
++}
++
++#[derive(Resource, Default)]
++pub(crate) struct FxGpu {
++    cfg: FxCfg,
++    base: Option<Base>,
++    base_failed: bool,
++    modules: HashMap<(u64, bool), Option<wgpu::ShaderModule>>,
++    bgls: HashMap<BglKey, Option<wgpu::BindGroupLayout>>,
++    pipes: HashMap<PipeKey, Option<Arc<Pipe>>>,
++    samplers: HashMap<u64, Option<wgpu::Sampler>>,
++    textures: HashMap<u64, Option<GpuTex>>,
++    targets: Option<Targets>,
++    composites: HashMap<wgpu::TextureFormat, Option<wgpu::RenderPipeline>>,
++    /// The set `ready` was built from (rebuilt only when the main world sends a new one).
++    last: Option<Arc<FxFrameSet>>,
++    ready: Option<Arc<Ready>>,
++    last_counts: (usize, usize),
++    mode: f32,
++    logged: HashSet<String>,
++    stats: Stats,
++    /// Errors met while recording (the node only reads the resource).
++    node_log: Mutex<HashSet<String>>,
++}
++
++/// Runs `f` inside validation and internal error scopes: wgpu's default handler panics.
++fn scoped<T>(dev: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
++    dev.push_error_scope(wgpu::ErrorFilter::Validation);
++    dev.push_error_scope(wgpu::ErrorFilter::Internal);
++    let v = f();
++    let internal = bevy::tasks::futures::now_or_never(dev.pop_error_scope()).flatten();
++    let validation = bevy::tasks::futures::now_or_never(dev.pop_error_scope()).flatten();
++    match internal.or(validation) {
++        Some(e) => Err(e.to_string()),
++        None => Ok(v),
++    }
++}
++
++fn tex_desc<'a>(
++    label: &'a str,
++    size: wgpu::Extent3d,
++    dim: wgpu::TextureDimension,
++    format: wgpu::TextureFormat,
++    usage: wgpu::TextureUsages,
++) -> wgpu::TextureDescriptor<'a> {
++    wgpu::TextureDescriptor {
++        label: Some(label),
++        size,
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: dim,
++        format,
++        usage,
++        view_formats: &[],
++    }
++}
++
++fn plain_view(t: &wgpu::Texture) -> wgpu::TextureView {
++    t.create_view(&wgpu::TextureViewDescriptor::default())
++}
++
++fn bgl_entry(binding: u32, ty: wgpu::BindingType, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
++    wgpu::BindGroupLayoutEntry { binding, visibility: vis, ty, count: None }
++}
++
++fn tex_ty(dim: wgpu::TextureViewDimension, sample_type: wgpu::TextureSampleType) -> wgpu::BindingType {
++    wgpu::BindingType::Texture { sample_type, view_dimension: dim, multisampled: false }
++}
++
++const UNFILTERABLE: wgpu::TextureSampleType = wgpu::TextureSampleType::Float { filterable: false };
++
++impl Base {
++    fn new(dev: &wgpu::Device, queue: &wgpu::Queue, light: f32) -> Result<Base, String> {
++        use wgpu::TextureViewDimension as D;
++        let frag = wgpu::ShaderStages::FRAGMENT;
++        let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
++        scoped(dev, || {
++            let arena = dev.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("wowbg3_fx_arena"),
++                size: 1 << 20,
++                usage: wgpu::BufferUsages::VERTEX
++                    | wgpu::BufferUsages::INDEX
++                    | wgpu::BufferUsages::UNIFORM
++                    | wgpu::BufferUsages::STORAGE
++                    | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            let dummy_buf = dev.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("wowbg3_fx_dummy"),
++                size: 256,
++                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            let linear = wgpu::SamplerDescriptor {
++                label: Some("wowbg3_fx_linear"),
++                address_mode_u: wgpu::AddressMode::ClampToEdge,
++                address_mode_v: wgpu::AddressMode::ClampToEdge,
++                address_mode_w: wgpu::AddressMode::ClampToEdge,
++                mag_filter: wgpu::FilterMode::Linear,
++                min_filter: wgpu::FilterMode::Linear,
++                mipmap_filter: wgpu::FilterMode::Linear,
++                ..Default::default()
++            };
++            let dummy_sampler = dev.create_sampler(&linear);
++            let linear_clamp = dev.create_sampler(&linear);
++            // Neutral (0, 0, 0, 1) textures of every view dimension and scalar kind.
++            let mut neutral = HashMap::new();
++            for (scalar, format, texel) in [
++                (Scalar::Float, wgpu::TextureFormat::Rgba16Float, bytemuck::cast_slice::<u16, u8>(&[0, 0, 0, 0x3c00]).to_vec()),
++                (Scalar::Uint, wgpu::TextureFormat::Rgba32Uint, bytemuck::cast_slice::<u32, u8>(&[0, 0, 0, 1]).to_vec()),
++                (Scalar::Sint, wgpu::TextureFormat::Rgba32Sint, bytemuck::cast_slice::<i32, u8>(&[0, 0, 0, 1]).to_vec()),
++            ] {
++                for dim in [D::D1, D::D2, D::D2Array, D::D3, D::Cube, D::CubeArray] {
++                    let (tdim, layers) = match dim {
++                        D::D1 => (wgpu::TextureDimension::D1, 1),
++                        D::D3 => (wgpu::TextureDimension::D3, 1),
++                        D::Cube | D::CubeArray => (wgpu::TextureDimension::D2, 6),
++                        _ => (wgpu::TextureDimension::D2, 1),
++                    };
++                    let size = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers };
++                    let t = dev.create_texture(&tex_desc(
++                        "wowbg3_fx_neutral",
++                        size,
++                        tdim,
++                        format,
++                        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++                    ));
++                    for layer in 0..layers {
++                        queue.write_texture(
++                            wgpu::TexelCopyTextureInfo {
++                                texture: &t,
++                                mip_level: 0,
++                                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
++                                aspect: wgpu::TextureAspect::All,
++                            },
++                            &texel,
++                            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(texel.len() as u32), rows_per_image: Some(1) },
++                            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
++                        );
++                    }
++                    let view = t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() });
++                    neutral.insert((dim, scalar), view);
++                }
++            }
++            let light_tex = dev.create_texture(&tex_desc(
++                "wowbg3_fx_light",
++                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
++                wgpu::TextureDimension::D3,
++                wgpu::TextureFormat::Rgba16Float,
++                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++            ));
++            let l = half::f16::from_f32(light).to_bits();
++            queue.write_texture(
++                light_tex.as_image_copy(),
++                bytemuck::cast_slice::<u16, u8>(&[l, l, l, half::f16::ONE.to_bits()]),
++                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
++                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
++            );
++            let light3d = plain_view(&light_tex);
++            let params = dev.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("wowbg3_fx_params"),
++                size: PARAMS_BYTES,
++                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            let table_tex = dev.create_texture(&tex_desc(
++                "wowbg3_fx_table",
++                wgpu::Extent3d { width: TABLE_N, height: 1, depth_or_array_layers: 1 },
++                wgpu::TextureDimension::D2,
++                TABLE_FMT,
++                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
++            ));
++            let table = plain_view(&table_tex);
++            let filterable = wgpu::TextureSampleType::Float { filterable: true };
++            let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
++            let chain_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                label: Some("wowbg3_fx_chain"),
++                entries: &[
++                    bgl_entry(
++                        0,
++                        wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
++                        vf,
++                    ),
++                    bgl_entry(1, tex_ty(D::D3, filterable), frag),
++                    bgl_entry(2, filtering, frag),
++                    bgl_entry(3, tex_ty(D::D3, filterable), frag),
++                    bgl_entry(4, filtering, frag),
++                ],
++            });
++            let table_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                label: Some("wowbg3_fx_table"),
++                entries: &[bgl_entry(0, tex_ty(D::D2, UNFILTERABLE), frag)],
++            });
++            let prep_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                label: Some("wowbg3_fx_prep"),
++                entries: &[
++                    bgl_entry(0, tex_ty(D::D2, wgpu::TextureSampleType::Depth), frag),
++                    bgl_entry(1, tex_ty(D::D2, UNFILTERABLE), frag),
++                ],
++            });
++            let comp_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                label: Some("wowbg3_fx_comp"),
++                entries: &[
++                    bgl_entry(0, tex_ty(D::D2, UNFILTERABLE), frag),
++                    bgl_entry(1, tex_ty(D::D2, UNFILTERABLE), frag),
++                    bgl_entry(2, tex_ty(D::D2, UNFILTERABLE), frag),
++                ],
++            });
++            let wgsl = |label: &str, body: &str| {
++                dev.create_shader_module(wgpu::ShaderModuleDescriptor {
++                    label: Some(label),
++                    source: wgpu::ShaderSource::Wgsl(format!("{WGSL_PRELUDE}\n{body}").into()),
++                })
++            };
++            let layout = |bgls: &[&wgpu::BindGroupLayout]| {
++                dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                    label: Some("wowbg3_fx_own"),
++                    bind_group_layouts: bgls,
++                    push_constant_ranges: &[],
++                })
++            };
++            let table_module = wgsl("wowbg3_fx_table", WGSL_TABLE);
++            let table_pipeline = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some("wowbg3_fx_table"),
++                layout: Some(&layout(&[&chain_bgl])),
++                vertex: wgpu::VertexState {
++                    module: &table_module,
++                    entry_point: Some("vs"),
++                    compilation_options: Default::default(),
++                    buffers: &[],
++                },
++                primitive: wgpu::PrimitiveState::default(),
++                depth_stencil: None,
++                multisample: wgpu::MultisampleState::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &table_module,
++                    entry_point: Some("fs_table"),
++                    compilation_options: Default::default(),
++                    targets: &[Some(TABLE_FMT.into())],
++                }),
++                multiview: None,
++                cache: None,
++            });
++            let prep_module = wgsl("wowbg3_fx_prep", &format!("{WGSL_INVERSE}\n{WGSL_PREP}"));
++            let prep_pipeline = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some("wowbg3_fx_prep"),
++                layout: Some(&layout(&[&chain_bgl, &table_bgl, &prep_bgl])),
++                vertex: wgpu::VertexState {
++                    module: &prep_module,
++                    entry_point: Some("vs"),
++                    compilation_options: Default::default(),
++                    buffers: &[],
++                },
++                primitive: wgpu::PrimitiveState::default(),
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: DEPTH_FMT,
++                    depth_write_enabled: true,
++                    depth_compare: wgpu::CompareFunction::Always,
++                    stencil: wgpu::StencilState::default(),
++                    bias: wgpu::DepthBiasState::default(),
++                }),
++                multisample: wgpu::MultisampleState::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &prep_module,
++                    entry_point: Some("fs_prep"),
++                    compilation_options: Default::default(),
++                    targets: &[
++                        Some(wgpu::TextureFormat::R32Float.into()),
++                        Some(wgpu::TextureFormat::R32Float.into()),
++                        Some(COLOR_FMT.into()),
++                    ],
++                }),
++                multiview: None,
++                cache: None,
++            });
++            let comp_module = wgsl("wowbg3_fx_comp", &format!("{WGSL_INVERSE}\n{WGSL_COMP}"));
++            let comp_layout = layout(&[&chain_bgl, &table_bgl, &comp_bgl]);
++            Base {
++                arena,
++                dummy_buf,
++                dummy_sampler,
++                linear_clamp,
++                neutral,
++                light3d,
++                storage_dummy: HashMap::new(),
++                params,
++                table,
++                chain_bgl,
++                table_bgl,
++                prep_bgl,
++                comp_bgl,
++                table_pipeline,
++                prep_pipeline,
++                comp_layout,
++                comp_module,
++            }
++        })
++    }
++}
++
++const PARAMS_BYTES: u64 = 96;
++
++impl FxGpu {
++    fn log_once(&mut self, msg: String) {
++        if self.logged.len() < 4096 && self.logged.insert(msg.clone()) {
++            warn!("wowbg3 fx: {msg}");
++        }
++    }
++
++    fn module(&mut self, dev: &wgpu::Device, key: u64, m: &SpvModule, flip: bool) -> Result<wgpu::ShaderModule, String> {
++        if let Some(slot) = self.modules.get(&(key, flip)) {
++            return slot.clone().ok_or_else(|| format!("module {key:016x} failed before"));
++        }
++        let words: &[u32] = if flip {
++            match &m.flipped {
++                Ok(w) => w,
++                Err(e) => {
++                    self.modules.insert((key, flip), None);
++                    return Err(format!("module {key:016x}: cannot flip Y ({e})"));
++                }
++            }
++        } else {
++            &m.words
++        };
++        let label = format!("bg3 {key:016x}");
++        // SAFETY: BG3's own SPIR-V, as BG3 hands it to Vulkan (Y flip aside); the pipeline
++        // layout mirrors BG3's set layouts binding for binding.
++        let made = scoped(dev, || unsafe {
++            dev.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
++                label: Some(&label),
++                spirv: Some(std::borrow::Cow::Borrowed(words)),
++                ..Default::default()
++            })
++        });
++        match made {
++            Ok(module) => {
++                self.modules.insert((key, flip), Some(module.clone()));
++                Ok(module)
++            }
++            Err(e) => {
++                self.modules.insert((key, flip), None);
++                Err(format!("module {key:016x}: {e}"))
++            }
++        }
++    }
++
++    fn bgl(&mut self, dev: &wgpu::Device, key: &BglKey) -> Result<wgpu::BindGroupLayout, String> {
++        if let Some(slot) = self.bgls.get(key) {
++            return slot.clone().ok_or_else(|| "bind group layout failed before".to_string());
++        }
++        let entries: Vec<wgpu::BindGroupLayoutEntry> = key
++            .iter()
++            .map(|&(binding, kind, vis)| {
++                let ty = match kind {
++                    Kind::Ubo => wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: false,
++                        min_binding_size: None,
++                    },
++                    // Read-only for wgpu's usage tracking (one arena buffer serves every use);
++                    // Vulkan sees a plain STORAGE_BUFFER either way.
++                    Kind::Ssbo => wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Storage { read_only: true },
++                        has_dynamic_offset: false,
++                        min_binding_size: None,
++                    },
++                    Kind::Sampler(true) => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
++                    Kind::Sampler(false) | Kind::Dummy => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                    Kind::Tex { dim, scalar } => tex_ty(
++                        dim,
++                        match scalar {
++                            // Unfilterable takes every float format and depth; passthrough
++                            // pipelines are not checked for sampler pairing.
++                            Scalar::Float => UNFILTERABLE,
++                            Scalar::Uint => wgpu::TextureSampleType::Uint,
++                            Scalar::Sint => wgpu::TextureSampleType::Sint,
++                        },
++                    ),
++                    Kind::Storage { format, dim } => wgpu::BindingType::StorageTexture {
++                        access: wgpu::StorageTextureAccess::ReadOnly,
++                        format,
++                        view_dimension: dim,
++                    },
++                };
++                bgl_entry(binding, ty, vis)
++            })
++            .collect();
++        let made = scoped(dev, || {
++            dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("bg3 set"), entries: &entries })
++        });
++        self.bgls.insert(key.clone(), made.as_ref().ok().cloned());
++        made
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn build_pipe(
++        &mut self,
++        dev: &wgpu::Device,
++        key: PipeKey,
++        r: &Recipe,
++        vs: (u64, &SpvModule, &str),
++        fs: (u64, &SpvModule, &str),
++    ) -> Result<Pipe, String> {
++        let features = dev.features();
++        let limits = dev.limits();
++        // Bind group layouts: BG3's set layouts, dense (gaps get a dummy sampler).
++        let refl = [&vs.1.info, &fs.1.info];
++        let mut sampler_i = 0u32;
++        let mut keys = Vec::new();
++        for (si, slots) in r.sets.iter().enumerate() {
++            let max = slots.iter().map(|s| s.binding).max();
++            if max.is_some_and(|m| m >= 1000) {
++                return Err(format!("set {si}: binding {} too high", max.unwrap_or(0)));
++            }
++            let mut key_set: BglKey = Vec::new();
++            for b in 0..max.map_or(0, |m| m + 1) {
++                let found: Vec<_> = slots.iter().filter(|s| s.binding == b).collect();
++                let Some(slot) = found.first() else {
++                    key_set.push((b, Kind::Dummy, wgpu::ShaderStages::VERTEX_FRAGMENT));
++                    continue;
++                };
++                if found.len() > 1 {
++                    return Err(format!("set {si} binding {b} declared twice"));
++                }
++                if slot.count != 1 {
++                    return Err(format!("set {si} binding {b}: descriptor array of {}", slot.count));
++                }
++                let sb = refl.iter().find_map(|i| i.bindings.get(&(si as u32, b)).copied());
++                let kind = match slot.ty {
++                    6 | 8 => Kind::Ubo,
++                    7 | 9 => Kind::Ssbo,
++                    0 => {
++                        let cmp = sampler_i < 64 && key.1 & (1u64 << sampler_i) != 0;
++                        sampler_i += 1;
++                        Kind::Sampler(cmp)
++                    }
++                    2 => match sb {
++                        Some(SpvBind::Image { dim, arrayed, ms: false, storage: false, scalar, .. }) => Kind::Tex {
++                            dim: view_dim(dim, arrayed).ok_or_else(|| format!("set {si} binding {b}: image dim {dim}"))?,
++                            scalar,
++                        },
++                        None => Kind::Tex { dim: wgpu::TextureViewDimension::D2, scalar: Scalar::Float },
++                        Some(other) => return Err(format!("set {si} binding {b}: sampled image declared as {other:?}")),
++                    },
++                    3 => match sb {
++                        Some(SpvBind::Image { dim, arrayed, ms: false, format, .. }) => Kind::Storage {
++                            format: spv_storage_format(format)
++                                .ok_or_else(|| format!("set {si} binding {b}: storage format {format}"))?,
++                            dim: view_dim(dim, arrayed).ok_or_else(|| format!("set {si} binding {b}: image dim {dim}"))?,
++                        },
++                        None => Kind::Storage {
++                            format: wgpu::TextureFormat::R32Float,
++                            dim: wgpu::TextureViewDimension::D2,
++                        },
++                        Some(other) => return Err(format!("set {si} binding {b}: storage image declared as {other:?}")),
++                    },
++                    t => return Err(format!("set {si} binding {b}: descriptor type {t} not supported")),
++                };
++                key_set.push((b, kind, visibility(slot.stages)));
++            }
++            keys.push(key_set);
++        }
++        let mut bgls = Vec::new();
++        for k in &keys {
++            bgls.push((self.bgl(dev, k)?, k.clone()));
++        }
++        // Push constants: one range over the union of the stages.
++        let push = if r.push.is_empty() {
++            None
++        } else {
++            let end = r.push.iter().map(|p| p.1 + p.2).max().unwrap_or(0).next_multiple_of(4);
++            let stages = r.push.iter().fold(wgpu::ShaderStages::NONE, |v, p| v | visibility(p.0));
++            if !features.contains(wgpu::Features::PUSH_CONSTANTS) || end > limits.max_push_constant_size {
++                return Err(format!("push constants of {end} bytes not available"));
++            }
++            Some((stages, end))
++        };
++        let layout = {
++            let refs: Vec<&wgpu::BindGroupLayout> = bgls.iter().map(|b| &b.0).collect();
++            let ranges: Vec<wgpu::PushConstantRange> =
++                push.iter().map(|&(stages, end)| wgpu::PushConstantRange { stages, range: 0..end }).collect();
++            scoped(dev, || {
++                dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                    label: Some("bg3 layout"),
++                    bind_group_layouts: &refs,
++                    push_constant_ranges: &ranges,
++                })
++            })?
++        };
++        // Vertex input, compacted: slots in the recipe's binding order, bindings without
++        // attributes dropped (wgpu would drop them and shift the rest).
++        let mut slots = Vec::new();
++        let mut attrs: Vec<Vec<wgpu::VertexAttribute>> = Vec::new();
++        for a in &r.attributes {
++            if !r.bindings.iter().any(|b| b.binding == a.binding) {
++                return Err(format!("attribute {} on undeclared binding {}", a.location, a.binding));
++            }
++        }
++        for b in &r.bindings {
++            let mut list = Vec::new();
++            let mut last = 0u64;
++            for a in r.attributes.iter().filter(|a| a.binding == b.binding) {
++                let format = vk_vertex_format(a.format).ok_or_else(|| format!("vertex format {}", a.format))?;
++                last = last.max(a.offset as u64 + format.size());
++                list.push(wgpu::VertexAttribute { format, offset: a.offset as u64, shader_location: a.location });
++            }
++            if list.is_empty() {
++                continue;
++            }
++            if b.stride % 4 != 0 || b.stride > limits.max_vertex_buffer_array_stride {
++                return Err(format!("vertex stride {}", b.stride));
++            }
++            slots.push(VbSlot { binding: b.binding, stride: b.stride as u64, last_stride: last, instance: b.rate == 1 });
++            attrs.push(list);
++        }
++        if slots.len() > limits.max_vertex_buffers as usize {
++            return Err(format!("{} vertex buffers", slots.len()));
++        }
++        let layouts: Vec<wgpu::VertexBufferLayout> = slots
++            .iter()
++            .zip(&attrs)
++            .map(|(s, a)| wgpu::VertexBufferLayout {
++                array_stride: s.stride,
++                step_mode: if s.instance { wgpu::VertexStepMode::Instance } else { wgpu::VertexStepMode::Vertex },
++                attributes: a,
++            })
++            .collect();
++        // Fixed function.
++        let c = r.color.first().ok_or("no colour attachment")?;
++        let blend = if c.blend {
++            let comp = |src: u32, dst: u32, op: u32| -> Result<wgpu::BlendComponent, String> {
++                let operation = vk_blend_op(op).ok_or_else(|| format!("blend op {op}"))?;
++                let (mut s, mut d) = (
++                    vk_blend_factor(src).ok_or_else(|| format!("blend factor {src}"))?,
++                    vk_blend_factor(dst).ok_or_else(|| format!("blend factor {dst}"))?,
++                );
++                if matches!(operation, wgpu::BlendOperation::Min | wgpu::BlendOperation::Max) {
++                    (s, d) = (wgpu::BlendFactor::One, wgpu::BlendFactor::One);
++                }
++                if (s.ref_second_blend_source() || d.ref_second_blend_source())
++                    && !features.contains(wgpu::Features::DUAL_SOURCE_BLENDING)
++                {
++                    return Err("dual-source blending not available".into());
++                }
++                Ok(wgpu::BlendComponent { src_factor: s, dst_factor: d, operation })
++            };
++            Some(wgpu::BlendState { color: comp(c.src_c, c.dst_c, c.op_c)?, alpha: comp(c.src_a, c.dst_a, c.op_a)? })
++        } else {
++            None
++        };
++        // BG3's target has no alpha: ours stays at 1, so DST_ALPHA reads 1 as in BG3.
++        let write_mask = wgpu::ColorWrites::from_bits_truncate(c.mask & 7);
++        let topology = vk_topology(r.topology).ok_or_else(|| format!("topology {}", r.topology))?;
++        if r.polygon != 0 {
++            return Err(format!("polygon mode {}", r.polygon));
++        }
++        let cull_mode = match r.cull {
++            0 => None,
++            1 => Some(wgpu::Face::Front),
++            2 => Some(wgpu::Face::Back),
++            m => return Err(format!("cull mode {m}")),
++        };
++        // The Y flip keeps framebuffer positions, so BG3's winding holds.
++        let front_face = if r.front == 1 { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw };
++        let depth_stencil = wgpu::DepthStencilState {
++            format: DEPTH_FMT,
++            depth_write_enabled: false,
++            depth_compare: if r.depth_test != 0 { vk_compare(r.depth_compare) } else { wgpu::CompareFunction::Always },
++            stencil: wgpu::StencilState::default(),
++            bias: if r.bias_enable != 0 {
++                wgpu::DepthBiasState {
++                    constant: r.bias_constant.round() as i32,
++                    slope_scale: r.bias_slope,
++                    clamp: r.bias_clamp,
++                }
++            } else {
++                wgpu::DepthBiasState::default()
++            },
++        };
++        let vs_mod = self.module(dev, vs.0, vs.1, true)?;
++        let fs_mod = self.module(dev, fs.0, fs.1, false)?;
++        let targets = [Some(wgpu::ColorTargetState { format: COLOR_FMT, blend, write_mask })];
++        let label = format!("bg3 pipe {:016x}", key.0);
++        let pipeline = scoped(dev, || {
++            dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some(&label),
++                layout: Some(&layout),
++                vertex: wgpu::VertexState {
++                    module: &vs_mod,
++                    entry_point: Some(vs.2),
++                    compilation_options: Default::default(),
++                    buffers: &layouts,
++                },
++                primitive: wgpu::PrimitiveState {
++                    topology,
++                    strip_index_format: key.2,
++                    front_face,
++                    cull_mode,
++                    unclipped_depth: false,
++                    polygon_mode: wgpu::PolygonMode::Fill,
++                    conservative: false,
++                },
++                depth_stencil: Some(depth_stencil),
++                multisample: wgpu::MultisampleState::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &fs_mod,
++                    entry_point: Some(fs.2),
++                    compilation_options: Default::default(),
++                    targets: &targets,
++                }),
++                multiview: None,
++                cache: None,
++            })
++        })?;
++        Ok(Pipe { pipeline, bgls, slots, push })
++    }
++
++    fn sampler(&mut self, dev: &wgpu::Device, key: u64, s: &FxSampler) -> Option<wgpu::Sampler> {
++        if let Some(slot) = self.samplers.get(&key) {
++            return slot.clone();
++        }
++        let border_ok = dev.features().contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
++        let address = |m: u32| match m {
++            0 => wgpu::AddressMode::Repeat,
++            1 => wgpu::AddressMode::MirrorRepeat,
++            3 if border_ok => wgpu::AddressMode::ClampToBorder,
++            _ => wgpu::AddressMode::ClampToEdge,
++        };
++        let filter = |f: u32| if f == 0 { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
++        let (mag, min, mip) = (filter(s.mag), filter(s.min), filter(s.mip));
++        let all_linear = [mag, min, mip].iter().all(|f| *f == wgpu::FilterMode::Linear);
++        let lod_min = if s.min_lod.is_finite() { s.min_lod.max(0.0) } else { 0.0 };
++        let lod_max = if s.max_lod.is_finite() { s.max_lod.max(lod_min) } else { 32.0 };
++        let modes = [address(s.address[0]), address(s.address[1]), address(s.address[2])];
++        let desc = wgpu::SamplerDescriptor {
++            label: Some("bg3 sampler"),
++            address_mode_u: modes[0],
++            address_mode_v: modes[1],
++            address_mode_w: modes[2],
++            mag_filter: mag,
++            min_filter: min,
++            mipmap_filter: mip,
++            lod_min_clamp: lod_min,
++            lod_max_clamp: lod_max,
++            compare: s.compare.then(|| vk_compare(s.compare_op)),
++            anisotropy_clamp: if s.aniso && all_linear { (s.max_aniso.round() as u16).clamp(1, 16) } else { 1 },
++            border_color: modes.contains(&wgpu::AddressMode::ClampToBorder).then_some(match s.border {
++                2 | 3 => wgpu::SamplerBorderColor::OpaqueBlack,
++                4 | 5 => wgpu::SamplerBorderColor::OpaqueWhite,
++                _ => wgpu::SamplerBorderColor::TransparentBlack,
++            }),
++        };
++        let made = scoped(dev, || dev.create_sampler(&desc));
++        if let Err(e) = &made {
++            self.log_once(format!("sampler {key:016x}: {e}"));
++        }
++        let out = made.ok();
++        self.samplers.insert(key, out.clone());
++        out
++    }
++
++    fn texture(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, key: u64, t: &TexFile) -> bool {
++        if let Some(slot) = self.textures.get(&key) {
++            return slot.is_some();
++        }
++        let made = upload_texture(dev, queue, key, t);
++        if let Err(e) = &made {
++            self.log_once(format!("texture {key:016x}: {e}"));
++        }
++        let ok = made.is_ok();
++        self.textures.insert(key, made.ok());
++        ok
++    }
++
++    /// A view of a loaded texture in the dimension a binding wants; `None` when it cannot be.
++    fn texture_view(&mut self, dev: &wgpu::Device, key: u64, dim: wgpu::TextureViewDimension) -> Option<wgpu::TextureView> {
++        use wgpu::TextureViewDimension as D;
++        let g = self.textures.get_mut(&key)?.as_mut()?;
++        if let Some(v) = g.views.get(&dim) {
++            return v.clone();
++        }
++        let square = g.width == g.height;
++        let (fits, layers) = match dim {
++            D::D2 => (g.dim == wgpu::TextureDimension::D2, Some(1)),
++            D::D2Array => (g.dim == wgpu::TextureDimension::D2, None),
++            D::Cube => (g.dim == wgpu::TextureDimension::D2 && g.layers >= 6 && square, Some(6)),
++            D::CubeArray => (g.dim == wgpu::TextureDimension::D2 && g.layers >= 6 && g.layers % 6 == 0 && square, None),
++            D::D3 => (g.dim == wgpu::TextureDimension::D3, None),
++            D::D1 => (false, None),
++        };
++        let view = if fits {
++            let tex = &g.tex;
++            scoped(dev, || {
++                tex.create_view(&wgpu::TextureViewDescriptor {
++                    dimension: Some(dim),
++                    array_layer_count: layers,
++                    ..Default::default()
++                })
++            })
++            .ok()
++        } else {
++            None
++        };
++        g.views.insert(dim, view.clone());
++        view
++    }
++
++    fn storage_dummy(&mut self, dev: &wgpu::Device, format: wgpu::TextureFormat, dim: wgpu::TextureViewDimension) -> Option<wgpu::TextureView> {
++        let base = self.base.as_mut()?;
++        if let Some(v) = base.storage_dummy.get(&(format, dim)) {
++            return v.clone();
++        }
++        let tdim = match dim {
++            wgpu::TextureViewDimension::D3 => wgpu::TextureDimension::D3,
++            wgpu::TextureViewDimension::D1 => wgpu::TextureDimension::D1,
++            _ => wgpu::TextureDimension::D2,
++        };
++        let made = scoped(dev, || {
++            let t = dev.create_texture(&tex_desc(
++                "wowbg3_fx_storage_dummy",
++                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
++                tdim,
++                format,
++                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
++            ));
++            t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() })
++        })
++        .ok();
++        base.storage_dummy.insert((format, dim), made.clone());
++        made
++    }
++
++    /// The view a texture binding gets for a key (specials 1 to 5 included).
++    fn image_for(
++        &mut self,
++        dev: &wgpu::Device,
++        queue: &wgpu::Queue,
++        set: &FxFrameSet,
++        key: u64,
++        kind: Kind,
++    ) -> Result<wgpu::TextureView, Skip> {
++        let (Some(base), Some(t)) = (self.base.as_ref(), self.targets.as_ref()) else { return Err(Skip::Silent) };
++        match kind {
++            Kind::Tex { dim, scalar } => {
++                let neutral = base.neutral.get(&(dim, scalar)).cloned().ok_or(Skip::Silent)?;
++                let plain = dim == wgpu::TextureViewDimension::D2 && scalar == Scalar::Float;
++                let grid = dim == wgpu::TextureViewDimension::D3 && scalar == Scalar::Float;
++                match key {
++                    // 3: BG3's fog volume, none (no in-scattering, full transmittance).
++                    0 | 3 => Ok(neutral),
++                    1 if plain => Ok(t.depth.clone()),
++                    2 if plain => Ok(t.scene.clone()),
++                    4 if plain => Ok(t.lin_a.clone()),
++                    5 if grid => Ok(base.light3d.clone()),
++                    1..=5 => Ok(neutral),
++                    k => {
++                        let Some(file) = set.textures.get(&k) else { return Err(Skip::Pending) };
++                        if !self.texture(dev, queue, k, file) {
++                            return Err(Skip::Once(format!("texture {k:016x} unusable (drawn without it)")));
++                        }
++                        let fmt = self.textures.get(&k).and_then(|g| g.as_ref()).map(|g| g.format);
++                        let kind_ok = match (fmt.and_then(|f| f.sample_type(None, Some(dev.features()))), scalar) {
++                            (Some(wgpu::TextureSampleType::Float { .. } | wgpu::TextureSampleType::Depth), Scalar::Float) => true,
++                            (Some(wgpu::TextureSampleType::Uint), Scalar::Uint) => true,
++                            (Some(wgpu::TextureSampleType::Sint), Scalar::Sint) => true,
++                            _ => false,
++                        };
++                        match self.texture_view(dev, k, dim).filter(|_| kind_ok) {
++                            Some(v) => Ok(v),
++                            None => {
++                                self.log_once(format!("texture {k:016x} does not fit a {dim:?} {scalar:?} binding: neutral"));
++                                Ok(self.base.as_ref().and_then(|b| b.neutral.get(&(dim, scalar)).cloned()).ok_or(Skip::Silent)?)
++                            }
++                        }
++                    }
++                }
++            }
++            Kind::Storage { format, dim } => {
++                if key == 4 && format == wgpu::TextureFormat::R32Float && dim == wgpu::TextureViewDimension::D2 {
++                    return Ok(t.lin_b.clone());
++                }
++                self.storage_dummy(dev, format, dim)
++                    .ok_or_else(|| Skip::Once(format!("no storage image of {format:?} {dim:?}")))
++            }
++            _ => Err(Skip::Silent),
++        }
++    }
++
++    fn prepare_draw(
++        &mut self,
++        dev: &wgpu::Device,
++        queue: &wgpu::Queue,
++        set: &FxFrameSet,
++        d: &FxDraw,
++        arena_len: u64,
++    ) -> Result<PreparedDraw, Skip> {
++        let pipe_name = format!("pipe {:016x}", d.pipe);
++        let Some(r) = set.recipes.get(&d.pipe) else { return Err(Skip::Once(format!("{pipe_name}: no recipe"))) };
++        if d.count == 0 || d.instances == 0 || r.cull == 3 {
++            return Err(Skip::Silent);
++        }
++        if self.cfg.skip.contains(&d.pipe) || (!self.cfg.only.is_empty() && !self.cfg.only.contains(&d.pipe)) {
++            return Err(Skip::Silent);
++        }
++        let stage = |bit: u32| r.stages.iter().find(|s| s.stage == bit);
++        if r.stages.iter().any(|s| s.stage != 1 && s.stage != 0x10) {
++            return Err(Skip::Once(format!("{pipe_name}: stages other than vertex and fragment")));
++        }
++        let (Some(vs), Some(fs)) = (stage(1), stage(0x10)) else {
++            return Err(Skip::Once(format!("{pipe_name}: needs a vertex and a fragment stage")));
++        };
++        let (Some(vm), Some(fm)) = (set.spv.get(&vs.spv), set.spv.get(&fs.spv)) else {
++            return Err(Skip::Once(format!("{pipe_name}: SPIR-V missing")));
++        };
++        let blob_len = set.frame.blob.len() as u64;
++        let slot_of = |s: u32, b: u32| {
++            d.sets.iter().find(|x| x.set == s).and_then(|x| x.slots.iter().find(|y| y.binding == b)).map(|y| y.res)
++        };
++        // Comparison samplers (by the bound sampler) decide the pipeline variant.
++        let mut mask = 0u64;
++        let mut i = 0u32;
++        for (si, slots) in r.sets.iter().enumerate() {
++            for b in 0..slots.iter().map(|s| s.binding + 1).max().unwrap_or(0) {
++                let Some(slot) = slots.iter().find(|s| s.binding == b) else { continue };
++                if slot.ty != 0 {
++                    continue;
++                }
++                let Some(SlotRes::Sampler(k)) = slot_of(si as u32, b) else {
++                    return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b} has no sampler")));
++                };
++                let Some(s) = set.samplers.get(&k) else { return Err(Skip::Pending) };
++                if s.compare && i < 64 {
++                    mask |= 1u64 << i;
++                }
++                i += 1;
++            }
++        }
++        let index_fmt = match d.index_type {
++            1 => Some(wgpu::IndexFormat::Uint16),
++            2 => Some(wgpu::IndexFormat::Uint32),
++            _ => None,
++        };
++        let strip = (matches!(r.topology, 2 | 4) && r.restart != 0).then_some(index_fmt).flatten();
++        let key: PipeKey = (d.pipe, mask, strip);
++        let pipe = match self.pipes.get(&key) {
++            Some(Some(p)) => p.clone(),
++            Some(None) => return Err(Skip::Silent),
++            None => {
++                let built = self.build_pipe(dev, key, r, (vs.spv, &**vm, vs.entry.as_str()), (fs.spv, &**fm, fs.entry.as_str()));
++                match built {
++                    Ok(p) => {
++                        let p = Arc::new(p);
++                        self.pipes.insert(key, Some(p.clone()));
++                        info!("wowbg3 fx: built {pipe_name} ({} sets, {} vertex buffers)", p.bgls.len(), p.slots.len());
++                        p
++                    }
++                    Err(e) => {
++                        self.pipes.insert(key, None);
++                        return Err(Skip::Once(format!("{pipe_name}: {e} (skipped from now on)")));
++                    }
++                }
++            }
++        };
++        // Bind groups, one per set, every binding filled.
++        let limits = dev.limits();
++        let mut groups = Vec::with_capacity(pipe.bgls.len());
++        for (si, (layout, keys)) in pipe.bgls.iter().enumerate() {
++            enum Bound {
++                Buf(wgpu::Buffer, u64, u64),
++                Sampler(wgpu::Sampler),
++                View(wgpu::TextureView),
++            }
++            let mut bound = Vec::with_capacity(keys.len());
++            for &(b, kind, _) in keys {
++                let res = if kind == Kind::Dummy { None } else { slot_of(si as u32, b) };
++                let base = self.base.as_ref().ok_or(Skip::Silent)?;
++                let entry = match (kind, res) {
++                    (Kind::Dummy, _) => Bound::Sampler(base.dummy_sampler.clone()),
++                    (Kind::Ubo | Kind::Ssbo, Some(SlotRes::Buffer { blob, size })) => {
++                        let (blob, size) = (blob as u64, size as u64);
++                        if size == 0 {
++                            Bound::Buf(base.dummy_buf.clone(), 0, 256)
++                        } else {
++                            let (align, max) = if kind == Kind::Ubo {
++                                (limits.min_uniform_buffer_offset_alignment, limits.max_uniform_buffer_binding_size)
++                            } else {
++                                (limits.min_storage_buffer_offset_alignment, limits.max_storage_buffer_binding_size)
++                            };
++                            if blob % align as u64 != 0 || blob + size > blob_len {
++                                return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b} buffer range {blob}+{size}")));
++                            }
++                            let size = size.next_multiple_of(4).min(max as u64).min(arena_len - blob);
++                            Bound::Buf(base.arena.clone(), blob, size)
++                        }
++                    }
++                    (Kind::Sampler(_), Some(SlotRes::Sampler(k))) => {
++                        let Some(s) = set.samplers.get(&k) else { return Err(Skip::Pending) };
++                        let s = **s;
++                        match self.sampler(dev, k, &s) {
++                            Some(x) => Bound::Sampler(x),
++                            None => return Err(Skip::Once(format!("{pipe_name}: sampler {k:016x} unusable"))),
++                        }
++                    }
++                    (Kind::Tex { .. } | Kind::Storage { .. }, Some(SlotRes::Image(k))) => {
++                        Bound::View(self.image_for(dev, queue, set, k, kind)?)
++                    }
++                    (k, res) => {
++                        return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b}: {k:?} bound to {res:?}")));
++                    }
++                };
++                bound.push((b, entry));
++            }
++            let entries: Vec<wgpu::BindGroupEntry> = bound
++                .iter()
++                .map(|(b, e)| wgpu::BindGroupEntry {
++                    binding: *b,
++                    resource: match e {
++                        Bound::Buf(buf, off, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: buf,
++                            offset: *off,
++                            size: NonZeroU64::new(*size),
++                        }),
++                        Bound::Sampler(s) => wgpu::BindingResource::Sampler(s),
++                        Bound::View(v) => wgpu::BindingResource::TextureView(v),
++                    },
++                })
++                .collect();
++            let group = scoped(dev, || {
++                dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bg3 group"), layout, entries: &entries })
++            })
++            .map_err(|e| Skip::Once(format!("{pipe_name}: set {si}: {e}")))?;
++            groups.push(group);
++        }
++        // Vertex and index buffers, checked as wgpu checks them.
++        let mut vbs = Vec::with_capacity(pipe.slots.len());
++        for s in &pipe.slots {
++            let Some(vb) = d.vbs.iter().find(|v| v.binding == s.binding) else {
++                return Err(Skip::Once(format!("{pipe_name}: vertex binding {} not bound", s.binding)));
++            };
++            let (off, size) = (vb.blob as u64, vb.size as u64);
++            if size == 0 || off % 4 != 0 || off + size > blob_len {
++                return Err(Skip::Once(format!("{pipe_name}: vertex binding {} range {off}+{size}", s.binding)));
++            }
++            vbs.push((off, size));
++        }
++        let sizes: Vec<u64> = vbs.iter().map(|v| v.1).collect();
++        let (vlimit, ilimit) = vertex_limits(&pipe.slots, &sizes);
++        if d.first_instance as u64 + d.instances as u64 > ilimit {
++            return Err(Skip::Once(format!("{pipe_name}: instances past the instance buffers")));
++        }
++        let index = if d.indexed {
++            let Some(fmt) = index_fmt else { return Err(Skip::Once(format!("{pipe_name}: index type {}", d.index_type))) };
++            let isz = if fmt == wgpu::IndexFormat::Uint16 { 2 } else { 4 };
++            let (off, size) = (d.index_blob as u64, d.index_size as u64);
++            if size == 0 || off % isz != 0 || off + size > blob_len || (d.first as u64 + d.count as u64) * isz > size {
++                return Err(Skip::Once(format!("{pipe_name}: index range {off}+{size} for {}+{}", d.first, d.count)));
++            }
++            Some((off, size, fmt))
++        } else {
++            if d.first as u64 + d.count as u64 > vlimit {
++                return Err(Skip::Once(format!("{pipe_name}: vertices past the vertex buffers")));
++            }
++            None
++        };
++        let push = pipe.push.map(|(stages, size)| {
++            let mut data = d.push.clone();
++            data.resize(size as usize, 0);
++            (stages, data)
++        });
++        Ok(PreparedDraw {
++            pipeline: pipe.pipeline.clone(),
++            groups,
++            vbs,
++            index,
++            count: d.count,
++            instances: d.instances,
++            first: d.first,
++            base_vertex: d.vertex_offset,
++            first_instance: d.first_instance,
++            push,
++        })
++    }
++
++    fn ensure_targets(&mut self, dev: &wgpu::Device, w: u32, h: u32) -> bool {
++        if self.targets.as_ref().is_some_and(|t| t.size == (w, h)) {
++            return true;
++        }
++        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
++        let ra = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
++        let d2 = wgpu::TextureDimension::D2;
++        let made = scoped(dev, || {
++            let mk = |label, format, usage| plain_view(&dev.create_texture(&tex_desc(label, size, d2, format, usage)));
++            Targets {
++                size: (w, h),
++                depth: mk("wowbg3_fx_depth", DEPTH_FMT, ra),
++                lin_a: mk("wowbg3_fx_lin", wgpu::TextureFormat::R32Float, ra),
++                lin_b: mk("wowbg3_fx_lin_storage", wgpu::TextureFormat::R32Float, ra | wgpu::TextureUsages::STORAGE_BINDING),
++                scene: mk("wowbg3_fx_scene", COLOR_FMT, ra),
++                c: mk("wowbg3_fx_over_black", COLOR_FMT, ra),
++                w: mk("wowbg3_fx_over_white", COLOR_FMT, ra),
++            }
++        });
++        match made {
++            Ok(t) => {
++                self.targets = Some(t);
++                true
++            }
++            Err(e) => {
++                self.log_once(format!("targets {w}x{h}: {e}"));
++                false
++            }
++        }
++    }
++
++    fn composite(&mut self, dev: &wgpu::Device, format: wgpu::TextureFormat) -> Option<wgpu::RenderPipeline> {
++        if let Some(p) = self.composites.get(&format) {
++            return p.clone();
++        }
++        let base = self.base.as_ref()?;
++        let made = scoped(dev, || {
++            dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some("wowbg3_fx_composite"),
++                layout: Some(&base.comp_layout),
++                vertex: wgpu::VertexState {
++                    module: &base.comp_module,
++                    entry_point: Some("vs"),
++                    compilation_options: Default::default(),
++                    buffers: &[],
++                },
++                primitive: wgpu::PrimitiveState::default(),
++                depth_stencil: None,
++                multisample: wgpu::MultisampleState::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &base.comp_module,
++                    entry_point: Some("fs_comp"),
++                    compilation_options: Default::default(),
++                    targets: &[Some(format.into())],
++                }),
++                multiview: None,
++                cache: None,
++            })
++        });
++        if let Err(e) = &made {
++            self.log_once(format!("composite for {format:?}: {e}"));
++        }
++        let p = made.ok();
++        self.composites.insert(format, p.clone());
++        p
++    }
++
++    /// BG3's grading and display LUTs as views, when the post block names usable ones.
++    fn luts(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, set: &FxFrameSet) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
++        let post = set.frame.post.filter(|p| p.have & 24 == 24)?;
++        let mut one = |k: u64| -> Option<wgpu::TextureView> {
++            let file = set.textures.get(&k)?;
++            if !self.texture(dev, queue, k, file) {
++                return None;
++            }
++            let g = self.textures.get(&k)?.as_ref()?;
++            let filterable = g.format.guaranteed_format_features(dev.features()).flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
++            if !filterable {
++                return None;
++            }
++            self.texture_view(dev, k, wgpu::TextureViewDimension::D3)
++        };
++        Some((one(post.grade_lut)?, one(post.display_lut)?))
++    }
++
++    /// Rebuilds the frame's GPU state: arena, targets, draws, the composite's bind groups.
++    fn rebuild(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, set: &FxFrameSet, format: wgpu::TextureFormat) -> Option<Ready> {
++        let (w, h) = (set.frame.width, set.frame.height);
++        if !self.ensure_targets(dev, w, h) {
++            return None;
++        }
++        // The blob area into the arena (grown as needed).
++        let blob = &set.frame.blob;
++        let need = (blob.len() as u64 + 256).next_multiple_of(256);
++        let max = dev.limits().max_buffer_size;
++        if need > max {
++            self.log_once(format!("frame blob of {} bytes too large", blob.len()));
++            return None;
++        }
++        {
++            let base = self.base.as_mut()?;
++            if base.arena.size() < need {
++                let size = need.next_power_of_two().min(max);
++                match scoped(dev, || {
++                    dev.create_buffer(&wgpu::BufferDescriptor {
++                        label: Some("wowbg3_fx_arena"),
++                        size,
++                        usage: wgpu::BufferUsages::VERTEX
++                            | wgpu::BufferUsages::INDEX
++                            | wgpu::BufferUsages::UNIFORM
++                            | wgpu::BufferUsages::STORAGE
++                            | wgpu::BufferUsages::COPY_DST,
++                        mapped_at_creation: false,
++                    })
++                }) {
++                    Ok(b) => base.arena = b,
++                    Err(e) => {
++                        warn!("wowbg3 fx: arena of {size} bytes: {e}");
++                        return None;
++                    }
++                }
++            }
++            let whole = blob.len() / 4 * 4;
++            if whole > 0 {
++                queue.write_buffer(&base.arena, 0, &blob[..whole]);
++            }
++            if whole < blob.len() {
++                let mut tail = [0u8; 4];
++                tail[..blob.len() - whole].copy_from_slice(&blob[whole..]);
++                queue.write_buffer(&base.arena, whole as u64, &tail);
++            }
++        }
++        let arena_len = self.base.as_ref()?.arena.size();
++        let mut draws = Vec::with_capacity(set.frame.draws.len());
++        let mut skipped = 0;
++        for d in &set.frame.draws {
++            match self.prepare_draw(dev, queue, set, d, arena_len) {
++                Ok(p) => draws.push(p),
++                Err(Skip::Once(m)) => {
++                    skipped += 1;
++                    self.log_once(m);
++                }
++                Err(Skip::Pending | Skip::Silent) => skipped += 1,
++            }
++        }
++        self.last_counts = (draws.len(), skipped);
++        let luts = self.luts(dev, queue, set);
++        self.mode = if luts.is_some() { 1.0 } else { 0.0 };
++        if luts.is_none() && set.frame.post.is_some() {
++            self.log_once("BG3's grading or display LUT unusable: plain sRGB composite".to_string());
++        }
++        let composite = self.composite(dev, format)?;
++        let base = self.base.as_ref()?;
++        let t = self.targets.as_ref()?;
++        let (glut, dlut) = luts.unwrap_or_else(|| {
++            let n = base.neutral[&(wgpu::TextureViewDimension::D3, Scalar::Float)].clone();
++            (n.clone(), n)
++        });
++        let groups = scoped(dev, || {
++            let chain_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("wowbg3_fx_chain"),
++                layout: &base.chain_bgl,
++                entries: &[
++                    wgpu::BindGroupEntry { binding: 0, resource: base.params.as_entire_binding() },
++                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&glut) },
++                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&base.linear_clamp) },
++                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dlut) },
++                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&base.linear_clamp) },
++                ],
++            });
++            let table_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("wowbg3_fx_table"),
++                layout: &base.table_bgl,
++                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&base.table) }],
++            });
++            (chain_bg, table_bg)
++        });
++        let (chain_bg, table_bg) = match groups {
++            Ok(g) => g,
++            Err(e) => {
++                warn!("wowbg3 fx: composite bind groups: {e}");
++                return None;
++            }
++        };
++        Some(Ready {
++            arena: base.arena.clone(),
++            draws,
++            chain_bg,
++            table_bg,
++            table_view: base.table.clone(),
++            table_pipeline: base.table_pipeline.clone(),
++            prep_pipeline: base.prep_pipeline.clone(),
++            prep_bgl: base.prep_bgl.clone(),
++            comp_bgl: base.comp_bgl.clone(),
++            composite,
++            composite_format: format,
++            depth: t.depth.clone(),
++            lin_a: t.lin_a.clone(),
++            lin_b: t.lin_b.clone(),
++            scene: t.scene.clone(),
++            c: t.c.clone(),
++            w: t.w.clone(),
++        })
++    }
++}
++
++fn upload_texture(dev: &wgpu::Device, queue: &wgpu::Queue, key: u64, t: &TexFile) -> Result<GpuTex, String> {
++    let format = vk_texture_format(t.format).ok_or_else(|| format!("VkFormat {}", t.format))?;
++    if !dev.features().contains(format.required_features()) {
++        return Err(format!("{format:?} needs {:?}", format.required_features()));
++    }
++    if matches!(t.view_type, 0 | 4) {
++        return Err("1D textures are not replayed".into());
++    }
++    let three_d = t.view_type == 2 || t.depth > 1;
++    if three_d && t.layers != 1 {
++        return Err("3D texture with layers".into());
++    }
++    let limits = dev.limits();
++    let maxd = if three_d { limits.max_texture_dimension_3d } else { limits.max_texture_dimension_2d };
++    if t.width > maxd || t.height > maxd || t.depth > maxd || t.layers > limits.max_texture_array_layers {
++        return Err(format!("{}x{}x{}x{} too large", t.width, t.height, t.depth, t.layers));
++    }
++    let (bw, bh) = format.block_dimensions();
++    let bsize = format.block_copy_size(None).ok_or("no block size")? as u64;
++    if t.width % bw != 0 || t.height % bh != 0 {
++        return Err(format!("{}x{} is not whole blocks of {format:?}", t.width, t.height));
++    }
++    let dim = if three_d { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 };
++    let size = wgpu::Extent3d {
++        width: t.width,
++        height: t.height,
++        depth_or_array_layers: if three_d { t.depth } else { t.layers },
++    };
++    if t.mips > size.max_mips(dim) {
++        return Err(format!("{} mips", t.mips));
++    }
++    // (layer, mip, offset, physical extent, bytes per row, rows)
++    let mut parts = Vec::new();
++    let mut off = 0u64;
++    for layer in 0..t.layers {
++        for mip in 0..t.mips {
++            let mw = (t.width >> mip).max(1);
++            let mh = (t.height >> mip).max(1);
++            let md = if three_d { (t.depth >> mip).max(1) } else { 1 };
++            let (pw, ph) = (mw.next_multiple_of(bw), mh.next_multiple_of(bh));
++            let bpr = (pw / bw) as u64 * bsize;
++            let rows = (ph / bh) as u64;
++            let bytes = bpr * rows * md as u64;
++            parts.push((layer, mip, off, wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: md }, bpr, rows));
++            off += bytes;
++        }
++    }
++    let data = t.data();
++    if (data.len() as u64) < off {
++        return Err(format!("{} bytes of data, {off} needed", data.len()));
++    }
++    let label = format!("bg3 tex {key:016x}");
++    let tex = scoped(dev, || {
++        let tex = dev.create_texture(&wgpu::TextureDescriptor {
++            label: Some(&label),
++            size,
++            mip_level_count: t.mips,
++            sample_count: 1,
++            dimension: dim,
++            format,
++            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++            view_formats: &[],
++        });
++        for &(layer, mip, o, extent, bpr, rows) in &parts {
++            let end = o + bpr * rows * extent.depth_or_array_layers as u64;
++            queue.write_texture(
++                wgpu::TexelCopyTextureInfo {
++                    texture: &tex,
++                    mip_level: mip,
++                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
++                    aspect: wgpu::TextureAspect::All,
++                },
++                &data[o as usize..end as usize],
++                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr as u32), rows_per_image: Some(rows as u32) },
++                extent,
++            );
++        }
++        tex
++    })?;
++    Ok(GpuTex {
++        dim,
++        width: t.width,
++        height: t.height,
++        layers: t.layers,
++        format,
++        tex,
++        views: HashMap::new(),
++    })
++}
++
++fn prepare_fx(
++    mut gpu: ResMut<FxGpu>,
++    ext: Option<Res<FxExtract>>,
++    device: Res<RenderDevice>,
++    queue: Res<RenderQueue>,
++    views: Query<(&ExtractedView, &ViewTarget), With<FxView>>,
++) {
++    let gpu = &mut *gpu;
++    let set = ext.and_then(|e| e.set.clone());
++    let (Some(set), Ok((view, target))) = (set, views.single()) else {
++        gpu.ready = None;
++        gpu.last = None;
++        return;
++    };
++    let dev = device.wgpu_device();
++    if gpu.base.is_none() {
++        if gpu.base_failed {
++            return;
++        }
++        let f = dev.features();
++        info!(
++            "wowbg3 fx: device has SPIR-V passthrough {}, BC {}, push constants {}, {} bind groups, {} vertex buffers",
++            f.contains(wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS),
++            f.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
++            f.contains(wgpu::Features::PUSH_CONSTANTS),
++            dev.limits().max_bind_groups,
++            dev.limits().max_vertex_buffers
++        );
++        if !f.contains(wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS) {
++            error!("wowbg3 fx: no SPIR-V passthrough on this device; BG3's effects are not replayed");
++            gpu.base_failed = true;
++            return;
++        }
++        match Base::new(dev, &queue, gpu.cfg.light) {
++            Ok(b) => gpu.base = Some(b),
++            Err(e) => {
++                error!("wowbg3 fx: setup failed: {e}");
++                gpu.base_failed = true;
++                return;
++            }
++        }
++    }
++    let format = target.main_texture_format();
++    let fresh = !gpu.last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &set));
++    if fresh {
++        gpu.ready = gpu.rebuild(dev, &queue, &set, format).map(Arc::new);
++        gpu.last = Some(set.clone());
++    }
++    // Per-frame constants (the near plane and depth offset move with WoW's camera).
++    let size = target.main_texture().size();
++    let near = view.clip_from_view.w_axis.z;
++    let (p22, p32, far) = set.frame.view.map_or((-1e-5, 0.1, 10_000.0), |v| (v.p22, v.p32, v.far));
++    let post = set.frame.post;
++    let grade = post.filter(|p| p.have & 8 != 0).map_or([1.0, 0.0, 0.0, 0.0], |p| p.grade);
++    let fade = post.filter(|p| p.have & 16 != 0).map_or(0.0, |p| p.fade);
++    let params: [f32; 24] = [
++        set.frame.width as f32,
++        set.frame.height as f32,
++        size.width as f32,
++        size.height as f32,
++        near,
++        crate::wowbg3_lead::depth_offset(),
++        far,
++        YD,
++        p22,
++        p32,
++        gpu.cfg.slack,
++        0.0,
++        set.exposure,
++        fade,
++        gpu.mode,
++        gpu.cfg.show,
++        grade[0],
++        grade[1],
++        grade[2],
++        grade[3],
++        TABLE_LO,
++        TABLE_HI,
++        TABLE_N as f32,
++        0.0,
++    ];
++    if let Some(base) = gpu.base.as_ref() {
++        queue.write_buffer(&base.params, 0, bytemuck::cast_slice(&params));
++    }
++    // Once a second: what was replayed.
++    let (replayed, skipped) = gpu.last_counts;
++    let st = &mut gpu.stats;
++    st.frames += 1;
++    st.replayed += replayed as u64;
++    st.skipped += skipped as u64;
++    let since = *st.since.get_or_insert_with(Instant::now);
++    if since.elapsed().as_secs_f32() >= 1.0 {
++        info!(
++            "wowbg3 fx: BG3 frame {}: {replayed} draws replayed, {skipped} skipped (last second: {} frames, {} replayed, {} skipped), {} colours, exposure {:.3}",
++            set.frame.frame,
++            st.frames,
++            st.replayed,
++            st.skipped,
++            if gpu.mode > 0.5 { "BG3's" } else { "sRGB" },
++            set.exposure
++        );
++        *st = Stats { since: Some(Instant::now()), ..Default::default() };
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// The node
++
++#[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
++struct FxLabel;
++
++#[derive(Default)]
++struct FxNode;
++
++impl FxGpu {
++    fn node_note(&self, msg: String) {
++        if let Ok(mut l) = self.node_log.lock() {
++            if l.len() < 256 && l.insert(msg.clone()) {
++                warn!("wowbg3 fx: {msg}");
++            }
++        }
++    }
++}
++
++fn color_pass<'e>(
++    enc: &'e mut wgpu::CommandEncoder,
++    label: &str,
++    views: &[&wgpu::TextureView],
++    clear: wgpu::Color,
++    depth: Option<(&wgpu::TextureView, bool)>,
++) -> wgpu::RenderPass<'e> {
++    let atts: Vec<Option<wgpu::RenderPassColorAttachment>> = views
++        .iter()
++        .map(|v| {
++            Some(wgpu::RenderPassColorAttachment {
++                view: v,
++                depth_slice: None,
++                resolve_target: None,
++                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
++            })
++        })
++        .collect();
++    enc.begin_render_pass(&wgpu::RenderPassDescriptor {
++        label: Some(label),
++        color_attachments: &atts,
++        depth_stencil_attachment: depth.map(|(view, write)| wgpu::RenderPassDepthStencilAttachment {
++            view,
++            depth_ops: write.then_some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
++            stencil_ops: None,
++        }),
++        timestamp_writes: None,
++        occlusion_query_set: None,
++    })
++}
++
++fn replay(pass: &mut wgpu::RenderPass, r: &Ready) {
++    for d in &r.draws {
++        pass.set_pipeline(&d.pipeline);
++        for (i, g) in d.groups.iter().enumerate() {
++            pass.set_bind_group(i as u32, g, &[]);
++        }
++        for (slot, &(off, size)) in d.vbs.iter().enumerate() {
++            pass.set_vertex_buffer(slot as u32, r.arena.slice(off..off + size));
++        }
++        if let Some((stages, data)) = &d.push {
++            pass.set_push_constants(*stages, 0, data);
++        }
++        let inst = d.first_instance..d.first_instance + d.instances;
++        match d.index {
++            Some((off, size, fmt)) => {
++                pass.set_index_buffer(r.arena.slice(off..off + size), fmt);
++                pass.draw_indexed(d.first..d.first + d.count, d.base_vertex, inst);
++            }
++            None => pass.draw(d.first..d.first + d.count, inst),
++        }
++    }
++}
++
++impl ViewNode for FxNode {
++    type ViewQuery = (&'static ViewTarget, &'static ViewDepthTexture, &'static FxView);
++
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        rc: &mut RenderContext,
++        (target, depth, _): QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let Some(gpu) = world.get_resource::<FxGpu>() else { return Ok(()) };
++        let Some(r) = gpu.ready.clone() else { return Ok(()) };
++        if r.draws.is_empty() {
++            return Ok(());
++        }
++        if target.main_texture_format() != r.composite_format {
++            return Ok(());
++        }
++        if !depth.texture.usage().contains(TextureUsages::TEXTURE_BINDING) || depth.texture.format() != DEPTH_FMT {
++            gpu.node_note(format!("the world depth ({:?}) cannot be sampled yet", depth.texture.format()));
++            return Ok(());
++        }
++        if !target.main_texture().usage().contains(TextureUsages::TEXTURE_BINDING) || target.main_texture().sample_count() != 1 {
++            gpu.node_note("the world colour cannot be sampled (MSAA on?)".to_string());
++            return Ok(());
++        }
++        let dev = rc.render_device().wgpu_device().clone();
++        let depth_view: &wgpu::TextureView = depth.view();
++        let main_view: &wgpu::TextureView = target.main_texture_view();
++        // Steps 1-3 in a command buffer of their own: an error there drops only the replay.
++        let recorded = scoped(&dev, || {
++            let prep_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("wowbg3_fx_prep"),
++                layout: &r.prep_bgl,
++                entries: &[
++                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_view) },
++                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(main_view) },
++                ],
++            });
++            let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wowbg3_fx") });
++            {
++                let mut pass = color_pass(&mut enc, "wowbg3_fx_table", &[&r.table_view], wgpu::Color::BLACK, None);
++                pass.set_pipeline(&r.table_pipeline);
++                pass.set_bind_group(0, &r.chain_bg, &[]);
++                pass.draw(0..3, 0..1);
++            }
++            {
++                let mut pass = color_pass(
++                    &mut enc,
++                    "wowbg3_fx_prep",
++                    &[&r.lin_a, &r.lin_b, &r.scene],
++                    wgpu::Color::BLACK,
++                    Some((&r.depth, true)),
++                );
++                pass.set_pipeline(&r.prep_pipeline);
++                pass.set_bind_group(0, &r.chain_bg, &[]);
++                pass.set_bind_group(1, &r.table_bg, &[]);
++                pass.set_bind_group(2, &prep_bg, &[]);
++                pass.draw(0..3, 0..1);
++            }
++            for (view, clear, label) in [
++                (&r.c, wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, "wowbg3_fx_over_black"),
++                (&r.w, wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, "wowbg3_fx_over_white"),
++            ] {
++                let mut pass = color_pass(&mut enc, label, &[view], clear, Some((&r.depth, false)));
++                replay(&mut pass, &r);
++            }
++            enc.finish()
++        });
++        let cb = match recorded {
++            Ok(cb) => cb,
++            Err(e) => {
++                gpu.node_note(format!("replay dropped: {e}"));
++                return Ok(());
++            }
++        };
++        rc.add_command_buffer(cb);
++        // Step 4: composite into the view target (its bind group first, so nothing is swapped
++        // when it cannot be made).
++        let comp_bg = scoped(&dev, || {
++            dev.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("wowbg3_fx_comp"),
++                layout: &r.comp_bgl,
++                entries: &[
++                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(main_view) },
++                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r.c) },
++                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&r.w) },
++                ],
++            })
++        });
++        let comp_bg = match comp_bg {
++            Ok(g) => g,
++            Err(e) => {
++                gpu.node_note(format!("composite skipped: {e}"));
++                return Ok(());
++            }
++        };
++        let post = target.post_process_write();
++        let dest: &wgpu::TextureView = post.destination;
++        let mut pass = color_pass(rc.command_encoder(), "wowbg3_fx_composite", &[dest], wgpu::Color::BLACK, None);
++        pass.set_pipeline(&r.composite);
++        pass.set_bind_group(0, &r.chain_bg, &[]);
++        pass.set_bind_group(1, &r.table_bg, &[]);
++        pass.set_bind_group(2, &comp_bg, &[]);
++        pass.draw(0..3, 0..1);
++        Ok(())
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// WGSL: the display chain, its inverse, the passes
++
++const WGSL_PRELUDE: &str = r#"
++struct Params {
++    sizes: vec4<f32>,   // BG3's extent (w, h), the view's (w, h)
++    depth: vec4<f32>,   // WoW near (yd), depth offset (yd), BG3's far (m), metres per yard
++    proj: vec4<f32>,    // BG3: depth = p22 + p32 / z; depth slack (m)
++    post: vec4<f32>,    // exposure, fade, mode (1: BG3's chain, 0: sRGB), show (1 C, 2 T)
++    grade: vec4<f32>,
++    table: vec4<f32>,   // log2 of the lowest and highest x, entries
++};
++@group(0) @binding(0) var<uniform> P: Params;
++@group(0) @binding(1) var grade_lut: texture_3d<f32>;
++@group(0) @binding(2) var grade_smp: sampler;
++@group(0) @binding(3) var display_lut: texture_3d<f32>;
++@group(0) @binding(4) var display_smp: sampler;
++
++struct VOut { @builtin(position) pos: vec4<f32> };
++
++@vertex
++fn vs(@builtin(vertex_index) i: u32) -> VOut {
++    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
++    var o: VOut;
++    o.pos = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
++    return o;
++}
++
++fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
++    let lo = c / 12.92;
++    let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
++    return select(hi, lo, c <= vec3<f32>(0.04045));
++}
++
++fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
++    let lo = c * 12.92;
++    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);
++    return select(hi, lo, c <= vec3<f32>(0.0031308));
++}
++
++fn rgb_hue(c: vec3<f32>) -> f32 {
++    let v = max(c.r, max(c.g, c.b));
++    let d = v - min(c.r, min(c.g, c.b));
++    if (d <= 0.0) {
++        return 0.0;
++    }
++    var h: f32;
++    if (v == c.r) {
++        h = (c.g - c.b) / d;
++    } else if (v == c.g) {
++        h = 2.0 + (c.b - c.r) / d;
++    } else {
++        h = 4.0 + (c.r - c.g) / d;
++    }
++    return fract(h / 6.0);
++}
++
++fn hue_rgb(h: f32) -> vec3<f32> {
++    return clamp(abs(fract(vec3<f32>(h) + vec3<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3<f32>(0.0), vec3<f32>(1.0));
++}
++
++// BG3's HSV grading (format doc, "Post block").
++fn grade(c: vec3<f32>) -> vec3<f32> {
++    let g = P.grade;
++    if (g.w == 0.0) {
++        return c;
++    }
++    let v = max(c.r, max(c.g, c.b));
++    let chroma = v - min(c.r, min(c.g, c.b));
++    let h = rgb_hue(c) + g.y;
++    let s = mix(0.0, chroma / (v + 1e-10), g.x);
++    let a = mix(vec3<f32>(1.0), hue_rgb(h), s) * v;
++    var b: vec3<f32>;
++    if (g.z < 0.0) {
++        b = a * (1.0 + g.z);
++    } else {
++        b = mix(a, vec3<f32>(1.0), g.z);
++    }
++    return mix(c, b, g.w);
++}
++
++fn pq(y: vec3<f32>) -> vec3<f32> {
++    let m1 = 0.1593017578125;
++    let m2 = 78.84375;
++    let c1 = 0.8359375;
++    let c2 = 18.8515625;
++    let c3 = 18.6875;
++    let ym = pow(clamp(y, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(m1));
++    return pow((vec3<f32>(c1) + c2 * ym) / (vec3<f32>(1.0) + c3 * ym), vec3<f32>(m2));
++}
++
++fn acescc(x: vec3<f32>) -> vec3<f32> {
++    let xc = select(vec3<f32>(0.0), x, x > vec3<f32>(0.0));
++    let xp = select(xc, xc * 0.5 + vec3<f32>(exp2(-16.0)), xc <= vec3<f32>(exp2(-15.0)));
++    return clamp((log2(xp) + vec3<f32>(9.72)) / 17.52, vec3<f32>(0.0), vec3<f32>(1.0));
++}
++
++// Scene-linear (after exposure) to display-encoded, as BG3 does it after its effects pass
++// (bloom left out); plain sRGB without BG3's post block.
++fn display_chain(x: vec3<f32>) -> vec3<f32> {
++    if (P.post.z < 0.5) {
++        return linear_to_srgb(clamp(x, vec3<f32>(0.0), vec3<f32>(1.0)));
++    }
++    let g = grade(max(x, vec3<f32>(0.0)));
++    let p = pq(g / 222.0);
++    let l = textureSampleLevel(grade_lut, grade_smp, p, 0.0).rgb;
++    let d = textureSampleLevel(display_lut, display_smp, acescc(l), 0.0).rgb;
++    return mix(d, vec3<f32>(0.0), P.post.y);
++}
++
++fn table_x(i: i32) -> f32 {
++    if (i <= 0) {
++        return 0.0;
++    }
++    let t = f32(i - 1) / (P.table.z - 2.0);
++    return exp2(mix(P.table.x, P.table.y, t));
++}
++"#;
++
++const WGSL_TABLE: &str = r#"
++@fragment
++fn fs_table(in: VOut) -> @location(0) vec4<f32> {
++    let x = table_x(i32(in.pos.x));
++    return vec4<f32>(display_chain(vec3<f32>(x)), x);
++}
++"#;
++
++const WGSL_INVERSE: &str = r#"
++@group(1) @binding(0) var table: texture_2d<f32>;
++
++fn table_at(i: i32, ch: i32) -> f32 {
++    return textureLoad(table, vec2<i32>(i, 0), 0)[ch];
++}
++
++// The scene-linear value whose display value is w, along one channel of the grey table.
++fn inv1(w: f32, ch: i32) -> f32 {
++    let n = i32(P.table.z);
++    var lo = 0;
++    var hi = n - 1;
++    if (w <= table_at(lo, ch)) {
++        return 0.0;
++    }
++    if (w >= table_at(hi, ch)) {
++        return table_x(hi);
++    }
++    for (var k = 0; k < 16; k++) {
++        if (hi - lo <= 1) {
++            break;
++        }
++        let mid = (lo + hi) / 2;
++        if (table_at(mid, ch) <= w) {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    let a = table_at(lo, ch);
++    let b = table_at(hi, ch);
++    let t = select(0.0, (w - a) / (b - a), b > a);
++    return mix(table_x(lo), table_x(hi), clamp(t, 0.0, 1.0));
++}
++
++fn inverse_chain(w: vec3<f32>) -> vec3<f32> {
++    if (P.post.z < 0.5) {
++        return srgb_to_linear(clamp(w, vec3<f32>(0.0), vec3<f32>(1.0)));
++    }
++    return vec3<f32>(inv1(w.r, 0), inv1(w.g, 1), inv1(w.b, 2));
++}
++"#;
++
++const WGSL_PREP: &str = r#"
++@group(2) @binding(0) var wow_depth: texture_depth_2d;
++@group(2) @binding(1) var wow_color: texture_2d<f32>;
++
++struct PrepOut {
++    @builtin(frag_depth) depth: f32,
++    @location(0) lin_a: f32,
++    @location(1) lin_b: f32,
++    @location(2) scene: vec4<f32>,
++};
++
++@fragment
++fn fs_prep(in: VOut) -> PrepOut {
++    let vsz = P.sizes.zw;
++    let q = vec2<i32>(clamp(floor(in.pos.xy * vsz / P.sizes.xy), vec2<f32>(0.0), vsz - 1.0));
++    let d = textureLoad(wow_depth, q, 0);
++    var o: PrepOut;
++    if (d > 0.0) {
++        // WoW: reverse infinite, view z = near / depth (yards); BG3's eye sits the depth
++        // offset behind WoW's. BG3's linear depth (key 4) is view z over its far plane.
++        let z = max((P.depth.x / d + P.depth.y) * P.depth.w + P.proj.z, 0.01);
++        o.depth = clamp(P.proj.x + P.proj.y / z, 0.0, 1.0);
++        o.lin_a = min(z / P.depth.z, 1.0);
++    } else {
++        o.depth = 0.0;
++        o.lin_a = 1.0;
++    }
++    o.lin_b = o.lin_a;
++    let w = textureLoad(wow_color, q, 0).rgb;
++    o.scene = vec4<f32>(inverse_chain(clamp(w, vec3<f32>(0.0), vec3<f32>(1.0))) / max(P.post.x, 1e-6), 1.0);
++    return o;
++}
++"#;
++
++const WGSL_COMP: &str = r#"
++@group(2) @binding(0) var src: texture_2d<f32>;
++@group(2) @binding(1) var fx_c: texture_2d<f32>;
++@group(2) @binding(2) var fx_w: texture_2d<f32>;
++
++fn finite3(v: vec3<f32>) -> bool {
++    let e = bitcast<vec3<u32>>(v) & vec3<u32>(0x7f800000u);
++    return all(e != vec3<u32>(0x7f800000u));
++}
++
++@fragment
++fn fs_comp(in: VOut) -> @location(0) vec4<f32> {
++    let s = textureLoad(src, vec2<i32>(in.pos.xy), 0);
++    let bs = P.sizes.xy;
++    let q = vec2<i32>(clamp(floor(in.pos.xy * bs / P.sizes.zw), vec2<f32>(0.0), bs - 1.0));
++    let c0 = textureLoad(fx_c, q, 0).rgb;
++    let w0 = textureLoad(fx_w, q, 0).rgb;
++    let ok = finite3(c0) && finite3(w0);
++    if (P.post.w > 3.5) {
++        // Round trip of WoW's colour through BG3's display chain and back.
++        return vec4<f32>(clamp(display_chain(inverse_chain(clamp(s.rgb, vec3<f32>(0.0), vec3<f32>(1.0)))), vec3<f32>(0.0), vec3<f32>(1.0)), s.a);
++    }
++    if (P.post.w > 2.5) {
++        if (!ok) {
++            return vec4<f32>(1.0, 0.0, 1.0, s.a);
++        }
++        let tt = w0 - c0;
++        let neg = clamp(-min(c0.r, min(c0.g, c0.b)) * 8.0, 0.0, 1.0);
++        let pos = clamp(max(c0.r, max(c0.g, c0.b)) * 8.0, 0.0, 1.0);
++        let dev = clamp(max(abs(tt.r - 1.0), max(abs(tt.g - 1.0), abs(tt.b - 1.0))) * 8.0, 0.0, 1.0);
++        return vec4<f32>(neg, pos, dev, s.a);
++    }
++    // A non-finite result (an effect shader's overflow or NaN) counts as no effect.
++    let c = select(vec3<f32>(0.0), c0, ok);
++    let t = select(vec3<f32>(1.0), max(w0 - c0, vec3<f32>(0.0)), ok);
++    if (P.post.w > 1.5) {
++        return vec4<f32>(clamp(t, vec3<f32>(0.0), vec3<f32>(1.0)), s.a);
++    }
++    if (P.post.w > 0.5) {
++        return vec4<f32>(linear_to_srgb(clamp(c * P.post.x, vec3<f32>(0.0), vec3<f32>(1.0))), s.a);
++    }
++    if (all(c == vec3<f32>(0.0)) && all(t == vec3<f32>(1.0))) {
++        return s;
++    }
++    let w = clamp(s.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
++    let xw = inverse_chain(w);
++    let x = xw * t + c * P.post.x;
++    let res = w + display_chain(x) - display_chain(xw);
++    return vec4<f32>(clamp(res, vec3<f32>(0.0), vec3<f32>(1.0)), s.a);
++}
++"#;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn vertex_limits_like_wgpu() {
++        let slots = [
++            VbSlot { binding: 0, stride: 64, last_stride: 64, instance: true },
++            VbSlot { binding: 1, stride: 8, last_stride: 8, instance: false },
++            VbSlot { binding: 2, stride: 28, last_stride: 28, instance: false },
++        ];
++        // 1 instance, 100 and 50 vertices
++        assert_eq!(vertex_limits(&slots, &[64, 800, 1400]), (50, 1));
++        // a buffer shorter than one element allows none
++        assert_eq!(vertex_limits(&slots, &[63, 800, 1400]).1, 0);
++        // the last element may end short of a whole stride
++        let s = [VbSlot { binding: 0, stride: 16, last_stride: 12, instance: false }];
++        assert_eq!(vertex_limits(&s, &[28]).0, 2);
++    }
++
++    #[test]
++    fn maps_bg3_formats() {
++        assert_eq!(vk_vertex_format(106), Some(wgpu::VertexFormat::Float32x3));
++        assert_eq!(vk_vertex_format(92), Some(wgpu::VertexFormat::Snorm16x4));
++        assert_eq!(vk_vertex_format(103), Some(wgpu::VertexFormat::Float32x2));
++        assert_eq!(vk_texture_format(145), Some(wgpu::TextureFormat::Bc7RgbaUnorm));
++        assert_eq!(vk_texture_format(64), Some(wgpu::TextureFormat::Rgb10a2Unorm));
++        assert_eq!(vk_texture_format(122), Some(wgpu::TextureFormat::Rg11b10Ufloat));
++        assert_eq!(view_dim(2, false), Some(wgpu::TextureViewDimension::D3));
++        assert_eq!(visibility(17), wgpu::ShaderStages::VERTEX_FRAGMENT);
++        assert_eq!(visibility(63), wgpu::ShaderStages::VERTEX_FRAGMENT);
++    }
++}
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 568bb61..a5a996d 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -58,6 +58,33 @@ pub(crate) fn ground_lock() -> f32 {
+     f32::from_bits(GROUND_LOCK.load(Ordering::Relaxed))
+ }
+ 
++/// The sequence of the `bg3cam.bin` record the world camera follows this frame (0: none):
++/// `wowbg3_fx` replays the effects BG3 drew with that same camera record (FXQ1 `bg3cam_seq`).
++static CAMERA_SEQ: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) fn camera_seq() -> u32 {
++    CAMERA_SEQ.load(Ordering::Relaxed)
++}
++
++/// `WOW_BG3_LEAD_ZOOM` (debug, default 1): narrows WoW's field of view by this factor, so
++/// benilla's own frame shows the middle of BG3's view magnified, for close surface checks. The
++/// composite does not line up while it is on.
++fn debug_zoom_fov(fovy: f32) -> f32 {
++    static ZOOM: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
++    let z = *ZOOM.get_or_init(|| {
++        std::env::var("WOW_BG3_LEAD_ZOOM")
++            .ok()
++            .and_then(|v| v.trim().parse::<f32>().ok())
++            .filter(|z| z.is_finite() && *z >= 1.0)
++            .unwrap_or(1.0)
++    });
++    if z == 1.0 {
++        fovy
++    } else {
++        2.0 * ((fovy * 0.5).tan() / z).atan()
++    }
++}
++
+ /// True in lead mode: the own character is drawn and voiced by BG3, not by benilla.
+ pub(crate) fn hide_self() -> bool {
+     HIDE_SELF.load(Ordering::Relaxed)
+@@ -321,6 +348,7 @@ fn follow_bg3(
+     world: benilla_world::world_point::WorldPoint,
+     mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
+ ) {
++    CAMERA_SEQ.store(0, Ordering::Relaxed);
+     if s.file.is_none() {
+         if s.retry > 0 {
+             s.retry -= 1;
+@@ -353,6 +381,7 @@ fn follow_bg3(
+     let Some(pose) = s.pose.filter(|_| fresh) else {
+         return;
+     };
++    CAMERA_SEQ.store(s.last_seq, Ordering::Relaxed);
+     let Ok((mut tf, mut proj)) = cam.single_mut() else {
+         return;
+     };
+@@ -392,7 +421,7 @@ fn follow_bg3(
+     tf.translation = eye;
+     tf.look_to(fwd, if up.length_squared() > 1e-6 { up } else { Vec3::Y });
+     if let Projection::Perspective(p) = proj.as_mut() {
+-        p.fov = pose.fovy;
++        p.fov = debug_zoom_fov(pose.fovy);
+     }
+     s.frames += 1;
+     if s.frames % 600 == 1 {

@@ -1,0 +1,270 @@
+WOW-BG3 benilla patch 0053: /wowbg3 commands typed in WoW's chat.
+
+- wowbg3_chatcmd.rs (new): defines WowBg3_ChatCommand(msg) in the UI's Lua; the WowBg3Layout addon
+  hands it every /wowbg3 line but "chat". Requests go to $WOW_BG3_LINK_DIR/chatcmd-request.txt, the
+  helper (link/tools/wowbg3-chatcmd.py) answers in chatcmd-reply.txt, the lines are printed in WoW's chat.
+- lib.rs, wowbg3.rs: module and plugin registration.
+
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -188,6 +188,7 @@
+ mod world_state_ui;
+ // WOW-BG3 fork: the link to the hidden BG3 (camera stream).
+ mod wowbg3;
++mod wowbg3_chatcmd;
+ mod wowbg3_create;
+ mod wowbg3_cursors;
+ mod wowbg3_fight;
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -51,6 +51,8 @@
+         crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
+         // Patch 0050: party bots' WoW bodies hidden, placed on their BG3 figures.
+         crate::wowbg3_party::build(app, PathBuf::from(&dir));
++        // Patch 0053: /wowbg3 commands typed in WoW's chat go to the WOW-BG3 helper.
++        crate::wowbg3_chatcmd::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_chatcmd.rs b/crates/benilla-app/src/wowbg3_chatcmd.rs
+new file mode 100644
+index 00000000..04319715
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_chatcmd.rs
+@@ -0,0 +1,236 @@
++//! WOW-BG3 (local fork, patch 0053): `/wowbg3 ...` commands typed in WoW's
++//! chat go to the WOW-BG3 command helper (`link/tools/wowbg3-chatcmd.py`, run beside benilla by the
++//! release's coordinator) and its answers come back as lines in WoW's chat.
++//!
++//! The UI side: this module defines the global `WowBg3_ChatCommand(msg)` in the UI's Lua (again after
++//! every UI load, checked a few times a second) and sets `WOWBG3_CHATCMD = 1`. The WowBg3Layout addon's
++//! `/wowbg3` handler keeps `chat` for itself and hands every other line to that function, which only
++//! queues it in `WowBg3_ChatCommandQueue`; this module empties the queue.
++//!
++//! `$WOW_BG3_LINK_DIR/chatcmd-request.txt` (whole-file rewrite through a .tmp and a rename):
++//! line 1 `WCC1 <benilla pid>`, then the newest requests (at most 8), one a line:
++//! `<seq>\t<unix seconds>\t<WoW character>\t<text>` (tabs in the text become spaces). seq grows by one
++//! per command and goes on from the file's newest at startup, so a helper never sees one twice.
++//!
++//! `$WOW_BG3_LINK_DIR/chatcmd-reply.txt` (the helper's, whole-file rewrites): one line of answer a line,
++//! `<seq>\t<kind>\t<text>`, kind `+` a line, `!` an error line, `.` the answer is complete (no text).
++//! Lines of a seq are printed as they come (a teleport prints "moving to ..." first, then "there").
++//! No line for a command in 6 s: "no answer from the WOW-BG3 command helper". An unfinished answer is
++//! given up silently after 5 minutes.
++
++use std::path::PathBuf;
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use benilla_ui::script::UiScript;
++use bevy::prelude::*;
++
++const KEEP: usize = 8;
++const NO_HELPER_SECS: f64 = 6.0;
++const GIVE_UP_SECS: f64 = 300.0;
++
++/// Defines the hook when the VM has none (a fresh UI load), then hands back the queued lines.
++const DRAIN: &str = r#"
++if not WowBg3_ChatCommand then
++    WOWBG3_CHATCMD = 1
++    WowBg3_ChatCommandQueue = {}
++    WowBg3_ChatCommand = function(msg)
++        table.insert(WowBg3_ChatCommandQueue, tostring(msg or ""))
++    end
++end
++local q = WowBg3_ChatCommandQueue
++if not q or not q[1] then return "" end
++WowBg3_ChatCommandQueue = {}
++return table.concat(q, "\n")
++"#;
++
++struct Pending {
++    seq: u64,
++    asked: f64,
++    printed: usize,
++    answered: bool,
++}
++
++#[derive(Resource)]
++struct ChatCmd {
++    request: PathBuf,
++    reply: PathBuf,
++    frame: u64,
++    seq: u64,
++    recent: Vec<String>,
++    pending: Vec<Pending>,
++}
++
++/// One request line: `seq\ttime\tchar\ttext`.
++pub(crate) fn request_line(seq: u64, time: u64, who: &str, text: &str) -> String {
++    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
++    format!("{seq}\t{time}\t{}\t{}", clean(who), clean(text.trim()))
++}
++
++/// The newest seq of a request file (0 when none).
++pub(crate) fn newest_seq(file: &str) -> u64 {
++    file.lines()
++        .skip(1)
++        .filter_map(|l| l.split('\t').next()?.parse::<u64>().ok())
++        .max()
++        .unwrap_or(0)
++}
++
++/// The answer lines for `seq` in a reply file: (error?, text) each, and whether it is complete.
++pub(crate) fn answer_for(file: &str, seq: u64) -> (Vec<(bool, String)>, bool) {
++    let mut lines = Vec::new();
++    let mut done = false;
++    for l in file.lines() {
++        let mut it = l.splitn(3, '\t');
++        let (Some(s), Some(kind)) = (it.next(), it.next()) else { continue };
++        if s.parse::<u64>().ok() != Some(seq) {
++            continue;
++        }
++        let text = it.next().unwrap_or("").to_string();
++        match kind {
++            "+" => lines.push((false, text)),
++            "!" => lines.push((true, text)),
++            "." => done = true,
++            _ => {}
++        }
++    }
++    (lines, done)
++}
++
++fn say(script: &UiScript, text: &str, error: bool) {
++    if let Err(e) = script.lua().globals().set("WOWBG3_CHATCMD_LINE", text) {
++        warn!("wowbg3 chatcmd: {e}");
++        return;
++    }
++    let colour = if error { "1.0, 0.45, 0.35" } else { "0.55, 0.85, 1.0" };
++    let chunk = format!(
++        "if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage(WOWBG3_CHATCMD_LINE, {colour}) end"
++    );
++    if let Err(e) = script.run(&chunk) {
++        warn!("wowbg3 chatcmd: printing an answer: {e}");
++    }
++}
++
++fn now_unix() -> u64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
++}
++
++fn chat_commands(mut c: ResMut<ChatCmd>, script: Option<NonSend<UiScript>>, time: Res<Time<Real>>) {
++    c.frame += 1;
++    if c.frame % 6 != 0 {
++        return;
++    }
++    let Some(script) = script else { return };
++    let now = time.elapsed_secs_f64();
++    let queued = match script.lua().load(DRAIN).eval::<String>() {
++        Ok(s) => s,
++        Err(e) => {
++            if c.frame % 600 == 0 {
++                warn!("wowbg3 chatcmd: {e}");
++            }
++            String::new()
++        }
++    };
++    let mut wrote = false;
++    for text in queued.lines().map(str::trim).filter(|t| !t.is_empty()) {
++        let who = script
++            .lua()
++            .load("return UnitName and UnitName(\"player\") or \"\"")
++            .eval::<String>()
++            .unwrap_or_default();
++        c.seq += 1;
++        let seq = c.seq;
++        let line = request_line(seq, now_unix(), &who, text);
++        c.recent.push(line);
++        let over = c.recent.len().saturating_sub(KEEP);
++        c.recent.drain(..over);
++        c.pending.push(Pending { seq, asked: now, printed: 0, answered: false });
++        info!("wowbg3 chatcmd: #{seq} {text:?} from {who:?}");
++        wrote = true;
++    }
++    if wrote {
++        let body = format!("WCC1 {}\n{}\n", std::process::id(), c.recent.join("\n"));
++        let tmp = c.request.with_extension("tmp");
++        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &c.request)) {
++            warn!("wowbg3 chatcmd: cannot write {:?}: {e}", c.request);
++            say(&script, &format!("WOW-BG3: cannot pass the command on ({e})"), true);
++        }
++    }
++    if c.pending.is_empty() {
++        return;
++    }
++    let reply = std::fs::read_to_string(&c.reply).unwrap_or_default();
++    let mut keep = Vec::new();
++    for mut p in std::mem::take(&mut c.pending) {
++        let (lines, done) = answer_for(&reply, p.seq);
++        for (error, text) in lines.iter().skip(p.printed) {
++            say(&script, text, *error);
++            info!("wowbg3 chatcmd: #{} {}{text}", p.seq, if *error { "error: " } else { "" });
++        }
++        if lines.len() > p.printed {
++            p.printed = lines.len();
++            p.answered = true;
++        }
++        if done {
++            continue;
++        }
++        if !p.answered && now - p.asked > NO_HELPER_SECS {
++            say(
++                &script,
++                "WOW-BG3: no answer from the WOW-BG3 command helper (it runs while the WoW side runs)",
++                true,
++            );
++            warn!("wowbg3 chatcmd: #{} no answer in {NO_HELPER_SECS} s", p.seq);
++            continue;
++        }
++        if now - p.asked > GIVE_UP_SECS {
++            warn!("wowbg3 chatcmd: #{} unfinished after {GIVE_UP_SECS} s; not waiting any more", p.seq);
++            continue;
++        }
++        keep.push(p);
++    }
++    c.pending = keep;
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    let request = dir.join("chatcmd-request.txt");
++    let old = std::fs::read_to_string(&request).unwrap_or_default();
++    let seq = newest_seq(&old);
++    let recent: Vec<String> = old.lines().skip(1).map(str::to_string).collect();
++    let recent = recent[recent.len().saturating_sub(KEEP)..].to_vec();
++    info!("wowbg3 chatcmd: /wowbg3 commands go to {request:?} (from #{})", seq + 1);
++    app.insert_resource(ChatCmd {
++        request,
++        reply: dir.join("chatcmd-reply.txt"),
++        frame: 0,
++        seq,
++        recent,
++        pending: Vec::new(),
++    })
++    .add_systems(Update, chat_commands);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn request_lines_and_seq() {
++        let l = request_line(7, 100, "Gale", " tele\tgoldshire \n");
++        assert_eq!(l, "7\t100\tGale\ttele goldshire");
++        let file = format!("WCC1 5\n{}\n{}\n", request_line(6, 1, "A", "x"), l);
++        assert_eq!(newest_seq(&file), 7);
++        assert_eq!(newest_seq(""), 0);
++    }
++
++    #[test]
++    fn answers_by_seq() {
++        let file = "3\t+\tmoving to Goldshire\n4\t!\tno such place\n4\t.\t\n3\t+\tthere\n";
++        let (l3, d3) = answer_for(file, 3);
++        assert_eq!(l3, vec![(false, "moving to Goldshire".into()), (false, "there".into())]);
++        assert!(!d3);
++        let (l4, d4) = answer_for(file, 4);
++        assert_eq!(l4, vec![(true, "no such place".into())]);
++        assert!(d4);
++        assert_eq!(answer_for(file, 5), (vec![], false));
++    }
++}

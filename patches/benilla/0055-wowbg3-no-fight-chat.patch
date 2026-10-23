@@ -1,0 +1,84 @@
+WOW-BG3 benilla patch 0055: the fight's own narration stays out of WoW's chat.
+
+- wowbg3_fight.rs: the bridge's fight log ("Turn 4: your turn", "a Young Wolf joins the fight",
+  "Fight over: victory") and benilla's own fight lines ("N mobs pulled into a BG3 fight", "N more
+  joining the BG3 fight", "BG3 started a fight with N mob(s)") were printed into WoW's chat as
+  "[BG3] ..." system lines. BG3's own turn order and combat banners already say all of it, so the
+  lines now go to benilla's log only (`info!("wowbg3 fight: ...")`, the same text `say` writes) and
+  WoW's chat keeps WoW's own messages. The read cursor `f.printed` still advances line by line, so
+  nothing is replayed when the switch is turned back on mid-fight.
+- New `narrate()` beside `say()`, and `fight_chat_in_wow()`, read once per process.
+- Kill switch: `WOW_BG3_FIGHT_CHAT=show` in BG3's environment prints them in WoW's chat again,
+  exactly as before.
+- WOW-BG3's own messages to the player (a refused pull, "Not your turn", the bridge not answering)
+  are untouched; the per-turn help line was already off in world mode.
+
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -731,6 +731,30 @@
+     }
+ }
+ 
++/// Whether the fight's own narration goes into WoW's chat as well as benilla's log. BG3's turn order
++/// and combat banners already tell the player what the fight is doing, so by default these lines stay
++/// out of WoW's chat, which keeps WoW's own messages. `WOW_BG3_FIGHT_CHAT=show` prints them there
++/// again, as before. Read once per process.
++fn fight_chat_in_wow() -> bool {
++    static SHOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *SHOW.get_or_init(|| {
++        std::env::var("WOW_BG3_FIGHT_CHAT")
++            .map(|v| v.trim().eq_ignore_ascii_case("show"))
++            .unwrap_or(false)
++    })
++}
++
++/// A line that only says what the fight is doing: WoW's chat with the switch on, benilla's log
++/// otherwise. Errors and answers to the player ("Not your turn", the bridge not answering) never come
++/// through here, so they always reach the player.
++fn narrate(chat: &mut Option<ResMut<ChatLog>>, line: String) {
++    if fight_chat_in_wow() {
++        say(chat, line);
++    } else {
++        info!("wowbg3 fight: {line}");
++    }
++}
++
+ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+     let tmp = path.with_extension("tmp");
+     std::fs::write(&tmp, text)?;
+@@ -1250,7 +1274,7 @@
+                 s.active = true;
+             }
+             let who = if list.len() == 1 { "1 mob".into() } else { format!("{} mobs", list.len()) };
+-            say(&mut chat, format!("{who} pulled into a BG3 fight; BG3 is setting it up"));
++            narrate(&mut chat, format!("{who} pulled into a BG3 fight; BG3 is setting it up"));
+         }
+     }
+     if f.active && !join.is_empty() {
+@@ -1273,7 +1297,7 @@
+             if let Err(e) = write_atomic(&f.dir.join("join.json"), &body) {
+                 warn!("wowbg3 fight: cannot write join: {e}");
+             }
+-            say(&mut chat, format!("{added} more joining the BG3 fight"));
++            narrate(&mut chat, format!("{added} more joining the BG3 fight"));
+         }
+     }
+     if f.active {
+@@ -1336,7 +1360,7 @@
+                 s.active = true;
+             }
+             let n = t.enemies.iter().filter(|e| e.3 != "refused").count();
+-            say(&mut chat, format!("BG3 started a fight with {n} mob(s)"));
++            narrate(&mut chat, format!("BG3 started a fight with {n} mob(s)"));
+         }
+         if f.active || !live {
+             f.encounter = t.encounter.clone();
+@@ -1346,7 +1370,7 @@
+         if *n > f.printed {
+             f.printed = *n;
+             if f.active {
+-                say(&mut chat, line.clone());
++                narrate(&mut chat, line.clone());
+             }
+         }
+     }

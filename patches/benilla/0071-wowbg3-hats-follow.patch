@@ -1,0 +1,55 @@
+WOW-BG3 benilla patch 0071: hats follow the head.
+
+A rigid mesh alone in its visual that sits above the figure's waist in the figure's own space (a
+hat) borrows the skin of the nearest skinned mesh of its figure, as the elf ears borrow the head's.
+
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -511,18 +511,42 @@
+ /// A rigid mesh in a visual that also has skinned meshes (the elf ears in the head visual) is
+ /// placed by BG3 with the visual's root transform but moves with a bone; it takes the skin of the
+ /// nearest vertex of the visual's largest skinned mesh (same model space), and that mesh's
+-/// palette. A rigid mesh alone in its visual (the greataxe) keeps its own world transform.
++/// palette. A rigid mesh alone in its visual (the greataxe) keeps its own world transform, unless it
++/// sits on the figure in the figure's own space (a hat, patch 0071: see below).
+ fn borrow_skin(meshes: &mut [TavMesh]) {
+     for i in 0..meshes.len() {
+         if meshes[i].kind != 1 {
+             continue;
+         }
+         let (part, figure) = (meshes[i].part, meshes[i].figure);
+-        let Some(j) = (0..meshes.len())
++        let sibling = (0..meshes.len())
+             .filter(|j| meshes[*j].kind == 0 && meshes[*j].part == part && meshes[*j].figure == figure)
+-            .max_by_key(|j| meshes[*j].pos.len())
+-        else {
+-            continue;
++            .max_by_key(|j| meshes[*j].pos.len());
++        // Patch 0071: a rigid mesh alone in its visual that sits on the figure in its own model space (a
++        // hat: BG3 gives its object the figure's root transform and moves it with the head bone at render,
++        // so it floated over a turning, nodding head; a playtest report) takes the skin of the skinned
++        // mesh of its figure nearest to it, as the ears take the head's. A weapon or a shield is in its
++        // own space (its origin at the grip, far from where it hangs), so it keeps its own transform:
++        // only a mesh above the figure's waist (its lowest vertex at 0.9 m or more) whose centre is within
++        // HAT_REACH of a skinned vertex is borrowed.
++        const HAT_REACH: f32 = 0.35;
++        let j = match sibling {
++            Some(j) => j,
++            None => {
++                let m = &meshes[i];
++                if m.pos.is_empty() || m.pos.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) < 0.9 {
++                    continue;
++                }
++                let c = m.pos.iter().copied().sum::<Vec3>() / m.pos.len() as f32;
++                let near = (0..meshes.len())
++                    .filter(|j| meshes[*j].kind == 0 && meshes[*j].figure == figure && meshes[*j].lod == m.lod)
++                    .filter_map(|j| meshes[j].pos.iter().map(|p| p.distance(c)).min_by(f32::total_cmp).map(|d| (j, d)))
++                    .min_by(|a, b| a.1.total_cmp(&b.1));
++                match near {
++                    Some((j, d)) if d <= HAT_REACH => j,
++                    _ => continue,
++                }
++            }
+         };
+         let (src_key, src_pos, src_w, src_b) =
+             (meshes[j].key, meshes[j].pos.clone(), meshes[j].weights.clone(), meshes[j].bones.clone());

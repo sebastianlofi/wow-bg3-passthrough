@@ -1,0 +1,665 @@
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -32,6 +32,17 @@
+ //! disc, pipe d9ffaf690de4d4e1) was painted over her as a pink haze; BG3 keeps decals off its
+ //! characters. The prep pass now also writes a linear depth for decals (`lin_d`) in which Tav's
+ //! pixels (a capsule round her root, [`TAV_MASK`]) are far, so a decal finds no surface there.
++//!
++//! Patch 0023 (BG3's vision cones on WoW's ground): BG3's sight overlay (EoCSight) draws one
++//! full-screen record per AI subgrid, each in a pass of its own that reads the previous record's
++//! output as its scene (b4) and writes every pixel (the scene where its subgrid is not). Replayed
++//! all against WoW's scene, the last record overwrote the others, so only one subgrid's part of a
++//! cone showed. Such a record (it reads the scene, special key 2, and writes it opaquely) now starts
++//! a new pass on a second over-black / over-white target and reads the one before, as BG3 chains
++//! them; its output is affine in the scene it reads (out = k * scene + c), so over black it gives
++//! k * C + c and over white k * W + c: the transmittance becomes k * T and the composite gets
++//! exactly BG3's overlay of WoW's scene with everything drawn before it. Its records also take the
++//! eye shift (`rebase_camera`), and its rays are WoW's.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::num::NonZeroU64;
+@@ -55,6 +66,9 @@
+ 
+ const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+ const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
++/// Patch 0023: the fragment shader of BG3's sight overlay records (EoCSight.bshd, pipe
++/// 6f232fc68065187b): set 1 binding 0 +16 is the record's subgrid origin.
++const EOC_SIGHT_FS: u64 = 0xf9ac_3c52_a928_d4f4;
+ const TABLE_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+ /// Entries of the display-chain table: x = 0, then 2^lo .. 2^hi.
+ const TABLE_N: u32 = 1024;
+@@ -377,6 +391,9 @@
+     scene: wgpu::TextureView,
+     c: wgpu::TextureView,
+     w: wgpu::TextureView,
++    /// Patch 0023: the second pair (scene readers write one pair while reading the other).
++    c2: wgpu::TextureView,
++    w2: wgpu::TextureView,
+ }
+ 
+ struct Base {
+@@ -424,11 +441,20 @@
+     scene: wgpu::TextureView,
+     c: wgpu::TextureView,
+     w: wgpu::TextureView,
++    /// Patch 0023: the second over-black / over-white targets (scene readers alternate), and
++    /// whether the frame ends on them (an odd number of scene readers).
++    c2: wgpu::TextureView,
++    w2: wgpu::TextureView,
++    final_second: bool,
+ }
+ 
+ struct PreparedDraw {
+     pipeline: wgpu::RenderPipeline,
++    /// The bind groups (for a scene reader: those of the over-black pass).
+     groups: Vec<wgpu::BindGroup>,
++    /// Patch 0023: a draw that reads BG3's scene and writes it opaquely (EoCSight): its bind
++    /// groups for the over-white pass, which read the over-white target before it.
++    groups_w: Option<Vec<wgpu::BindGroup>>,
+     vbs: Vec<(u64, u64)>,
+     index: Option<(u64, u64, wgpu::IndexFormat)>,
+     count: u32,
+@@ -1148,7 +1174,9 @@
+         out
+     }
+ 
+-    fn texture(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, key: u64, t: &TexFile) -> bool {
++    /// `inline`: one of the frame's inline (sight overlay) textures (patch 0023: by the frame's list,
++    /// not by the key's top bit, which ordinary keys can have too).
++    fn texture(&mut self, dev: &wgpu::Device, queue: &wgpu::Queue, key: u64, t: &TexFile, inline: bool) -> bool {
+         if let Some(slot) = self.textures.get(&key) {
+             return slot.is_some();
+         }
+@@ -1160,7 +1188,7 @@
+         self.textures.insert(key, made.ok());
+         // Patch 0021: BG3's sight textures change as enemies move; old copies are dropped (a bind
+         // group still using one keeps it alive).
+-        if key & crate::wowbg3_fx::INLINE_KEY != 0 {
++        if inline {
+             self.inline_order.push_back(key);
+             while self.inline_order.len() > INLINE_KEEP {
+                 if let Some(old) = self.inline_order.pop_front() {
+@@ -1264,7 +1292,8 @@
+                             }
+                             return Err(Skip::Pending);
+                         };
+-                        if !self.texture(dev, queue, k, file) {
++                        let inline = set.frame.inline.iter().any(|(c, _)| *c == k);
++                        if !self.texture(dev, queue, k, file, inline) {
+                             return Err(Skip::Once(format!("texture {k:016x} unusable (draw skipped)")));
+                         }
+                         let fmt = self.textures.get(&k).and_then(|g| g.as_ref()).map(|g| g.format);
+@@ -1302,6 +1331,7 @@
+         set: &FxFrameSet,
+         d: &FxDraw,
+         arena_len: u64,
++        reader_parity: usize,
+     ) -> Result<PreparedDraw, Skip> {
+         let pipe_name = format!("pipe {:016x}", d.pipe);
+         let Some(r) = set.recipes.get(&d.pipe) else { return Err(Skip::Once(format!("{pipe_name}: no recipe"))) };
+@@ -1333,6 +1363,13 @@
+         };
+         // Patch 0020: a projected decal is a draw that reads the G-buffer normal (special key 6).
+         let decal = d.sets.iter().any(|x| x.slots.iter().any(|y| y.res == SlotRes::Image(6)));
++        // Patch 0023: a scene reader, an EoCSight record (it reads BG3's scene, special key 2, and
++        // writes every pixel of its one target without blending), reads the targets as the draws
++        // before it left them. Only these: a draw covering part of the screen would lose the rest.
++        let scene_reader = fs.spv == EOC_SIGHT_FS
++            && r.color.len() == 1
++            && !r.color[0].blend
++            && d.sets.iter().any(|x| x.slots.iter().any(|y| y.res == SlotRes::Image(2)));
+         // Comparison samplers (by the bound sampler) decide the pipeline variant.
+         let mut mask = 0u64;
+         let mut i = 0u32;
+@@ -1380,74 +1417,92 @@
+         };
+         // Bind groups, one per set, every binding filled.
+         let limits = dev.limits();
+-        let mut groups = Vec::with_capacity(pipe.bgls.len());
+-        for (si, (layout, keys)) in pipe.bgls.iter().enumerate() {
+-            enum Bound {
+-                Buf(wgpu::Buffer, u64, u64),
+-                Sampler(wgpu::Sampler),
+-                View(wgpu::TextureView),
+-            }
+-            let mut bound = Vec::with_capacity(keys.len());
+-            for &(b, kind, _) in keys {
+-                let res = if kind == Kind::Dummy { None } else { slot_of(si as u32, b) };
+-                let base = self.base.as_ref().ok_or(Skip::Silent)?;
+-                let entry = match (kind, res) {
+-                    (Kind::Dummy, _) => Bound::Sampler(base.dummy_sampler.clone()),
+-                    (Kind::Ubo | Kind::Ssbo, Some(SlotRes::Buffer { blob, size })) => {
+-                        let (blob, size) = (blob as u64, size as u64);
+-                        if size == 0 {
+-                            Bound::Buf(base.dummy_buf.clone(), 0, 256)
+-                        } else {
+-                            let (align, max) = if kind == Kind::Ubo {
+-                                (limits.min_uniform_buffer_offset_alignment, limits.max_uniform_buffer_binding_size)
++        // Patch 0023: a scene reader gets two sets of groups, reading the over-black and the
++        // over-white target as the draws before it left them.
++        let readers: Vec<Option<wgpu::TextureView>> = if scene_reader {
++            let t = self.targets.as_ref().ok_or(Skip::Silent)?;
++            let (c, w) = if reader_parity == 0 { (&t.c, &t.w) } else { (&t.c2, &t.w2) };
++            vec![Some(c.clone()), Some(w.clone())]
++        } else {
++            vec![None]
++        };
++        let mut variants = Vec::with_capacity(readers.len());
++        for over in &readers {
++            let mut groups = Vec::with_capacity(pipe.bgls.len());
++            for (si, (layout, keys)) in pipe.bgls.iter().enumerate() {
++                enum Bound {
++                    Buf(wgpu::Buffer, u64, u64),
++                    Sampler(wgpu::Sampler),
++                    View(wgpu::TextureView),
++                }
++                let mut bound = Vec::with_capacity(keys.len());
++                for &(b, kind, _) in keys {
++                    let res = if kind == Kind::Dummy { None } else { slot_of(si as u32, b) };
++                    let base = self.base.as_ref().ok_or(Skip::Silent)?;
++                    let entry = match (kind, res) {
++                        (Kind::Dummy, _) => Bound::Sampler(base.dummy_sampler.clone()),
++                        (Kind::Ubo | Kind::Ssbo, Some(SlotRes::Buffer { blob, size })) => {
++                            let (blob, size) = (blob as u64, size as u64);
++                            if size == 0 {
++                                Bound::Buf(base.dummy_buf.clone(), 0, 256)
+                             } else {
+-                                (limits.min_storage_buffer_offset_alignment, limits.max_storage_buffer_binding_size)
+-                            };
+-                            if blob % align as u64 != 0 || blob + size > blob_len {
+-                                return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b} buffer range {blob}+{size}")));
++                                let (align, max) = if kind == Kind::Ubo {
++                                    (limits.min_uniform_buffer_offset_alignment, limits.max_uniform_buffer_binding_size)
++                                } else {
++                                    (limits.min_storage_buffer_offset_alignment, limits.max_storage_buffer_binding_size)
++                                };
++                                if blob % align as u64 != 0 || blob + size > blob_len {
++                                    return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b} buffer range {blob}+{size}")));
++                                }
++                                let size = size.next_multiple_of(4).min(max as u64).min(arena_len - blob);
++                                Bound::Buf(base.arena.clone(), blob, size)
+                             }
+-                            let size = size.next_multiple_of(4).min(max as u64).min(arena_len - blob);
+-                            Bound::Buf(base.arena.clone(), blob, size)
+                         }
+-                    }
+-                    (Kind::Sampler(_), Some(SlotRes::Sampler(k))) => {
+-                        let Some(s) = set.samplers.get(&k) else { return Err(Skip::Pending) };
+-                        let s = **s;
+-                        match self.sampler(dev, k, &s) {
+-                            Some(x) => Bound::Sampler(x),
+-                            None => return Err(Skip::Once(format!("{pipe_name}: sampler {k:016x} unusable"))),
++                        (Kind::Sampler(_), Some(SlotRes::Sampler(k))) => {
++                            let Some(s) = set.samplers.get(&k) else { return Err(Skip::Pending) };
++                            let s = **s;
++                            match self.sampler(dev, k, &s) {
++                                Some(x) => Bound::Sampler(x),
++                                None => return Err(Skip::Once(format!("{pipe_name}: sampler {k:016x} unusable"))),
++                            }
+                         }
+-                    }
+-                    (Kind::Tex { .. } | Kind::Storage { .. }, Some(SlotRes::Image(k))) => {
+-                        Bound::View(self.image_for(dev, queue, set, k, kind, decal)?)
+-                    }
+-                    (k, res) => {
+-                        return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b}: {k:?} bound to {res:?}")));
+-                    }
+-                };
+-                bound.push((b, entry));
+-            }
+-            let entries: Vec<wgpu::BindGroupEntry> = bound
+-                .iter()
+-                .map(|(b, e)| wgpu::BindGroupEntry {
+-                    binding: *b,
+-                    resource: match e {
+-                        Bound::Buf(buf, off, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+-                            buffer: buf,
+-                            offset: *off,
+-                            size: NonZeroU64::new(*size),
+-                        }),
+-                        Bound::Sampler(s) => wgpu::BindingResource::Sampler(s),
+-                        Bound::View(v) => wgpu::BindingResource::TextureView(v),
+-                    },
++                        (Kind::Tex { .. } | Kind::Storage { .. }, Some(SlotRes::Image(k))) => match over {
++                            Some(v) if k == 2 && matches!(kind, Kind::Tex { dim: wgpu::TextureViewDimension::D2, scalar: Scalar::Float }) => {
++                                Bound::View(v.clone())
++                            }
++                            _ => Bound::View(self.image_for(dev, queue, set, k, kind, decal)?),
++                        },
++                        (k, res) => {
++                            return Err(Skip::Once(format!("{pipe_name}: set {si} binding {b}: {k:?} bound to {res:?}")));
++                        }
++                    };
++                    bound.push((b, entry));
++                }
++                let entries: Vec<wgpu::BindGroupEntry> = bound
++                    .iter()
++                    .map(|(b, e)| wgpu::BindGroupEntry {
++                        binding: *b,
++                        resource: match e {
++                            Bound::Buf(buf, off, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                                buffer: buf,
++                                offset: *off,
++                                size: NonZeroU64::new(*size),
++                            }),
++                            Bound::Sampler(s) => wgpu::BindingResource::Sampler(s),
++                            Bound::View(v) => wgpu::BindingResource::TextureView(v),
++                        },
++                    })
++                    .collect();
++                let group = scoped(dev, || {
++                    dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bg3 group"), layout, entries: &entries })
+                 })
+-                .collect();
+-            let group = scoped(dev, || {
+-                dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("bg3 group"), layout, entries: &entries })
+-            })
+-            .map_err(|e| Skip::Once(format!("{pipe_name}: set {si}: {e}")))?;
+-            groups.push(group);
++                .map_err(|e| Skip::Once(format!("{pipe_name}: set {si}: {e}")))?;
++                groups.push(group);
++            }
++            variants.push(groups);
+         }
++        let groups_w = if scene_reader { variants.pop() } else { None };
++        let groups = variants.pop().ok_or(Skip::Silent)?;
+         // Vertex and index buffers, checked as wgpu checks them.
+         let mut vbs = Vec::with_capacity(pipe.slots.len());
+         for s in &pipe.slots {
+@@ -1487,6 +1542,7 @@
+         Ok(PreparedDraw {
+             pipeline: pipe.pipeline.clone(),
+             groups,
++            groups_w,
+             vbs,
+             index,
+             count: d.count,
+@@ -1516,6 +1572,8 @@
+                 scene: mk("wowbg3_fx_scene", COLOR_FMT, ra),
+                 c: mk("wowbg3_fx_over_black", COLOR_FMT, ra),
+                 w: mk("wowbg3_fx_over_white", COLOR_FMT, ra),
++                c2: mk("wowbg3_fx_over_black_2", COLOR_FMT, ra),
++                w2: mk("wowbg3_fx_over_white_2", COLOR_FMT, ra),
+             }
+         });
+         match made {
+@@ -1571,7 +1629,7 @@
+         let post = set.frame.post.filter(|p| p.have & 24 == 24)?;
+         let mut one = |k: u64| -> Option<wgpu::TextureView> {
+             let file = set.textures.get(&k)?;
+-            if !self.texture(dev, queue, k, file) {
++            if !self.texture(dev, queue, k, file, false) {
+                 return None;
+             }
+             let g = self.textures.get(&k)?.as_ref()?;
+@@ -1634,9 +1692,16 @@
+         let arena_len = self.base.as_ref()?.arena.size();
+         let mut draws = Vec::with_capacity(set.frame.draws.len());
+         let mut skipped = 0;
++        // Patch 0023: scene readers so far (each reads the pair of targets the previous one wrote).
++        let mut readers = 0usize;
+         for d in &set.frame.draws {
+-            match self.prepare_draw(dev, queue, set, d, arena_len) {
+-                Ok(p) => draws.push(p),
++            match self.prepare_draw(dev, queue, set, d, arena_len, readers % 2) {
++                Ok(p) => {
++                    if p.groups_w.is_some() {
++                        readers += 1;
++                    }
++                    draws.push(p)
++                }
+                 Err(Skip::Once(m)) => {
+                     skipped += 1;
+                     self.log_once(m);
+@@ -1702,6 +1767,9 @@
+             scene: t.scene.clone(),
+             c: t.c.clone(),
+             w: t.w.clone(),
++            c2: t.c2.clone(),
++            w2: t.w2.clone(),
++            final_second: readers % 2 == 1,
+         })
+     }
+ }
+@@ -1929,9 +1997,14 @@
+ //   forward; translation -R·eye), P (WoW's focal lengths, BG3's reverse-Z depth terms, no TAA
+ //   jitter), camera-relative VP = P·[R | R·(eye_bg3 - eye_wow)] (positions stay relative to the
+ //   eye BG3 drew with, +208, which is kept);
+-// - set 0 binding 1 (+48): the camera's right, up and forward rows (billboards, decals).
+-// Projected decals rebuild their surface point from WoW's linear depth along WoW's rays, relative
+-// to WoW's eye; they sit off by the eye shift (the dolly; none on level ground).
++// - set 0 binding 1 (+48): the camera's right, up and forward rows (billboards, decals);
++// - set 0 binding 1 (+112, patch 0023): the three full-screen corner rays, far * (forward +
++//   x * right / P00 + y * up / P11) for (x, y) = (-1, 1), (3, 1), (-1, -3), which full-screen passes
++//   scale by the linear depth to rebuild positions (BG3's sight overlay, EoCSight.bshd).
++// Projected decals and BG3's sight records rebuild their surface point from WoW's linear depth
++// along WoW's rays, relative to WoW's eye; since patch 0023 their object blocks take the eye shift
++// (the sight record's origin, the decal's inverse world translation), so they no longer sit off by
++// it (BG3's frame trails WoW's camera by the pacing lag; the clearance dolly).
+ 
+ /// WoW's camera in BG3's coordinates: eye, right, up, forward; WoW's focal lengths.
+ pub(crate) struct CamPose {
+@@ -2008,6 +2081,38 @@
+     Some(o)
+ }
+ 
++/// Patch 0023: BG3's full-screen corner rays (set 0 binding 1, floats 28..39) for camera `c` and
++/// far plane `far`; `w` keeps each ray's fourth float.
++pub(crate) fn corner_rays(c: &CamPose, far: f32, w: [f32; 3]) -> [f32; 12] {
++    let mut o = [0f32; 12];
++    for (i, (x, y)) in [(-1.0f32, 1.0f32), (3.0, 1.0), (-1.0, -3.0)].into_iter().enumerate() {
++        let r = (c.fwd + c.right * (x / c.p00) + c.up * (y / c.p11)) * far;
++        o[i * 4..i * 4 + 3].copy_from_slice(&r.to_array());
++        o[i * 4 + 3] = w[i];
++    }
++    o
++}
++
++/// Patch 0023: a projected decal, whose object block takes the eye shift (`rebase_camera`): a draw
++/// that reads the G-buffer normal (special key 6), other than BG3's sight records (they read it
++/// too and take the shift in their origin).
++fn projected_decal(d: &FxDraw, recipes: &HashMap<u64, Arc<Recipe>>) -> bool {
++    let normal = d.sets.iter().any(|x| x.slots.iter().any(|y| y.res == SlotRes::Image(6)));
++    let fs = recipes.get(&d.pipe).and_then(|r| r.stages.iter().find(|s| s.stage == 0x10)).map(|s| s.spv);
++    normal && fs != Some(EOC_SIGHT_FS)
++}
++
++/// Patch 0023: row 3 (the translation) of a row-major inverse world matrix `m` (16 floats, applied
++/// as `[p, 1] * M`) for points rebuilt relative to WoW's eye, `shift` = BG3's eye - WoW's:
++/// `[p - shift, 1] * M = [p, 1] * M'`.
++pub(crate) fn inverse_row3_shifted(m: &[f32], shift: Vec3) -> [f32; 4] {
++    let mut r = [m[12], m[13], m[14], m[15]];
++    for (j, v) in r.iter_mut().enumerate() {
++        *v -= shift.x * m[j] + shift.y * m[4 + j] + shift.z * m[8 + j];
++    }
++    r
++}
++
+ /// BG3's G-buffer normal encoding (its decals' decode: s = (x, y) * 3.5554 - 1.7777, z 1;
+ /// n = (s.xy * 2 / |s|², 1 - 2 / |s|²)), for a view-space normal.
+ pub(crate) fn encode_normal(n: Vec3) -> [f32; 2] {
+@@ -2050,6 +2155,74 @@
+             }
+             queue.write_buffer(&ready.arena, off as u64 + 48, bytemuck::cast_slice(&rows));
+         }
++        // Patch 0023: the corner rays for WoW's camera, with BG3's far plane (the one its linear
++        // depth, special key 4, is divided by). Blocks without rays (shorter, or a first ray
++        // shorter than the far plane) keep theirs.
++        let far = f.cam_b2.first().and_then(|&off| floats(off, 56)).map(|b| b[49]).filter(|v| v.is_finite() && *v > 0.0);
++        if let Some(far) = far {
++            for &off in &f.cam_b1 {
++                let Some(orig) = floats(off, 40) else { continue };
++                if !(Vec3::new(orig[28], orig[29], orig[30]).length() >= far * 0.99) {
++                    continue;
++                }
++                let rays = corner_rays(&c, far, [orig[31], orig[35], orig[39]]);
++                queue.write_buffer(&ready.arena, off as u64 + 112, bytemuck::cast_slice(&rays));
++            }
++        }
++        // Patch 0023: an EoCSight record puts a pixel's point at BG3's eye (set 0 binding 2 +208,
++        // kept) plus WoW's ray times WoW's linear depth, so it would sit off by the eye shift
++        // (BG3's frame trails WoW's camera; the clearance dolly). Its subgrid origin (set 1
++        // binding 0 +16) takes the shift instead: point - origin is then WoW's point's.
++        let mut moved = HashSet::new();
++        for d in &f.draws {
++            let fs = set.recipes.get(&d.pipe).and_then(|r| r.stages.iter().find(|s| s.stage == 0x10)).map(|s| s.spv);
++            if fs != Some(EOC_SIGHT_FS) {
++                continue;
++            }
++            let buf = |s: u32, b: u32| {
++                d.sets.iter().find(|x| x.set == s).and_then(|x| x.slots.iter().find(|y| y.binding == b)).and_then(|y| match y.res {
++                    SlotRes::Buffer { blob, size } => Some((blob, size)),
++                    _ => None,
++                })
++            };
++            let (Some((b2, s2)), Some((b0, s0))) = (buf(0, 2), buf(1, 0)) else { continue };
++            if s2 < 224 || s0 < 32 || !moved.insert(b0) {
++                continue;
++            }
++            let (Some(vb), Some(rec)) = (floats(b2, 56), floats(b0, 8)) else { continue };
++            let shift = Vec3::new(vb[52], vb[53], vb[54]) - c.eye;
++            let origin = [rec[4] + shift.x, rec[5] + shift.y, rec[6] + shift.z];
++            if origin.iter().all(|v| v.is_finite()) {
++                queue.write_buffer(&ready.arena, b0 as u64 + 16, bytemuck::cast_slice(&origin));
++            }
++        }
++        // Patch 0023: a projected decal (it reads the G-buffer normal, special key 6; its object
++        // block, set 1 binding 0, holds the box's world and inverse world matrices relative to
++        // BG3's eye, row-major, the inverse at +64) rebuilds its surface point relative to WoW's
++        // eye, so it sat off by the same shift ("projected decals off by the
++        // dolly's eye shift on hills"). The inverse's translation row takes it instead:
++        // [p + eye_wow - eye_bg3, 1] * M = [p, 1] * M' with row 3 of M' = row 3 - shift * rows 0..2.
++        for d in &f.draws {
++            if !projected_decal(d, &set.recipes) {
++                continue;
++            }
++            let buf = |s: u32, b: u32| {
++                d.sets.iter().find(|x| x.set == s).and_then(|x| x.slots.iter().find(|y| y.binding == b)).and_then(|y| match y.res {
++                    SlotRes::Buffer { blob, size } => Some((blob, size)),
++                    _ => None,
++                })
++            };
++            let (Some((b2, s2)), Some((b0, s0))) = (buf(0, 2), buf(1, 0)) else { continue };
++            if s2 < 224 || s0 < 128 || !moved.insert(b0) {
++                continue;
++            }
++            let (Some(vb), Some(m)) = (floats(b2, 56), floats(b0, 32)) else { continue };
++            let shift = Vec3::new(vb[52], vb[53], vb[54]) - c.eye;
++            let row3 = inverse_row3_shifted(&m[16..32], shift);
++            if row3.iter().all(|v| v.is_finite()) {
++                queue.write_buffer(&ready.arena, b0 as u64 + 112, bytemuck::cast_slice(&row3));
++            }
++        }
+         // Special key 6: WoW's ground as level, its normal in the camera's axes.
+         let n = Vec3::new(c.right.y, c.up.y, c.fwd.y);
+         let e = encode_normal(n);
+@@ -2114,10 +2287,12 @@
+     })
+ }
+ 
+-fn replay(pass: &mut wgpu::RenderPass, r: &Ready) {
+-    for d in &r.draws {
++/// Draws `draws` (the over-white pass takes a scene reader's over-white groups, patch 0023).
++fn replay(pass: &mut wgpu::RenderPass, r: &Ready, draws: &[PreparedDraw], white: bool) {
++    for d in draws {
+         pass.set_pipeline(&d.pipeline);
+-        for (i, g) in d.groups.iter().enumerate() {
++        let groups = if white { d.groups_w.as_ref().unwrap_or(&d.groups) } else { &d.groups };
++        for (i, g) in groups.iter().enumerate() {
+             pass.set_bind_group(i as u32, g, &[]);
+         }
+         for (slot, &(off, size)) in d.vbs.iter().enumerate() {
+@@ -2197,12 +2372,20 @@
+                 pass.set_bind_group(2, &prep_bg, &[]);
+                 pass.draw(0..3, 0..1);
+             }
+-            for (view, clear, label) in [
+-                (&r.c, wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, "wowbg3_fx_over_black"),
+-                (&r.w, wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, "wowbg3_fx_over_white"),
++            // Patch 0023: each scene reader starts a pass on the other target of the pair, reading
++            // the one before (it writes every pixel, as BG3's EoCSight records do).
++            let n = r.draws.len();
++            let mut starts = vec![0usize];
++            starts.extend((0..n).filter(|&i| r.draws[i].groups_w.is_some()));
++            for (views, clear, label, white) in [
++                ([&r.c, &r.c2], wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, "wowbg3_fx_over_black", false),
++                ([&r.w, &r.w2], wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, "wowbg3_fx_over_white", true),
+             ] {
+-                let mut pass = color_pass(&mut enc, label, &[view], clear, Some((&r.depth, false)));
+-                replay(&mut pass, &r);
++                for (j, &a) in starts.iter().enumerate() {
++                    let b = starts.get(j + 1).copied().unwrap_or(n);
++                    let mut pass = color_pass(&mut enc, label, &[views[j % 2]], clear, Some((&r.depth, false)));
++                    replay(&mut pass, &r, &r.draws[a..b], white);
++                }
+             }
+             enc.finish()
+         });
+@@ -2222,8 +2405,15 @@
+                 layout: &r.comp_bgl,
+                 entries: &[
+                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(main_view) },
+-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&r.c) },
+-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&r.w) },
++                    // Patch 0023: the pair the last scene reader wrote.
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::TextureView(if r.final_second { &r.c2 } else { &r.c }),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 2,
++                        resource: wgpu::BindingResource::TextureView(if r.final_second { &r.w2 } else { &r.w }),
++                    },
+                 ],
+             })
+         });
+@@ -2575,6 +2765,47 @@
+     }
+ 
+     #[test]
++    fn corner_rays_match_bg3s() {
++        // BG3's own block (layer research log sight.txt): far 333, P00 1.08055,
++        // P11 1.92098, axes and rays as logged.
++        let c = CamPose {
++            eye: Vec3::ZERO,
++            right: Vec3::new(0.4226, -1.49e-8, 0.9063),
++            up: Vec3::new(-0.5911, 0.758, 0.2756),
++            fwd: Vec3::new(-0.687, -0.6522, 0.3204),
++            p00: 1.08055,
++            p11: 1.92098,
++        };
++        let r = corner_rays(&c, 333.0, [0.0; 3]);
++        let want = [-461.5, -85.81, -125.0, 0.0, 59.42, -85.81, 992.2, 0.0, -51.66, -611.4, -316.1, 0.0];
++        for k in 0..12 {
++            assert!((r[k] - want[k]).abs() < 0.5, "ray float {k}: {} vs {}", r[k], want[k]);
++        }
++    }
++
++    #[test]
++    fn decal_inverse_takes_the_eye_shift() {
++        // A row-major inverse world matrix (rotation, scale, translation) as BG3's decal boxes carry.
++        let m: [f32; 16] = [0.5, 0.1, -0.2, 0.0, -0.1, 0.4, 0.3, 0.0, 0.2, -0.3, 0.45, 0.0, 1.5, -2.0, 0.75, 1.0];
++        let apply = |p: Vec3, m: &[f32]| -> [f32; 4] {
++            let mut o = [0f32; 4];
++            for (j, v) in o.iter_mut().enumerate() {
++                *v = p.x * m[j] + p.y * m[4 + j] + p.z * m[8 + j] + m[12 + j];
++            }
++            o
++        };
++        let shift = Vec3::new(0.7, -0.25, 1.3);
++        let mut moved = m;
++        moved[12..16].copy_from_slice(&inverse_row3_shifted(&m, shift));
++        for p in [Vec3::new(3.0, -1.0, 2.0), Vec3::new(-4.5, 0.2, 7.0)] {
++            let (want, got) = (apply(p - shift, &m), apply(p, &moved));
++            for k in 0..4 {
++                assert!((want[k] - got[k]).abs() < 1e-4, "component {k}: {} vs {}", got[k], want[k]);
++            }
++        }
++    }
++
++    #[test]
+     fn encodes_normals_as_bg3s_decals_decode_them() {
+         for n in [Vec3::new(0.0, 0.85, -0.52), Vec3::new(0.3, 0.6, -0.74), Vec3::new(0.0, 1.0, 0.0)] {
+             let n = n.normalize();
+diff --git a/crates/benilla-app/src/wowbg3_fx.rs b/crates/benilla-app/src/wowbg3_fx.rs
+--- a/crates/benilla-app/src/wowbg3_fx.rs
++++ b/crates/benilla-app/src/wowbg3_fx.rs
+@@ -60,6 +60,11 @@
+ /// sight overlay textures, which BG3 rewrites as enemies turn and walk): bits 32..61 its texel
+ /// bytes, bits 0..31 the blob offset of its FXT1 header (texels right after it). The parse renames
+ /// each to [`INLINE_KEY`] | its content's hash, so unchanged ones are not uploaded again.
++/// Patch 0023: the layer's ordinary texture keys are 64-bit hashes, so a quarter of them have
++/// these top bits too and another quarter [`INLINE_KEY`]'s: such a key is inline only when it
++/// names an FXT1 copy in the blob, and a renamed one only when the frame lists it
++/// ([`FxFrame::inline`]); before, those textures counted as inline and their draws were skipped
++/// (BG3's sight hatch textures among them) or bound neutral.
+ pub(crate) const SIGHT_INLINE: u64 = 0xc000_0000_0000_0000;
+ /// Patch 0021: keys of inline textures after the parse (the replay drops old ones, a few hundred kept).
+ pub(crate) const INLINE_KEY: u64 = 0x8000_0000_0000_0000;
+@@ -594,7 +599,8 @@
+ }
+ 
+ /// Patch 0021: the inline textures' FXT1 copies out of the blob, each draw's key renamed to its
+-/// content's ([`SIGHT_INLINE`]); a key that does not fit the blob becomes 3 (neutral).
++/// content's ([`SIGHT_INLINE`]); patch 0023: a key that names no FXT1 copy in the blob is an
++/// ordinary texture key and stays as it is.
+ fn inline_textures(f: &mut FxFrame) {
+     let mut named: HashMap<u64, u64> = HashMap::new();
+     for d in &mut f.draws {
+@@ -611,9 +617,9 @@
+                 *k = *named.entry(raw).or_insert_with(|| {
+                     let at = (raw & 0xffff_ffff) as usize;
+                     let size = ((raw >> 32) & 0x3fff_ffff) as usize;
+-                    let Some(b) = f.blob.get(at..at.saturating_add(TexFile::DATA).saturating_add(size)) else { return 3 };
++                    let Some(b) = f.blob.get(at..at.saturating_add(TexFile::DATA).saturating_add(size)) else { return raw };
+                     if b.len() != TexFile::DATA + size || &b[..4] != b"FXT1" {
+-                        return 3;
++                        return raw;
+                     }
+                     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                     for &x in b {
+@@ -1316,7 +1322,8 @@
+                     }
+                 }
+                 // Patch 0021: inline textures come with the frame.
+-                if let Some(k) = tex.filter(|k| *k & INLINE_KEY != 0 && !set.textures.contains_key(k)) {
++                // Patch 0023: inline only when the frame lists it (an ordinary key may have the bit).
++                if let Some(k) = tex.filter(|k| frame.inline.iter().any(|(c, _)| c == k) && !set.textures.contains_key(k)) {
+                     match frame.inline.iter().find(|(c, _)| *c == k).and_then(|(_, b)| parse_tex(b.to_vec())) {
+                         Some(t) => {
+                             set.textures.insert(k, Arc::new(t));
+@@ -1475,6 +1482,53 @@
+     }
+ 
+     #[test]
++    fn only_blob_copies_are_inline_textures() {
++        // Patch 0023: ordinary texture keys (64-bit hashes) with the inline bits stay as they are;
++        // a key naming an FXT1 copy in the blob becomes an inline texture.
++        let size = 16u64;
++        let mut blob = vec![0u8; 256];
++        blob[..4].copy_from_slice(b"FXT1");
++        let inline = SIGHT_INLINE | (size << 32);
++        let keys = [0xd96b_7e56_20a2_d567u64, 0x8487_4a6a_72a9_1155, inline];
++        let slots = keys.iter().enumerate().map(|(i, &k)| FxSlot { binding: i as u32, ty: 2, res: SlotRes::Image(k) }).collect();
++        let draw = FxDraw {
++            pipe: 1,
++            indexed: false,
++            count: 3,
++            instances: 1,
++            first: 0,
++            vertex_offset: 0,
++            first_instance: 0,
++            index_type: 0,
++            index_blob: 0,
++            index_size: 0,
++            vbs: Vec::new(),
++            sets: vec![FxSet { set: 1, slots }],
++            push: Vec::new(),
++        };
++        let mut f = FxFrame {
++            frame: 1,
++            wall: 0.0,
++            eye: [0.0; 3],
++            width: 1,
++            height: 1,
++            draws: vec![draw],
++            blob,
++            post: None,
++            view: None,
++            cam_b2: Vec::new(),
++            cam_b1: Vec::new(),
++            inline: Vec::new(),
++        };
++        inline_textures(&mut f);
++        let got: Vec<SlotRes> = f.draws[0].sets[0].slots.iter().map(|s| s.res).collect();
++        assert_eq!(&got[..2], &[SlotRes::Image(keys[0]), SlotRes::Image(keys[1])]);
++        assert_eq!(f.inline.len(), 1);
++        assert_eq!(got[2], SlotRes::Image(f.inline[0].0));
++        assert_eq!(f.inline[0].1.len(), TexFile::DATA + size as usize);
++    }
++
++    #[test]
+     fn decodes_recipe() {
+         let r = parse_recipe(&recipe_bytes()).expect("decodes");
+         assert_eq!((r.topology, r.front, r.depth_compare), (3, 1, 6));

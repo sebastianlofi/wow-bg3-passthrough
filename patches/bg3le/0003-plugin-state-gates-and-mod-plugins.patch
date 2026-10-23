@@ -1,0 +1,377 @@
+diff -ruN a/include/bg3le_plugin.h b/include/bg3le_plugin.h
+--- a/include/bg3le_plugin.h
++++ b/include/bg3le_plugin.h
+@@ -5,6 +5,13 @@
+  * starts, once the engine and its allocator are up, and calls its
+  * bg3le_plugin_init(). No LD_PRELOAD and no launch option is involved.
+  *
++ * A mod can also ship its plugins beside its archive: for Mods/<Name>.pak
++ * with a folder Mods/<Name>/ next to it, the files the archive's
++ * Mods/<Folder>/ScriptExtender/Config.json lists as "NativePlugins" (plain
++ * .so file names) load from Mods/<Name>/, after the plugins folder. They
++ * load whether or not the mod is enabled, since the mod manager can enable
++ * it later in the same session; such a plugin checks that for itself.
++ *
+  * Plugins build against this header alone: everything bg3le offers comes
+  * through the host table, so a plugin links against nothing of bg3le's.
+  */
+@@ -42,6 +49,14 @@
+  * the previous frame. */
+ typedef void (*bg3le_frame_handler)(void* user, double dt);
+ 
++/* Asked on the client's game thread when the engine queues the client game
++ * state `to` while it is in `from` (state names as Ext.Utils.GetGameState()
++ * gives them, e.g. "PrepareRunning" -> "Running"), and again once a frame
++ * while that switch is held. Return nonzero to hold it: the switch, and any
++ * queued after it, wait in order until no gate holds the first one. The
++ * loading screen a switch would end stays up meanwhile. Keep it cheap. */
++typedef int (*bg3le_state_gate)(void* user, const char* from, const char* to);
++
+ typedef struct bg3le_host {
+     uint32_t abi;          /* BG3LE_PLUGIN_ABI of this bg3le */
+     uint32_t size;         /* sizeof(bg3le_host): fields past it don't exist */
+@@ -72,6 +87,16 @@
+     /* Called once per client frame. Only from bg3le_plugin_init; 0 on success.
+      * Added after v0.3.4: check host->size covers it before calling. */
+     int (*add_frame_handler)(bg3le_plugin* self, bg3le_frame_handler handler, void* user);
++
++    /* A gate on the client's game-state switches. Only from
++     * bg3le_plugin_init; 0 on success, nonzero if the switch is not hooked
++     * in this build. Newer than add_frame_handler: check host->size. */
++    int (*add_state_gate)(bg3le_plugin* self, bg3le_state_gate gate, void* user);
++
++    /* The current game state of the client (server = 0) or the server
++     * (server = 1), as Ext.Utils.GetGameState() names it, or NULL before
++     * there is one. Any thread. */
++    const char* (*game_state)(int server);
+ } bg3le_host;
+ 
+ /* Exported by every plugin. Return 0 on success. Anything else reports it as
+diff -ruN a/src/game_state.cpp b/src/game_state.cpp
+--- a/src/game_state.cpp
++++ b/src/game_state.cpp
+@@ -7,13 +7,17 @@
+ // - The per-frame call is the client's state-queue update, which EoCClient's
+ //   update calls once a frame; upstream's ticks come from the same place.
+ // - ecl::GameStateMachine::SetTargetState (it logs "ecl::GameStateQueued:
+-//   %s") is hooked only to log what is queued.
++//   %s") is hooked to log what is queued, and to let plugins' state gates
++//   hold a switch: a held state, and every one queued after it, waits here
++//   in order and is queued for real by the per-frame update once no gate
++//   holds it (bg3le_plugin.h, add_state_gate).
+ 
+ #include "game_state.h"
+ 
+ #include <atomic>
+ #include <cstdint>
+ #include <cstring>
++#include <deque>
+ #include <mutex>
+ #include <string>
+ 
+@@ -37,6 +41,7 @@
+ void translated_string_show_version(char const* suffix);
+ bool note_session_ended();
+ void plugins_dispatch_frame();  // src/plugins.cpp
++bool plugins_state_held(char const* from, char const* to);  // src/plugins.cpp
+ 
+ namespace {
+ 
+@@ -163,11 +168,40 @@
+ 
+ StateProc g_machine_update = nullptr;
+ 
++// Client switches a plugin's state gate holds: the state objects, in the
++// order the engine queued them, and the machine they were queued on.
++std::mutex g_held_lock;
++std::deque<void*> g_held;
++void* g_held_machine = nullptr;
++std::atomic<bool> g_any_held{false};
++
++char const* queued_state_name(void* state) {
++    std::uint32_t id = 0;
++    return state_id(state, &id) ? state_name(id) : "Unknown";
++}
++
++// Queues what is held once no gate holds the first of it. Before the
++// machine's update, on the client's game thread.
++void release_held_states() {
++    if (!g_any_held.load(std::memory_order_acquire)) return;
++    std::lock_guard<std::mutex> held(g_held_lock);
++    while (!g_held.empty()) {
++        void* state = g_held.front();
++        char const* to = queued_state_name(state);
++        if (plugins_state_held(client_game_state(), to)) return;
++        g_held.pop_front();
++        logf("gamestate: client switch to %s released", to);
++        g_set_target_state(g_held_machine, state);
++    }
++    g_any_held.store(false, std::memory_order_release);
++}
++
+ // Every frame is a client tick, and a state that differs from the last
+ // frame's is GameStateChanged -- upstream compares around its update call.
+ std::uint64_t machine_update_hook(void* machine, void* a, void* b, void* c) {
+     static std::atomic<bool> first{true};
+     if (first.exchange(false)) logf("gamestate: client frames are ticking");
++    release_held_states();
+     const std::uint64_t result = g_machine_update(machine, a, b, c);
+     net_client_tick();
+ 
+@@ -228,6 +262,23 @@
+         logf("gamestate: client queued %s (vtable image+%#lx)", state_name(to),
+              (unsigned long)(reinterpret_cast<std::uintptr_t>(vtable) - load_bias()));
+     }
++    std::lock_guard<std::mutex> held(g_held_lock);
++    char const* name = queued_state_name(state);
++    if (!g_held.empty()) {
++        // Behind a held switch: the engine's order is kept.
++        g_held.push_back(state);
++        g_held_machine = machine;
++        logf("gamestate: client %s waits behind a held switch", name);
++        return;
++    }
++    char const* from = client_game_state();
++    if (g_machine_update != nullptr && plugins_state_held(from, name)) {
++        g_held.push_back(state);
++        g_held_machine = machine;
++        g_any_held.store(true, std::memory_order_release);
++        logf("gamestate: a plugin holds the client's switch %s -> %s", from != nullptr ? from : "?", name);
++        return;
++    }
+     g_set_target_state(machine, state);
+ }
+ 
+@@ -248,6 +299,10 @@
+     return 2;
+ }
+ 
++bool game_state_gate_hooked() {
++    return g_set_target_state != nullptr && g_machine_update != nullptr;
++}
++
+ char const* client_state_name() {
+     char const* state = client_game_state();
+     return state != nullptr ? state : "unknown";
+diff -ruN a/src/game_state.h b/src/game_state.h
+--- a/src/game_state.h
++++ b/src/game_state.h
+@@ -11,4 +11,8 @@
+ // The server's state, upstream's esv::GameState name, or null if unknown.
+ char const* server_game_state();
+ 
++// Whether client state switches can be held (SetTargetState is hooked), for
++// the plugins' state gates (src/plugins.cpp).
++bool game_state_gate_hooked();
++
+ }  // namespace bg3le
+diff -ruN a/src/plugins.cpp b/src/plugins.cpp
+--- a/src/plugins.cpp
++++ b/src/plugins.cpp
+@@ -24,6 +24,8 @@
+ 
+ #include "../include/bg3le_plugin.h"
+ #include "debug_server.h"
++#include "game_state.h"
++#include "pak.h"
+ #include "lauxlib.h"
+ #include "log.h"
+ #include "lua.h"
+@@ -71,6 +73,14 @@
+ // once g_frames_ready publishes them.
+ std::vector<FrameHandler> g_frame_handlers;
+ std::atomic<bool> g_frames_ready{false};
++struct StateGate {
++    bg3le_plugin* owner;
++    bg3le_state_gate fn;
++    void* user;
++};
++// Added during loading and read on the client's game thread once
++// g_frames_ready publishes them, like the frame handlers.
++std::vector<StateGate> g_state_gates;
+ 
+ std::string plugins_dir() {
+     if (const char* dir = std::getenv("BG3LE_PLUGINS_DIR")) return dir;
+@@ -208,6 +218,17 @@
+     return 0;
+ }
+ 
++int host_add_state_gate(bg3le_plugin* self, bg3le_state_gate fn, void* user) {
++    if (fn == nullptr || g_frames_ready.load(std::memory_order_acquire)) return -1;
++    if (!game_state_gate_hooked()) return -2;
++    g_state_gates.push_back({self, fn, user});
++    return 0;
++}
++
++const char* host_game_state(int server) {
++    return server ? server_game_state() : client_game_state();
++}
++
+ // From bg3le's own object, so RTLD_NEXT is SDL's real function, past ours.
+ void* host_sdl_function(const char* name) {
+     if (void* next = ::dlsym(RTLD_NEXT, name)) return next;
+@@ -242,6 +263,8 @@
+     host_sdl_function,
+     host_add_setting,
+     host_add_frame_handler,
++    host_add_state_gate,
++    host_game_state,
+ };
+ 
+ bg3le_plugin* find_plugin(const char* name) {
+@@ -260,6 +283,95 @@
+ 
+ }  // namespace
+ 
++namespace {
++
++bool ends_with(std::string const& s, char const* tail) {
++    const std::size_t n = std::strlen(tail);
++    return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
++}
++
++// The string items of the JSON array "key": [...] in text, or nothing.
++// Config.json is small and flat; the array holds plain file names.
++std::vector<std::string> json_string_array(std::string const& text, char const* key) {
++    std::vector<std::string> out;
++    const std::string quoted = std::string("\"") + key + "\"";
++    std::size_t at = text.find(quoted);
++    if (at == std::string::npos) return out;
++    at = text.find_first_not_of(" \t\r\n", at + quoted.size());
++    if (at == std::string::npos || text[at] != ':') return out;
++    at = text.find_first_not_of(" \t\r\n", at + 1);
++    if (at == std::string::npos || text[at] != '[') return out;
++    const std::size_t end = text.find(']', at);
++    if (end == std::string::npos) return out;
++    for (std::size_t i = at + 1; i < end;) {
++        const std::size_t open = text.find('"', i);
++        if (open == std::string::npos || open > end) break;
++        const std::size_t close = text.find('"', open + 1);
++        if (close == std::string::npos || close > end) break;
++        out.push_back(text.substr(open + 1, close - open - 1));
++        i = close + 1;
++    }
++    return out;
++}
++
++// Plugins mods ship beside their archives: for Mods/<Name>.pak with a folder
++// Mods/<Name>/, each plain .so file name the archive's
++// Mods/<Folder>/ScriptExtender/Config.json lists under "NativePlugins",
++// taken from Mods/<Name>/. Only names the archive itself declares load, so a
++// stray library dropped in the folder does not.
++std::vector<std::string> mod_plugin_files() {
++    std::vector<std::string> out;
++    char const* home = std::getenv("HOME");
++    if (home == nullptr) return out;
++    const std::string mods = std::string(home) + "/.local/share/Larian Studios/Baldur's Gate 3/Mods";
++    DIR* d = ::opendir(mods.c_str());
++    if (d == nullptr) return out;
++    std::vector<std::string> paks;
++    while (dirent* e = ::readdir(d)) {
++        std::string name = e->d_name;
++        if (name.size() > 4 && ends_with(name, ".pak")) paks.push_back(name);
++    }
++    ::closedir(d);
++    std::sort(paks.begin(), paks.end());
++    for (std::string const& pak : paks) {
++        const std::string folder = mods + "/" + pak.substr(0, pak.size() - 4);
++        struct stat st{};
++        if (::stat(folder.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
++        std::vector<std::string> names;
++        bg3le::pak_read(
++            (mods + "/" + pak).c_str(),
++            [](char const* name) {
++                const std::string n = name;
++                // Mods/<Folder>/ScriptExtender/Config.json, one folder deep.
++                return n.rfind("Mods/", 0) == 0 && ends_with(n, "/ScriptExtender/Config.json")
++                       && n.find('/', 5) == n.size() - std::strlen("/ScriptExtender/Config.json");
++            },
++            [&](char const*, char const* data, std::size_t size) {
++                for (std::string const& n : json_string_array(std::string(data, size), "NativePlugins")) {
++                    names.push_back(n);
++                }
++            });
++        for (std::string const& n : names) {
++            if (n.empty() || n.find('/') != std::string::npos || n[0] == '.' || !ends_with(n, ".so")) {
++                statusf("WARNING: %s lists native plugin \"%s\", which is not a plain .so file name; ignored",
++                        pak.c_str(), n.c_str());
++                continue;
++            }
++            const std::string file = folder + "/" + n;
++            if (::stat(file.c_str(), &st) != 0) {
++                statusf("WARNING: %s lists native plugin %s, which is not in %s", pak.c_str(), n.c_str(),
++                        folder.c_str());
++                continue;
++            }
++            logf("plugins: %s ships %s", pak.c_str(), file.c_str());
++            out.push_back(file);
++        }
++    }
++    return out;
++}
++
++}  // namespace
++
+ // On the game's first SDL_PollEvent: the engine and its allocator are up.
+ void plugins_load() {
+     static bool done = false;
+@@ -272,14 +384,27 @@
+ 
+     const std::string dir = plugins_dir();
+     DIR* d = dir.empty() ? nullptr : ::opendir(dir.c_str());
+-    if (d == nullptr) return;
+     std::vector<std::string> files;
+-    while (dirent* e = ::readdir(d)) {
+-        std::string name = e->d_name;
+-        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".so") == 0) files.push_back(dir + "/" + name);
++    if (d != nullptr) {
++        while (dirent* e = ::readdir(d)) {
++            std::string name = e->d_name;
++            if (name.size() > 3 && name.compare(name.size() - 3, 3, ".so") == 0) files.push_back(dir + "/" + name);
++        }
++        ::closedir(d);
+     }
+-    ::closedir(d);
+     std::sort(files.begin(), files.end());
++    // Then the ones mods ship beside their archives, in the mods' name order;
++    // one already in the plugins folder under the same name is not loaded twice.
++    for (std::string const& file : mod_plugin_files()) {
++        bool twice = false;
++        for (std::string const& have : files) twice = twice || base_name(have) == base_name(file);
++        if (twice) {
++            statusf("WARNING: plugin %s is in the plugins folder too; the mod's copy %s is not loaded",
++                    base_name(file).c_str(), file.c_str());
++            continue;
++        }
++        files.push_back(file);
++    }
+ 
+     for (std::string const& file : files) {
+         auto plugin = std::make_unique<bg3le_plugin>();
+@@ -318,6 +443,9 @@
+             g_frame_handlers.erase(std::remove_if(g_frame_handlers.begin(), g_frame_handlers.end(),
+                                                   [p](FrameHandler const& h) { return h.owner == p; }),
+                                    g_frame_handlers.end());
++            g_state_gates.erase(std::remove_if(g_state_gates.begin(), g_state_gates.end(),
++                                               [p](StateGate const& h) { return h.owner == p; }),
++                                g_state_gates.end());
+             statusf("WARNING: plugin %s failed to start (%s)", p->name.c_str(), p->error.c_str());
+             continue;
+         }
+@@ -342,6 +470,16 @@
+     }
+     return false;
+ }
++
++// Whether a plugin holds the client's switch from `from` to `to`. On the
++// client's game thread.
++bool plugins_state_held(char const* from, char const* to) {
++    if (!g_frames_ready.load(std::memory_order_acquire)) return false;
++    for (StateGate const& g : g_state_gates) {
++        if (g.fn(g.user, from != nullptr ? from : "", to != nullptr ? to : "") != 0) return true;
++    }
++    return false;
++}
+ 
+ // Once per client frame, on the client's game thread.
+ void plugins_dispatch_frame() {

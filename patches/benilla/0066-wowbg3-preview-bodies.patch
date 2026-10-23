@@ -1,0 +1,703 @@
+WOW-BG3 benilla patch 0066: a stand-in's WoW body for BG3's examine and trade previews.
+
+- portrait: a fifth body booth, wowbg3body (576x768, its own layer before the glue booth's), aimed
+  like the inspect pane by sync_wowbg3_body at the unit and turn wowbg3::drive_body sets.
+- portrait/wowbg3.rs drive_body: while link/wowpreview.txt names a stand-in (RenderScreen.lua: the
+  screen, its previews, the stand-in's, its guid and BG3's turn of it), renders that unit every frame,
+  animated and turned with BG3's preview, and writes every readback to the live file (/dev/shm when
+  there is one, named in link/wowbody/live.path; a header and two frame slots). In between it bakes a
+  still per mirrored display (link/wowbody/d<display>.rgba) and writes link/wowbody/<guid>.txt (display,
+  WoW race, creature type, NPC flags). The capture layer draws the body over BG3's preview; PreviewRaces.lua
+  names the race in BG3's screens.
+
+--- a/crates/benilla-app/src/portrait/mod.rs
++++ b/crates/benilla-app/src/portrait/mod.rs
+@@ -138,10 +138,13 @@
+ const INSPECT_LAYER: usize = PAPERDOLL_LAYER + 1;
+ const PETDOLL_LAYER: usize = INSPECT_LAYER + 1;
+ const STABLE_LAYER: usize = PETDOLL_LAYER + 1;
++/// WOW-BG3 (patch 0066): the body booth [`wowbg3::drive_body`] bakes a stand-in's WoW model in, for
++/// BG3's examine and trade previews.
++const WOWBG3_BODY_LAYER: usize = STABLE_LAYER + 1;
+ /// The glue booth's layer. Every booth layer is computed in this one ladder: two cameras on one
+ /// layer collide silently, in rendering and in the emitter-to-camera match (`particles::sim` takes
+ /// the first camera whose layers intersect).
+-pub(super) const GLUE_LAYER: usize = STABLE_LAYER + 1;
++pub(super) const GLUE_LAYER: usize = WOWBG3_BODY_LAYER + 1;
+ /// The dressing room's layer.
+ pub(super) const DRESSUP_LAYER: usize = GLUE_LAYER + 1;
+ /// The warm pass's twin booth layer; only the warm menagerie rides it, only while the pass runs
+@@ -782,6 +785,7 @@
+             .init_resource::<GxAspect>()
+             .init_resource::<BoothLight>()
+             .init_resource::<wowbg3::WowBg3Portraits>()
++            .init_resource::<wowbg3::WowBg3Body>()
+             .add_systems(Startup, setup_booths)
+             // The variant-cache reaper: booth twins die with their world source material.
+             .add_systems(Update, (light::reap_dead_variants, feed_gx_aspect))
+@@ -797,6 +801,7 @@
+                     sync_portraits,
+                     sync_paperdoll,
+                     sync_inspect_booth,
++                    sync_wowbg3_body,
+                     sync_petdoll_booth,
+                     // The stand-in must exist before the booth mirrors it.
+                     sync_stable_standin,
+@@ -822,6 +827,8 @@
+             )
+             // WOW-BG3: the stand-in portraits, after the gate settled this frame's booths.
+             .add_systems(Update, wowbg3::drive.after(gate_booth_cameras))
++            // WOW-BG3 (patch 0066): the stand-in bodies for BG3's previews, the same way.
++            .add_systems(Update, wowbg3::drive_body.after(gate_booth_cameras))
+             // Re-face each booth's eye-glow cards to its own camera.
+             .add_systems(Update, booth::face_booth_billboards)
+             // Push each booth part's sampled `MatAnim` alpha, after the sampler.
+@@ -997,17 +1004,24 @@
+     }
+ 
+     // The four body booths: the paper doll, inspect, the pet paper doll and the stable
+-    // (`0x4cb870`), at 512², aimed per bake by `sync_body_booth`.
++    // (`0x4cb870`), at 512², aimed per bake by `sync_body_booth`. WOW-BG3 (patch 0066): a fifth,
++    // portrait-shaped, for BG3's previews ([`wowbg3::drive_body`]).
+     for (i, (slot, layer_index)) in [
+         (PAPERDOLL_SLOT, PAPERDOLL_LAYER),
+         (INSPECT_SLOT, INSPECT_LAYER),
+         (PETDOLL_SLOT, PETDOLL_LAYER),
+         (STABLE_SLOT, STABLE_LAYER),
++        (wowbg3::BODY_SLOT, WOWBG3_BODY_LAYER),
+     ]
+     .into_iter()
+     .enumerate()
+     {
+-        let image = images.add(new_target_image(PAPERDOLL_SIZE));
++        let wowbg3_body = slot == wowbg3::BODY_SLOT;
++        let image = images.add(if wowbg3_body {
++            new_target_image_sized(wowbg3::BODY_W, wowbg3::BODY_H)
++        } else {
++            new_target_image(PAPERDOLL_SIZE)
++        });
+         portraits
+             .0
+             .insert(slot.to_string(), PortraitSource::Live(image.clone()));
+@@ -1053,7 +1067,12 @@
+                 pending_since: None,
+                 pipes_settling: false,
+                 pipes_since: None,
+-                aspect: 1.0,
++                // No pane latches the BG3 booth's aspect: its target's own.
++                aspect: if wowbg3_body {
++                    wowbg3::BODY_W as f32 / wowbg3::BODY_H as f32
++                } else {
++                    1.0
++                },
+                 rigged: false,
+                 parked: false,
+                 turn: Turn::default(),
+@@ -1643,6 +1662,48 @@
+         &mut last_pose,
+         framing_in.gx.0,
+         &mut commands,
++        &mut booths,
++        &mut portraits,
++        &mut booth_light,
++        creatures.as_deref(),
++        &ent_q,
++        &look,
++        &mut wow_mats,
++        &mut cams,
++        anim_data.as_deref(),
++        &framing_in.panes,
++    );
++}
++
++/// WOW-BG3 (patch 0066): the BG3 preview booth, pointed at [`wowbg3::drive_body`]'s unit.
++fn sync_wowbg3_body(
++    mut commands: Commands,
++    mut booths: ResMut<Booths>,
++    mut portraits: ResMut<PortraitImages>,
++    mut booth_light: ResMut<BoothLight>,
++    creatures: Option<Res<Creatures>>,
++    ent_q: Query<&NetEntity>,
++    look: DressedLook,
++    body: Res<wowbg3::WowBg3Body>,
++    mut palettes: ResMut<benilla_world::rig_palette::RigPalettes>,
++    mut wow_mats: ResMut<Assets<WowModelMaterial>>,
++    mut env_cache: Local<Option<bool>>,
++    mut last_pose: Local<Option<(f32, f32)>>,
++    mut cams: Query<(&BoothCam, &mut Transform, &mut Projection)>,
++    framing_in: BoothFraming,
++    anim_data: Option<Res<crate::creature_anim::AnimData>>,
++) {
++    if test_mode(&mut env_cache) {
++        return;
++    }
++    sync_body_booth(
++        &mut palettes,
++        wowbg3::BODY_SLOT,
++        body.subject,
++        body.yaw,
++        &mut last_pose,
++        framing_in.gx.0,
++        &mut commands,
+         &mut booths,
+         &mut portraits,
+         &mut booth_light,
+--- a/crates/benilla-app/src/portrait/wowbg3.rs
++++ b/crates/benilla-app/src/portrait/wowbg3.rs
+@@ -13,6 +13,25 @@
+ //! file. The mirrored mobs are the bridge's (`mirrored.txt`, `m <guid hex>` lines).
+ //!
+ //! Off unless `WOW_BG3_LINK_DIR` is set. Logs `wowbg3 portrait:` lines.
++//!
++//! Patch 0066: BG3's examine and trade screens draw the character they show into a picture of their
++//! own (a "preview"), and for a stand-in that is the BG3 body under the WoW model. [`drive_body`]
++//! shows the WoW model there instead, through the capture layer (wowbg3_preview.inc.c):
++//! - While the mod names a stand-in in `$WOW_BG3_LINK_DIR/wowpreview.txt` (`1 <screen> <previews>
++//!   <index> <guid hex> <turn>`, the turn being BG3's preview yaw in radians; `0` when no preview shows
++//!   a stand-in), its own booth, [`BODY_SLOT`] ([`BODY_W`]x[`BODY_H`], the inspect pane's light and
++//!   framing), renders that unit every frame, animated as WoW's body panes are and turned with BG3's
++//!   preview, and every finished readback goes into the live file (`/dev/shm` when there is one; its
++//!   path in `wowbody/live.path`): a 64-byte header (`WBL1`, width, height, newest slot, sequence,
++//!   guid, the covered box so far, display) and two frame slots, written alternately.
++//! - In between it bakes a still of every mirrored mob's display once per run,
++//!   `wowbody/d<display>.rgba` (`WBR2`, width, height, display, covered box, then the frame), so a
++//!   screen that opens has a WoW body at once, and writes `wowbody/<guid hex>.txt` (`display`, `race`,
++//!   `type` lines: the WoW race of a player-race model, else the beast family, else the creature
++//!   type; `npcflags`, the unit's UNIT_NPC_FLAGS: 0 for an NPC with nothing to say) for the layer and
++//!   for the mod, which names the race in BG3's screens and offers Talk only where WoW has something.
++//! Frames are sRGB RGBA8; the booth clears to transparent and blends, so the colour is already over
++//! black; alpha is coverage (the box). Logs `wowbg3 preview:` lines.
+ 
+ use std::collections::{BTreeMap, HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -25,6 +44,15 @@
+ 
+ /// The booth slot the stand-in portraits bake in.
+ pub(super) const SLOT: &str = "wowbg3";
++/// The body booth for BG3's previews (patch 0066).
++pub(super) const BODY_SLOT: &str = "wowbg3body";
++/// Its target: portrait-shaped, so fitted to the height of BG3's examine preview (525x690 at
++/// 1080p) it fills it, and its trade previews (700x690) get black (empty) sides.
++pub(super) const BODY_W: u32 = 576;
++pub(super) const BODY_H: u32 = 768;
++/// The model's turn in it when BG3's preview stands unturned (radians; 0 faces the camera, more turns
++/// its face to the viewer's right): BG3's own 25 degrees, mirrored, as BG3 stands it.
++pub(super) const BODY_YAW: f32 = -0.436_332;
+ 
+ /// Frames the settled booth is held awake before the shot: a sleeping booth's target reads back
+ /// empty (see `WOW_BOOTH_DUMP`).
+@@ -92,6 +120,269 @@
+     Shooting,
+ }
+ 
++/// Patch 0066: the BG3 preview bodies ([`drive_body`]).
++#[derive(Resource)]
++pub(crate) struct WowBg3Body {
++    dir: Option<PathBuf>,
++    /// The unit the body booth shows now and its turn, read by `sync_wowbg3_body`.
++    pub(super) subject: Option<Entity>,
++    pub(super) yaw: f32,
++    /// A still baking in the background.
++    job: Option<Job>,
++    /// The stand-in a preview shows, streaming.
++    live: Option<Live>,
++    /// What `wowpreview.txt` asks for: the guid and BG3's turn of its preview.
++    want: Option<(u64, Option<f32>)>,
++    /// Displays with a still this run, and displays whose still failed (when).
++    stills: HashSet<u32>,
++    failed: HashMap<u32, f64>,
++    /// Guids whose `wowbody/<guid>.txt` is written.
++    infos: HashSet<u64>,
++    mirrored: Vec<u64>,
++    frame: u64,
++    /// Still readbacks the observers finished: display, file size or why not.
++    shots: Arc<Mutex<Vec<(u32, Result<usize, String>)>>>,
++    /// The live file and its writer.
++    stream: Arc<Mutex<Stream>>,
++}
++
++struct Live {
++    guid: u64,
++    display: u32,
++    entity: Entity,
++    /// Frames since the stream began: the first bake settles before the first readback.
++    frames: u32,
++}
++
++/// The live file's writer (shared with the readback observers).
++struct Stream {
++    file: Option<std::fs::File>,
++    seq: u32,
++    slot: u32,
++    /// The subject the frames belong to and the stream they come from: a readback of an earlier
++    /// stream (in flight when its screen closed, the same stand-in or not) is dropped.
++    guid: u64,
++    stream: u64,
++    /// The covered box over the stream so far (x0, y0, x1, y1), so the layer's framing holds still.
++    bbox: [u32; 4],
++    in_flight: bool,
++    written: u64,
++    failed: bool,
++}
++
++impl Default for WowBg3Body {
++    fn default() -> Self {
++        let dir = std::env::var_os("WOW_BG3_LINK_DIR").map(PathBuf::from);
++        if let Some(d) = &dir {
++            let _ = std::fs::create_dir_all(d.join("wowbody"));
++        }
++        Self {
++            dir,
++            subject: None,
++            yaw: BODY_YAW,
++            job: None,
++            live: None,
++            want: None,
++            stills: HashSet::new(),
++            failed: HashMap::new(),
++            infos: HashSet::new(),
++            mirrored: Vec::new(),
++            frame: 0,
++            shots: Arc::new(Mutex::new(Vec::new())),
++            stream: Arc::new(Mutex::new(Stream {
++                file: None,
++                seq: 0,
++                slot: 1,
++                guid: 0,
++                stream: 0,
++                bbox: NO_BOX,
++                in_flight: false,
++                written: 0,
++                failed: false,
++            })),
++        }
++    }
++}
++
++const NO_BOX: [u32; 4] = [u32::MAX, u32::MAX, 0, 0];
++/// BG3's preview yaw when its screen opens (its paperdoll's rotation, 25 degrees), and which way a
++/// BG3 turn turns the booth's model.
++const BG3_YAW0: f32 = 0.436_332;
++const YAW_SIGN: f32 = -1.0;
++/// Frames between two background stills: one booth bake now and then, never a stream of them.
++const STILL_EVERY: u64 = 20;
++
++/// `wowpreview.txt`: `1 <screen> <previews> <index> <guid hex> [<turn>]`; `None` for `0`.
++fn preview_request(dir: &Path) -> Option<(u64, Option<f32>)> {
++    let text = std::fs::read_to_string(dir.join("wowpreview.txt")).ok()?;
++    let mut words = text.split_whitespace();
++    if words.next()? != "1" {
++        return None;
++    }
++    let guid = u64::from_str_radix(words.nth(3)?, 16).ok()?;
++    Some((guid, words.next().and_then(|w| w.parse::<f32>().ok()).filter(|y| y.is_finite())))
++}
++
++/// BG3's preview turn as the booth's model turn.
++fn booth_yaw(bg3: Option<f32>) -> f32 {
++    bg3.map_or(BODY_YAW, |y| BODY_YAW + YAW_SIGN * (y - BG3_YAW0))
++}
++
++/// `CreatureType.dbc` names by id.
++fn type_name(id: u32) -> &'static str {
++    match id {
++        1 => "Beast",
++        2 => "Dragonkin",
++        3 => "Demon",
++        4 => "Elemental",
++        5 => "Giant",
++        6 => "Undead",
++        7 => "Humanoid",
++        8 => "Critter",
++        9 => "Mechanical",
++        _ => "Creature",
++    }
++}
++
++/// `CreatureFamily.dbc` names by id (1.12's rows).
++fn family_name(id: u32) -> Option<&'static str> {
++    Some(match id {
++        1 => "Wolf",
++        2 => "Cat",
++        3 => "Spider",
++        4 => "Bear",
++        5 => "Boar",
++        6 => "Crocolisk",
++        7 => "Carrion Bird",
++        8 => "Crab",
++        9 => "Gorilla",
++        11 => "Raptor",
++        12 => "Tallstrider",
++        15 => "Felhunter",
++        16 => "Voidwalker",
++        17 => "Succubus",
++        19 => "Doomguard",
++        20 => "Scorpid",
++        21 => "Turtle",
++        23 => "Imp",
++        24 => "Bat",
++        25 => "Hyena",
++        26 => "Owl",
++        27 => "Wind Serpent",
++        _ => return None,
++    })
++}
++
++/// A creature's WoW race (its model's, for a player-race model; else its beast family; else its
++/// creature type) and its creature type, once its template record is in.
++fn kind_names(
++    names: &crate::names::NameCache,
++    creatures: Option<&crate::entities::Creatures>,
++    guid: u64,
++    display: u32,
++) -> Option<(&'static str, &'static str)> {
++    // A creature guid carries its entry in bits 24..48.
++    let record = names.creature_record(((guid >> 24) & 0xff_ffff) as u32)?;
++    let kind = type_name(record.creature_type);
++    let race = creatures
++        .and_then(|c| c.display_race_sex(display))
++        .and_then(|(race, _)| crate::ui_unit::race_names(race))
++        .map(|(name, _)| name)
++        .or_else(|| family_name(record.pet_family))
++        .unwrap_or(kind);
++    Some((race, kind))
++}
++
++/// The booth's readback (Rgba16Float, linear) as sRGB RGBA8 (coverage stays linear), with the box of
++/// covered pixels (exclusive ends) if any.
++fn encode_body(shot: &Image) -> Option<(u32, u32, Vec<u8>, Option<[u32; 4]>)> {
++    use bevy::render::render_resource::TextureFormat;
++    use std::sync::OnceLock;
++    if shot.texture_descriptor.format != TextureFormat::Rgba16Float {
++        return None;
++    }
++    let (w, h) = (shot.texture_descriptor.size.width, shot.texture_descriptor.size.height);
++    let src = shot.data.as_ref()?;
++    let n = (w * h) as usize;
++    if src.len() < n * 8 {
++        return None;
++    }
++    // Every half's sRGB byte and linear byte, made once (a powf per channel per pixel per frame was
++    // the alternative).
++    static LUT: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
++    let (srgb, lin) = LUT.get_or_init(|| {
++        let mut srgb = vec![0u8; 65536];
++        let mut lin = vec![0u8; 65536];
++        for bits in 0..65536usize {
++            let v = half::f16::from_bits(bits as u16).to_f32();
++            let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
++            let e = if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
++            srgb[bits] = (e.clamp(0.0, 1.0) * 255.0).round() as u8;
++            lin[bits] = (v * 255.0).round() as u8;
++        }
++        (srgb, lin)
++    });
++    let mut out = vec![0u8; n * 4];
++    let mut bb = NO_BOX;
++    for i in 0..n {
++        for c in 0..4 {
++            let bits = u16::from_le_bytes([src[i * 8 + c * 2], src[i * 8 + c * 2 + 1]]) as usize;
++            out[i * 4 + c] = if c == 3 { lin[bits] } else { srgb[bits] };
++        }
++        if out[i * 4 + 3] > 8 {
++            let (x, y) = ((i as u32) % w, (i as u32) / w);
++            bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x + 1), bb[3].max(y + 1)];
++        }
++    }
++    Some((w, h, out, (bb[2] > bb[0]).then_some(bb)))
++}
++
++impl Stream {
++    /// One frame into the slot not read last, then the header (the sequence moves last).
++    fn write(&mut self, dir: &Path, w: u32, h: u32, display: u32, px: &[u8], bb: Option<[u32; 4]>) -> std::io::Result<()> {
++        use std::os::unix::fs::FileExt;
++        let frame = (w * h * 4) as u64;
++        if self.file.is_none() {
++            // One name per link folder, so a new run reuses it rather than adding another.
++            let key = dir
++                .to_string_lossy()
++                .bytes()
++                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
++            let shm = Path::new("/dev/shm");
++            let path = if shm.is_dir() {
++                shm.join(format!("wowbg3-body-{key:016x}.bin"))
++            } else {
++                dir.join("wowbody").join("live.bin")
++            };
++            let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
++            file.set_len(64 + 2 * frame)?;
++            write_atomic(&dir.join("wowbody").join("live.path"), path.to_string_lossy().as_bytes())?;
++            self.file = Some(file);
++        }
++        if let Some(b) = bb {
++            self.bbox = [self.bbox[0].min(b[0]), self.bbox[1].min(b[1]), self.bbox[2].max(b[2]), self.bbox[3].max(b[3])];
++        }
++        let file = self.file.as_ref().expect("opened above");
++        let slot = 1 - self.slot;
++        file.write_at(px, 64 + slot as u64 * frame)?;
++        self.slot = slot;
++        self.seq = self.seq.wrapping_add(1);
++        let bbox = if self.bbox[2] > self.bbox[0] { self.bbox } else { [0, 0, 0, 0] };
++        let mut hdr = Vec::with_capacity(64);
++        hdr.extend_from_slice(b"WBL1");
++        for v in [w, h, slot, self.seq, 0] {
++            hdr.extend_from_slice(&v.to_le_bytes());
++        }
++        hdr.extend_from_slice(&self.guid.to_le_bytes());
++        for v in bbox.into_iter().chain([display, 0, 0, 0]) {
++            hdr.extend_from_slice(&v.to_le_bytes());
++        }
++        file.write_at(&hdr, 0)?;
++        self.written += 1;
++        Ok(())
++    }
++}
++
+ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+     let tmp = path.with_extension("tmp");
+     std::fs::write(&tmp, bytes)?;
+@@ -243,5 +534,244 @@
+             booth.wake = booth.wake.max(1);
+         }
+     }
++    state.job = Some(job);
++}
++
++/// Patch 0066, after [`super::gate_booth_cameras`]: the live body of the stand-in `wowpreview.txt`
++/// names, and in between the stills and the race files of the mirrored mobs.
++pub(super) fn drive_body(
++    mut commands: Commands,
++    mut state: ResMut<WowBg3Body>,
++    mut booths: ResMut<Booths>,
++    index: Res<crate::net::GuidIndex>,
++    ents: Query<&crate::net::NetEntity>,
++    names: Res<crate::names::NameCache>,
++    creatures: Option<Res<crate::entities::Creatures>>,
++    stores: Query<&crate::net::ObjectStore>,
++    time: Res<Time<bevy::time::Real>>,
++) {
++    let Some(dir) = state.dir.clone() else {
++        return;
++    };
++    state.frame += 1;
++    let now = time.elapsed_secs_f64();
++    let finished: Vec<_> = state.shots.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
++    for (disp, result) in finished {
++        match result {
++            Ok(bytes) => {
++                info!("wowbg3 preview: still of display {disp} written ({bytes} bytes)");
++                state.stills.insert(disp);
++                state.failed.remove(&disp);
++            }
++            Err(why) => {
++                warn!("wowbg3 preview: still of display {disp} not written: {why}");
++                state.failed.insert(disp, now);
++            }
++        }
++        if state.job.as_ref().is_some_and(|j| j.display == disp) {
++            state.job = None;
++            state.subject = None;
++        }
++    }
++    if state.frame % 2 == 0 {
++        state.want = preview_request(&dir);
++    }
++    let display_of = |guid: u64| -> Option<(Entity, u32)> {
++        let e = *index.0.get(&guid)?;
++        Some((e, ents.get(e).ok()?.display_id?))
++    };
++    // The mirrored mobs and their race files.
++    if state.frame % 30 == 7 {
++        let text = std::fs::read_to_string(dir.join("mirrored.txt")).unwrap_or_default();
++        state.mirrored = text
++            .lines()
++            .filter_map(|l| l.strip_prefix("m "))
++            .filter_map(|g| u64::from_str_radix(g.trim(), 16).ok())
++            .collect();
++        let guids: Vec<u64> = state.mirrored.iter().copied().chain(state.want.map(|w| w.0)).collect();
++        for guid in guids {
++            if state.infos.contains(&guid) {
++                continue;
++            }
++            let Some((_, display)) = display_of(guid) else { continue };
++            let Some((race, kind)) = kind_names(&names, creatures.as_deref(), guid, display) else { continue };
++            let npc = index.0.get(&guid).and_then(|e| stores.get(*e).ok()).map_or(0, |s| s.0.unit_npc_flags());
++            let text = format!("display {display}\nrace {race}\ntype {kind}\nnpcflags {npc}\n");
++            match write_atomic(&dir.join("wowbody").join(format!("{guid:016x}.txt")), text.as_bytes()) {
++                Ok(()) => {
++                    state.infos.insert(guid);
++                }
++                Err(e) => warn!("wowbg3 preview: cannot write {guid:016x}.txt: {e}"),
++            }
++        }
++    }
++    let Some(booth) = booths.0.get_mut(BODY_SLOT) else {
++        return;
++    };
++    // The stream follows the request.
++    match state.want {
++        Some((guid, turn)) => {
++            if state.live.as_ref().map(|l| l.guid) != Some(guid) {
++                if let Some((entity, disp)) = display_of(guid) {
++                    info!("wowbg3 preview: streaming {guid:016x} (display {disp})");
++                    // A background still gives way; its display is picked again later.
++                    state.job = None;
++                    state.live = Some(Live { guid, display: disp, entity, frames: 0 });
++                    state.subject = Some(entity);
++                    if let Ok(mut s) = state.stream.lock() {
++                        s.guid = guid;
++                        s.stream = s.stream.wrapping_add(1);
++                        s.bbox = NO_BOX;
++                        s.written = 0;
++                    }
++                }
++            }
++            state.yaw = booth_yaw(turn);
++        }
++        None => {
++            if let Some(live) = state.live.take() {
++                let written = state.stream.lock().map(|s| s.written).unwrap_or(0);
++                info!("wowbg3 preview: {:016x} streamed ({written} frames)", live.guid);
++                state.subject = None;
++                state.yaw = BODY_YAW;
++                if let Ok(mut s) = state.stream.lock() {
++                    s.guid = 0;
++                }
++            }
++        }
++    }
++    let stream = state.stream.clone();
++    if let Some(live) = state.live.as_mut() {
++        if ents.get(live.entity).is_err() {
++            state.live = None;
++            state.subject = None;
++            return;
++        }
++        live.frames += 1;
++        // Rendered every frame while a preview shows it: the model animates, the turn follows. Not
++        // while a fresh bake's pipelines settle: the settle ends only once the wake has drained (the
++        // gate keeps the camera up meanwhile), and a wake held up kept it 15 s (harness).
++        if !booth.pipes_settling {
++            booth.wake = booth.wake.max(1);
++        }
++        let settled = live.frames > BOOTH_SETTLE_FRAMES + WAKE_LEAD
++            && booth.snap.is_some()
++            && booth.pending.is_empty()
++            && !booth.pipes_settling;
++        let idle = stream.lock().is_ok_and(|s| !s.in_flight);
++        if settled && idle {
++            let mut of = 0;
++            if let Ok(mut s) = stream.lock() {
++                s.in_flight = true;
++                of = s.stream;
++            }
++            let (guid, display) = (live.guid, live.display);
++            let dir = dir.clone();
++            commands
++                .spawn(Screenshot::image(booth.target.clone()))
++                .observe(move |shot: On<ScreenshotCaptured>| {
++                    let Ok(mut s) = stream.lock() else { return };
++                    s.in_flight = false;
++                    if s.guid != guid || s.stream != of {
++                        return; // the screen closed or moved on
++                    }
++                    let Some((w, h, px, bb)) = encode_body(&shot.image) else { return };
++                    match s.write(&dir, w, h, display, &px, bb) {
++                        Ok(()) => s.failed = false,
++                        Err(e) if !s.failed => {
++                            s.failed = true;
++                            warn!("wowbg3 preview: cannot write the live frame: {e}");
++                        }
++                        Err(_) => {}
++                    }
++                });
++        }
++        return;
++    }
++    // Background stills, one display at a time, now and then.
++    let Some(mut job) = state.job.take() else {
++        if state.frame % STILL_EVERY != 0 {
++            return;
++        }
++        let next = state.mirrored.iter().find_map(|&g| {
++            let (e, d) = display_of(g)?;
++            let blocked = state.stills.contains(&d) || state.failed.get(&d).is_some_and(|t| now - t < RETRY_AFTER);
++            (!blocked).then_some((g, e, d))
++        });
++        if let Some((guid, entity, display)) = next {
++            state.subject = Some(entity);
++            state.yaw = BODY_YAW;
++            state.job = Some(Job {
++                guid,
++                display,
++                entity,
++                since: now,
++                stage: Stage::Baking { armed: false },
++            });
++        } else {
++            state.subject = None;
++        }
++        return;
++    };
++    if ents.get(job.entity).is_err() {
++        state.subject = None;
++        return;
++    }
++    let timeout = match job.stage {
++        Stage::Shooting => BAKE_TIMEOUT + SHOT_TIMEOUT,
++        _ => BAKE_TIMEOUT,
++    };
++    if now - job.since > timeout {
++        warn!(
++            "wowbg3 preview: still of display {} (guid {:016x}) gave up after {timeout:.0} s",
++            job.display, job.guid
++        );
++        state.failed.insert(job.display, now);
++        state.subject = None;
++        return;
++    }
++    match job.stage {
++        Stage::Baking { armed } => {
++            let busy = booth.wake > 0 || !booth.pending.is_empty() || booth.pipes_settling;
++            if busy {
++                job.stage = Stage::Baking { armed: true };
++            } else if armed && booth.snap.is_some() {
++                job.stage = Stage::Waking(0);
++            }
++        }
++        Stage::Waking(n) => {
++            booth.wake = booth.wake.max(BOOTH_SETTLE_FRAMES);
++            if n + 1 < WAKE_LEAD {
++                job.stage = Stage::Waking(n + 1);
++            } else {
++                let path = dir.join("wowbody").join(format!("d{}.rgba", job.display));
++                let shots = state.shots.clone();
++                let display = job.display;
++                commands
++                    .spawn(Screenshot::image(booth.target.clone()))
++                    .observe(move |shot: On<ScreenshotCaptured>| {
++                        let result = (|| -> Result<usize, String> {
++                            let (w, h, px, bb) = encode_body(&shot.image).ok_or("unexpected target format")?;
++                            let bb = bb.unwrap_or([0, 0, 0, 0]);
++                            let mut out = Vec::with_capacity(32 + px.len());
++                            out.extend_from_slice(b"WBR2");
++                            for v in [w, h, display].into_iter().chain(bb) {
++                                out.extend_from_slice(&v.to_le_bytes());
++                            }
++                            out.extend_from_slice(&px);
++                            write_atomic(&path, &out).map_err(|e| e.to_string())?;
++                            Ok(out.len())
++                        })();
++                        if let Ok(mut s) = shots.lock() {
++                            s.push((display, result));
++                        }
++                    });
++                job.stage = Stage::Shooting;
++            }
++        }
++        Stage::Shooting => {
++            booth.wake = booth.wake.max(1);
++        }
++    }
+     state.job = Some(job);
+ }

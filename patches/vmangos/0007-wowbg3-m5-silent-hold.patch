@@ -1,0 +1,33 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 6d4c58b..5959905 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -36,6 +36,7 @@
+ #include "ObjectGuid.h"
+ #include "Player.h"
+ #include "SharedDefines.h"
++#include "SpellMgr.h"
+ #include "ThreatManager.h"
+ #include "Timer.h"
+ #include "World.h"
+@@ -373,12 +374,19 @@ namespace
+     }
+ 
+     // Stun with the GM freeze aura. False if the mob cannot be stunned.
++    // 0007: the aura is applied, not cast. A cast sends the spell's start and go packets, and the
++    // client plays spell visual 87's cast and impact kits for them ("Magic Cast", "Sleep Impact"):
++    // a sleep sound on every held mob at each fight start. The cast's own immunity rule is kept
++    // (a self cast: IsImmuneToSpell, then the aura effect's immunity, both as cast on self).
+     bool Freeze(Creature* c)
+     {
+         if (!c->HasAura(FREEZE_SPELL))
+         {
+             c->InterruptNonMeleeSpells(false);
+-            c->CastSpell(c, FREEZE_SPELL, true);
++            SpellEntry const* freeze = sSpellMgr.GetSpellEntry(FREEZE_SPELL);
++            if (freeze && !c->IsImmuneToSpell(freeze, true) &&
++                !c->IsImmuneToSpellEffect(freeze, EFFECT_INDEX_0, true))
++                c->AddAura(FREEZE_SPELL, ADD_AURA_NO_OPTION, c);
+         }
+         // Stunned mobs keep their leash anyway; this also covers the moment after release.
+         c->UpdateLeashExtensionTime();

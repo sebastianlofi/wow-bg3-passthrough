@@ -1,0 +1,320 @@
+WOW-BG3 benilla patch 0036: BG3's vertex-colour cuts on the figures (on top of 0001-0009, 0011-0035).
+
+Bodies poked through the clothes (Gale's legs and chest through his robe,
+Astarion's feet and shins through his boots, underwear through trousers), because BG3's own cuts were never
+active in WoW. BG3's rule (from its shaders and its own textures at runtime):
+- Every material whose shader has a VertexColor_MSK texture (CHAR_Skin_Body, the genitals' and pubes' shaders,
+  CHAR_BASE_*VertCut* for underwear and clothes) moves, in its vertex shader, each vertex to its object's origin
+  where step(0.01, VertexColor_MSK.g) at uv (fract(16 g), floor(16 g) / 16), g the vertex colour's G, point-wrap
+  sampled (CHAR_BASE_VertCut_VT_ST_DEF_Vulkan.bshd): texel k for G byte k (255 wraps to 0).
+- One 16x16 RGBA8 mask per character, bound to all its such draws (G-buffer and depth), texel k = 255 for the
+  NakedBodySystem byte (Mods/Shared/EquipmentSettings/VisualSlots.lsx) of every VertexColorMaskSlots entry of its
+  equipped visuals (ClientEquipmentVisuals), rewritten in place when the equipment changes. Layer tavlog + image
+  dumps: Gale, Astarion, Shadowheart, Lae'zel, Wyll, Karlach all as the rule says; Astarion's boots unequipped
+  dropped 150 (feet) and 20 (Pants), kept 36 (shins, from his pants), equipped again restored them.
+Here (wowbg3_tav.rs): each skinned mesh keeps its vertex colour's G byte (stream 0 starts with the u8x4 colour
+when uv0 is at offset 4; the layer already copies stream 0), link/tools/tavtex.py writes the figure's mask bytes
+as tavtex.txt's `cut:<b>,...` token on the meshes whose material cuts, and the triangles whose three vertices
+are cut are left out of the index buffer (exactly what BG3's collapse leaves without area; no triangle of the six
+origins has only some vertices cut: such a one would be kept whole and logged). A mesh key keeps its cut across
+plans until tavtex.txt gives the plan's own; an equipment change rebuilds the indices. WOW_BG3_TAV_CUTS=off: no
+cuts. Supersedes the cut half of link/benilla/0010-wowbg3-tav-mips-cuts.patch (WIP, never applied).
+
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -100,6 +100,21 @@
+ //!   `WOW_BG3_TAV_SIDES=two` draws everything two-sided as before.
+ //! - Size: plans of up to [`MAX_MESHES`] (512, the layer's TAV_MAX) meshes and pose records; at 256, Gale
+ //!   and five companions (296 meshes with every LOD planned) did not decode and every figure vanished.
++//!
++//! Patch 0036 (bodies poked through the clothes, Gale's legs through his robe,
++//! Astarion's feet through his boots): BG3's vertex-colour cuts. The vertex shader of every material with a
++//! `VertexColor_MSK` texture (bodies, genitals, pubes, underwear, the `_VertCut` clothes;
++//! `CHAR_BASE_VertCut_VT_ST_DEF_Vulkan.bshd`) samples that texture point-wrapped at
++//! `(fract(16 g), floor(16 g) / 16)` from the vertex colour's G and moves the vertex to its object's origin where
++//! the texel's G is at least 0.01: texel `k` for a G byte `k` (255 wraps to texel 0). BG3 binds one 16x16 mask per
++//! character to all of them, the texels of the NakedBodySystem bytes (`VisualSlots.lsx`) of the
++//! `VertexColorMaskSlots` of its equipped visuals set, and rewrites it in place when the equipment changes (
++//! the layer's `tavlog` and image dumps, all six origins, an Unequip and Equip). `tavtex.py` writes those bytes per
++//! mesh as `tavtex.txt`'s `cut:<b>,<b>...` token ([`cut_token`]) and the triangles whose three vertices are cut,
++//! which BG3's collapse leaves without area, are left out of the index buffer ([`cut_triangles`]). No triangle of
++//! the six origins' meshes has only some of its vertices cut; such a one is kept whole and counted (BG3 would
++//! stretch it to the origin). A mesh key keeps its cut across plans until `tavtex.txt` gives the plan's own.
++//! `WOW_BG3_TAV_CUTS=off`: no cuts, as before. Supersedes the cut half of the 0010 WIP.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -171,6 +186,9 @@
+     pub(crate) weights: Vec<[f32; 4]>,
+     pub(crate) bones: Vec<[u8; 4]>,
+     pub(crate) idx: Vec<u32>,
++    /// Patch 0036: each vertex's colour G byte (BG3's vertex-colour mask region), when its stream-0 vertex
++    /// starts with the u8x4 colour (a skinned mesh with uv0 at offset 4).
++    pub(crate) green: Option<Vec<u8>>,
+     /// A rigid mesh riding a skinned sibling (the elf ears on the head): whose palette its
+     /// borrowed weights index. See [`borrow_skin`].
+     pub(crate) skin_from: Option<u64>,
+@@ -451,7 +469,9 @@
+             return None;
+         }
+         let (nrm, tan) = qtangent_frames(&pos, &uv, &qt, &idx);
+-        meshes.push(TavMesh { key, kind, part, figure, lod, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
++        // Patch 0036: the colour's G byte (stream 0 starts with the u8x4 colour when uv0 is at offset 4).
++        let green = (kind == 0 && uvoff == 4).then(|| (0..vc).map(|v| vb[v * vs + 1]).collect());
++        meshes.push(TavMesh { key, kind, part, figure, lod, pos, nrm, tan, uv, weights, bones, idx, green, skin_from: None });
+     }
+     borrow_skin(&mut meshes);
+     Some(MeshFile { seq, centre, wow, meshes })
+@@ -719,6 +739,10 @@
+     dressed: bool,
+     /// Patch 0034: its rig slot when skinned on the GPU.
+     rig: Option<PartRig>,
++    /// Patch 0036: the vertex-colour cut its index buffer was built with (BG3's mask bytes; empty: whole) and the
++    /// triangles it left out.
++    cut: Vec<u8>,
++    cut_out: usize,
+ }
+ 
+ /// Patch 0034: a GPU-skinned mesh's rig slot (the `RigSkin` on its entity frees it with the entity),
+@@ -826,6 +850,11 @@
+     lod_fine: bool,
+     lod0_drawn: HashSet<u64>,
+     sides: bool,
++    /// Patch 0036: `WOW_BG3_TAV_CUTS` (`off`: no vertex-colour cuts), the last cut per mesh key (kept across plans
++    /// until `tavtex.txt` gives the plan's own) and the `tavtex.txt` stamp the cuts were read at.
++    cuts_on: bool,
++    cuts: HashMap<u64, Vec<u8>>,
++    cut_stamp: Option<(SystemTime, u32)>,
+ }
+ 
+ pub(crate) fn build(app: &mut App) {
+@@ -864,6 +893,12 @@
+     // Patch 0035.
+     let lod_fine = std::env::var("WOW_BG3_TAV_LOD").map_or(true, |v| v.trim() != "bg3");
+     let sides = std::env::var("WOW_BG3_TAV_SIDES").map_or(true, |v| v.trim() != "two");
++    // Patch 0036.
++    let cuts_on = std::env::var("WOW_BG3_TAV_CUTS").map_or(true, |v| v.trim() != "off");
++    info!(
++        "wowbg3 tav: BG3's vertex-colour cuts {} (WOW_BG3_TAV_CUTS off: none)",
++        if cuts_on { "on" } else { "off" }
++    );
+     info!(
+         "wowbg3 tav: LOD {} (WOW_BG3_TAV_LOD fine or bg3), sides {} (WOW_BG3_TAV_SIDES two: all two-sided)",
+         if lod_fine { "finest of each visual BG3 shows" } else { "as BG3 draws it" },
+@@ -922,13 +957,22 @@
+         lod_fine,
+         lod0_drawn: HashSet::new(),
+         sides,
++        cuts_on,
++        cuts: HashMap::new(),
++        cut_stamp: None,
+     })
+     .init_resource::<TavFeet>()
+     .init_resource::<PartyFeet>()
+     .add_systems(
+         Update,
+         // Patch 0034: posing after the maps, whose visibility the LOD gate in `apply_pose` corrects.
+-        (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_textures).in_set(TavPose)),
++        // Patch 0036: the cuts before the maps, so a mesh shows with its cut.
++        (
++            load_meshes,
++            apply_cuts.after(load_meshes).before(load_textures),
++            load_textures.after(load_meshes),
++            apply_pose.after(load_textures).in_set(TavPose),
++        ),
+     );
+ }
+ 
+@@ -937,6 +981,111 @@
+     idx.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect()
+ }
+ 
++/// Patch 0036: a `tavtex.txt` line's mesh key and its `cut:` token (BG3's vertex-colour mask bytes for the
++/// mesh, sorted; none: no cut). `key:value` tokens follow the positional columns and are read independently
++/// of each other; the `TAVTEX` head line has no key.
++pub(crate) fn cut_token(line: &str) -> Option<(u64, Vec<u8>)> {
++    let mut f = line.split_whitespace();
++    let key = u64::from_str_radix(f.next()?, 16).ok()?;
++    let mut cut: Vec<u8> = f
++        .skip(2)
++        .find_map(|t| t.strip_prefix("cut:"))
++        .map_or_else(Vec::new, |c| c.split(',').filter_map(|b| b.trim().parse().ok()).collect());
++    cut.sort_unstable();
++    cut.dedup();
++    Some((key, cut))
++}
++
++/// Patch 0036: a mesh's triangles under BG3's vertex-colour cut. BG3's vertex shader moves every vertex whose
++/// colour G byte names a set texel of the figure's mask (`cut`, sorted; texel `g`, 255 wrapping to 0) to the
++/// object's origin, so a triangle with all three vertices cut has no area: those are left out. A triangle with
++/// only some of them cut is kept whole (BG3 stretches it to the origin; none in the meshes seen). Returns the
++/// kept indices, the triangles left out and those kept across a cut's edge. No colours or no cut: all of them.
++pub(crate) fn cut_triangles(idx: &[u32], green: Option<&[u8]>, cut: &[u8]) -> (Vec<u32>, usize, usize) {
++    let Some(green) = green.filter(|_| !cut.is_empty()) else { return (idx.to_vec(), 0, 0) };
++    let gone = |i: u32| green.get(i as usize).is_some_and(|g| cut.binary_search(&if *g == 255 { 0 } else { *g }).is_ok());
++    let (mut kept, mut out, mut edge) = (Vec::with_capacity(idx.len()), 0, 0);
++    for t in idx.chunks_exact(3) {
++        match t.iter().filter(|i| gone(**i)).count() {
++            3 => out += 1,
++            n => {
++                edge += usize::from(n > 0);
++                kept.extend_from_slice(t);
++            }
++        }
++    }
++    (kept, out, edge)
++}
++
++/// Patch 0036: a built mesh with the index buffer of its cut (re-wound for the mirrored mapping, as built).
++fn with_cut(mut mesh: Mesh, m: &TavMesh, cut: &[u8], det: f32) -> Mesh {
++    if !cut.is_empty() {
++        let idx = cut_triangles(&m.idx, m.green.as_deref(), cut).0;
++        mesh.insert_indices(Indices::U32(if det < 0.0 { rewind(&idx) } else { idx }));
++    }
++    mesh
++}
++
++/// Patch 0036: BG3's vertex-colour cuts from `tavtex.txt`'s `cut:` tokens, read whenever the file or the plan
++/// changes (`tavtex.py` writes the plan's tokens with its first lines): a part whose cut changed gets its index
++/// buffer rebuilt ([`cut_triangles`]). Runs before the maps are applied, so a mesh shows with its cut.
++fn apply_cuts(mut d: ResMut<TavDraw>, mut meshes: ResMut<Assets<Mesh>>) {
++    if !d.cuts_on || d.root.is_none() {
++        return;
++    }
++    let path = d.dir.join("tavtex.txt");
++    let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
++    let Some(seq) = d.file.as_ref().map(|f| f.seq) else { return };
++    if d.cut_stamp == Some((mtime, seq)) {
++        return;
++    }
++    let Ok(text) = std::fs::read_to_string(&path) else { return };
++    let mut lines = text.lines();
++    let head: Vec<&str> = lines.next().unwrap_or("").split_whitespace().collect();
++    if head.len() < 3 || head[0] != "TAVTEX" || head[2].parse::<u32>().ok() != Some(seq) {
++        return; // the baker has not caught up with this plan yet
++    }
++    d.cut_stamp = Some((mtime, seq));
++    let TavDraw { file, parts, cuts, det_sign, .. } = &mut *d;
++    let Some(file) = file.as_ref() else { return };
++    let (mut changed, mut edge, mut colourless) = (0, 0, 0);
++    for (key, cut) in lines.filter_map(cut_token) {
++        let Some(part) = parts.iter_mut().find(|p| p.key == key) else { continue };
++        let Some(m) = file.meshes.iter().find(|m| m.key == key) else { continue };
++        cuts.insert(key, cut.clone());
++        if part.cut == cut {
++            continue;
++        }
++        if !cut.is_empty() && m.green.is_none() {
++            colourless += 1;
++        }
++        let (idx, out, e) = cut_triangles(&m.idx, m.green.as_deref(), &cut);
++        let idx = if *det_sign < 0.0 { rewind(&idx) } else { idx };
++        if let Some(c) = part.rig.as_ref().and_then(|r| r.cpu_mesh.as_ref()).and_then(|h| meshes.get_mut(h)) {
++            c.insert_indices(Indices::U32(idx.clone()));
++        }
++        if let Some(mesh) = meshes.get_mut(&part.mesh) {
++            mesh.insert_indices(Indices::U32(idx));
++        }
++        part.cut = cut;
++        part.cut_out = out;
++        edge += e;
++        changed += 1;
++    }
++    if changed > 0 {
++        let cut_parts: Vec<&Part> = parts.iter().filter(|p| !p.cut.is_empty()).collect();
++        let tris = |p: &Part| file.meshes.iter().find(|m| m.key == p.key).map_or(0, |m| m.idx.len() / 3);
++        info!(
++            "wowbg3 tav: cuts for plan {seq}: {changed} meshes changed; {} meshes cut, {} of their {} triangles left out              (BG3's vertex-colour cuts){}{}",
++            cut_parts.len(),
++            cut_parts.iter().map(|p| p.cut_out).sum::<usize>(),
++            cut_parts.iter().map(|p| tris(p)).sum::<usize>(),
++            if edge > 0 { format!(", {edge} triangles across a cut's edge kept whole") } else { String::new() },
++            if colourless > 0 { format!(", {colourless} cut meshes without vertex colours drawn whole") } else { String::new() },
++        );
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn load_meshes(
+     mut commands: Commands,
+@@ -1070,7 +1219,10 @@
+     let (mut kept, mut waiting) = (0, 0);
+     for (i, m) in file.meshes.iter().enumerate() {
+         let rig = rigs.get_mut(i).and_then(Option::take);
+-        let handle = meshes.add(if rig.is_some() { gpu_mesh(m, det) } else { cpu_mesh(m, det) });
++        // Patch 0036: the cut this mesh key had until tavtex.txt gives this plan's.
++        let cut = if d.cuts_on { d.cuts.get(&m.key).cloned().unwrap_or_default() } else { Vec::new() };
++        let cut_out = if cut.is_empty() { 0 } else { cut_triangles(&m.idx, m.green.as_deref(), &cut).1 };
++        let handle = meshes.add(with_cut(if rig.is_some() { gpu_mesh(m, det) } else { cpu_mesh(m, det) }, m, &cut, det));
+         // A mesh key the last plan had keeps its look; a new one waits hidden for its maps.
+         let (look, visibility, dressed) = match d.looks.get(&m.key) {
+             Some(Look::Shown(h)) => (h.clone(), Visibility::Inherited, true),
+@@ -1096,10 +1248,10 @@
+         let rig = rig.map(|(skin, bones)| {
+             let slot = skin.slot;
+             spawned.insert(skin);
+-            PartRig { slot, bones, cpu_mesh: ab.then(|| meshes.add(cpu_mesh(m, det))) }
++            PartRig { slot, bones, cpu_mesh: ab.then(|| meshes.add(with_cut(cpu_mesh(m, det), m, &cut, det))) }
+         });
+         let entity = spawned.id();
+-        parts.push(Part { key: m.key, entity, mesh: handle, dressed, rig });
++        parts.push(Part { key: m.key, entity, mesh: handle, dressed, rig, cut, cut_out });
+     }
+     info!(
+         "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals of {} figure(s); {kept} keep their look, {waiting} wait for maps ({} ms); \
+@@ -2390,6 +2542,54 @@
+         b
+     }
+ 
++    /// Patch 0036: [`mesh_file`] with a u8x4 colour (green bytes `g`) before uv0 in the stream-0 vertex, as
++    /// BG3's VertexColor_MSK meshes have it.
++    fn mesh_file_coloured(g: [u8; 3]) -> Vec<u8> {
++        let b = mesh_file();
++        let mut out = b[..48].to_vec();
++        let mut u: Vec<u32> = (0..12).map(|k| u32::from_le_bytes(b[48 + 4 * k..52 + 4 * k].try_into().unwrap())).collect();
++        (u[5], u[6], u[10]) = (8, 4, 24); // vertex size, uv0 offset, vertex bytes
++        for v in &u {
++            out.extend_from_slice(&v.to_le_bytes());
++        }
++        out.extend_from_slice(&b[96..188]); // figure, LOD, source, skin
++        for (k, g) in g.iter().enumerate() {
++            out.extend_from_slice(&[7, *g, 9, 255]);
++            out.extend_from_slice(&b[188 + 4 * k..192 + 4 * k]);
++        }
++        out.extend_from_slice(&b[200..]); // indices
++        out
++    }
++
++    #[test]
++    fn reads_the_vertex_colour_and_cuts_as_bg3() {
++        let f = decode_mesh(&mesh_file_coloured([150, 150, 36])).expect("decodes");
++        let m = &f.meshes[0];
++        assert_eq!((m.green.as_deref(), m.uv[2]), (Some(&[150u8, 150, 36][..]), [0.5, 1.0]));
++        assert!(decode_mesh(&mesh_file()).expect("decodes").meshes[0].green.is_none(), "no colour before uv0");
++        assert_eq!(cut_triangles(&m.idx, m.green.as_deref(), &[36, 150]), (vec![], 1, 0));
++        assert_eq!(cut_triangles(&m.idx, m.green.as_deref(), &[150]), (vec![0, 1, 2], 0, 1), "across an edge: kept");
++        // Four triangles: none, all and two of three vertices in region 150 (feet), and one in 20.
++        let idx = [0, 1, 2, 3, 4, 5, 3, 4, 0, 6, 6, 6];
++        let green = [0u8, 0, 0, 150, 150, 150, 20];
++        assert_eq!(cut_triangles(&idx, Some(&green[..]), &[20, 150]), (vec![0, 1, 2, 3, 4, 0], 2, 1));
++        assert_eq!(cut_triangles(&idx, Some(&green[..]), &[]), (idx.to_vec(), 0, 0));
++        assert_eq!(cut_triangles(&idx, None, &[150]), (idx.to_vec(), 0, 0));
++        // G 255 reads texel 0 (BG3's wrap): cut only when texel 0 is set.
++        assert_eq!(cut_triangles(&[0, 1, 2], Some(&[255u8, 255, 255][..]), &[0]).1, 1);
++        assert_eq!(cut_triangles(&[0, 1, 2], Some(&[255u8, 255, 255][..]), &[150]).1, 0);
++        // tavtex.txt tokens: read independently of the others, sorted; none, and the head line.
++        assert_eq!(
++            cut_token("395ee6bf100 /c/a.tvt 17 /c/a-n.tvt /c/a-s.tvt shade:2 cut:170,20,160,20 detail:/c/d.tvt"),
++            Some((0x395ee6bf100, vec![20, 160, 170]))
++        );
++        assert_eq!(cut_token("42 /c/d.tvt 0 - -"), Some((0x42, vec![])));
++        assert_eq!(cut_token("TAVTEX 1 7"), None);
++        // Built with its cut, re-wound for the mirrored mapping.
++        let mesh = with_cut(gpu_mesh(m, -1.0), m, &[150], -1.0);
++        assert!(matches!(mesh.indices(), Some(Indices::U32(i)) if *i == vec![0, 2, 1]));
++    }
++
+     #[test]
+     fn decodes_and_skins() {
+         let f = decode_mesh(&mesh_file()).expect("decodes");

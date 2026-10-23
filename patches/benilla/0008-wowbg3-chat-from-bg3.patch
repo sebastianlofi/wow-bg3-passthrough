@@ -1,0 +1,621 @@
+WOW-BG3 benilla patch 0008: WoW's chat typed from the BG3 window (on top of 0001-0007).
+
+- wowbg3_keys.rs (new): reads $WOW_BG3_LINK_DIR/bg3keys.bin (BGK1, written by the BG3 mod's
+  WowChat.lua) and plays its key records as benilla's own keyboard (KeyboardInput before bevy's
+  input systems: physical key, key-up of every key-down played, US-layout character from the SDL
+  scancode and Shift/Caps), one record a frame; records above the last played, oldest first, the
+  file's history skipped at startup. Guard: after a session's first key (Enter or /, which open
+  WoW's chat box through its own bindings) the rest plays only while a visible WoW edit box holds
+  the keyboard; none within 0.5 s, or focus lost, drops the rest of the session (key-ups of keys
+  already played still go). Writes bg3keys-reader.txt at startup in world mode, the mod's
+  go-ahead for typing sessions.
+- lib.rs, wowbg3.rs: module and plugin registration.
+
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 8112930..0532b5c 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -192,6 +192,7 @@ mod wowbg3_fight;
+ mod wowbg3_frames;
+ mod wowbg3_fx;
+ mod wowbg3_fx_render;
++mod wowbg3_keys;
+ mod wowbg3_lead;
+ mod wowbg3_tav;
+ 
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index f2e4b95..24ece16 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -34,6 +34,8 @@ impl Plugin for WowBg3Plugin {
+         crate::wowbg3_fight::build(app, PathBuf::from(&dir));
+         // World mode: BG3 leads the camera, WoW frames go to BG3's compositor.
+         crate::wowbg3_lead::build(app, PathBuf::from(&dir));
++        // WoW's chat typed from the BG3 window (patch 0008).
++        crate::wowbg3_keys::build(app, PathBuf::from(&dir));
+         crate::wowbg3_frames::build(app);
+         // Tav drawn inside WoW from BG3's copied meshes and poses.
+         crate::wowbg3_tav::build(app);
+diff --git a/crates/benilla-app/src/wowbg3_keys.rs b/crates/benilla-app/src/wowbg3_keys.rs
+new file mode 100644
+index 0000000..940064e
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_keys.rs
+@@ -0,0 +1,577 @@
++//! WOW-BG3 (local fork, patch 0008): WoW's chat typed from the BG3 window. In world mode BG3
++//! has the keyboard (on the desktop it runs fullscreen and benilla renders in a headless
++//! compositor nobody can focus), so the BG3 mod (`WowChat.lua`) hands WoW a typing session: a
++//! plain Enter or `/` in BG3 starts one, and every key from that one to the closing Enter or
++//! Escape goes to benilla through `$WOW_BG3_LINK_DIR/bg3keys.bin` instead of BG3. This module plays
++//! those keys as benilla's own keyboard, so WoW opens its chat edit box on Enter or `/` exactly as
++//! a real keypress would (the OPENCHAT and OPENCHATSLASH bindings), the text goes in, Enter sends
++//! and Escape closes.
++//!
++//! `bg3keys.bin` (little endian, whole-file rewrites): `BGK1`, the newest seq u32, a count u32 (at
++//! most 32), that many records {seq u32, SDL2 scancode u32, SDL modifier bits u32, flags u32}, the
++//! newest seq again (a torn read shows two different seqs). Flags: 1 key down, 2 repeat, 4 the
++//! session's first key, 8 its last. Records with a seq above the last one played are played,
++//! oldest first; at startup the newest counts as played, so an old session never replays. The
++//! mod starts sessions only once `bg3keys-reader.txt` exists in the link dir, which this module
++//! writes at startup (world mode only), so a benilla without it never swallows BG3's keys.
++//!
++//! Each record becomes a `KeyboardInput` message before bevy's input systems, as winit's own: the
++//! physical key (SDL scancodes are USB HID usages), the key-up of every key-down played, and the
++//! character a US layout types from the scancode and Shift or Caps Lock. One record per frame, so
++//! a press and its release never share a frame.
++//!
++//! The guard: after a session's first key, the rest plays only while a visible WoW edit box holds
++//! the keyboard (the chat box that key opened). If none takes it within half a second, or the
++//! focus goes mid-session, the rest of that session is dropped (its key-ups of keys already
++//! played still go), so a typed letter never reaches a WoW binding: W is "move forward", and the
++//! WoW character walks after BG3's.
++
++use std::collections::VecDeque;
++use std::path::PathBuf;
++
++use benilla_ui::script::UiScript;
++use bevy::input::keyboard::{Key, KeyCode, KeyboardInput, NativeKey};
++use bevy::input::ButtonState;
++use bevy::prelude::*;
++use bevy::window::PrimaryWindow;
++
++/// Records the mod keeps in the file.
++pub(crate) const RING: usize = 32;
++/// Record flags.
++pub(crate) const FLAG_DOWN: u32 = 1;
++pub(crate) const FLAG_REPEAT: u32 = 2;
++pub(crate) const FLAG_FIRST: u32 = 4;
++pub(crate) const FLAG_LAST: u32 = 8;
++/// How long the session's first key may take to give WoW's chat box the keyboard (s).
++const GRACE_SECS: f64 = 0.5;
++
++/// SDL modifier bits (`SDL_Keymod`).
++const KMOD_SHIFT: u32 = 0x0001 | 0x0002;
++const KMOD_CTRL: u32 = 0x0040 | 0x0080;
++const KMOD_ALT: u32 = 0x0100 | 0x0200;
++const KMOD_GUI: u32 = 0x0400 | 0x0800;
++const KMOD_NUM: u32 = 0x1000;
++const KMOD_CAPS: u32 = 0x2000;
++
++/// One forwarded key event.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct KeyRec {
++    pub(crate) seq: u32,
++    /// `SDL_SCANCODE_*`.
++    pub(crate) scancode: u32,
++    /// `SDL_Keymod` bits.
++    pub(crate) mods: u32,
++    pub(crate) flags: u32,
++}
++
++/// Decodes `bg3keys.bin`: the newest seq and the records, oldest first. `None` for a torn or
++/// foreign file.
++pub(crate) fn decode_keys(b: &[u8]) -> Option<(u32, Vec<KeyRec>)> {
++    let u = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
++    if b.get(0..4)? != b"BGK1" {
++        return None;
++    }
++    let (newest, count) = (u(4)?, u(8)? as usize);
++    if count > RING || u(12 + 16 * count)? != newest {
++        return None;
++    }
++    let recs: Vec<KeyRec> = (0..count)
++        .map(|i| {
++            let o = 12 + 16 * i;
++            Some(KeyRec { seq: u(o)?, scancode: u(o + 4)?, mods: u(o + 8)?, flags: u(o + 12)? })
++        })
++        .collect::<Option<_>>()?;
++    let ordered = recs.windows(2).all(|w| w[0].seq < w[1].seq);
++    (ordered && recs.last().is_none_or(|r| r.seq == newest)).then_some((newest, recs))
++}
++
++/// The physical key of an SDL2 scancode (a USB HID usage), for the keys a US keyboard has.
++pub(crate) fn key_code(scancode: u32) -> Option<KeyCode> {
++    use KeyCode::*;
++    const LETTERS: [KeyCode; 26] = [
++        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
++        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
++    ];
++    const DIGITS: [KeyCode; 10] = [Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, Digit0];
++    const FKEYS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
++    const PAD: [KeyCode; 10] =
++        [Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9, Numpad0];
++    let s = scancode as usize;
++    Some(match scancode {
++        4..=29 => LETTERS[s - 4],
++        30..=39 => DIGITS[s - 30],
++        40 => Enter,
++        41 => Escape,
++        42 => Backspace,
++        43 => Tab,
++        44 => Space,
++        45 => Minus,
++        46 => Equal,
++        47 => BracketLeft,
++        48 => BracketRight,
++        // SDL_SCANCODE_NONUSHASH is the US backslash's position on an ISO board.
++        49 | 50 => Backslash,
++        51 => Semicolon,
++        52 => Quote,
++        53 => Backquote,
++        54 => Comma,
++        55 => Period,
++        56 => Slash,
++        57 => CapsLock,
++        58..=69 => FKEYS[s - 58],
++        70 => PrintScreen,
++        71 => ScrollLock,
++        72 => Pause,
++        73 => Insert,
++        74 => Home,
++        75 => PageUp,
++        76 => Delete,
++        77 => End,
++        78 => PageDown,
++        79 => ArrowRight,
++        80 => ArrowLeft,
++        81 => ArrowDown,
++        82 => ArrowUp,
++        83 => NumLock,
++        84 => NumpadDivide,
++        85 => NumpadMultiply,
++        86 => NumpadSubtract,
++        87 => NumpadAdd,
++        88 => NumpadEnter,
++        89..=98 => PAD[s - 89],
++        99 => NumpadDecimal,
++        100 => IntlBackslash,
++        101 => ContextMenu,
++        224 => ControlLeft,
++        225 => ShiftLeft,
++        226 => AltLeft,
++        227 => SuperLeft,
++        228 => ControlRight,
++        229 => ShiftRight,
++        230 => AltRight,
++        231 => SuperRight,
++        _ => return None,
++    })
++}
++
++/// The character a US layout types for a scancode with these SDL modifiers (`shift` also when a
++/// Shift key's own record is held): `None` for a key that types nothing, and while Ctrl or the
++/// GUI key is held without Alt (a shortcut, as benilla's own key feed treats it).
++pub(crate) fn us_char(scancode: u32, mods: u32, shift_held: bool) -> Option<char> {
++    if mods & (KMOD_CTRL | KMOD_GUI) != 0 && mods & KMOD_ALT == 0 {
++        return None;
++    }
++    let shift = shift_held || mods & KMOD_SHIFT != 0;
++    let pick = |plain: char, shifted: char| Some(if shift { shifted } else { plain });
++    match scancode {
++        4..=29 => {
++            let c = (b'a' + (scancode - 4) as u8) as char;
++            Some(if shift != (mods & KMOD_CAPS != 0) { c.to_ascii_uppercase() } else { c })
++        }
++        30..=39 => {
++            let i = (scancode - 30) as usize;
++            pick(b"1234567890"[i] as char, b"!@#$%^&*()"[i] as char)
++        }
++        44 => Some(' '),
++        45 => pick('-', '_'),
++        46 => pick('=', '+'),
++        47 => pick('[', '{'),
++        48 => pick(']', '}'),
++        49 | 50 => pick('\\', '|'),
++        51 => pick(';', ':'),
++        52 => pick('\'', '"'),
++        53 => pick('`', '~'),
++        54 => pick(',', '<'),
++        55 => pick('.', '>'),
++        56 => pick('/', '?'),
++        84 => Some('/'),
++        85 => Some('*'),
++        86 => Some('-'),
++        87 => Some('+'),
++        // The keypad's digits and point type only with Num Lock on.
++        89..=98 if mods & KMOD_NUM != 0 => Some(b"1234567890"[(scancode - 89) as usize] as char),
++        99 if mods & KMOD_NUM != 0 => Some('.'),
++        _ => None,
++    }
++}
++
++/// The logical key winit would report alongside.
++fn logical_key(code: KeyCode, text: Option<char>) -> Key {
++    match code {
++        KeyCode::Enter | KeyCode::NumpadEnter => Key::Enter,
++        KeyCode::Escape => Key::Escape,
++        KeyCode::Backspace => Key::Backspace,
++        KeyCode::Tab => Key::Tab,
++        KeyCode::Space => Key::Space,
++        KeyCode::Delete => Key::Delete,
++        KeyCode::Home => Key::Home,
++        KeyCode::End => Key::End,
++        KeyCode::ArrowLeft => Key::ArrowLeft,
++        KeyCode::ArrowRight => Key::ArrowRight,
++        KeyCode::ArrowUp => Key::ArrowUp,
++        KeyCode::ArrowDown => Key::ArrowDown,
++        KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
++        KeyCode::ControlLeft | KeyCode::ControlRight => Key::Control,
++        KeyCode::AltLeft | KeyCode::AltRight => Key::Alt,
++        KeyCode::SuperLeft | KeyCode::SuperRight => Key::Super,
++        KeyCode::CapsLock => Key::CapsLock,
++        _ => match text {
++            Some(c) => Key::Character(c.to_string().into()),
++            None => Key::Unidentified(NativeKey::Unidentified),
++        },
++    }
++}
++
++/// Where the current typing session stands.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Session {
++    /// No session: a stray key-down (not a session's first) is not WoW's.
++    Idle,
++    /// The first key went in; waiting for WoW's chat box to take the keyboard.
++    Opening,
++    /// WoW's chat box has the keyboard.
++    Typing,
++    /// Nothing of this session reaches WoW any more but the key-ups of keys it already got.
++    Dropped,
++}
++
++/// One key event to play as benilla's own.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Play {
++    pub(crate) code: KeyCode,
++    pub(crate) down: bool,
++    pub(crate) repeat: bool,
++    pub(crate) text: Option<char>,
++}
++
++/// The record queue and session state (no I/O; [`play_keys`] feeds it).
++pub(crate) struct KeyPlayer {
++    /// The last seq taken off the file (`None` until the first read).
++    applied: Option<u32>,
++    queue: VecDeque<KeyRec>,
++    pub(crate) session: Session,
++    /// Keys played down and not yet up: (key, scancode).
++    held: Vec<(KeyCode, u32)>,
++    /// When the session's first key went in (benilla's clock, s).
++    opened_at: f64,
++}
++
++impl Default for KeyPlayer {
++    fn default() -> Self {
++        Self { applied: None, queue: VecDeque::new(), session: Session::Idle, held: Vec::new(), opened_at: 0.0 }
++    }
++}
++
++impl KeyPlayer {
++    /// Takes a read of the file. Returns how many records were lost (the ring moved past them),
++    /// which drops the session in flight.
++    pub(crate) fn take(&mut self, newest: u32, recs: &[KeyRec]) -> u32 {
++        let Some(applied) = self.applied else {
++            // Startup: whatever is in the file is history.
++            self.applied = Some(newest);
++            return 0;
++        };
++        if newest < applied {
++            // BG3 restarted (its seq starts over): its old session is gone, so are its key-ups.
++            self.applied = Some(newest);
++            self.queue.clear();
++            self.session = Session::Idle;
++            for &(_, scancode) in self.held.iter() {
++                self.queue.push_back(KeyRec { seq: 0, scancode, mods: 0, flags: 0 });
++            }
++            return 0;
++        }
++        if newest == applied {
++            return 0;
++        }
++        let fresh: Vec<KeyRec> = recs.iter().filter(|r| r.seq > applied).copied().collect();
++        let lost = fresh.first().map_or(newest - applied, |r| r.seq - applied - 1);
++        if lost > 0 && self.session != Session::Idle {
++            self.session = Session::Dropped;
++        }
++        self.queue.extend(fresh);
++        self.applied = Some(newest);
++        lost
++    }
++
++    /// The next key event to play this frame (one at most), given whether a visible WoW edit box
++    /// holds the keyboard now. Records the guard swallows go without a word.
++    pub(crate) fn next(&mut self, focused: bool, now: f64) -> Option<Play> {
++        loop {
++            let r = *self.queue.front()?;
++            let Some(code) = key_code(r.scancode) else {
++                self.queue.pop_front();
++                continue;
++            };
++            if r.flags & FLAG_DOWN == 0 {
++                self.queue.pop_front();
++                // Only the release of a key WoW got: a dropped key's release is nothing to WoW.
++                match self.held.iter().position(|(k, _)| *k == code) {
++                    Some(i) => {
++                        self.held.swap_remove(i);
++                        return Some(Play { code, down: false, repeat: false, text: None });
++                    }
++                    None => continue,
++                }
++            }
++            if r.flags & FLAG_FIRST != 0 {
++                // Enter or `/`: WoW's own binding opens the chat box.
++                self.queue.pop_front();
++                self.session = Session::Opening;
++                self.opened_at = now;
++                return Some(self.press(code, r));
++            }
++            match self.session {
++                Session::Idle | Session::Dropped => {
++                    self.queue.pop_front();
++                    if r.flags & FLAG_LAST != 0 {
++                        self.session = Session::Idle;
++                    }
++                    continue;
++                }
++                Session::Opening if !focused => {
++                    if now - self.opened_at < GRACE_SECS {
++                        return None;
++                    }
++                    self.drop_session(r);
++                    continue;
++                }
++                Session::Typing if !focused => {
++                    self.drop_session(r);
++                    continue;
++                }
++                Session::Opening | Session::Typing => {}
++            }
++            self.queue.pop_front();
++            self.session = if r.flags & FLAG_LAST != 0 { Session::Idle } else { Session::Typing };
++            return Some(self.press(code, r));
++        }
++    }
++
++    fn press(&mut self, code: KeyCode, r: KeyRec) -> Play {
++        let shift_held = self.held.iter().any(|(k, _)| matches!(k, KeyCode::ShiftLeft | KeyCode::ShiftRight));
++        if !self.held.iter().any(|(k, _)| *k == code) {
++            self.held.push((code, r.scancode));
++        }
++        Play { code, down: true, repeat: r.flags & FLAG_REPEAT != 0, text: us_char(r.scancode, r.mods, shift_held) }
++    }
++
++    fn drop_session(&mut self, r: KeyRec) {
++        warn!("wowbg3 keys: no WoW chat box has the keyboard; the rest of this typing session is dropped");
++        self.queue.pop_front();
++        self.session = if r.flags & FLAG_LAST != 0 { Session::Idle } else { Session::Dropped };
++    }
++}
++
++#[derive(Resource)]
++struct KeyLink {
++    path: PathBuf,
++    player: KeyPlayer,
++}
++
++fn play_keys(
++    mut link: ResMut<KeyLink>,
++    script: Option<NonSend<UiScript>>,
++    window: Query<Entity, With<PrimaryWindow>>,
++    time: Res<Time<Real>>,
++    mut out: MessageWriter<KeyboardInput>,
++) {
++    if let Some((newest, recs)) = std::fs::read(&link.path).ok().as_deref().and_then(decode_keys) {
++        let lost = link.player.take(newest, &recs);
++        if lost > 0 {
++            warn!("wowbg3 keys: {lost} key records were overwritten before they were read");
++        }
++    }
++    let focused = script.as_deref().is_some_and(UiScript::has_keyboard_focus);
++    let Some(play) = link.player.next(focused, time.elapsed_secs_f64()) else { return };
++    if play.down && link.player.session == Session::Opening {
++        info!("wowbg3 keys: a typing session from BG3 opens with {:?}", play.code);
++    }
++    out.write(KeyboardInput {
++        key_code: play.code,
++        logical_key: logical_key(play.code, play.text),
++        state: if play.down { ButtonState::Pressed } else { ButtonState::Released },
++        text: play.text.map(|c| c.to_string().into()),
++        repeat: play.repeat,
++        window: window.single().unwrap_or(Entity::PLACEHOLDER),
++    });
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    // The mod's go-ahead: typing sessions start only once a reader is there.
++    let marker = dir.join("bg3keys-reader.txt");
++    let tmp = marker.with_extension("tmp");
++    let note = "benilla patch 0008: plays bg3keys.bin as WoW's keyboard (chat typed from BG3)\n";
++    match std::fs::write(&tmp, note).and_then(|()| std::fs::rename(&tmp, &marker)) {
++        Ok(()) => info!("wowbg3 keys: WoW's chat takes typing sessions from BG3 ({:?})", dir.join("bg3keys.bin")),
++        Err(e) => warn!("wowbg3 keys: cannot write {marker:?} ({e}); BG3 keeps its keys"),
++    }
++    app.insert_resource(KeyLink { path: dir.join("bg3keys.bin"), player: KeyPlayer::default() })
++        .add_systems(PreUpdate, play_keys.before(bevy::input::InputSystems));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn file(newest: u32, recs: &[KeyRec]) -> Vec<u8> {
++        let mut b = b"BGK1".to_vec();
++        b.extend_from_slice(&newest.to_le_bytes());
++        b.extend_from_slice(&(recs.len() as u32).to_le_bytes());
++        for r in recs {
++            for v in [r.seq, r.scancode, r.mods, r.flags] {
++                b.extend_from_slice(&v.to_le_bytes());
++            }
++        }
++        b.extend_from_slice(&newest.to_le_bytes());
++        b
++    }
++
++    fn rec(seq: u32, scancode: u32, mods: u32, flags: u32) -> KeyRec {
++        KeyRec { seq, scancode, mods, flags }
++    }
++
++    /// "Enter h i Enter" as the mod writes it: each key down then up.
++    fn hi_session(from: u32) -> Vec<KeyRec> {
++        vec![
++            rec(from, 40, 0, FLAG_DOWN | FLAG_FIRST),
++            rec(from + 1, 40, 0, 0),
++            rec(from + 2, 11, 0x1, FLAG_DOWN),
++            rec(from + 3, 11, 0x1, 0),
++            rec(from + 4, 12, 0, FLAG_DOWN),
++            rec(from + 5, 12, 0, 0),
++            rec(from + 6, 40, 0, FLAG_DOWN | FLAG_LAST),
++            rec(from + 7, 40, 0, 0),
++        ]
++    }
++
++    #[test]
++    fn decodes_the_ring_and_refuses_torn_files() {
++        let recs = hi_session(5);
++        let b = file(12, &recs);
++        assert_eq!(decode_keys(&b), Some((12, recs.clone())));
++        let mut torn = b.clone();
++        let end = torn.len();
++        torn[end - 4..].copy_from_slice(&11u32.to_le_bytes());
++        assert_eq!(decode_keys(&torn), None, "seq and trailing seq differ");
++        assert_eq!(decode_keys(&b[..b.len() - 2]), None, "short");
++        assert_eq!(decode_keys(&file(3, &[])), Some((3, vec![])), "an empty ring");
++        let mut big = b"BGK1".to_vec();
++        big.extend_from_slice(&[1, 0, 0, 0, 33, 0, 0, 0]);
++        assert_eq!(decode_keys(&big), None, "more than the ring holds");
++    }
++
++    #[test]
++    fn maps_scancodes_to_us_keys() {
++        assert_eq!(key_code(4), Some(KeyCode::KeyA));
++        assert_eq!(key_code(26), Some(KeyCode::KeyW));
++        assert_eq!(key_code(39), Some(KeyCode::Digit0));
++        assert_eq!(key_code(40), Some(KeyCode::Enter));
++        assert_eq!(key_code(56), Some(KeyCode::Slash));
++        assert_eq!(key_code(88), Some(KeyCode::NumpadEnter));
++        assert_eq!(key_code(225), Some(KeyCode::ShiftLeft));
++        assert_eq!(key_code(500), None);
++        assert_eq!(us_char(4, 0, false), Some('a'));
++        assert_eq!(us_char(4, 0x1, false), Some('A'), "left shift");
++        assert_eq!(us_char(4, 0, true), Some('A'), "a held Shift key");
++        assert_eq!(us_char(4, KMOD_CAPS, false), Some('A'), "caps lock");
++        assert_eq!(us_char(4, KMOD_CAPS | 0x2, false), Some('a'), "caps lock and shift");
++        assert_eq!(us_char(30, 0, false), Some('1'));
++        assert_eq!(us_char(30, 0x2, false), Some('!'));
++        assert_eq!(us_char(39, 0x1, false), Some(')'));
++        assert_eq!(us_char(56, 0, false), Some('/'));
++        assert_eq!(us_char(56, 0x1, false), Some('?'));
++        assert_eq!(us_char(52, 0x1, false), Some('"'));
++        assert_eq!(us_char(44, 0x1, false), Some(' '));
++        assert_eq!(us_char(40, 0, false), None, "Enter types nothing");
++        assert_eq!(us_char(6, 0x40, false), None, "Ctrl+C is a shortcut");
++        assert_eq!(us_char(89, 0, false), None, "keypad without Num Lock");
++        assert_eq!(us_char(89, KMOD_NUM, false), Some('1'));
++    }
++
++    #[test]
++    fn plays_a_session_one_key_a_frame_into_the_chat_box() {
++        let mut p = KeyPlayer::default();
++        assert_eq!(p.take(4, &[rec(4, 4, 0, FLAG_DOWN)]), 0, "startup: history");
++        let s = hi_session(5);
++        p.take(12, &s);
++        let mut t = 0.0;
++        let mut step = |p: &mut KeyPlayer, focused: bool| {
++            t += 1.0 / 60.0;
++            p.next(focused, t)
++        };
++        let enter = step(&mut p, false).unwrap();
++        assert_eq!((enter.code, enter.down, enter.text), (KeyCode::Enter, true, None));
++        let up = step(&mut p, false).unwrap();
++        assert_eq!((up.code, up.down), (KeyCode::Enter, false), "a release goes whatever the focus");
++        assert_eq!(step(&mut p, false), None, "the box has not opened yet: wait");
++        let h = step(&mut p, true).unwrap();
++        assert_eq!((h.code, h.text), (KeyCode::KeyH, Some('H')));
++        assert_eq!(step(&mut p, true).map(|k| k.down), Some(false));
++        assert_eq!(step(&mut p, true).and_then(|k| k.text), Some('i'));
++        assert_eq!(step(&mut p, true).map(|k| k.down), Some(false));
++        let send = step(&mut p, true).unwrap();
++        assert_eq!((send.code, send.down), (KeyCode::Enter, true));
++        assert_eq!(p.session, Session::Idle);
++        assert_eq!(step(&mut p, false).map(|k| (k.code, k.down)), Some((KeyCode::Enter, false)));
++        assert_eq!(step(&mut p, false), None);
++    }
++
++    #[test]
++    fn letters_never_reach_wow_without_its_chat_box() {
++        let mut p = KeyPlayer::default();
++        p.take(0, &[]);
++        // Enter, then W A S D typed while no box ever takes the keyboard.
++        let mut recs = vec![rec(1, 40, 0, FLAG_DOWN | FLAG_FIRST), rec(2, 40, 0, 0)];
++        for (i, sc) in [26u32, 4, 22, 7].into_iter().enumerate() {
++            recs.push(rec(3 + 2 * i as u32, sc, 0, FLAG_DOWN));
++            recs.push(rec(4 + 2 * i as u32, sc, 0, 0));
++        }
++        recs.push(rec(11, 41, 0, FLAG_DOWN | FLAG_LAST));
++        recs.push(rec(12, 41, 0, 0));
++        p.take(12, &recs);
++        let mut played = Vec::new();
++        for f in 0..120 {
++            if let Some(k) = p.next(false, f as f64 / 60.0) {
++                played.push(k);
++            }
++        }
++        assert_eq!(played.len(), 2, "only Enter's press and release: {played:?}");
++        assert!(played.iter().all(|k| k.code == KeyCode::Enter));
++        assert_eq!(p.session, Session::Idle, "the session's last key ends it");
++        // The next session plays again.
++        p.take(14, &[rec(13, 56, 0, FLAG_DOWN | FLAG_FIRST), rec(14, 56, 0, 0)]);
++        assert_eq!(p.next(false, 3.0).map(|k| (k.code, k.text)), Some((KeyCode::Slash, Some('/'))));
++    }
++
++    #[test]
++    fn a_lost_focus_drops_the_rest_and_a_restart_releases_held_keys() {
++        let mut p = KeyPlayer::default();
++        p.take(0, &[]);
++        p.take(4, &[
++            rec(1, 40, 0, FLAG_DOWN | FLAG_FIRST),
++            rec(2, 40, 0, 0),
++            rec(3, 225, 0x1, FLAG_DOWN),
++            rec(4, 26, 0x1, FLAG_DOWN),
++        ]);
++        assert!(p.next(false, 0.0).is_some_and(|k| k.down));
++        assert!(p.next(false, 0.01).is_some_and(|k| !k.down));
++        assert_eq!(p.next(true, 0.02).map(|k| k.code), Some(KeyCode::ShiftLeft));
++        assert_eq!(p.next(false, 0.03), None, "the box lost the keyboard: W is dropped");
++        assert_eq!(p.session, Session::Dropped);
++        // BG3 restarts with Shift still down here: its release is played.
++        p.take(1, &[rec(1, 4, 0, FLAG_DOWN)]);
++        assert_eq!(p.next(false, 0.04).map(|k| (k.code, k.down)), Some((KeyCode::ShiftLeft, false)));
++        assert_eq!(p.next(false, 0.05), None);
++        // A gap in the ring drops a session in flight.
++        let mut q = KeyPlayer::default();
++        q.take(0, &[]);
++        q.take(1, &[rec(1, 40, 0, FLAG_DOWN | FLAG_FIRST)]);
++        q.next(false, 0.0);
++        assert_eq!(q.take(40, &[rec(40, 4, 0, FLAG_DOWN)]), 38);
++        assert_eq!(q.session, Session::Dropped);
++    }
++}

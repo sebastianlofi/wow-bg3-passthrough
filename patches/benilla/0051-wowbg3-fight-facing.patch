@@ -1,0 +1,68 @@
+diff --git a/crates/benilla-app/src/net/motion/facing.rs b/crates/benilla-app/src/net/motion/facing.rs
+--- a/crates/benilla-app/src/net/motion/facing.rs
++++ b/crates/benilla-app/src/net/motion/facing.rs
+@@ -192,6 +192,13 @@
+         if net.kind != EntityKind::Unit {
+             continue; // a GameObject sits at its authored facing
+         }
++        // WOW-BG3 0051: a model held by a BG3 fight faces where BG3's stand-in faces
++        // (`wowbg3_fight`, which also sets its turn latch); easing it back to the server's facing
++        // here fought that every frame and left it turn-shuffling for good ("stuck walking
++        // backwards").
++        if crate::wowbg3_fight::held_motion(e).is_some() {
++            continue;
++        }
+         let fields = &store.0;
+         // Rows 2-4.
+         if fields.unit_stand_state() != 0
+@@ -262,7 +269,7 @@
+         trace_face(e, source, goal, cur, new);
+     }
+     for e in &latched {
+-        if !stepping.contains(&e) {
++        if !stepping.contains(&e) && crate::wowbg3_fight::held_motion(e).is_none() {
+             commands.entity(e).remove::<FacingStep>();
+         }
+     }
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -530,6 +530,9 @@
+ /// it in place of the server's movement (the server holds the mob still).
+ static WALKERS: LazyLock<Mutex<HashMap<Entity, Option<f32>>>> = LazyLock::new(Default::default);
+ 
++/// The yaw a held model must turn in a frame to latch a turn shuffle (the client's 1e-5 band).
++const TURN_LATCH: f32 = 1.0e-5;
++
+ /// A held fight mob's motion ([`WALKERS`]): None when the entity is not held.
+ pub(crate) fn held_motion(entity: Entity) -> Option<Option<f32>> {
+     WALKERS.lock().ok()?.get(&entity).copied()
+@@ -1635,6 +1638,7 @@
+     mut impacts: MessageWriter<SwingImpact>,
+     mut play_seq: ResMut<PlaySeq>,
+     mut trace_t: Local<f32>,
++    mut commands: Commands,
+ ) {
+     let dt = time.delta_secs();
+     let f = &mut *f;
+@@ -1816,11 +1820,20 @@
+             }
+         };
+         let yaw = h.yaw.get_or_insert_with(|| tf.rotation.to_euler(EulerRot::YXZ).0);
++        let before = *yaw;
+         if let Some(want) = want {
+             let step = TURN_RATE * dt;
+             *yaw = angle_diff(*yaw + angle_diff(want, *yaw).clamp(-step, step), 0.0);
+         }
+         tf.rotation = Quat::from_rotation_y(*yaw);
++        // 0051: the turn latch of a held model (the net's display facing leaves it alone): it
++        // shuffles while BG3 turns it in place, and stops when BG3's facing is reached.
++        let turned = angle_diff(*yaw, before);
++        if !walking && h.walk_left <= 0.0 && turned.abs() > TURN_LATCH {
++            commands.entity(entity).try_insert(crate::net::FacingStep(turned));
++        } else {
++            commands.entity(entity).try_remove::<crate::net::FacingStep>();
++        }
+         tf.translation = moved;
+         // Issue 15/18 checks: while BG3 moves it, the record's age, the model's gap to the
+         // stand-in (to its record and to where it is now), speeds and both facings.

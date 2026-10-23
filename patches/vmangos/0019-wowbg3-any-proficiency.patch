@@ -1,0 +1,45 @@
+WOW-BG3 vmangos patch 0019: any item regardless of proficiency, for now.
+
+Before `.wowbg3 equip` and an item's equip verb, the member learns the weapon or armour proficiency
+spell the item needs (ItemPrototype::GetProficiencySpell, as a trainer teaches it), so WoW's own
+check passes (a playtest report: a stolen throwing knife went back to the bags, refused with
+EQUIP_ERR_NO_REQUIRED_PROFICIENCY). Class, race, level and reputation requirements stay WoW's.
+
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index 022ff9f..632e75d 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -233,6 +233,17 @@ namespace
+         out.Add(buf);
+     }
+ 
++    // WOW-BG3 (local patch 0019): any item regardless of proficiency, for now (BG3 lets anyone wear
++    // anything). Before an equip the member learns the weapon or armour proficiency the item needs, as
++    // a trainer would teach it, so WoW's own check passes and the skill counts as WoW's from then on.
++    void LearnProficiency(Player* m, Item* it)
++    {
++        ItemPrototype const* pr = it ? it->GetProto() : nullptr;
++        uint32 const spell = pr ? pr->GetProficiencySpell() : 0;
++        if (spell && !m->HasSpell(spell))
++            m->LearnSpell(spell, false);
++    }
++
+     // equip MEMBER ITEMGUID [SLOT]: from its bags onto it (WoW's auto slot, or SLOT 0-18).
+     void Equip(Player* m, std::string const& member, std::vector<std::string> const& a, Out& out)
+     {
+@@ -247,6 +258,7 @@ namespace
+         if (a.size() == 5 && (!ParseUInt(a[4], slot, EQUIPMENT_SLOT_END - 1)))
+             return out.Add(head + "refused usage");
+         uint16 dest = 0;
++        LearnProficiency(m, it);
+         InventoryResult r = m->CanEquipItem(uint8(slot), dest, it, !it->IsBag());
+         if (r != EQUIP_ERR_OK)
+             return out.Add(head + "refused inv " + std::to_string(uint32(r)));
+@@ -711,6 +723,7 @@ namespace
+             uint16 dst = 0;
+             if (sub == "equip" || (bag == INVENTORY_SLOT_BAG_0 && slot < EQUIPMENT_SLOT_END))
+             {
++                LearnProficiency(m, it);
+                 InventoryResult r = m->CanEquipItem(sub == "equip" ? uint8(NULL_SLOT) : uint8(slot), dst, it, !it->IsBag());
+                 if (r != EQUIP_ERR_OK)
+                     return out.Add(ihead + "refused " + Code(r));

@@ -1,0 +1,524 @@
+--- a/crates/benilla-app/src/minimap/wowbg3.rs
++++ b/crates/benilla-app/src/minimap/wowbg3.rs
+@@ -12,6 +12,27 @@
+ //! is written off-thread when the player enters another tile or map, so the player's tile is always
+ //! the middle one. Off unless `WOW_BG3_LINK_DIR` and `WOW_BG3_LEAD` are set. Logs `wowbg3 minimap:`
+ //! lines.
++//!
++//! Patch 0043 (day and night): the image carries WoW's own day-night tint of its
++//! outdoor minimap tiles (`super::minimap_day_tint`, the reference's vertex colour on the tile
++//! quads, from the world's lighting), multiplied into the gamma bytes as WoW draws them; a new image
++//! is written when the tint moves a step ([`TINT_STEP`] of 255 on any channel).
++//!
++//! Patch 0043 (indoor maps): inside a building with its own minimap art (WoW's
++//! interior branch: the same WMO containment, portal flood-fill and draw order, `super::
++//! minimap_interior` and `interior_group_selection`) the image is that building's interior tiles
++//! instead, composited north up round the player ([`INDOOR_HALF`] yd each way at 0.5 yd a pixel,
++//! re-made when the player moves [`INDOOR_STEP`] yd or the selection changes), alpha-tested as WoW
++//! does (224 of 255), transparent elsewhere; `minimap.json` says `"Indoor": true` and gives its
++//! bounds, which BG3's side already places by.
++//!
++//! Patch 0043 (WoW's blips): [`export_blips`] writes `minimap-blips.json` four times a
++//! second while world mode runs: `{"Seq", "Map", "Blips": [[cell, x, y, z], ...], "Corpse": [x, y, z]
++//! or null}`, WoW yards, every dot WoW's own minimap would draw within [`BLIP_RANGE`] yd of the
++//! point WoW is seen from (`ObjectIcons.blp` cells: 0 a tracked resource, 1 a tracked creature, 3 a
++//! quest giver with a reward, 4 a party member), and the own corpse. The icon sheet itself is written
++//! once as `minimap/objecticons.dds` (BGRA, the sheet's own size: 4 x 4 cells, cell n at column
++//! n % 4, row n / 4 from the top left). BG3's side draws them in its minimap layer (`WowUi.lua`).
+ 
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+@@ -32,16 +53,42 @@
+ const RADIUS: u32 = 1;
+ /// A minimap tile's edge in the image (WoW's tiles are 256²).
+ const TILE_PX: u32 = 256;
++/// Patch 0043: the indoor image's half extent (yd), its re-centring step (yd) and the selection
++/// radius (WoW's default indoor zoom, 60 yd; the flood's box is twice that).
++const INDOOR_HALF: f32 = 128.0;
++const INDOOR_STEP: f32 = 32.0;
++const INDOOR_RADIUS: f32 = 60.0;
++
++/// Patch 0043: yards round the view point whose blips are listed (BG3's minimap shows 270 m at most).
++const BLIP_RANGE: f32 = 300.0;
++/// Patch 0043: seconds between blip files.
++const BLIP_EVERY: f64 = 0.25;
++
+ /// A failed export is tried again after this long (wall seconds).
+ const RETRY_AFTER: f64 = 10.0;
+ /// Image files used in turn: the one BG3 shows is never the one being written.
+ const SLOTS: u32 = 4;
++/// Patch 0043: the tint is kept in steps of this many 255ths, so a new image waits for a visible
++/// change (dusk takes several minutes of game time per step).
++const TINT_STEP: f32 = 8.0;
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+ struct Key {
+     map: u32,
+     tx: u32,
+     ty: u32,
++    /// Patch 0043: the day-night tint, quantized bytes (255 = untinted).
++    tint: [u8; 3],
++    /// Patch 0043: indoors, (building and selection hash, centre x, y in [`INDOOR_STEP`]s).
++    indoor: Option<(u64, i32, i32)>,
++}
++
++/// Patch 0043: one interior tile to composite: its file, its rectangle in the model's frame (the
++/// texture's u along model +X from `min[0]`, v from model +Y `max[1]` down).
++struct IndoorTile {
++    path: String,
++    min: [f32; 2],
++    max: [f32; 2],
+ }
+ 
+ struct Done {
+@@ -98,6 +145,13 @@
+     player: Res<Player>,
+     time: Res<Time<bevy::time::Real>>,
+     subject: Option<Res<crate::player::ViewSubject>>,
++    lighting: Option<Res<benilla_world::lighting::WowLighting>>,
++    (instances, wmos, wp, asset_server): (
++        Query<&benilla_world::wmo_portal::WmoPortalInstance>,
++        Res<Assets<benilla_assets::WmoModel>>,
++        benilla_world::world_point::WorldPoint,
++        Res<AssetServer>,
++    ),
+ ) {
+     let Some(dir) = st.dir.clone() else {
+         return;
+@@ -109,8 +163,8 @@
+         match d.result {
+             Ok((file, bytes, tiles)) => {
+                 info!(
+-                    "wowbg3 minimap: {file} written ({bytes} bytes, {tiles} tiles, map {} tile {},{}, {:.1} ms off-thread)",
+-                    d.key.map, d.key.tx, d.key.ty, d.ms
++                    "wowbg3 minimap: {file} written ({bytes} bytes, {tiles} tiles, map {} tile {},{}, tint {:?}, {:.1} ms off-thread)",
++                    d.key.map, d.key.tx, d.key.ty, d.key.tint, d.ms
+                 );
+                 st.shown = Some(d.key);
+             }
+@@ -136,7 +190,40 @@
+     // Patch 0040 (Far Sight): the tiles round the point WoW is seen from.
+     let wow = bevy_to_wow(subject.as_deref().map_or(player.pos, |s| s.point(player.pos)));
+     let (tx, ty) = world_to_tile(wow[0], wow[1]);
+-    let key = Key { map: map.0, tx, ty };
++    // Patch 0043: WoW's day-night tint of its outdoor tiles; white without lighting, as WoW.
++    let tint = lighting.as_deref().map_or([1.0; 3], |l| super::minimap_day_tint(l.ambient, l.diffuse));
++    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 / TINT_STEP).round() * TINT_STEP).min(255.0) as u8;
++    let key = Key { map: map.0, tx, ty, tint: [q(tint[0]), q(tint[1]), q(tint[2])], indoor: None };
++    // Patch 0043: indoors (the own body's building; not while the view is out on someone else).
++    let view_out = subject.as_deref().is_some_and(|s| s.remote.is_some());
++    if !view_out {
++        if let Some(job) = indoor_job(&player, &assets, &instances, &wmos, &wp, &asset_server, map.0) {
++            if st.shown == Some(job.0) {
++                return;
++            }
++            let (key, tiles, local_from_world, centre, z) = job;
++            st.seq += 1;
++            let file = format!("mm-{}.dds", st.seq % SLOTS);
++            let (seq, run) = (st.seq, st.run);
++            let chain = world.chain.clone();
++            let done = st.done.clone();
++            st.busy = true;
++            let spawned = std::thread::Builder::new().name("wowbg3-minimap".into()).spawn(move || {
++                let t0 = std::time::Instant::now();
++                let result = export_indoor(&chain, &tiles, local_from_world, centre, z, &dir, &file, (run, seq), key.map);
++                let ms = t0.elapsed().as_secs_f64() * 1000.0;
++                if let Ok(mut d) = done.lock() {
++                    *d = Some(Done { key, result, ms });
++                }
++            });
++            if let Err(e) = spawned {
++                warn!("wowbg3 minimap: no export thread: {e}");
++                st.busy = false;
++                st.failed_at = now;
++            }
++            return;
++        }
++    }
+     if st.shown == Some(key) {
+         return;
+     }
+@@ -168,7 +255,7 @@
+         .name("wowbg3-minimap".into())
+         .spawn(move || {
+             let t0 = std::time::Instant::now();
+-            let result = export(&chain, &names, cols, rows, &dir, &file, (run, seq), key.map, [south, north, east, west]);
++            let result = export(&chain, &names, cols, rows, &dir, &file, (run, seq), key.map, [south, north, east, west], key.tint);
+             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+             if let Ok(mut d) = done.lock() {
+                 *d = Some(Done { key, result, ms });
+@@ -222,7 +309,9 @@
+     (run, seq): (u64, u32),
+     map: u32,
+     [x0, x1, y0, y1]: [f32; 4],
++    tint: [u8; 3],
+ ) -> Result<(String, usize, u32), String> {
++    let mul = |b: u8, t: u8| ((u16::from(b) * u16::from(t) + 127) / 255) as u8;
+     let (w, h) = (cols * TILE_PX, rows * TILE_PX);
+     let mut out = dds_header(w, h);
+     let head = out.len();
+@@ -261,19 +350,270 @@
+                 let sx = x * tw / TILE_PX;
+                 let s = ((sy * tw + sx) * 4) as usize;
+                 let d = (((row * TILE_PX + y) * w + col * TILE_PX + x) * 4) as usize;
++                px[d] = mul(rgba[s + 2], tint[2]);
++                px[d + 1] = mul(rgba[s + 1], tint[1]);
++                px[d + 2] = mul(rgba[s], tint[0]);
++                px[d + 3] = 255;
++            }
++        }
++        tiles += 1;
++    }
++    let bytes = out.len();
++    write_atomic(&dir.join("minimap").join(file), &out)?;
++    let json = format!(
++        "{{\"Run\":{run},\"Seq\":{seq},\"File\":\"{file}\",\"Map\":{map},\"X0\":{x0:.3},\"X1\":{x1:.3},\"Y0\":{y0:.3},\"Y1\":{y1:.3},\"Width\":{w},\"Height\":{h},\"Tiles\":{tiles},\"Tint\":[{},{},{}]}}\n",
++        tint[0], tint[1], tint[2]
++    );
++    write_atomic(&dir.join("minimap.json"), json.as_bytes())?;
++    Ok((file.to_string(), bytes, tiles))
++}
++
++/// Patch 0043: the blip list's state.
++#[derive(Resource, Default)]
++pub(super) struct BlipExport {
++    seq: u32,
++    next: f64,
++    icons_written: bool,
++    last: String,
++}
++
++/// Patch 0043: what the blip list reads (the blip layer's inputs without the HUD's hover, ping and
++/// Lua VM, which this never touches).
++pub(super) type BlipData<'w, 's> = (
++    Res<'w, crate::ui_quest::QuestGiver>,
++    Res<'w, crate::net::GuidIndex>,
++    Query<'w, 's, &'static GlobalTransform, With<crate::net::NetEntity>>,
++    Res<'w, crate::ui_party::GroupState>,
++    super::blips::TrackedCandidates<'w, 's>,
++    Query<'w, 's, (&'static crate::net::ObjectStore, &'static crate::net::Guid), With<crate::net::SelfPlayer>>,
++    Res<'w, crate::names::NameCache>,
++    Res<'w, crate::go_templates::GameObjectTemplates>,
++    Option<Res<'w, crate::go_templates::Locks>>,
++);
++
++/// Patch 0043 (see the module notes): WoW's minimap blips round the view point for BG3's minimap.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn export_blips(
++    mut ex: ResMut<BlipExport>,
++    st: Res<WowBg3Minimap>,
++    assets: Option<Res<MinimapAssets>>,
++    world: Option<Res<WorldAssets>>,
++    map: Option<Res<CurrentMap>>,
++    player: Res<Player>,
++    time: Res<Time<bevy::time::Real>>,
++    subject: Option<Res<crate::player::ViewSubject>>,
++    inputs: BlipData,
++    death_net: Res<crate::death::DeathNet>,
++) {
++    let Some(dir) = st.dir.clone() else { return };
++    let now = time.elapsed_secs_f64();
++    if now < ex.next || !player.active || player.pos == Vec3::ZERO {
++        return;
++    }
++    ex.next = now + BLIP_EVERY;
++    let (Some(assets), Some(map)) = (assets, map) else { return };
++    if !ex.icons_written {
++        if let Some(world) = world.as_deref() {
++            ex.icons_written = true;
++            let chain = world.chain.clone();
++            let out = dir.join("minimap").join("objecticons.dds");
++            let _ = std::thread::Builder::new().name("wowbg3-icons".into()).spawn(move || {
++                let read = chain.lock_recover().read_file("Interface\\Minimap\\ObjectIcons.blp");
++                match read.map_err(|e| format!("{e:#}")).and_then(|b| benilla_formats::blp_to_rgba(&b).map_err(|e| format!("{e:#}"))) {
++                    Ok((w, h, rgba)) => {
++                        let mut bytes = dds_header(w, h);
++                        for p in rgba.chunks_exact(4) {
++                            bytes.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
++                        }
++                        match write_atomic(&out, &bytes) {
++                            Ok(()) => info!("wowbg3 minimap: blip icons written ({w}x{h}, {:?})", out),
++                            Err(e) => warn!("wowbg3 minimap: blip icons: {e}"),
++                        }
++                    }
++                    Err(e) => warn!("wowbg3 minimap: ObjectIcons.blp: {e}"),
++                }
++            });
++        }
++    }
++    let (quest, guids, unit_pos, group, tracked, self_store, names, go_templates, locks) = inputs;
++    let me = self_store.iter().next();
++    let tracking = me
++        .map(|(s, _)| super::blips::SelfTracking {
++            creatures: s.0.player_track_creatures(),
++            resources: s.0.player_track_resources(),
++            stealthed: s.0.player_track_stealthed(),
++        })
++        .unwrap_or_default();
++    let at = bevy_to_wow(subject.as_deref().map_or(player.pos, |s| s.point(player.pos)));
++    let mut dots = super::blips::list_dots(
++        at,
++        BLIP_RANGE,
++        tracking,
++        &tracked,
++        quest.statuses(),
++        me.map(|(_, g)| g.0),
++        &names,
++        &go_templates,
++        locks.as_deref().map(|l| &l.0),
++        assets.forms.as_ref(),
++    );
++    for m in group.party_slots() {
++        if let Some((x, y)) = super::blips::party_member_pos(m, &group, &guids, &unit_pos) {
++            if ((x - at[0]).powi(2) + (y - at[1]).powi(2)).sqrt() <= BLIP_RANGE {
++                dots.push((4, [x, y, at[2]], m.guid));
++            }
++        }
++    }
++    dots.sort_by_key(|d| (d.0, d.2));
++    let mut list = String::new();
++    for (i, (cell, w, _)) in dots.iter().enumerate() {
++        if i > 0 {
++            list.push(',');
++        }
++        list += &format!("[{cell},{:.1},{:.1},{:.1}]", w[0], w[1], w[2]);
++    }
++    let corpse = death_net
++        .corpse
++        .filter(|c| c.display_map == map.0 as i32)
++        .map_or("null".to_string(), |c| format!("[{:.1},{:.1},{:.1}]", c.position[0], c.position[1], c.position[2]));
++    let body = format!("\"Map\":{},\"Blips\":[{list}],\"Corpse\":{corpse}", map.0);
++    if body == ex.last {
++        return;
++    }
++    ex.last = body.clone();
++    ex.seq = ex.seq.wrapping_add(1);
++    let json = format!("{{\"Seq\":{},{body}}}\n", ex.seq);
++    if let Err(e) = write_atomic(&dir.join("minimap-blips.json"), json.as_bytes()) {
++        warn!("wowbg3 minimap: blips: {e}");
++    }
++}
++
++/// Patch 0043: the indoor image to show, if the own body is inside a building with interior
++/// minimap art: (key, tiles in draw order, local-from-world, centre WoW x y, WoW z).
++#[allow(clippy::type_complexity)]
++fn indoor_job(
++    player: &Player,
++    assets: &MinimapAssets,
++    instances: &Query<&benilla_world::wmo_portal::WmoPortalInstance>,
++    wmos: &Assets<benilla_assets::WmoModel>,
++    wp: &benilla_world::world_point::WorldPoint,
++    asset_server: &AssetServer,
++    map: u32,
++) -> Option<(Key, Vec<IndoorTile>, bevy::math::Affine3A, [f32; 2], f32)> {
++    use std::hash::{Hash, Hasher};
++    let (world_from_local, model, stem, in_group) = super::minimap_interior(player, instances, wmos, wp, asset_server)?;
++    let drawable = super::interior::interior_group_selection(model, &world_from_local, player.pos, INDOOR_RADIUS, in_group);
++    // The reference's draw order: by storey height from the player's, her own group last.
++    let player_z = bevy_to_wow(world_from_local.inverse().transform_point3(player.pos))[2];
++    let sort_key = |gi: usize| -> f32 {
++        if gi == in_group {
++            f32::MAX
++        } else {
++            let gn = &model.group_nav[gi];
++            0.5 * (gn.bbox_min[2] + gn.bbox_max[2]) - player_z
++        }
++    };
++    let mut order: Vec<usize> = (0..model.group_nav.len()).filter(|&gi| drawable[gi]).collect();
++    order.sort_by(|&a, &b| sort_key(a).total_cmp(&sort_key(b)));
++    let mut tiles = Vec::new();
++    for &gi in &order {
++        let gn = &model.group_nav[gi];
++        let (nx, tw_x) = benilla_assets::minimap_grid::group_axis_grid(gn.bbox_max[0] - gn.bbox_min[0]);
++        let (ny, tw_y) = benilla_assets::minimap_grid::group_axis_grid(gn.bbox_max[1] - gn.bbox_min[1]);
++        for col in 0..nx {
++            for row in 0..ny {
++                // As WoW's interior branch: the cell plus the outer-edge bleed, stretched by the
++                // half-texel inset (`super::texel_stretch`).
++                let bleed = |edge: bool| if edge { super::EDGE_BLEED_YD } else { 0.0 };
++                let x0 = gn.bbox_min[0] + col as f32 * tw_x - bleed(col == 0);
++                let x1 = gn.bbox_min[0] + (col + 1) as f32 * tw_x + bleed(col + 1 == nx);
++                let y0 = gn.bbox_min[1] + row as f32 * tw_y - bleed(row == 0);
++                let y1 = gn.bbox_min[1] + (row + 1) as f32 * tw_y + bleed(row + 1 == ny);
++                let key = format!("{stem}_{gi:03}_{col:02}_{row:02}.blp");
++                let Some(hash) = assets.translate.get(&key) else { continue };
++                let (cx, cy) = (0.5 * (x0 + x1), 0.5 * (y0 + y1));
++                let hx = 0.5 * (x1 - x0) * super::texel_stretch(tw_x);
++                let hy = 0.5 * (y1 - y0) * super::texel_stretch(tw_y);
++                tiles.push(IndoorTile { path: format!("textures\\Minimap\\{hash}"), min: [cx - hx, cy - hy], max: [cx + hx, cy + hy] });
++            }
++        }
++    }
++    if tiles.is_empty() {
++        return None;
++    }
++    let wow = bevy_to_wow(player.pos);
++    let snap = |v: f32| (v / INDOOR_STEP).round() as i32;
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    stem.hash(&mut h);
++    in_group.hash(&mut h);
++    drawable.hash(&mut h);
++    let (sx, sy) = (snap(wow[0]), snap(wow[1]));
++    let key = Key { map, tx: u32::MAX, ty: u32::MAX, tint: [255; 3], indoor: Some((h.finish(), sx, sy)) };
++    Some((key, tiles, world_from_local.inverse(), [sx as f32 * INDOOR_STEP, sy as f32 * INDOOR_STEP], wow[2]))
++}
++
++/// Patch 0043: composites the interior tiles north up round `centre` and writes the image and
++/// `minimap.json` as [`export`] does; (file, bytes, tiles).
++#[allow(clippy::too_many_arguments)]
++fn export_indoor(
++    chain: &Arc<Mutex<benilla_formats::Chain>>,
++    tiles: &[IndoorTile],
++    local_from_world: bevy::math::Affine3A,
++    centre: [f32; 2],
++    z: f32,
++    dir: &Path,
++    file: &str,
++    (run, seq): (u64, u32),
++    map: u32,
++) -> Result<(String, usize, u32), String> {
++    use benilla_assets::coords::wow_to_bevy;
++    // Decode every tile once.
++    let mut decoded: Vec<Option<(u32, u32, Vec<u8>)>> = Vec::with_capacity(tiles.len());
++    for t in tiles {
++        let read = chain.lock_recover().read_file(&t.path);
++        decoded.push(read.ok().and_then(|b| benilla_formats::blp_to_rgba(&b).ok()).filter(|(w, h, _)| *w > 0 && *h > 0));
++    }
++    let n = (2.0 * INDOOR_HALF / 0.5) as u32;
++    let mut out = dds_header(n, n);
++    let head = out.len();
++    out.resize(head + (n * n * 4) as usize, 0);
++    let px = &mut out[head..];
++    let alpha_ref = (super::INTERIOR_TILE_ALPHA_REF * 255.0).round() as u8;
++    for r in 0..n {
++        // North at the top, west on the left, as the outdoor image.
++        let x = centre[0] + INDOOR_HALF - (r as f32 + 0.5) * 0.5;
++        for c in 0..n {
++            let y = centre[1] + INDOOR_HALF - (c as f32 + 0.5) * 0.5;
++            let m = bevy_to_wow(local_from_world.transform_point3(wow_to_bevy([x, y, z])));
++            // Later tiles draw over earlier ones (the reference's order); alpha-tested.
++            for (t, d) in tiles.iter().zip(&decoded).rev() {
++                let Some((tw, th, rgba)) = d else { continue };
++                let u = (m[0] - t.min[0]) / (t.max[0] - t.min[0]);
++                let v = (t.max[1] - m[1]) / (t.max[1] - t.min[1]);
++                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
++                    continue;
++                }
++                let (sx, sy) = ((u * *tw as f32) as u32, (v * *th as f32) as u32);
++                let s = ((sy.min(th - 1) * tw + sx.min(tw - 1)) * 4) as usize;
++                if rgba[s + 3] < alpha_ref {
++                    continue;
++                }
++                let d = ((r * n + c) * 4) as usize;
+                 px[d] = rgba[s + 2];
+                 px[d + 1] = rgba[s + 1];
+                 px[d + 2] = rgba[s];
+                 px[d + 3] = 255;
+-            }
+-        }
+-        tiles += 1;
++                break;
++            }
++        }
+     }
+     let bytes = out.len();
+     write_atomic(&dir.join("minimap").join(file), &out)?;
++    let (x0, x1, y0, y1) = (centre[0] - INDOOR_HALF, centre[0] + INDOOR_HALF, centre[1] - INDOOR_HALF, centre[1] + INDOOR_HALF);
++    let count = decoded.iter().filter(|d| d.is_some()).count() as u32;
+     let json = format!(
+-        "{{\"Run\":{run},\"Seq\":{seq},\"File\":\"{file}\",\"Map\":{map},\"X0\":{x0:.3},\"X1\":{x1:.3},\"Y0\":{y0:.3},\"Y1\":{y1:.3},\"Width\":{w},\"Height\":{h},\"Tiles\":{tiles}}}\n"
++        "{{\"Run\":{run},\"Seq\":{seq},\"File\":\"{file}\",\"Map\":{map},\"X0\":{x0:.3},\"X1\":{x1:.3},\"Y0\":{y0:.3},\"Y1\":{y1:.3},\"Width\":{n},\"Height\":{n},\"Tiles\":{count},\"Indoor\":true}}\n"
+     );
+     write_atomic(&dir.join("minimap.json"), json.as_bytes())?;
+-    Ok((file.to_string(), bytes, tiles))
+-}
++    Ok((file.to_string(), bytes, count))
++}
+--- a/crates/benilla-app/src/minimap/blips/dots.rs
++++ b/crates/benilla-app/src/minimap/blips/dots.rs
+@@ -251,6 +251,62 @@
+     }
+ }
+ 
++/// WOW-BG3 (patch 0043): the dots the classifier would draw, as data for BG3's
++/// minimap: `(ObjectIcons.blp cell, WoW position, guid)` within `range` yd (3-D) of `at`, by the
++/// same rules as the emitters above (tracking cells 0 and 1, quest cell 3; party members are
++/// listed by [`super::party_member_pos`] in `minimap::wowbg3`).
++#[allow(clippy::too_many_arguments)]
++pub(in crate::minimap) fn list_dots(
++    at: [f32; 3],
++    range: f32,
++    tracking: SelfTracking,
++    candidates: &TrackedCandidates,
++    statuses: &HashMap<u64, u32>,
++    self_guid: Option<u64>,
++    names: &NameCache,
++    templates: &GameObjectTemplates,
++    locks: Option<&LockCatalog>,
++    forms: Option<&HashMap<u32, ShapeshiftForm>>,
++) -> Vec<(u8, [f32; 3], u64)> {
++    let mut out = Vec::new();
++    let near = |tf: &GlobalTransform| {
++        let w = bevy_to_wow(tf.translation());
++        let d = ((w[0] - at[0]).powi(2) + (w[1] - at[1]).powi(2) + (w[2] - at[2]).powi(2)).sqrt();
++        (d <= range).then_some(w)
++    };
++    if tracking.resources != 0 {
++        if let Some(locks) = locks {
++            for (guid, net, tf, _) in candidates.iter() {
++                if net.kind != EntityKind::GameObject {
++                    continue;
++                }
++                let Some(t) = templates.get(guid.0) else { continue };
++                if tracked_resource(tracking.resources, t.lock_id, locks) {
++                    if let Some(w) = near(tf) {
++                        out.push((0, w, guid.0));
++                    }
++                }
++            }
++        }
++    }
++    let types = CreatureTypeSources { names: Some(names), forms };
++    for (guid, net, tf, store) in candidates.iter() {
++        if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) || !unit_dot_eligible(store, self_guid) {
++            continue;
++        }
++        let Some(w) = near(tf) else { continue };
++        if statuses.get(&guid.0).copied().and_then(quest_dot_cell).is_some() {
++            out.push((3, w, guid.0));
++            continue;
++        }
++        let (dyn_flags, creeping) = store.map(|s| (s.0.unit_dynamic_flags(), s.0.unit_is_stealthed())).unwrap_or((0, false));
++        if tracked_creature(tracking, store.map(|s| types.of(s)), dyn_flags, creeping) {
++            out.push((1, w, guid.0));
++        }
++    }
++    out
++}
++
+ /// How a tracking dot's hover names itself: a unit resolves by guid through the name cache;
+ /// a GameObject's template name is already in hand.
+ enum DotName {
+--- a/crates/benilla-app/src/minimap/blips/mod.rs
++++ b/crates/benilla-app/src/minimap/blips/mod.rs
+@@ -31,7 +31,7 @@
+ 
+ mod dots;
+ 
+-pub(super) use dots::{emit_party_dots, emit_quest_dots, emit_tracking_dots, SelfTracking};
++pub(super) use dots::{emit_party_dots, emit_quest_dots, emit_tracking_dots, list_dots, SelfTracking};
+ 
+ use bevy::ecs::system::NonSendMut;
+ use bevy::math::Rect;
+--- a/crates/benilla-app/src/minimap/mod.rs
++++ b/crates/benilla-app/src/minimap/mod.rs
+@@ -874,7 +874,8 @@
+             .init_resource::<composite::MinimapComposite>()
+             // WOW-BG3: off unless world mode's link dir is set.
+             .init_resource::<wowbg3::WowBg3Minimap>()
+-            .add_systems(Update, wowbg3::drive)
++            .init_resource::<wowbg3::BlipExport>()
++            .add_systems(Update, (wowbg3::drive, wowbg3::export_blips))
+             .add_systems(Startup, setup_minimap.after(AssetSet::Open))
+             .add_systems(Startup, composite::setup_composite)
+             .add_systems(

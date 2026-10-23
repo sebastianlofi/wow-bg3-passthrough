@@ -1,0 +1,235 @@
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_teleport.rs
+@@ -0,0 +1,163 @@
++//! WOW-BG3 (local fork, patch 0041): a WoW-side teleport moves BG3's character.
++//!
++//! In world mode the own body follows BG3's character every frame (`wowbg3_lead::body`), so a
++//! teleport the server makes (hearthstone, a graveyard, a GM `.tele`, a summon) was undone within a
++//! second: the follow put the body back on her. Now a server teleport of our own body while world
++//! mode runs (`MSG_MOVE_TELEPORT_ACK` on the same map, `SMSG_NEW_WORLD` to another) asks the world
++//! bridge to move world mode there, the same request `link/tools/tele.sh` makes:
++//! `wow-bg3/world-move.json` {RunId, Seq, Wow: [x, y, z], Map, What, Arrived: true}. `Arrived`
++//! says WoW's character already stands there (no server teleport of the bridge's own). The bridge
++//! stops world mode and starts it again with that point under the hero, so she stands where WoW
++//! put the body. Until she does (her packet root within [`ARRIVE`] yd of the destination) the body
++//! follow and the Click to Move fallback leave the body where the server put it; after [`GIVE_UP`]
++//! s without her the follow resumes (the old behaviour) and the log says so.
++//!
++//! Not asked: outside world mode (no fresh `tav.bin`), during a BG3 fight (the bridge refuses
++//! moves then; the follow puts the body back as before), while another move is in flight (a
++//! `world-move.json` for this run newer than `world-move-result.json`: the bridge's own cross-continent
++//! teleport for tele.sh), and for a destination within [`NEAR`] yd of her.
++
++use std::path::PathBuf;
++use std::sync::Mutex;
++use std::time::Instant;
++
++use benilla_assets::coords::wow_to_bevy;
++use bevy::prelude::*;
++
++/// Yards between the destination and BG3's character under which nothing is asked.
++const NEAR: f32 = 5.0;
++/// Yards between her packet root and the destination that count as arrived.
++const ARRIVE: f32 = 20.0;
++/// Seconds the body is held at the destination waiting for her.
++const GIVE_UP: f32 = 90.0;
++
++struct Hold {
++    at: Vec3,
++    since: Instant,
++}
++
++static HOLD: Mutex<Option<Hold>> = Mutex::new(None);
++
++/// True while a server teleport holds the body away from `aim` (Bevy world): she has not arrived
++/// at the destination yet. Clears the hold once she has, or after [`GIVE_UP`].
++pub(crate) fn held_away(aim: Vec3) -> bool {
++    let Ok(mut g) = HOLD.lock() else { return false };
++    let Some(h) = g.as_ref() else { return false };
++    let gap = Vec2::new(aim.x - h.at.x, aim.z - h.at.z).length();
++    if gap < ARRIVE {
++        info!("wowbg3 teleport: BG3's character is at the destination ({gap:.1} yd); the body follows her again");
++        *g = None;
++        return false;
++    }
++    if h.since.elapsed().as_secs_f32() > GIVE_UP {
++        warn!("wowbg3 teleport: BG3's character did not come to the destination in {GIVE_UP} s ({gap:.0} yd away); the body follows her again");
++        *g = None;
++        return false;
++    }
++    true
++}
++
++/// True while a hold is on (for the Click to Move fallback, which has no aim of its own).
++pub(crate) fn holding() -> bool {
++    HOLD.lock().ok().is_some_and(|g| g.is_some())
++}
++
++#[derive(Resource)]
++struct TeleLink {
++    /// The SE folder's `wow-bg3` (the link folder's parent).
++    io: PathBuf,
++    asked: u64,
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let Some(io) = dir.parent().map(PathBuf::from) else { return };
++    info!("wowbg3 teleport: a server teleport in world mode moves BG3's character ({:?})", io.join("world-move.json"));
++    app.insert_resource(TeleLink { io, asked: 0 }).add_systems(Update, on_teleport);
++}
++
++/// `"Key": "text"` or `"Key": 12` from a small flat JSON object.
++fn json_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
++    let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
++    let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
++    if let Some(s) = rest.strip_prefix('"') {
++        return s.split('"').next();
++    }
++    let end = rest.find([',', '}', '\n']).unwrap_or(rest.len());
++    Some(rest[..end].trim())
++}
++
++/// (RunId of the BG3 run, Seq of the newest request and of the newest answer for it).
++fn move_state(io: &std::path::Path) -> Option<(String, u64, u64)> {
++    let client = std::fs::read_to_string(io.join("m3-client.json")).ok()?;
++    let run = json_field(&client, "RunId")?.to_string();
++    let seq_of = |name: &str| -> u64 {
++        std::fs::read_to_string(io.join(name)).ok().filter(|t| json_field(t, "RunId") == Some(run.as_str())).and_then(|t| json_field(&t, "Seq")?.parse().ok()).unwrap_or(0)
++    };
++    Some((run.clone(), seq_of("world-move.json"), seq_of("world-move-result.json")))
++}
++
++fn on_teleport(
++    mut link: ResMut<TeleLink>,
++    mut same: MessageReader<crate::net::TeleportMessage>,
++    mut cross: MessageReader<crate::net::WorldportMessage>,
++    map: Option<Res<benilla_world::world_map::CurrentMap>>,
++    follow: Option<Res<crate::wowbg3_lead::TavFollow>>,
++) {
++    let mut dest: Option<([f32; 3], u32, &str)> = None;
++    for t in same.read() {
++        if let Some(m) = map.as_deref() {
++            dest = Some((t.position, m.0, "same map"));
++        }
++    }
++    for w in cross.read() {
++        // A port onto a boat carries a deck-local position: not a place on the map.
++        if w.transport_entry.is_none() {
++            dest = Some((w.position, w.map_id, "another map"));
++        }
++    }
++    let Some((wow, map_id, kind)) = dest else { return };
++    let Some(tav) = crate::wowbg3_lead::tav_if_fresh(follow.as_deref()) else {
++        debug!("wowbg3 teleport: server teleport ({kind}) outside world mode, nothing to move");
++        return;
++    };
++    let at = wow_to_bevy(wow);
++    let gap = Vec2::new(at.x - tav.x, at.z - tav.z).length();
++    if gap < NEAR {
++        return;
++    }
++    if crate::wowbg3_lead::bg3_combat() {
++        warn!("wowbg3 teleport: server teleport ({kind}, {gap:.0} yd) during a BG3 fight: not moved, the body follows BG3's character back");
++        return;
++    }
++    let Some((run, req, done)) = move_state(&link.io) else {
++        warn!("wowbg3 teleport: no BG3 run id (m3-client.json); not moved");
++        return;
++    };
++    if req > done {
++        info!("wowbg3 teleport: server teleport ({kind}) while world move {req} is in flight; the bridge's own move");
++        return;
++    }
++    let seq = req.max(done) + 1;
++    let body = format!(
++        "{{\"RunId\": \"{run}\", \"Seq\": {seq}, \"Wow\": [{:.3}, {:.3}, {:.3}], \"Map\": {map_id}, \"What\": \"WoW server teleport\", \"Arrived\": true}}",
++        wow[0], wow[1], wow[2]
++    );
++    let path = link.io.join("world-move.json");
++    let tmp = path.with_extension("json.tmp");
++    match std::fs::write(&tmp, body.as_bytes()).and_then(|()| std::fs::rename(&tmp, &path)) {
++        Ok(()) => {
++            link.asked += 1;
++            info!(
++                "wowbg3 teleport: the server moved the body {gap:.0} yd ({kind}, map {map_id}, WoW {:.1} {:.1} {:.1}); asked world mode to move there (move {seq})",
++                wow[0], wow[1], wow[2]
++            );
++            if let Ok(mut g) = HOLD.lock() {
++                *g = Some(Hold { at, since: Instant::now() });
++            }
++        }
++        Err(e) => warn!("wowbg3 teleport: could not write {path:?}: {e}"),
++    }
++}
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -367,7 +367,7 @@
+ }
+ 
+ #[derive(Resource)]
+-struct TavFollow {
++pub(crate) struct TavFollow {
+     path: PathBuf,
+     last_seq: u32,
+     armed: Option<Vec3>,
+@@ -382,6 +382,13 @@
+     want: f32,
+ }
+ 
++/// Patch 0041: where `tav.bin` last put BG3's character (Bevy world), while it is fresh (world
++/// mode runs).
++pub(crate) fn tav_if_fresh(t: Option<&TavFollow>) -> Option<Vec3> {
++    let seen = TAV_SEEN_MS.load(Ordering::Relaxed);
++    t.and_then(|t| t.tav).filter(|_| seen != 0 && clock_ms().saturating_sub(seen) < 1000)
++}
++
+ /// Decodes `tav.bin`: (seq, WoW position).
+ pub(crate) fn decode_tav(rec: &[u8]) -> Option<(u32, [f32; 3])> {
+     if rec.len() < 44 || &rec[0..4] != b"TAV1" {
+@@ -502,6 +509,10 @@
+         auto.approach.enabled = true;
+     }
+     let Some(at) = t.walk_to.take() else { return };
++    // Patch 0041: a server teleport holds the body where it was put until she is there too.
++    if crate::wowbg3_teleport::holding() && crate::wowbg3_teleport::held_away(at) {
++        return;
++    }
+     // Patch 0025: the body follows her frame by frame from the packet poses (`wowbg3_lead::body`, `wowbg3_body.rs`); Click
+     // to Move after `tav.bin` stays the fallback without packets.
+     if body::active() {
+--- a/crates/benilla-app/src/wowbg3_body.rs
++++ b/crates/benilla-app/src/wowbg3_body.rs
+@@ -292,6 +292,9 @@
+         seen != 0 && super::clock_ms().saturating_sub(seen) < TAV_FRESH_MS
+     });
+     let matched = aim.filter(|x| tav.is_some_and(|t| Vec2::new(t.x - x.at.x, t.z - x.at.z).length() < MATCH));
++    // Patch 0041: after a server teleport the body stays where the server put it
++    // until BG3's character has been moved there too (`wowbg3_teleport`).
++    let matched = matched.filter(|x| !crate::wowbg3_teleport::held_away(x.at));
+     let refused = aim.is_some() && matched.is_none();
+     if matched.is_some() {
+         a.steady_since.get_or_insert_with(std::time::Instant::now);
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -43,6 +43,8 @@
+         crate::wowbg3_tav::build(app);
+         // BG3's own effects replayed inside WoW with BG3's shaders (patch 0005).
+         crate::wowbg3_fx::build(app);
++        // Patch 0041: a server teleport in world mode moves BG3's character.
++        crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -197,6 +197,7 @@
+ mod wowbg3_offscreen;
+ mod wowbg3_pace;
+ mod wowbg3_tav;
++mod wowbg3_teleport;
+ 
+ use bevy::prelude::*;
+ 

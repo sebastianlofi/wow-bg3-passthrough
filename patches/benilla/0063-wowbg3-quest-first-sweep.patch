@@ -1,0 +1,51 @@
+WOW-BG3 benilla patch 0063: the first frame with our own player sweeps the quest givers.
+
+- quest_markers/query.rs query_statuses: our store comes a frame before the SelfPlayer marker, so the
+  frame that first finds our player never saw the store changed: the descriptor walk did not run, the
+  generation stayed at its default and no sweep came, and the units of that early frame had used up their
+  first sight. No quest giver was asked until our own fields moved (a fresh level 1 character: its first
+  fight), so the talk ladder had no status and sent nothing: BG3's Talk and WoW's own right click on a
+  quest giver did nothing (a 0.1.0 playtest report; measured in a test run with patch 0062: self true,
+  15 quest givers in view, asked 0). Now the first frame after any frame without our player sweeps.
+
+--- a/crates/benilla-app/src/quest_markers/query.rs
++++ b/crates/benilla-app/src/quest_markers/query.rs
+@@ -91,10 +91,19 @@
+         );
+     }
+     let Some(store) = self_q.iter().next() else {
++        state.had_self = false;
+         return;
+     };
++    // WOW-BG3 (patch 0063): the first frame that finds our own player is a sweep. Our store comes a
++    // frame before the `SelfPlayer` marker, so on that frame this system returned above, and the store
++    // no longer reads changed when the marker lands: the descriptor walk never ran, `fields` stayed 0,
++    // the generation stayed equal and no sweep came. The units seen in that frame had used up their
++    // first sight too, so no quest giver was asked until our own fields moved (a fresh level 1
++    // character with no money: its first fight). Their talk ladder then had no status and refused.
++    let first = !state.had_self;
++    state.had_self = true;
+     // The descriptor walk runs only when our store changed; the epoch is a plain counter.
+-    if store.is_changed() {
++    if store.is_changed() || first {
+         state.fields = self_generation(&store.0);
+     }
+     let generation = state.fields ^ (u64::from(quest.reask_epoch()) << 32);
+@@ -111,7 +120,7 @@
+         state.my_faction = my_faction;
+     }
+     // A sweep frame, the only time a GameObject is asked about.
+-    let swept = state.generation != generation || full;
++    let swept = first || state.generation != generation || full;
+     state.generation = generation;
+     // A guid that left the world drops its ask key and cached status. A sweep never clears the
+     // map: only a unit's own key moving is a `0x607380`. Pruned only when the index moved, as the
+@@ -283,6 +292,8 @@
+     hostile: std::collections::HashSet<u64>,
+     /// WOW-BG3 (patch 0062): frames run, for the once-a-minute line.
+     frames: u32,
++    /// WOW-BG3 (patch 0063): whether the last run found our own player.
++    had_self: bool,
+ }
+ 
+ #[cfg(test)]

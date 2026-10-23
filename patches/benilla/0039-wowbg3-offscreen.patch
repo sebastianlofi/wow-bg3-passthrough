@@ -1,0 +1,283 @@
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_offscreen.rs
+@@ -0,0 +1,226 @@
++//! WOW-BG3 (local fork, patch 0039): benilla without a window. With `WOW_BG3_OFFSCREEN=1` the
++//! client opens no window and needs no display server or compositor (no headless gamescope): the
++//! release starts it from the bg3le plugin as a child process inside Steam's runtime container,
++//! where there is no screen of its own to show.
++//!
++//! - winit is left out ([`window_plugins`]): the `Window` entity stays (its size from `WOW_WIN`,
++//!   scale factor 1), so every system that sizes or places by the window works as before, but no
++//!   OS window or surface is made. Bevy's own loop (`ScheduleRunnerPlugin`, added here: the default
++//!   plugins carry it only in builds without windows) drives the frames.
++//! - Every camera aimed at a window renders into one offscreen image of the window's size
++//!   ([`retarget`]). The world camera already draws into its own target (`world_backdrop`); the
++//!   player-UI camera, whose main texture is the frame BG3 composites (`wowbg3_frames`), is the one
++//!   that changes. Nothing reads the image itself: the frame export copies the view's main texture,
++//!   as with a window.
++//! - Input comes through the link files as in world mode already (`bg3input.bin` pointer,
++//!   `bg3keys.bin` keys, BG3's clicks), never from a window.
++//! - Pacing (`wowbg3_pace`) still starts each frame on BG3's packet. Out of lockstep (login, BG3
++//!   loading, world mode off) the loop is held to `WOW_BG3_IDLE_FPS` (default 60) frames a second
++//!   ([`idle_limit`]); a window's vsync or gamescope did that before. At most [`IN_FLIGHT`] frames
++//!   are queued on the GPU ([`bound_gpu`]): with no swapchain nothing else stops the CPU running
++//!   ahead of the GPU.
++//! - `WOW_BG3_EXIT_WITH=<pid>`: benilla exits by itself once that process is gone (the launcher in
++//!   BG3's process), checked every second ([`exit_with`]).
++//! - SIGTERM (the launcher stopping it, BG3 closing) is a clean exit, as a window close was: the
++//!   app's exit systems run (settings, WoW's saved variables) and the session closes, which logs the
++//!   character out on the server ([`on_sigterm`]). A second SIGTERM kills at once.
++
++use std::collections::VecDeque;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::{Duration, Instant};
++
++use bevy::app::PluginGroupBuilder;
++use bevy::camera::{ImageRenderTarget, RenderTarget};
++use bevy::prelude::*;
++use bevy::render::render_resource::{TextureFormat, TextureUsages};
++use wgpu::SubmissionIndex;
++use bevy::render::renderer::{RenderDevice, RenderQueue};
++use bevy::render::{Render, RenderApp, RenderSystems};
++use bevy::window::PrimaryWindow;
++
++/// Frames the render thread may have queued on the GPU before it waits for the oldest.
++const IN_FLIGHT: usize = 2;
++
++/// Set by the SIGTERM handler; read by [`exit_with`].
++static TERM: AtomicBool = AtomicBool::new(false);
++
++/// The SIGTERM handler: async-signal-safe (an atomic store; a second signal exits at once).
++extern "C" fn on_sigterm(_: libc::c_int) {
++    if TERM.swap(true, Ordering::SeqCst) {
++        // SAFETY: _exit is async-signal-safe.
++        unsafe { libc::_exit(143) };
++    }
++}
++
++/// Set by `wowbg3_pace` while frames start on BG3's packets (lockstep).
++pub(crate) static LOCKSTEP: AtomicBool = AtomicBool::new(false);
++
++/// `WOW_BG3_OFFSCREEN=1`.
++pub(crate) fn enabled() -> bool {
++    std::env::var("WOW_BG3_OFFSCREEN").as_deref() == Ok("1")
++}
++
++/// The default plugins, without winit when offscreen, plus [`OffscreenPlugin`].
++pub(crate) fn window_plugins(plugins: PluginGroupBuilder) -> PluginGroupBuilder {
++    if !enabled() {
++        return plugins;
++    }
++    // `DefaultPlugins` carries `ScheduleRunnerPlugin` only without the `bevy_window` feature, and an
++    // app with no runner updates once and returns: the loop is ours to add.
++    plugins
++        .disable::<bevy::winit::WinitPlugin>()
++        .add(bevy::app::ScheduleRunnerPlugin::run_loop(Duration::ZERO))
++        .add(OffscreenPlugin)
++}
++
++struct OffscreenPlugin;
++
++/// The image every window camera renders into, and its size in physical px.
++#[derive(Resource, Default)]
++struct OffscreenTarget {
++    image: Option<Handle<Image>>,
++    size: UVec2,
++    /// The image before the last resize: cameras still on it move to the new one.
++    retired: Option<AssetId<Image>>,
++}
++
++impl Plugin for OffscreenPlugin {
++    fn build(&self, app: &mut App) {
++        let idle_fps = std::env::var("WOW_BG3_IDLE_FPS")
++            .ok()
++            .and_then(|v| v.parse::<f64>().ok())
++            .filter(|v| v.is_finite() && *v >= 1.0)
++            .unwrap_or(60.0);
++        let parent = std::env::var("WOW_BG3_EXIT_WITH").ok().and_then(|v| v.parse::<i32>().ok()).filter(|p| *p > 0);
++        info!(
++            "wowbg3 offscreen: no window (winit off); cameras render offscreen, {idle_fps} frames/s out of lockstep{}",
++            parent.map_or(String::new(), |p| format!(", exits with process {p}"))
++        );
++        // SAFETY: installs a handler that only stores an atomic (or _exits); see `on_sigterm`.
++        unsafe {
++            libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
++        }
++        app.init_resource::<OffscreenTarget>()
++            .insert_resource(IdleLimit { period: Duration::from_secs_f64(1.0 / idle_fps), last: None })
++            .insert_resource(ExitWith { pid: parent, next: Instant::now() })
++            .add_systems(PostUpdate, retarget.before(bevy::camera::CameraUpdateSystems))
++            .add_systems(Update, exit_with)
++            .add_systems(Last, idle_limit);
++    }
++
++    fn finish(&self, app: &mut App) {
++        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
++            render_app.init_resource::<InFlight>().add_systems(Render, bound_gpu.after(RenderSystems::Render));
++        }
++    }
++}
++
++/// A target image of `size` physical px: rendered into, never sampled or read back.
++fn new_target(size: UVec2) -> Image {
++    let mut image = Image::new_target_texture(size.x.max(1), size.y.max(1), TextureFormat::Bgra8UnormSrgb, None);
++    image.texture_descriptor.usage = TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
++    // Only the render world needs it; the zero fill is not kept on the CPU side.
++    image.asset_usage = bevy::asset::RenderAssetUsages::RENDER_WORLD;
++    image
++}
++
++/// Every camera aimed at a window renders into [`OffscreenTarget`] instead; rebuilt when the
++/// window's size changes (`WOW_WIN`, a resize from the UI's video options).
++fn retarget(
++    mut target: ResMut<OffscreenTarget>,
++    mut images: ResMut<Assets<Image>>,
++    windows: Query<&Window, With<PrimaryWindow>>,
++    mut cameras: Query<(Entity, &mut RenderTarget)>,
++) {
++    let Ok(window) = windows.single() else { return };
++    let size = UVec2::new(window.physical_width().max(1), window.physical_height().max(1));
++    if target.image.is_none() || target.size != size {
++        let fresh = images.add(new_target(size));
++        if let Some(old) = target.image.replace(fresh) {
++            target.retired = Some(old.id());
++            images.remove(&old);
++        }
++        target.size = size;
++        info!("wowbg3 offscreen: window cameras render into a {}x{} image", size.x, size.y);
++    }
++    let Some(handle) = target.image.clone() else { return };
++    let scale_factor = window.resolution.scale_factor();
++    for (entity, mut current) in &mut cameras {
++        let stale = match &*current {
++            RenderTarget::Window(_) => true,
++            RenderTarget::Image(t) => target.retired == Some(t.handle.id()),
++            _ => false,
++        };
++        if stale {
++            debug!("wowbg3 offscreen: camera {entity} now renders offscreen");
++            *current = RenderTarget::Image(ImageRenderTarget { handle: handle.clone(), scale_factor });
++        }
++    }
++}
++
++#[derive(Resource)]
++struct IdleLimit {
++    period: Duration,
++    last: Option<Instant>,
++}
++
++/// Out of lockstep, hold the loop to the idle rate (a window's vsync did this before).
++fn idle_limit(mut limit: ResMut<IdleLimit>) {
++    let now = Instant::now();
++    if !LOCKSTEP.load(Ordering::Relaxed) {
++        if let Some(last) = limit.last {
++            let due = last + limit.period;
++            if due > now {
++                std::thread::sleep(due - now);
++            }
++        }
++    }
++    limit.last = Some(Instant::now());
++}
++
++#[derive(Resource)]
++struct ExitWith {
++    pid: Option<i32>,
++    next: Instant,
++}
++
++/// Exits once the process named by `WOW_BG3_EXIT_WITH` is gone.
++fn exit_with(mut state: ResMut<ExitWith>, mut exit: MessageWriter<AppExit>, mut termed: Local<bool>) {
++    if TERM.load(Ordering::Relaxed) && !*termed {
++        *termed = true;
++        info!("wowbg3 offscreen: SIGTERM; exiting cleanly");
++        exit.write(AppExit::Success);
++        return;
++    }
++    let Some(pid) = state.pid else { return };
++    let now = Instant::now();
++    if now < state.next {
++        return;
++    }
++    state.next = now + Duration::from_secs(1);
++    // SAFETY: kill with signal 0 only checks that the process exists.
++    let gone = unsafe { libc::kill(pid, 0) } != 0
++        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
++    if gone {
++        info!("wowbg3 offscreen: process {pid} is gone; exiting");
++        state.pid = None;
++        exit.write(AppExit::Success);
++    }
++}
++
++#[derive(Resource, Default)]
++struct InFlight(VecDeque<SubmissionIndex>);
++
++/// After each frame's submissions: wait for the frame [`IN_FLIGHT`] back to finish on the GPU.
++fn bound_gpu(mut q: ResMut<InFlight>, device: Res<RenderDevice>, queue: Res<RenderQueue>) {
++    // An empty submit returns the index of everything submitted so far.
++    let index = queue.submit(std::iter::empty());
++    q.0.push_back(index);
++    while q.0.len() > IN_FLIGHT {
++        let Some(oldest) = q.0.pop_front() else { break };
++        let _ = device.poll(bevy::render::render_resource::PollType::Wait {
++            submission_index: Some(oldest),
++            timeout: Some(Duration::from_millis(250)),
++        });
++    }
++}
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -194,6 +194,7 @@
+ mod wowbg3_fx_render;
+ mod wowbg3_keys;
+ mod wowbg3_lead;
++mod wowbg3_offscreen;
+ mod wowbg3_pace;
+ mod wowbg3_tav;
+ 
+@@ -343,7 +344,8 @@
+     // No `game://` source: the five UI shaders are compiled in by `crate::shaders`
+     // (`embedded://benilla_app/shaders/…`), so no build-machine path reaches the binary.
+ 
+-    app.add_plugins(benilla_world::boot::tuned_default_plugins(Window {
++    // WOW-BG3 (patch 0039): `WOW_BG3_OFFSCREEN=1` leaves winit out and renders offscreen.
++    app.add_plugins(crate::wowbg3_offscreen::window_plugins(benilla_world::boot::tuned_default_plugins(Window {
+         title: "benilla".into(),
+         // Born in the player's display mode (`gxWindow` read straight off `config.toml`) rather
+         // than flipped into it at `Startup`, which would flash on every launch and, under
+@@ -410,7 +412,7 @@
+             bevy::window::WindowLevel::Normal
+         },
+         ..default()
+-    }))
++    })))
+     .add_plugins(benilla_world::thread_qos::ThreadQosPlugin)
+     // Undoes winit's forced macOS app activation for background runs; the window-side half is the
+     // `Window` above.
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -218,6 +218,8 @@
+     if p.current.is_some() {
+         p.stats.lockstep += 1;
+     }
++    // Patch 0039: the offscreen loop's idle limit stays off while frames come from packets.
++    crate::wowbg3_offscreen::LOCKSTEP.store(p.current.is_some(), std::sync::atomic::Ordering::Relaxed);
+     if p.stats.frames.is_multiple_of(LOG_EVERY) {
+         let s = &mut p.stats;
+         s.frame_us.sort_unstable();
+--- a/crates/benilla-app/src/debug_panel/mod.rs
++++ b/crates/benilla-app/src/debug_panel/mod.rs
+@@ -122,6 +122,11 @@
+             egui.auto_create_primary_context = false;
+             // The player hides the OS cursor and draws `Point.blp`, so egui must not drive it.
+             egui.enable_cursor_icon_updates = false;
++            // WOW-BG3 (patch 0039): no winit window offscreen, so no IME to drive (its system
++            // warned every frame).
++            if crate::wowbg3_offscreen::enabled() {
++                egui.enable_ime = false;
++            }
+         }
+ 
+         // The inspector, its mouseover pick and the cast journal. `DebugState`, `InspectMode` and

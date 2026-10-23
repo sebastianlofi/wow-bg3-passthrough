@@ -1,0 +1,883 @@
+WOW-BG3 benilla patch 0013: frame pacing (on top of 0001-0009; skips 0010).
+
+A test on the desktop (BG3 fullscreen 3440x1440 at 60): Tav looked lower frame
+rate than the world and the camera staggered. benilla drew on its own 60 Hz clock with the
+newest BG3 camera record, Tav blended one BG3 frame behind on BG3's clock (0007), and the
+capture layer took the newest WoW frame at each BG3 present: three clocks.
+
+- wowbg3_pace.rs (new): frame packets. The capture layer appends the camera record it read at
+  each BG3 present to Tav's pose file (tavpose.bin "TVC1" trailer, the last 128 bytes). While
+  packets come, each frame waits at its start (First) for the next packet (at most 60 ms; none
+  for 250 ms: benilla's own clock as before), so benilla draws exactly one frame per BG3 present
+  with the camera and Tav's pose of that present. FrameTag (packet, camera seq, flags, depth
+  offset) is extracted into the render world for the export. `wowbg3 pace` log lines every 600
+  frames. WOW_BG3_PACE=off turns it off. Needs WOW_NOVSYNC=1 (benilla's own present must not
+  hold it to 60 Hz; its window is never shown).
+- wowbg3_lead.rs (follow_bg3 only): the camera record comes from the frame's packet when there is
+  one, else from bg3cam.bin as before. Ground lock and clearance unchanged.
+- wowbg3_tav.rs (apply_pose only): in lockstep the packet's pose is drawn as it is (no blending).
+- wowbg3_frames.rs: non-blocking export. Three readback buffer pairs; each frame's copies are
+  mapped without waiting and a writer thread polls the device and writes the slot file (the
+  render thread used to wait for the frame's GPU work and the 40 MB write at 3440x1440 every
+  frame). WBF1 bytes 36..56: packet u32, camera seq u32, flags u32 (bit 0 lockstep), publish
+  time f64 (CLOCK_MONOTONIC s); the depth offset now comes with the frame (FrameTag) instead of
+  the main world's current value. `wowbg3 frames` log lines every 10 s.
+
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 0532b5c..ec7471b 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -194,6 +194,7 @@ mod wowbg3_fx;
+ mod wowbg3_fx_render;
+ mod wowbg3_keys;
+ mod wowbg3_lead;
++mod wowbg3_pace;
+ mod wowbg3_tav;
+ 
+ use bevy::prelude::*;
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index 24ece16..1f74369 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -37,6 +37,8 @@ impl Plugin for WowBg3Plugin {
+         // WoW's chat typed from the BG3 window (patch 0008).
+         crate::wowbg3_keys::build(app, PathBuf::from(&dir));
+         crate::wowbg3_frames::build(app);
++        // One WoW frame per BG3 present, camera and Tav from the same packet (patch 0013).
++        crate::wowbg3_pace::build(app);
+         // Tav drawn inside WoW from BG3's copied meshes and poses.
+         crate::wowbg3_tav::build(app);
+         // BG3's own effects replayed inside WoW with BG3's shaders (patch 0005).
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+index b92a6df..c0de987 100644
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -14,12 +14,24 @@
+ //! A reader copies while seq == seq2 before and after.
+ //! MSAA must be off (`WOW_MSAA=off`); a multisampled frame is not copied.
+ //!
++//! Patch 0013 (frame pacing, `wowbg3_pace`): bytes 36..56 say what the frame was drawn from:
++//! packet u32 at 36 (the BG3 present whose camera and pose it shows, 0 none), camera record seq
++//! u32 at 40 (`bg3cam.bin`, 0 none), flags u32 at 44 (bit 0: drawn in lockstep from a packet),
++//! publish time f64 at 48 (CLOCK_MONOTONIC s, when the file became whole). The readback no longer
++//! blocks the render thread: [`SLOTS`] buffer pairs, each frame's copies are mapped without
++//! waiting and a writer thread waits for the GPU and writes the file (the render thread used to
++//! wait for the whole frame's GPU work and the 40 MB write at 3440x1440 every frame). A frame
++//! whose pair is still being written is not exported (counted in the log).
++//!
+ //! The colour is normally the player-UI camera's target just after its quads (the world with
+ //! benilla's UI over it, in the gamma bytes WoW shows, so chat, minimap and dialogs reach BG3's
+ //! window too); `WOW_BG3_FRAMES_SOURCE=world` takes the world camera's tonemapped colour instead.
+ 
+ use std::fs::OpenOptions;
+-use std::sync::Mutex;
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::mpsc;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
+ 
+ use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
+ use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
+@@ -27,6 +39,7 @@ use bevy::ui_render::graph::NodeUi;
+ use bevy::ecs::query::QueryItem;
+ use bevy::prelude::*;
+ use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
++use bevy::render::extract_resource::ExtractResourcePlugin;
+ use bevy::render::render_graph::{
+     NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
+ };
+@@ -41,6 +54,9 @@ use bevy::render::{Render, RenderApp, RenderSystems};
+ use benilla_world::view::WorldCamera;
+ 
+ pub(crate) const HEADER: usize = 64;
++/// Readback buffer pairs in flight: the frame being copied, one waiting for the GPU, one being
++/// written.
++const SLOTS: usize = 3;
+ 
+ pub(crate) fn format_code(f: TextureFormat) -> Option<(u32, u32)> {
+     // (code, bytes per texel)
+@@ -69,6 +85,14 @@ pub(crate) fn header(seq: u32, w: u32, h: u32, code: u32, cbpr: u32, dbpr: u32,
+     out
+ }
+ 
++/// Patch 0013: what the frame was drawn from and when it was published (bytes 36..56).
++pub(crate) fn tag_header(h: &mut [u8; HEADER], tag: &crate::wowbg3_pace::FrameTag, publish: f64) {
++    h[36..40].copy_from_slice(&tag.packet.to_le_bytes());
++    h[40..44].copy_from_slice(&tag.cam.to_le_bytes());
++    h[44..48].copy_from_slice(&tag.flags.to_le_bytes());
++    h[48..56].copy_from_slice(&publish.to_le_bytes());
++}
++
+ pub(crate) fn build(app: &mut App) {
+     let Some(path) = std::env::var_os("WOW_BG3_FRAMES") else {
+         return;
+@@ -80,7 +104,8 @@ pub(crate) fn build(app: &mut App) {
+     app.insert_resource(sink)
+         .add_systems(Update, (arm, arm_ui))
+         .add_plugins(ExtractComponentPlugin::<FrameExportView>::default())
+-        .add_plugins(ExtractComponentPlugin::<FrameExportUi>::default());
++        .add_plugins(ExtractComponentPlugin::<FrameExportUi>::default())
++        .add_plugins(ExtractResourcePlugin::<crate::wowbg3_pace::FrameTag>::default());
+     let sink = app.world().resource::<FrameSink>().clone_handle();
+     let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+         warn!("wowbg3 frames: no render app");
+@@ -88,6 +113,7 @@ pub(crate) fn build(app: &mut App) {
+     };
+     render_app
+         .insert_resource(sink)
++        .init_resource::<crate::wowbg3_pace::FrameTag>()
+         .add_systems(
+             Render,
+             (
+@@ -111,14 +137,47 @@ struct FrameSink {
+ 
+ struct SinkState {
+     path: std::path::PathBuf,
+-    files: [Option<std::fs::File>; 2],
+     seq: u32,
+-    color: Option<(Buffer, u32, u32, u32, TextureFormat)>, // buffer, bpr, w, h, format
+-    depth: Option<(Buffer, u32)>,                        // buffer, bpr
++    /// Readback buffer pairs; `cur` is the one this frame's copies go to (none: not exported).
++    slots: Vec<Slot>,
++    cur: Option<usize>,
+     color_copied: bool,
+     depth_copied: bool,
+     warned: bool,
+     ui_source: bool,
++    /// Frames to the writer thread.
++    jobs: Option<mpsc::Sender<Job>>,
++    stats: Arc<Mutex<ExportStats>>,
++}
++
++/// One readback buffer pair. `state`: 0 free, 1 copied into this frame, 2 with the writer.
++struct Slot {
++    color: (Buffer, u32, u32, u32, TextureFormat), // buffer, bpr, w, h, format
++    depth: (Buffer, u32),                          // buffer, bpr
++    state: Arc<AtomicU8>,
++}
++
++/// A frame for the writer: the slot's buffers, their mapped flags and the header.
++struct Job {
++    color: Buffer,
++    depth: Buffer,
++    /// Per buffer: 0 mapping, 1 mapped, 2 the mapping failed.
++    mapped: [Arc<AtomicU8>; 2],
++    state: Arc<AtomicU8>,
++    header: [u8; HEADER],
++    tag: crate::wowbg3_pace::FrameTag,
++    submitted: Instant,
++}
++
++#[derive(Default)]
++struct ExportStats {
++    written: u64,
++    busy: u64,
++    failed: u64,
++    map_us: u64,
++    map_max_us: u64,
++    write_us: u64,
++    write_max_us: u64,
+ }
+ 
+ impl FrameSink {
+@@ -126,14 +185,15 @@ impl FrameSink {
+         FrameSink {
+             inner: std::sync::Arc::new(Mutex::new(SinkState {
+                 path,
+-                files: [None, None],
+                 seq: 0,
+-                color: None,
+-                depth: None,
++                slots: Vec::new(),
++                cur: None,
+                 color_copied: false,
+                 depth_copied: false,
+                 warned: false,
+                 ui_source: true,
++                jobs: None,
++                stats: Arc::new(Mutex::new(ExportStats::default())),
+             })),
+         }
+     }
+@@ -203,6 +263,7 @@ fn prepare(
+     let mut s = sink.inner.lock().unwrap();
+     s.color_copied = false;
+     s.depth_copied = false;
++    s.cur = None;
+     let source = if s.ui_source {
+         let Ok(ui) = ui_views.single() else { return };
+         ui
+@@ -220,30 +281,40 @@ fn prepare(
+         return;
+     };
+     let cbpr = RenderDevice::align_copy_bytes_per_row(size.width as usize * bpt as usize) as u32;
+-    let fits = s
+-        .color
+-        .as_ref()
+-        .is_some_and(|c| c.1 == cbpr && c.2 == size.width && c.3 == size.height && c.4 == format);
+-    if !fits {
+-        let buffer = device.create_buffer(&BufferDescriptor {
+-            label: Some("wowbg3_color_readback"),
+-            size: u64::from(cbpr) * u64::from(size.height),
+-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+-            mapped_at_creation: false,
+-        });
+-        s.color = Some((buffer, cbpr, size.width, size.height, format));
+-    }
+     let dsize = depth.texture.size();
+     let dbpr = RenderDevice::align_copy_bytes_per_row(dsize.width as usize * 4) as u32;
+-    if s.depth.as_ref().is_none_or(|d| d.1 != dbpr) || !fits {
+-        let buffer = device.create_buffer(&BufferDescriptor {
+-            label: Some("wowbg3_depth_readback"),
+-            size: u64::from(dbpr) * u64::from(dsize.height),
++    let make = |label: &'static str, size: u64| {
++        device.create_buffer(&BufferDescriptor {
++            label: Some(label),
++            size,
+             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+             mapped_at_creation: false,
+-        });
+-        s.depth = Some((buffer, dbpr));
++        })
++    };
++    // A free pair (0013): the writer may still hold the others.
++    let fits = |sl: &Slot| sl.color.1 == cbpr && sl.color.2 == size.width && sl.color.3 == size.height && sl.color.4 == format && sl.depth.1 == dbpr;
++    let free = (0..s.slots.len()).find(|&i| s.slots[i].state.load(Ordering::Acquire) == 0);
++    let i = match free {
++        Some(i) => i,
++        None if s.slots.len() < SLOTS => {
++            s.slots.push(Slot {
++                color: (make("wowbg3_color_readback", u64::from(cbpr) * u64::from(size.height)), cbpr, size.width, size.height, format),
++                depth: (make("wowbg3_depth_readback", u64::from(dbpr) * u64::from(dsize.height)), dbpr),
++                state: Arc::new(AtomicU8::new(0)),
++            });
++            s.slots.len() - 1
++        }
++        None => {
++            s.stats.lock().unwrap().busy += 1;
++            return;
++        }
++    };
++    if !fits(&s.slots[i]) {
++        s.slots[i].color = (make("wowbg3_color_readback", u64::from(cbpr) * u64::from(size.height)), cbpr, size.width, size.height, format);
++        s.slots[i].depth = (make("wowbg3_depth_readback", u64::from(dbpr) * u64::from(dsize.height)), dbpr);
+     }
++    s.slots[i].state.store(1, Ordering::Release);
++    s.cur = Some(i);
+ }
+ 
+ #[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -269,7 +340,7 @@ impl ViewNode for DepthNode {
+         if !depth.texture.usage().contains(TextureUsages::COPY_SRC) {
+             return Ok(());
+         }
+-        let Some((buffer, bpr)) = s.depth.as_ref().map(|d| (d.0.clone(), d.1)) else { return Ok(()) };
++        let Some((buffer, bpr)) = s.cur.map(|i| (s.slots[i].depth.0.clone(), s.slots[i].depth.1)) else { return Ok(()) };
+         let size = depth.texture.size();
+         rc.command_encoder().copy_texture_to_buffer(
+             TexelCopyTextureInfo { texture: &depth.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::DepthOnly },
+@@ -329,7 +400,10 @@ fn copy_color(s: &mut SinkState, rc: &mut RenderContext, target: &ViewTarget) {
+     if !tex.usage().contains(TextureUsages::COPY_SRC) {
+         return;
+     }
+-    let Some((buffer, bpr, w, h, format)) = s.color.as_ref().map(|c| (c.0.clone(), c.1, c.2, c.3, c.4)) else {
++    let Some((buffer, bpr, w, h, format)) = s.cur.map(|i| {
++        let c = &s.slots[i].color;
++        (c.0.clone(), c.1, c.2, c.3, c.4)
++    }) else {
+         return;
+     };
+     if tex.size().width != w || tex.size().height != h || tex.format() != format {
+@@ -346,70 +420,161 @@ fn copy_color(s: &mut SinkState, rc: &mut RenderContext, target: &ViewTarget) {
+     s.color_copied = true;
+ }
+ 
+-/// Map both copies back (blocking: one frame of latency is the price of simplicity) and write
+-/// them into the shared file in place, framed by the sequence number.
+-fn publish(sink: Res<FrameSink>, views: Query<&ExtractedView, With<FrameExportView>>, device: Res<RenderDevice>) {
++/// Map both copies without waiting and hand the frame to the writer thread (0013; this used to
++/// wait here for the GPU and write the file on the render thread).
++fn publish(
++    sink: Res<FrameSink>,
++    views: Query<&ExtractedView, With<FrameExportView>>,
++    device: Res<RenderDevice>,
++    tag: Res<crate::wowbg3_pace::FrameTag>,
++) {
+     let mut s = sink.inner.lock().unwrap();
++    let Some(i) = s.cur.take() else { return };
++    let state = s.slots[i].state.clone();
+     if !(s.color_copied && s.depth_copied) {
++        state.store(0, Ordering::Release);
+         return;
+     }
+-    let (Some(color), Some(depth)) = (s.color.clone(), s.depth.clone()) else { return };
+-    let Ok(view) = views.single() else { return };
+-    // Reverse infinite perspective: clip z = near, so view z = near / depth.
+-    let near = view.clip_from_view.w_axis.z;
+-    color.0.slice(..).map_async(MapMode::Read, |_| {});
+-    depth.0.slice(..).map_async(MapMode::Read, |_| {});
+-    if device.poll(bevy::render::render_resource::PollType::wait_indefinitely()).is_err() {
++    let Ok(view) = views.single() else {
++        state.store(0, Ordering::Release);
+         return;
+-    }
+-    s.seq = s.seq.wrapping_add(1).max(1);
+-    let slot = (s.seq % 2) as usize;
+-    if s.files[slot].is_none() {
+-        let mut o = OpenOptions::new();
+-        o.read(true).write(true).create(true);
+-        #[cfg(unix)]
+-        {
+-            use std::os::unix::fs::OpenOptionsExt;
+-            o.mode(0o644);
+-        }
+-        let path = s.path.with_extension(if slot == 0 { "a.bin" } else { "b.bin" });
+-        match o.open(&path) {
+-            Ok(f) => s.files[slot] = Some(f),
++    };
++    if s.jobs.is_none() {
++        let (tx, rx) = mpsc::channel::<Job>();
++        let path = s.path.clone();
++        let stats = s.stats.clone();
++        let dev = device.clone();
++        match std::thread::Builder::new().name("wowbg3 frames".into()).spawn(move || writer(rx, path, dev, stats)) {
++            Ok(_) => s.jobs = Some(tx),
+             Err(e) => {
+-                if !s.warned {
+-                    s.warned = true;
+-                    warn!("wowbg3 frames: cannot open {:?}: {e}", path);
+-                }
+-                color.0.unmap();
+-                depth.0.unmap();
++                warn!("wowbg3 frames: no writer thread: {e}");
++                state.store(0, Ordering::Release);
+                 return;
+             }
+         }
+     }
++    // Reverse infinite perspective: clip z = near, so view z = near / depth.
++    let near = view.clip_from_view.w_axis.z;
++    let (color, depth) = (s.slots[i].color.clone(), s.slots[i].depth.clone());
++    let mapped = [Arc::new(AtomicU8::new(0)), Arc::new(AtomicU8::new(0))];
++    let (mc, md) = (mapped[0].clone(), mapped[1].clone());
++    color.0.slice(..).map_async(MapMode::Read, move |r| mc.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release));
++    depth.0.slice(..).map_async(MapMode::Read, move |r| md.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release));
++    s.seq = s.seq.wrapping_add(1).max(1);
+     let (code, _) = format_code(color.4).unwrap_or((0, 4));
+-    let hdr = header(s.seq, color.2, color.3, code, color.1, depth.1, near, crate::wowbg3_lead::depth_offset());
+-    let mut torn = hdr;
+-    torn[56..60].copy_from_slice(&0u32.to_le_bytes());
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::FileExt;
+-        if let Some(f) = s.files[slot].as_ref() {
+-            let cbytes = color.0.slice(..).get_mapped_range();
+-            let dbytes = depth.0.slice(..).get_mapped_range();
+-            // seq2 = 0 while the rows change, the real seq once they are whole.
+-            let ok = f.write_all_at(&torn, 0).is_ok()
+-                && f.write_all_at(&cbytes, HEADER as u64).is_ok()
+-                && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok()
+-                && f.write_all_at(&hdr, 0).is_ok();
+-            drop(cbytes);
+-            drop(dbytes);
+-            if !ok {
+-                s.files[slot] = None;
++    let header = header(s.seq, color.2, color.3, code, color.1, depth.1, near, tag.depth_offset);
++    state.store(2, Ordering::Release);
++    let job = Job { color: color.0, depth: depth.0, mapped, state: state.clone(), header, tag: *tag, submitted: Instant::now() };
++    if s.jobs.as_ref().is_some_and(|tx| tx.send(job).is_err()) {
++        s.jobs = None;
++        state.store(0, Ordering::Release);
++    }
++}
++
++/// The writer thread: waits for each frame's mapping (polling the device without blocking it)
++/// and writes it into its slot file, framed by the sequence number, then frees the pair.
++fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevice, stats: Arc<Mutex<ExportStats>>) {
++    let mut files: [Option<std::fs::File>; 2] = [None, None];
++    let mut warned = false;
++    let mut logged_at = Instant::now();
++    while let Ok(job) = rx.recv() {
++        let t0 = Instant::now();
++        let mut lost = false;
++        while job.mapped.iter().any(|m| m.load(Ordering::Acquire) == 0) {
++            let _ = device.poll(bevy::render::render_resource::PollType::Poll);
++            if job.submitted.elapsed() > Duration::from_secs(2) {
++                lost = true;
++                break;
++            }
++            std::thread::sleep(Duration::from_micros(150));
++        }
++        let mut ok = !lost && job.mapped.iter().all(|m| m.load(Ordering::Acquire) == 1);
++        let map_us = t0.elapsed().as_micros() as u64;
++        let t1 = Instant::now();
++        let seq = u32::from_le_bytes(job.header[4..8].try_into().unwrap());
++        let slot = (seq % 2) as usize;
++        if ok && files[slot].is_none() {
++            let mut o = OpenOptions::new();
++            o.read(true).write(true).create(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                o.mode(0o644);
+             }
++            let p = path.with_extension(if slot == 0 { "a.bin" } else { "b.bin" });
++            match o.open(&p) {
++                Ok(f) => files[slot] = Some(f),
++                Err(e) => {
++                    if !warned {
++                        warned = true;
++                        warn!("wowbg3 frames: cannot open {:?}: {e}", p);
++                    }
++                    ok = false;
++                }
++            }
++        }
++        #[cfg(unix)]
++        if ok {
++            use std::os::unix::fs::FileExt;
++            if let Some(f) = files[slot].as_ref() {
++                let cbytes = job.color.slice(..).get_mapped_range();
++                let dbytes = job.depth.slice(..).get_mapped_range();
++                let mut torn = job.header;
++                torn[56..60].copy_from_slice(&0u32.to_le_bytes());
++                // seq2 = 0 while the rows change, the real seq once they are whole.
++                let mut whole = job.header;
++                let written = f.write_all_at(&torn, 0).is_ok()
++                    && f.write_all_at(&cbytes, HEADER as u64).is_ok()
++                    && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok();
++                tag_header(&mut whole, &job.tag, crate::wowbg3_pace::mono_seconds());
++                ok = written && f.write_all_at(&whole, 0).is_ok();
++                drop(cbytes);
++                drop(dbytes);
++                if !ok {
++                    files[slot] = None;
++                }
++            }
++        }
++        if job.mapped[0].load(Ordering::Acquire) == 1 {
++            job.color.unmap();
++        }
++        if job.mapped[1].load(Ordering::Acquire) == 1 {
++            job.depth.unmap();
++        }
++        // A mapping still pending after 2 s keeps its pair out of use (copying into a buffer that
++        // gets mapped later would be a wgpu error).
++        if !lost {
++            job.state.store(0, Ordering::Release);
++        } else {
++            warn!("wowbg3 frames: a readback never finished; its buffers are left out");
++        }
++        let write_us = t1.elapsed().as_micros() as u64;
++        let mut st = stats.lock().unwrap();
++        if ok {
++            st.written += 1;
++            st.map_us += map_us;
++            st.map_max_us = st.map_max_us.max(map_us);
++            st.write_us += write_us;
++            st.write_max_us = st.write_max_us.max(write_us);
++        } else {
++            st.failed += 1;
++        }
++        if logged_at.elapsed() > Duration::from_secs(10) {
++            logged_at = Instant::now();
++            let n = st.written.max(1) as f64;
++            info!(
++                "wowbg3 frames: {} written in 10 s, {} not exported (readbacks busy), {} failed; GPU done {:.2} ms after the frame (max {:.2}), write {:.2} ms (max {:.2})",
++                st.written,
++                st.busy,
++                st.failed,
++                st.map_us as f64 / n / 1e3,
++                st.map_max_us as f64 / 1e3,
++                st.write_us as f64 / n / 1e3,
++                st.write_max_us as f64 / 1e3
++            );
++            *st = ExportStats::default();
+         }
+     }
+-    color.0.unmap();
+-    depth.0.unmap();
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 397053f..77907cc 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -408,6 +408,7 @@ fn follow_bg3(
+     player: Res<crate::player::Player>,
+     world: benilla_world::world_point::WorldPoint,
+     mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
++    pace: Option<Res<crate::wowbg3_pace::Pace>>,
+ ) {
+     CAMERA_SEQ.store(0, Ordering::Relaxed);
+     if s.file.is_none() {
+@@ -422,13 +423,19 @@ fn follow_bg3(
+         }
+     }
+     let mut rec = [0u8; 96];
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::FileExt;
+-        let ok = s.file.as_ref().is_some_and(|f| f.read_exact_at(&mut rec, 0).is_ok());
+-        if !ok {
+-            s.file = None;
+-            return;
++    // Patch 0013: in lockstep the record comes with BG3's present packet (`wowbg3_pace`), so the
++    // world and Tav are drawn from the same BG3 present.
++    if let Some(packet) = pace.as_deref().and_then(crate::wowbg3_pace::packet_camera) {
++        rec = packet;
++    } else {
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::FileExt;
++            let ok = s.file.as_ref().is_some_and(|f| f.read_exact_at(&mut rec, 0).is_ok());
++            if !ok {
++                s.file = None;
++                return;
++            }
+         }
+     }
+     if let Some((seq, pose)) = decode(&rec) {
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+new file mode 100644
+index 0000000..effd60d
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -0,0 +1,302 @@
++//! WOW-BG3 (local fork, patch 0013): frame pacing. A test on the desktop (
++//! BG3 fullscreen 3440x1440 at 60): Tav looked lower frame rate than the world and the camera
++//! staggered. benilla drew on its own 60 Hz clock with the newest BG3 camera record, Tav blended
++//! one BG3 frame behind on BG3's clock (patch 0007), and the capture layer took the newest WoW
++//! frame at each BG3 present: three clocks.
++//!
++//! Frame packets: at every BG3 present the capture layer writes Tav's pose (`tavpose.bin`) with
++//! the plugin's camera record read at that same present appended: the `TVC1` trailer, the last
++//! 128 bytes of the file: "TVC1", frame u32 (the pose header's), present time f64
++//! (CLOCK_MONOTONIC s), present index u64, the `BGC1` record (96 bytes, zeros when it was torn),
++//! its seq u32, "TVC1". While packets come, benilla draws exactly one frame per packet:
++//! [`wait_packet`] holds the start of the next frame until a new packet is there (at most
++//! [`MAX_WAIT`]), the world camera takes the packet's camera record (`wowbg3_lead`) and Tav
++//! exactly the packet's pose (`wowbg3_tav`, no blending), so Tav and the world always come from
++//! the same BG3 state and advance together, once per BG3 frame. Without packets for [`STALE`]
++//! (world mode off, BG3 gone, an old layer) benilla runs on its own clock as before.
++//! `WOW_BG3_PACE=off` turns it off. Run with `WOW_NOVSYNC=1`: benilla's own present (never shown,
++//! headless gamescope) must not hold it to its own 60 Hz.
++//!
++//! Every exported frame (`wowbg3_frames`) carries [`FrameTag`]: the packet and the camera record
++//! it was drawn from, so the layer can composite the WoW frame drawn for the camera of the BG3
++//! frame it presents. `pace` log lines every [`LOG_EVERY`] frames.
++
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use bevy::prelude::*;
++use bevy::render::extract_resource::ExtractResource;
++
++/// No packet for this long: benilla runs on its own clock.
++const STALE: Duration = Duration::from_millis(250);
++/// The longest a frame waits for the next packet (BG3 hitching or loading).
++const MAX_WAIT: Duration = Duration::from_millis(60);
++/// How often the pose file is checked while waiting.
++const POLL: Duration = Duration::from_micros(250);
++const LOG_EVERY: u64 = 600;
++const TRAILER: usize = 128;
++
++/// One BG3 present's packet.
++#[derive(Clone)]
++pub(crate) struct Packet {
++    pub(crate) frame: u32,
++    pub(crate) present_time: f64,
++    /// The `BGC1` camera record read at that present (`None` when it was torn or missing).
++    pub(crate) cam: Option<[u8; 96]>,
++    /// The whole pose file (`wowbg3_tav::decode_pose` reads it).
++    pub(crate) pose: Arc<Vec<u8>>,
++}
++
++/// Decodes the `TVC1` trailer of a pose file: (frame, present time, present index, camera record).
++pub(crate) fn decode_trailer(b: &[u8]) -> Option<(u32, f64, u64, Option<[u8; 96]>)> {
++    if b.len() < 24 + TRAILER || b.get(0..3)? != b"TVP" {
++        return None;
++    }
++    let t = &b[b.len() - TRAILER..];
++    if &t[0..4] != b"TVC1" || &t[124..128] != b"TVC1" {
++        return None;
++    }
++    let frame = u32::from_le_bytes(t[4..8].try_into().ok()?);
++    let header_frame = u32::from_le_bytes(b[8..12].try_into().ok()?);
++    if frame != header_frame {
++        return None;
++    }
++    let time = f64::from_le_bytes(t[8..16].try_into().ok()?);
++    let index = u64::from_le_bytes(t[16..24].try_into().ok()?);
++    let mut cam = [0u8; 96];
++    cam.copy_from_slice(&t[24..120]);
++    let seq = u32::from_le_bytes(t[120..124].try_into().ok()?);
++    let whole = seq != 0 && &cam[0..4] == b"BGC1" && u32::from_le_bytes(cam[4..8].try_into().ok()?) == seq;
++    Some((frame, time, index, whole.then_some(cam)))
++}
++
++/// The packet this frame is drawn from (`None` while running on benilla's own clock).
++#[derive(Resource)]
++pub(crate) struct Pace {
++    path: PathBuf,
++    enabled: bool,
++    pub(crate) current: Option<Packet>,
++    /// (inode, modification time ns) of the pose file last read.
++    stamp: Option<(u64, i64)>,
++    last_frame: u32,
++    last_at: Option<Instant>,
++    stats: PaceStats,
++}
++
++#[derive(Default)]
++struct PaceStats {
++    frames: u64,
++    lockstep: u64,
++    waits: u64,
++    wait_us: u64,
++    wait_max_us: u64,
++    timeouts: u64,
++    skipped: u64,
++    frame_at: Option<Instant>,
++    frame_us: Vec<u64>,
++    /// BG3 present to the start of this frame (µs), from the packet's present time.
++    latency_us: u64,
++    latency_max_us: u64,
++}
++
++/// What the exported frame was drawn from, extracted into the render world (`wowbg3_frames`).
++#[derive(Resource, Clone, Copy, Default, ExtractResource)]
++pub(crate) struct FrameTag {
++    /// The packet (BG3 present, tavpose.bin's frame), 0 none.
++    pub(crate) packet: u32,
++    /// The `bg3cam.bin` record the world camera followed, 0 none.
++    pub(crate) cam: u32,
++    /// Bit 0: drawn in lockstep from a packet.
++    pub(crate) flags: u32,
++    /// `wowbg3_lead::depth_offset` for this frame (the render world runs a frame behind).
++    pub(crate) depth_offset: f32,
++}
++
++/// CLOCK_MONOTONIC in seconds (the clock BG3's layer and plugin stamp with).
++pub(crate) fn mono_seconds() -> f64 {
++    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    // SAFETY: clock_gettime writes the timespec it is given.
++    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
++    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
++}
++
++pub(crate) fn build(app: &mut App) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let dir = std::env::var_os("WOW_BG3_TAV_DIR").map_or_else(|| PathBuf::from("/tmp/wowbg3/tav"), PathBuf::from);
++    let enabled = std::env::var("WOW_BG3_PACE").map_or(true, |v| v != "off");
++    info!(
++        "wowbg3 pace: {} (packets from {:?}, vsync {})",
++        if enabled { "one frame per BG3 present while packets come" } else { "off" },
++        dir.join("tavpose.bin"),
++        if crate::video::novsync_env() { "off" } else { "on: set WOW_NOVSYNC=1" }
++    );
++    app.insert_resource(Pace {
++        path: dir.join("tavpose.bin"),
++        enabled,
++        current: None,
++        stamp: None,
++        last_frame: 0,
++        last_at: None,
++        stats: PaceStats::default(),
++    })
++    .init_resource::<FrameTag>()
++    .add_systems(First, wait_packet)
++    .add_systems(Last, tag_frame);
++}
++
++/// (inode, mtime ns) of the file, cheap enough to check every [`POLL`].
++fn stamp(path: &std::path::Path) -> Option<(u64, i64)> {
++    use std::os::unix::fs::MetadataExt;
++    let md = std::fs::metadata(path).ok()?;
++    Some((md.ino(), md.mtime() * 1_000_000_000 + md.mtime_nsec()))
++}
++
++/// A new packet, if the pose file changed and holds one.
++fn take_packet(p: &mut Pace) -> Option<Packet> {
++    let st = stamp(&p.path)?;
++    if p.stamp == Some(st) {
++        return None;
++    }
++    let raw = std::fs::read(&p.path).ok()?;
++    p.stamp = Some(st);
++    let (frame, present_time, _present_index, cam) = decode_trailer(&raw)?;
++    if frame == p.last_frame {
++        return None;
++    }
++    Some(Packet { frame, present_time, cam, pose: Arc::new(raw) })
++}
++
++/// Start of a frame: wait for the next packet while packets come.
++fn wait_packet(mut p: ResMut<Pace>) {
++    let now = Instant::now();
++    if let Some(at) = p.stats.frame_at {
++        let us = now.duration_since(at).as_micros() as u64;
++        p.stats.frame_us.push(us);
++    }
++    p.stats.frame_at = Some(now);
++    p.stats.frames += 1;
++    if p.enabled {
++        let start = Instant::now();
++        let mut waited = false;
++        loop {
++            if let Some(pk) = take_packet(&mut p) {
++                if p.last_frame != 0 && pk.frame.wrapping_sub(p.last_frame) > 1 && pk.frame.wrapping_sub(p.last_frame) < 1000 {
++                    p.stats.skipped += u64::from(pk.frame.wrapping_sub(p.last_frame) - 1);
++                }
++                p.last_frame = pk.frame;
++                p.last_at = Some(Instant::now());
++                let lat = ((mono_seconds() - pk.present_time) * 1e6).max(0.0) as u64;
++                p.stats.latency_us += lat;
++                p.stats.latency_max_us = p.stats.latency_max_us.max(lat);
++                p.current = Some(pk);
++                break;
++            }
++            // No packets lately: benilla's own clock.
++            if p.last_at.is_none_or(|t| t.elapsed() > STALE) {
++                p.current = None;
++                break;
++            }
++            if start.elapsed() > MAX_WAIT {
++                p.stats.timeouts += 1;
++                break;
++            }
++            waited = true;
++            std::thread::sleep(POLL);
++        }
++        if waited {
++            let us = start.elapsed().as_micros() as u64;
++            p.stats.waits += 1;
++            p.stats.wait_us += us;
++            p.stats.wait_max_us = p.stats.wait_max_us.max(us);
++        }
++    } else {
++        p.current = None;
++    }
++    if p.current.is_some() {
++        p.stats.lockstep += 1;
++    }
++    if p.stats.frames.is_multiple_of(LOG_EVERY) {
++        let s = &mut p.stats;
++        s.frame_us.sort_unstable();
++        let n = s.frame_us.len().max(1);
++        let pct = |q: f64| s.frame_us.get(((n - 1) as f64 * q) as usize).copied().unwrap_or(0) as f64 / 1e3;
++        let mean = s.frame_us.iter().sum::<u64>() as f64 / n as f64 / 1e3;
++        info!(
++            "wowbg3 pace: {} frames, {} in lockstep; frame interval ms mean {:.2} p50 {:.2} p95 {:.2} max {:.2}; packet waits {} ({:.2} ms avg, max {:.2}), \
++             timeouts {}, packets skipped {}, BG3 present to frame start {:.2} ms avg (max {:.2})",
++            LOG_EVERY,
++            s.lockstep,
++            mean,
++            pct(0.5),
++            pct(0.95),
++            pct(1.0),
++            s.waits,
++            if s.waits > 0 { s.wait_us as f64 / s.waits as f64 / 1e3 } else { 0.0 },
++            s.wait_max_us as f64 / 1e3,
++            s.timeouts,
++            s.skipped,
++            if s.lockstep > 0 { s.latency_us as f64 / s.lockstep as f64 / 1e3 } else { 0.0 },
++            s.latency_max_us as f64 / 1e3
++        );
++        let frames = s.frames;
++        *s = PaceStats { frames, frame_at: s.frame_at, ..Default::default() };
++    }
++}
++
++/// The camera record of this frame's packet (lockstep only).
++pub(crate) fn packet_camera(p: &Pace) -> Option<[u8; 96]> {
++    p.current.as_ref().and_then(|k| k.cam)
++}
++
++/// End of a frame's update: what it was drawn from, for the export.
++fn tag_frame(p: Res<Pace>, mut tag: ResMut<FrameTag>) {
++    *tag = FrameTag {
++        packet: p.current.as_ref().map_or(0, |k| k.frame),
++        cam: crate::wowbg3_lead::camera_seq(),
++        flags: u32::from(p.current.is_some()),
++        depth_offset: crate::wowbg3_lead::depth_offset(),
++    };
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pose_file(frame: u32, cam_seq: u32) -> Vec<u8> {
++        let mut b = vec![0u8; 24];
++        b[0..4].copy_from_slice(b"TVP1");
++        b[8..12].copy_from_slice(&frame.to_le_bytes());
++        let mut t = [0u8; 128];
++        t[0..4].copy_from_slice(b"TVC1");
++        t[4..8].copy_from_slice(&frame.to_le_bytes());
++        t[8..16].copy_from_slice(&12.5f64.to_le_bytes());
++        t[16..24].copy_from_slice(&77u64.to_le_bytes());
++        if cam_seq != 0 {
++            t[24..28].copy_from_slice(b"BGC1");
++            t[28..32].copy_from_slice(&cam_seq.to_le_bytes());
++            t[88..92].copy_from_slice(&cam_seq.to_le_bytes());
++        }
++        t[120..124].copy_from_slice(&cam_seq.to_le_bytes());
++        t[124..128].copy_from_slice(b"TVC1");
++        b.extend_from_slice(&t);
++        b
++    }
++
++    #[test]
++    fn decodes_the_trailer() {
++        let (frame, time, index, cam) = decode_trailer(&pose_file(9, 41)).expect("a trailer");
++        assert_eq!((frame, time, index), (9, 12.5, 77));
++        let cam = cam.expect("a camera record");
++        assert_eq!(&cam[0..4], b"BGC1");
++        assert_eq!(u32::from_le_bytes(cam[4..8].try_into().unwrap()), 41);
++        assert!(decode_trailer(&pose_file(9, 0)).unwrap().3.is_none(), "no camera record");
++        let mut other = pose_file(9, 41);
++        other[8..12].copy_from_slice(&10u32.to_le_bytes());
++        assert!(decode_trailer(&other).is_none(), "trailer of another frame");
++        let old = &pose_file(9, 41)[..24];
++        assert!(decode_trailer(old).is_none(), "a pose file without a trailer");
++    }
++}
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index 87f20d5..13a5b28 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -1162,14 +1162,18 @@ fn apply_pose(
+     mut roots: Query<(&mut Transform, &mut Visibility)>,
+     mut feet: ResMut<TavFeet>,
+     mut wow_frame: Local<u64>,
++    pace: Option<Res<crate::wowbg3_pace::Pace>>,
+ ) {
+     *wow_frame += 1;
+     let Some(root) = d.root else {
+         feet.0 = None;
+         return;
+     };
+-    let raw = std::fs::read(d.dir.join("tavpose.bin")).ok();
+-    let pose = raw.as_deref().and_then(decode_pose);
++    // Patch 0013: in lockstep the pose comes with BG3's present packet (`wowbg3_pace`) and is drawn
++    // as it is, with the camera of the same present.
++    let packet = pace.as_deref().and_then(|p| p.current.as_ref()).map(|k| k.pose.clone());
++    let raw = if packet.is_some() { None } else { std::fs::read(d.dir.join("tavpose.bin")).ok() };
++    let pose = packet.as_deref().map(|v| v.as_slice()).or(raw.as_deref()).and_then(decode_pose);
+     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64());
+     let seq_ok = |p: &PoseFile| d.file.as_ref().is_some_and(|f| f.seq == p.seq) && !p.recs.is_empty();
+     let fresh = pose.as_ref().is_some_and(|p| seq_ok(p) && (now - p.time).abs() < STALE_SECS);
+@@ -1196,7 +1200,7 @@ fn apply_pose(
+     }
+     // The pair to draw and where between them (smoothing off: the newest record alone).
+     let (recs, key) = match (&d.track.prev, &d.track.last) {
+-        (Some(a), Some(b)) if d.smooth => {
++        (Some(a), Some(b)) if d.smooth && packet.is_none() => {
+             let t = blend_at(a.time, b.time, now, d.track.interval);
+             let key = (a.frame, b.frame, t);
+             (if d.track.drawn == Some(key) { None } else { Some(blend_pose(a, b, t)) }, key)

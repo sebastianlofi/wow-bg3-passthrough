@@ -1,0 +1,647 @@
+WOW-BG3 benilla patch 0033 (the party): BG3's companions drawn in WoW like the hero.
+Companions follow the hero in world mode and show in WoW, client-only (party-design.md).
+The capture layer's Tav copy now holds the hero and her companions in one plan, each mesh with its
+figure (TVM1 record word 14; TavPlan.lua figures). wowbg3_tav draws each companion's figure under a
+root of its own at its own place, on WoW's ground by a ground lock of its own (wowbg3_lead's
+ground_under), with its own ground shade; poses (idle, walk, run, fight) are BG3's own every frame.
+blob_shadow lays the WoW blob shadow under each companion (PartyFeet). wowbg3_fight: a stand-in's
+attack on a companion (strikes.bin flag 16) plays with BG3's own facing and no WoW victim.
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -50,6 +50,17 @@
+ //! parts and sizes: only the plan number, its K lines or the mapping changed) keeps the figure
+ //! instead of rebuilding it ([`same_meshes`]). The `wowbg3 tav: poses` log line counts frames
+ //! drawn from another plan's pose by key and frames with no pose for the figure.
++//!
++//! Patch 0033 (the party: BG3's companions travel with the hero in world mode,
++//! client-only, AI Context/party-design.md): the plan holds the hero and her companions, each a
++//! figure (`TavPlan.lua`: figure 0 the hero, her lines first; the layer writes each mesh's figure in
++//! the TVM1 record's spare word). The hero is drawn as before. Each companion's figure gets a root of
++//! its own at its own place (its first mesh's object origin, mapped), stands on WoW's ground under it
++//! by a ground lock of its own (`wowbg3_lead::ground_under`, eased like hers; hers also lowers the
++//! camera, theirs only the figure), and has its own ground shade; its feet go to [`PartyFeet`], where
++//! `blob_shadow` lays a WoW blob shadow under each. Poses, idle, walking, running and fighting, are
++//! BG3's own, copied like hers every frame. A rigid mesh borrows the skin of a skinned mesh of its own
++//! figure only.
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -89,6 +100,8 @@
+     pub(crate) kind: u32,
+     /// Which of Tav's visuals it belongs to (0 the root, then attachments in order); for logs.
+     pub(crate) part: u32,
++    /// Patch 0033: whose figure it is (0 the hero, 1... her companions).
++    pub(crate) figure: u32,
+     pub(crate) pos: Vec<Vec3>,
+     pub(crate) nrm: Vec<Vec3>,
+     /// Bind-pose tangents (model space, along +U); `w` = the handedness that makes
+@@ -103,8 +116,8 @@
+     pub(crate) skin_from: Option<u64>,
+ }
+ 
+-/// A `tavmesh.bin` header's mesh records: (key, kind, part, vertex count, index count).
+-type MeshHeads = Vec<(u64, u32, u32, u32, u32)>;
++/// A `tavmesh.bin` header's mesh records: (key, kind, part, vertex count, index count, figure).
++type MeshHeads = Vec<(u64, u32, u32, u32, u32, u32)>;
+ 
+ /// The plan number, mapping and mesh records of a `tavmesh.bin` without decoding its blobs.
+ pub(crate) fn mesh_heads(b: &[u8]) -> Option<(u32, [f32; 3], [f32; 3], MeshHeads)> {
+@@ -119,7 +132,7 @@
+     let heads = (0..n)
+         .map(|i| {
+             let h = 40 + 64 * i;
+-            Some((u64_at(b, h)?, u32_at(b, h + 8)?, u32_at(b, h + 12)?, u32_at(b, h + 16)?, u32_at(b, h + 20)?))
++            Some((u64_at(b, h)?, u32_at(b, h + 8)?, u32_at(b, h + 12)?, u32_at(b, h + 16)?, u32_at(b, h + 20)?, u32_at(b, h + 56)?))
+         })
+         .collect::<Option<MeshHeads>>()?;
+     Some((seq, f3(16)?, f3(28)?, heads))
+@@ -129,7 +142,7 @@
+ pub(crate) fn same_meshes(f: &MeshFile, heads: &MeshHeads) -> bool {
+     f.meshes.len() == heads.len()
+         && f.meshes.iter().zip(heads).all(|(m, h)| {
+-            (m.key, m.kind, m.part, m.pos.len() as u32, m.idx.len() as u32) == (h.0, h.1, h.2, h.3, h.4)
++            (m.key, m.kind, m.part, m.pos.len() as u32, m.idx.len() as u32, m.figure) == (h.0, h.1, h.2, h.3, h.4, h.5)
+         })
+ }
+ 
+@@ -312,6 +325,8 @@
+         let (kind, part, vc, ic, isz, vs, uvoff, stride) =
+             (u[0], u[1], u[2] as usize, u[3] as usize, u[4] as usize, u[5] as usize, u[6] as usize, u[7] as usize);
+         let sizes = [u[8] as usize, u[9] as usize, u[10] as usize, u[11] as usize];
++        // Patch 0033: the figure in the record's spare word (0 in files before the party).
++        let figure = u32_at(b, h + 56)?;
+         let mut blob = [&b[0..0]; 4];
+         for k in 0..4 {
+             blob[k] = b.get(at..at + sizes[k])?;
+@@ -365,7 +380,7 @@
+             return None;
+         }
+         let (nrm, tan) = qtangent_frames(&pos, &uv, &qt, &idx);
+-        meshes.push(TavMesh { key, kind, part, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
++        meshes.push(TavMesh { key, kind, part, figure, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
+     }
+     borrow_skin(&mut meshes);
+     Some(MeshFile { seq, centre, wow, meshes })
+@@ -380,9 +395,9 @@
+         if meshes[i].kind != 1 {
+             continue;
+         }
+-        let part = meshes[i].part;
++        let (part, figure) = (meshes[i].part, meshes[i].figure);
+         let Some(j) = (0..meshes.len())
+-            .filter(|j| meshes[*j].kind == 0 && meshes[*j].part == part)
++            .filter(|j| meshes[*j].kind == 0 && meshes[*j].part == part && meshes[*j].figure == figure)
+             .max_by_key(|j| meshes[*j].pos.len())
+         else {
+             continue;
+@@ -577,6 +592,20 @@
+ #[derive(Resource, Default, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
+ pub(crate) struct TavFeet(pub(crate) Option<Vec3>);
+ 
++/// Patch 0033 (the party): where each companion WoW draws stands this frame (Bevy world, at its feet
++/// on WoW's ground; `None` of them while hidden): `blob_shadow` lays their shadows there.
++#[derive(Resource, Default, Clone)]
++pub(crate) struct PartyFeet(pub(crate) Vec<Vec3>);
++
++/// Patch 0033: a companion's figure: its root (place, ground shade, visibility) and ground lock.
++struct Fig {
++    figure: u32,
++    root: Entity,
++    lock: f32,
++    posed: bool,
++    at: Vec3,
++}
++
+ /// The system that poses Tav; a reader of [`TavFeet`] runs after it.
+ #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+ pub(crate) struct TavPose;
+@@ -618,6 +647,10 @@
+     root: Option<Entity>,
+     /// The previous plan's figure, shown until the new one has its first pose.
+     old_root: Option<Entity>,
++    /// Patch 0033: the companions' figures, and the previous plan's (shown until the new figure's
++    /// first pose, like `old_root`).
++    figs: Vec<Fig>,
++    old_figs: Vec<Entity>,
+     parts: Vec<Part>,
+     last_pose: u32,
+     last_pose_at: Option<Instant>,
+@@ -694,6 +727,8 @@
+         file: None,
+         root: None,
+         old_root: None,
++        figs: Vec::new(),
++        old_figs: Vec::new(),
+         parts: Vec::new(),
+         last_pose: 0,
+         last_pose_at: None,
+@@ -723,6 +758,7 @@
+         totals: [0; 2],
+     })
+     .init_resource::<TavFeet>()
++    .init_resource::<PartyFeet>()
+     .add_systems(
+         Update,
+         (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes).in_set(TavPose)),
+@@ -831,6 +867,32 @@
+             benilla_world::entity_shade::GroundShade::default(),
+         ))
+         .id();
++    // Patch 0033 (the party): a root of its own for each companion's figure; the previous plan's
++    // companions stay until the new figure's first pose.
++    let olds = std::mem::take(&mut d.figs);
++    if !olds.is_empty() {
++        for older in std::mem::take(&mut d.old_figs) {
++            commands.entity(older).despawn();
++        }
++        d.old_figs = olds.iter().map(|f| f.root).collect();
++    }
++    let mut figure_ids: Vec<u32> = file.meshes.iter().map(|m| m.figure).filter(|f| *f != 0).collect();
++    figure_ids.sort_unstable();
++    figure_ids.dedup();
++    let figs: Vec<Fig> = figure_ids
++        .iter()
++        .map(|&figure| {
++            let root = commands
++                .spawn((
++                    Name::new(format!("wowbg3 companion {figure}")),
++                    Transform::default(),
++                    Visibility::Hidden,
++                    benilla_world::entity_shade::GroundShade::default(),
++                ))
++                .id();
++            Fig { figure, root, lock: 0.0, posed: false, at: Vec3::ZERO }
++        })
++        .collect();
+     let mut parts = Vec::new();
+     let (mut kept, mut waiting) = (0, 0);
+     for m in &file.meshes {
+@@ -862,18 +924,19 @@
+                 Transform::default(),
+                 NoFrustumCulling,
+                 visibility,
+-                ChildOf(root),
++                ChildOf(if m.figure == 0 { root } else { figs.iter().find(|f| f.figure == m.figure).map_or(root, |f| f.root) }),
+             ))
+             .id();
+         parts.push(Part { key: m.key, entity, mesh: handle, dressed });
+     }
+     info!(
+-        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals; {kept} keep their look, {waiting} wait for maps ({} ms); \
++        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals of {} figure(s); {kept} keep their look, {waiting} wait for maps ({} ms); \
+          since the last plan {} frames posed by key, {} without a fitting pose{}",
+         file.seq,
+         file.meshes.len(),
+         file.meshes.iter().map(|m| m.pos.len()).sum::<usize>(),
+-        file.meshes.iter().map(|m| m.part).collect::<HashSet<_>>().len(),
++        file.meshes.iter().map(|m| (m.figure, m.part)).collect::<HashSet<_>>().len(),
++        figs.len() + 1,
+         started.elapsed().as_millis(),
+         d.by_key,
+         d.no_fit,
+@@ -884,6 +947,7 @@
+     d.parts = parts;
+     d.tex_stamp = None; // new meshes: apply the textures again
+     d.root = Some(root);
++    d.figs = figs;
+     d.file = Some(file);
+     d.last_pose = 0;
+     d.track = PoseTrack::new();
+@@ -1269,18 +1333,23 @@
+     info!("wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped), {hidden} hidden");
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn apply_pose(
+     mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut roots: Query<(&mut Transform, &mut Visibility)>,
+     mut feet: ResMut<TavFeet>,
++    mut party_feet: ResMut<PartyFeet>,
+     mut wow_frame: Local<u64>,
+     pace: Option<Res<crate::wowbg3_pace::Pace>>,
++    collide: benilla_world::collision::WorldCollision,
++    world: benilla_world::world_point::WorldPoint,
+ ) {
+     *wow_frame += 1;
+     let Some(root) = d.root else {
+         feet.0 = None;
++        party_feet.0.clear();
+         return;
+     };
+     // Patch 0013: in lockstep the pose comes with BG3's present packet (`wowbg3_pace`) and is drawn
+@@ -1303,11 +1372,24 @@
+         }
+     }
+     let fresh = fits;
+-    let Ok((mut tf, mut vis)) = roots.get_mut(root) else { return };
+     if !fresh {
+-        if *vis != Visibility::Hidden && d.last_pose_at.is_none_or(|t| t.elapsed().as_secs_f32() > 0.5) {
+-            *vis = Visibility::Hidden;
++        let mut hid = false;
++        {
++            let Ok((_, mut vis)) = roots.get_mut(root) else { return };
++            if *vis != Visibility::Hidden && d.last_pose_at.is_none_or(|t| t.elapsed().as_secs_f32() > 0.5) {
++                *vis = Visibility::Hidden;
++                hid = true;
++            }
++        }
++        if hid {
+             feet.0 = None;
++            // Patch 0033: her companions go with her.
++            party_feet.0.clear();
++            for f in &d.figs {
++                if let Ok((_, mut v)) = roots.get_mut(f.root) {
++                    *v = Visibility::Hidden;
++                }
++            }
+         }
+         // The old figure stands in for a new plan's first pose, not for a stale stream.
+         let stale = pose.as_ref().is_none_or(|p| (now - p.time).abs() >= STALE_SECS);
+@@ -1315,6 +1397,9 @@
+             if let Some(old) = d.old_root.take() {
+                 commands.entity(old).despawn();
+             }
++            for old in std::mem::take(&mut d.old_figs) {
++                commands.entity(old).despawn();
++            }
+         }
+         return;
+     }
+@@ -1337,8 +1422,9 @@
+         }
+         _ => return,
+     };
+-    if tf.translation.distance_squared(d.trace_root.0) > 1e-8 {
+-        d.trace_root = (tf.translation, *wow_frame);
++    let root_at = roots.get(root).map_or(Vec3::ZERO, |(t, _)| t.translation);
++    if root_at.distance_squared(d.trace_root.0) > 1e-8 {
++        d.trace_root = (root_at, *wow_frame);
+     }
+     let tracing = d.trace > 0 && *wow_frame - d.trace_root.1 < 60;
+     if tracing {
+@@ -1349,7 +1435,7 @@
+             key.0,
+             key.1,
+             key.2,
+-            tf.translation,
++            root_at,
+             if recs.is_none() { " (unchanged)" } else { "" }
+         );
+     }
+@@ -1357,43 +1443,86 @@
+     d.track.drawn = Some(key);
+     let (det, interval) = (d.det_sign, d.track.interval);
+     let old_root = d.old_root.take();
+-    let TavDraw { file, parts, logged, trace, skin_cost, totals, early, kept_plans, .. } = &mut *d;
++    let old_figs = std::mem::take(&mut d.old_figs);
++    let TavDraw { file, parts, figs, logged, trace, skin_cost, totals, early, kept_plans, .. } = &mut *d;
+     let Some(file) = file.as_ref() else { return };
++    let (centre, wow) = (file.centre, file.wow);
+     // Her root: the first mesh's object origin, mapped; the ground lock lowers her with the camera.
+     let Some(anchor) = recs.iter().find(|r| r.flags & 1 != 0) else { return };
+-    let origin = wow_to_bevy(bg3_to_wow(Vec3::new(anchor.world[4], anchor.world[5], anchor.world[6]), file.centre, file.wow))
+-        - Vec3::Y * crate::wowbg3_lead::ground_lock();
+-    tf.translation = origin;
+-    tf.rotation = Quat::IDENTITY;
++    let lift = crate::wowbg3_lead::ground_lock();
++    let base = wow_to_bevy(bg3_to_wow(Vec3::new(anchor.world[4], anchor.world[5], anchor.world[6]), centre, wow));
++    let origin = base - Vec3::Y * lift;
++    {
++        let Ok((mut tf, mut vis)) = roots.get_mut(root) else { return };
++        tf.translation = origin;
++        tf.rotation = Quat::IDENTITY;
++        if *vis != Visibility::Inherited {
++            *vis = Visibility::Inherited;
++        }
++    }
+     feet.0 = Some(origin);
+-    if *vis != Visibility::Inherited {
+-        *vis = Visibility::Inherited;
++    // Patch 0033 (the party): each companion's figure at its own place (its first mesh's object
++    // origin, mapped), standing on WoW's ground under it by a ground lock of its own (hers also lowers
++    // the camera, so she keeps BG3's place in the view), with its own ground shade.
++    let mut bases: Vec<(u32, Vec3)> = vec![(0, base)];
++    party_feet.0.clear();
++    for f in figs.iter_mut() {
++        let a = file
++            .meshes
++            .iter()
++            .filter(|m| m.figure == f.figure)
++            .find_map(|m| recs.iter().find(|r| r.key == m.key && r.flags & 1 != 0));
++        let Ok((mut tf, mut vis)) = roots.get_mut(f.root) else { continue };
++        let Some(a) = a else {
++            if *vis != Visibility::Hidden {
++                *vis = Visibility::Hidden;
++            }
++            f.posed = false;
++            continue;
++        };
++        let at = wow_to_bevy(bg3_to_wow(Vec3::new(a.world[4], a.world[5], a.world[6]), centre, wow));
++        let want = match crate::wowbg3_lead::ground_under(&collide, &world, at) {
++            Some(g) if (at.y - g).abs() < crate::wowbg3_lead::LOCK_REACH => at.y - g,
++            _ => 0.0,
++        };
++        f.lock = if f.posed { f.lock + (want - f.lock) * 0.25 } else { want };
++        f.posed = true;
++        f.at = at - Vec3::Y * f.lock;
++        tf.translation = f.at;
++        tf.rotation = Quat::IDENTITY;
++        if *vis != Visibility::Inherited {
++            *vis = Visibility::Inherited;
++        }
++        bases.push((f.figure, at));
++        party_feet.0.push(f.at);
+     }
+     if let Some(old) = old_root {
+         commands.entity(old).despawn();
+     }
++    for old in old_figs {
++        commands.entity(old).despawn();
++    }
+     let skin_started = Instant::now();
+     // Skinned on every WoW frame now, so the meshes skin in parallel (the hair alone is a third
+-    // of her vertices); the attributes go in on this thread.
+-    let lift = Vec3::Y * crate::wowbg3_lead::ground_lock();
+-    let (centre, wow) = (file.centre, file.wow);
+-    let jobs: Vec<(usize, &TavMesh, &PoseRec)> = file
++    // of her vertices); the attributes go in on this thread. Each mesh relative to its figure's root.
++    let jobs: Vec<(usize, &TavMesh, &PoseRec, Vec3)> = file
+         .meshes
+         .iter()
+         .enumerate()
+         .filter_map(|(i, m)| {
++            let base = bases.iter().find(|b| b.0 == m.figure)?.1;
+             let want = m.skin_from.unwrap_or(m.key);
+             let rec = recs.iter().find(|r| r.key == want && r.flags & 1 != 0)?;
+-            (m.weights.is_empty() || !rec.palette.is_empty()).then_some((i, m, rec))
++            (m.weights.is_empty() || !rec.palette.is_empty()).then_some((i, m, rec, base))
+         })
+         .collect();
+     let skinned = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
+-        for (i, m, rec) in jobs {
++        for (i, m, rec, base) in jobs {
+             scope.spawn(async move {
+                 let (mut pos, mut nrm, mut tan) = (Vec::new(), Vec::new(), Vec::new());
+                 pose_mesh(m, rec, &mut pos, &mut nrm, &mut tan);
+                 let p: Vec<[f32; 3]> =
+-                    pos.iter().map(|v| (wow_to_bevy(bg3_to_wow(*v, centre, wow)) - lift - origin).to_array()).collect();
++                    pos.iter().map(|v| (wow_to_bevy(bg3_to_wow(*v, centre, wow)) - base).to_array()).collect();
+                 let n: Vec<[f32; 3]> = nrm.iter().map(|v| bg3_dir_to_bevy(*v).normalize_or_zero().to_array()).collect();
+                 // Tangents map like normals; the mirror flips their frame's handedness.
+                 let t: Vec<[f32; 4]> = tan
+@@ -1438,6 +1567,16 @@
+             early,
+             kept_plans
+         );
++        // Patch 0033: where each companion stands and its own ground lock.
++        for f in figs.iter() {
++            info!(
++                "wowbg3 tav: companion figure {} {} at {:?}, ground lock {:.2} yd",
++                f.figure,
++                if f.posed { "drawn" } else { "without a pose" },
++                f.at,
++                f.lock
++            );
++        }
+     }
+ }
+ 
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -116,7 +116,7 @@
+ static PLUGIN_KEPT: AtomicU32 = AtomicU32::new(0);
+ 
+ /// How far Tav may stand above or below WoW's ground under her for the lock to take it up (yd).
+-const LOCK_REACH: f32 = 0.75;
++pub(crate) const LOCK_REACH: f32 = 0.75;
+ 
+ pub(crate) fn ground_lock() -> f32 {
+     f32::from_bits(GROUND_LOCK.load(Ordering::Relaxed))
+@@ -802,8 +802,8 @@
+ }
+ 
+ /// WoW's ground under Tav (Bevy y, yards): the walking collision's floor within the lock's reach,
+-/// else the terrain.
+-fn ground_under(
++/// else the terrain. Patch 0033: also under each companion BG3 draws (`wowbg3_tav`).
++pub(crate) fn ground_under(
+     collide: &benilla_world::collision::WorldCollision,
+     world: &benilla_world::world_point::WorldPoint,
+     tav: Vec3,
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -147,6 +147,10 @@
+ const STRIKE_HIT: u32 = 1;
+ const STRIKE_WOUND: u32 = 2;
+ const STRIKE_LETHAL: u32 = 4;
++/// Patch 0033 (the party): the stand-in's victim is one of the hero's BG3 companions, whom WoW draws
++/// but the WoW server never hears of: the mob swings with BG3's own facing (toward the companion) and
++/// no WoW victim (the hidden own body is not hit).
++const STRIKE_PARTY: u32 = 16;
+ 
+ enum Event {
+     Swing(u64),
+@@ -280,8 +284,9 @@
+     /// the live position comes in steps (about 3 a second), so the model reaches each one early.
+     walk_left: f32,
+     walk_speed: f32,
+-    /// Early strikes (`strikes.bin`) to play now: hit, damage, BG3's time of the strike (ms).
+-    early: VecDeque<(bool, u32, f64)>,
++    /// Early strikes (`strikes.bin`) to play now: hit, damage, BG3's time of the strike (ms), and
++    /// (patch 0033) whether its victim is a companion.
++    early: VecDeque<(bool, u32, f64, bool)>,
+     /// When early strikes and early wounds were played (fight clock), until fight.txt's own
+     /// strike or HP drop for them arrives (that one is then skipped).
+     early_played: VecDeque<f32>,
+@@ -1586,7 +1591,7 @@
+                 impacts.write(flinch(me, entity, s.damage, play_seq.next()));
+             }
+         } else if let Some(h) = f.held.get_mut(&s.guid) {
+-            h.early.push_back((s.flags & STRIKE_HIT != 0, s.damage, s.t));
++            h.early.push_back((s.flags & STRIKE_HIT != 0, s.damage, s.t, s.flags & STRIKE_PARTY != 0));
+         } else {
+             info!("wowbg3 fight: early strike from guid {:#x}, not a held mob", s.guid);
+         }
+@@ -1682,22 +1687,24 @@
+         }
+         let mut swing = None;
+         if h.since >= EARLY_GAP {
+-            if let Some((hit, damage, t)) = h.early.pop_front() {
++            if let Some((hit, damage, t, party)) = h.early.pop_front() {
+                 h.early_played.push_back(clock);
+-                swing = Some((hit, damage, format!("early, {:.0} ms after BG3", now - t)));
++                swing = Some((hit, damage, format!("early, {:.0} ms after BG3{}", now - t, if party { ", at a companion" } else { "" }), party));
+             }
+         }
+         if swing.is_none() && !walking && h.since >= STRIKE_GAP {
+             if let Some((hit, damage)) = h.strikes.pop_front() {
+-                swing = Some((hit, damage, "fight.txt".to_string()));
++                swing = Some((hit, damage, "fight.txt".to_string(), false));
+             }
+         }
+-        if let Some((hit, damage, how)) = swing {
++        if let Some((hit, damage, how, party)) = swing {
+             h.since = 0.0;
+-            h.face_victim = FACE_VICTIM;
++            // Patch 0033: at a companion the model keeps BG3's own facing (toward the companion), and
++            // the swing has no WoW victim.
++            h.face_victim = if party { 0.0 } else { FACE_VICTIM };
+             swings.write(SwingMessage {
+                 attacker: entity,
+-                victim,
++                victim: if party { None } else { victim },
+                 hit_info: if hit { HIT_NORMAL } else { HIT_MISS },
+                 victim_state: hit as u32,
+                 damage,
+diff --git a/crates/benilla-app/src/blob_shadow.rs b/crates/benilla-app/src/blob_shadow.rs
+--- a/crates/benilla-app/src/blob_shadow.rs
++++ b/crates/benilla-app/src/blob_shadow.rs
+@@ -35,6 +35,10 @@
+ //! body, which is hidden (`wowbg3_lead`); the own shadow lies under her instead, at her root this
+ //! frame ([`crate::wowbg3_tav::TavFeet`], set by her pose before this runs), never under the
+ //! hidden body that walks after her.
++//!
++//! WOW-BG3 patch 0033 (the party): the hero's BG3 companions that WoW draws cast the same shadow,
++//! with the own body's box (a humanoid's Stand box), under each one's feet this frame
++//! ([`crate::wowbg3_tav::PartyFeet`], on WoW's ground).
+ 
+ use benilla_assets::ModelAnimations;
+ use benilla_protocol::EntityKind;
+@@ -61,6 +65,10 @@
+     owner: Entity,
+ }
+ 
++/// WOW-BG3 patch 0033: the shadow of the companion at this index of `PartyFeet`.
++#[derive(Component)]
++struct PartyShadow(usize);
++
+ /// Last frame's rebuild inputs. `surfaces` counts the decal receivers, so a tile streaming in
+ /// under a standing unit still re-arms the rebuild.
+ #[derive(Component, Default)]
+@@ -92,7 +100,7 @@
+         app.add_systems(Startup, setup_shadow_assets)
+             .add_systems(
+                 Update,
+-                (sync_shadows, update_shadows)
++                (sync_shadows, sync_party_shadows, update_shadows)
+                     .chain()
+                     // After net motion and input, so the decal follows this frame's transforms.
+                     .after(WorldStage::Input)
+@@ -159,6 +167,28 @@
+     }
+ }
+ 
++/// WOW-BG3 patch 0033: one shadow record per companion WoW draws (`PartyFeet`, by index).
++fn sync_party_shadows(
++    mut commands: Commands,
++    feet: Option<Res<crate::wowbg3_tav::PartyFeet>>,
++    have: Query<(Entity, &PartyShadow)>,
++) {
++    let want = feet.as_deref().map_or(0, |f| f.0.len());
++    let mut present = vec![false; want];
++    for (e, ps) in &have {
++        if ps.0 < want && !present[ps.0] {
++            present[ps.0] = true;
++        } else {
++            commands.entity(e).despawn();
++        }
++    }
++    for (i, p) in present.iter().enumerate() {
++        if !p {
++            commands.spawn((PartyShadow(i), ShadowKey::default(), ShadowVerts::default()));
++        }
++    }
++}
++
+ /// Re-project each shadow whose inputs moved; clear it when the box degenerates, the fade
+ /// reaches zero, or no receiving surface is in the box (the reference's no-ground gate).
+ #[allow(clippy::type_complexity)]
+@@ -186,6 +216,9 @@
+     mut shadows: Query<(&BlobShadow, &mut ShadowKey, &mut ShadowVerts)>,
+     // WOW-BG3: where BG3's character stands this frame, in world mode (module docs).
+     tav: Option<Res<crate::wowbg3_tav::TavFeet>>,
++    // WOW-BG3 patch 0033: where her companions stand, and their shadow records.
++    party_feet: Option<Res<crate::wowbg3_tav::PartyFeet>>,
++    mut party: Query<(&PartyShadow, &mut ShadowKey, &mut ShadowVerts), Without<BlobShadow>>,
+     // A once-a-second census of shadows and why the hidden ones hid, at
+     // `RUST_LOG=benilla_app::blob_shadow=debug` (a `benilla::` filter matches nothing).
+     mut census_at: Local<f32>,
+@@ -200,6 +233,8 @@
+     // Apart from `n_no_owner`: an undrawn body still has an owner.
+     let mut n_undrawn = 0u32;
+     let surface_count = decals.receiver_count();
++    // WOW-BG3 patch 0033: the own body's box, for the companions' shadows.
++    let mut self_box: Option<(Vec3, Vec3)> = None;
+     for (shadow, mut key, mut verts) in &mut shadows {
+         n_total += 1;
+         let Ok((unit, anims, is_self, mount_child, drawn)) = owners.get(shadow.owner) else {
+@@ -256,6 +291,9 @@
+             n_degen += 1;
+             continue;
+         }
++        if is_self {
++            self_box = Some((bmin, bmax));
++        }
+         // The unit's render alpha from the root, which also tells a pending appear fade (zero)
+         // from a settled unit, and carries the first-person fade.
+         let alpha = if stand_in.is_some() { 1.0 } else { unit_alpha.get(shadow.owner) };
+@@ -390,6 +428,54 @@
+             );
+         }
+     }
++    // WOW-BG3 patch 0033 (the party): each companion's shadow under its feet, with the own body's box
++    // (a humanoid's; a fixed one until that model has loaded), unrotated, at full alpha.
++    let (pmin, pmax) = self_box.unwrap_or((Vec3::new(-0.4, 0.0, -0.4), Vec3::new(0.4, 2.0, 0.4)));
++    let party_list: &[Vec3] = party_feet.as_deref().map_or(&[][..], |p| p.0.as_slice());
++    for (ps, mut key, mut verts) in &mut party {
++        let Some(&feet) = party_list.get(ps.0) else {
++            hide(&mut key, &mut verts);
++            continue;
++        };
++        let next = ShadowKey {
++            feet,
++            rotation: Quat::IDENTITY,
++            box_min: pmin,
++            box_max: pmax,
++            alpha: 1.0,
++            surfaces: surface_count,
++            shown: true,
++        };
++        if key.shown && !key_changed(&key, &next) {
++            continue;
++        }
++        let half_v = (pmax.y - pmin.y) * 0.5;
++        let frame = DecalFrame {
++            center: feet,
++            sin: 0.0,
++            cos: 1.0,
++            min_x: pmin.x,
++            max_x: pmax.x,
++            min_z: pmin.z,
++            max_z: pmax.z,
++            min_y: -half_v * (5.0 / 3.0),
++            max_y: half_v,
++        };
++        let span_v = frame.max_y - frame.min_y;
++        verts.0.clear();
++        let projected = span_v > 0.0
++            && decals.project(
++                &mut verts.0,
++                &frame,
++                |p| shadow_ramp((p.y - frame.min_y) / span_v),
++                |x, z| frame.rect_uv(x, z),
++            );
++        *key = next;
++        key.shown = projected;
++        if !projected {
++            verts.0.clear();
++        }
++    }
+     if census && n_total > 0 {
+         // The texture's content, not just its load: a white-decoded blob multiplies to nothing.
+         let tex = shadow_assets.map_or("no-resource".into(), |a| {

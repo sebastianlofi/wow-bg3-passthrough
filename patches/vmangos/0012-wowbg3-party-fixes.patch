@@ -1,0 +1,137 @@
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index bd9415a..062ab7d 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -382,6 +382,67 @@ namespace
+             out.Add(l);
+     }
+ 
++    // give MEMBER ITEMGUID TOMEMBER [COUNT]: an item from one party member's bags or body to
++    // another's bags (BG3's one party inventory; dragging onto another member). Whole stack, or COUNT
++    // of a stack (a new stack for the receiver). Both are saved at once, as a trade does.
++    void Give(Player* owner, Player* m, std::string const& member, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 give " + member + " ";
++        ObjectGuid g;
++        uint32 count = 0;
++        if (!ParseGuid(a[3], g) || (a.size() == 6 && (!ParseUInt(a[5], count, 10000) || count == 0)))
++            return out.Add(head + "refused usage");
++        char const* why = nullptr;
++        Player* to = FindMember(owner, a[4], why);
++        if (!to)
++            return out.Add(head + "refused " + std::string(why) + " " + a[4]);
++        if (to == m)
++            return out.Add(head + "refused same");
++        Item* it = FindCarried(m, g);
++        if (!it)
++            return out.Add(head + "refused noitem");
++        if (it->IsBag() && !static_cast<Bag*>(it)->IsEmpty())
++            return out.Add(head + "refused notempty");
++        if (it->IsEquipped())
++        {
++            InventoryResult r = m->CanUnequipItem(it->GetPos(), false);
++            if (r != EQUIP_ERR_OK)
++                return out.Add(head + "refused inv " + std::to_string(uint32(r)));
++        }
++        auto const beforeFrom = Snapshot(m);
++        auto const beforeTo = Snapshot(to);
++        uint32 const moneyFrom = m->GetMoney(), moneyTo = to->GetMoney();
++        ItemPosCountVec dest;
++        if (count && count < it->GetCount())
++        {
++            InventoryResult r = to->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, it->GetEntry(), count);
++            if (r != EQUIP_ERR_OK)
++                return out.Add(head + "refused inv " + std::to_string(uint32(r)));
++            Item* made = to->StoreNewItem(dest, it->GetEntry(), true, it->GetItemRandomPropertyId());
++            if (!made)
++                return out.Add(head + "failed");
++            m->DestroyItemCount(it, count, true);
++        }
++        else
++        {
++            uint8 bagSlot = 0;
++            InventoryResult r = to->CanStoreItem(NULL_BAG, NULL_SLOT, dest, it, bagSlot, false);
++            if (r != EQUIP_ERR_OK)
++                return out.Add(head + "refused inv " + std::to_string(uint32(r)));
++            m->MoveItemFromInventory(it->GetBagSlot(), it->GetSlot(), true);
++            to->MoveItemToInventory(dest, it, true, true);
++        }
++        m->SaveInventoryAndGoldToDB();
++        to->SaveInventoryAndGoldToDB();
++        std::vector<std::string> lines;
++        Out d{ lines };
++        Diff(member, m, beforeFrom, moneyFrom, d);
++        Diff(a[4], to, beforeTo, moneyTo, d);
++        out.Add(head + "ok " + std::to_string(lines.size()));
++        for (std::string const& l : lines)
++            out.Add(l);
++    }
++
+     // money MEMBER DELTA: copper added (or taken, never below 0 or above WoW's cap).
+     void Money(Player* m, std::string const& member, std::vector<std::string> const& a, Out& out)
+     {
+@@ -555,7 +616,7 @@ bool ExecuteItems(Player* owner, std::vector<std::string> const& a, std::vector<
+     };
+     static Shape const shapes[] = {
+         { "inv", 3, 3 }, { "equip", 4, 5 }, { "unequip", 4, 4 }, { "moveitem", 7, 7 }, { "additem", 4, 5 },
+-        { "delitem", 4, 5 }, { "money", 4, 4 }, { "loot", 4, 4 }, { "vendor", 4, 4 }, { "buy", 5, 6 }, { "sell", 5, 6 },
++        { "delitem", 4, 5 }, { "money", 4, 4 }, { "give", 5, 6 }, { "loot", 4, 4 }, { "vendor", 4, 4 }, { "buy", 5, 6 }, { "sell", 5, 6 },
+     };
+     Shape const* shape = nullptr;
+     for (Shape const& s : shapes)
+@@ -590,6 +651,8 @@ bool ExecuteItems(Player* owner, std::vector<std::string> const& a, std::vector<
+         DelItem(m, member, a, out);
+     else if (verb == "money")
+         Money(m, member, a, out);
++    else if (verb == "give")
++        Give(owner, m, member, a, out);
+     else if (verb == "loot")
+         LootAll(m, member, a, out);
+     else if (verb == "vendor")
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+index 361e315..84f2221 100644
+--- a/src/game/WowBg3Party.cpp
++++ b/src/game/WowBg3Party.cpp
+@@ -343,6 +343,16 @@ namespace
+         bot->SetUInt32Value(PLAYER_XP, 0);
+     }
+ 
++    // A new character's first login plays its race's intro, and vmangos moves the camera (the
++    // view point the server sends objects for) along the intro's path until the client says it
++    // ended (CMSG_COMPLETE_CINEMATIC). A bot has no client: end it as that message would, or the
++    // bot "sees" the intro's places instead of its own (0012).
++    void EndCinematic(Player* m)
++    {
++        if (m->GetCurrentCinematicEntry())
++            m->CinematicEnd();
++    }
++
+     void Refresh(Player* m)
+     {
+         m->GetCamera().UpdateVisibilityForOwner();
+@@ -1285,6 +1295,8 @@ void UpdateParty(uint32 diff)
+             if (m && m->IsBeingTeleportedFar() && m->GetSession() && m->GetSession()->GetBot() &&
+                 !m->GetSession()->PlayerLoading())
+                 m->GetSession()->HandleMoveWorldportAck();
++            else if (m && m->IsInWorld() && m->GetCurrentCinematicEntry() && m->GetSession()->GetBot())
++                EndCinematic(m);
+         }
+         g_puppets.erase(std::remove_if(g_puppets.begin(), g_puppets.end(),
+             [](ObjectGuid g) { return !ObjectAccessor::FindPlayerNotInWorld(g); }), g_puppets.end());
+@@ -1399,6 +1411,7 @@ void UpdateParty(uint32 diff)
+                 if (m->IsBeingTeleported() || (!there && age < LOGIN_WAIT_MS))
+                     break;
+                 // Arrived: one of the owner's party, at the owner's level.
++                EndCinematic(m);
+                 JoinParty(owner, m);
+                 if (b.follow)
+                     FollowLevel(owner, m);
+@@ -1411,6 +1424,8 @@ void UpdateParty(uint32 diff)
+             }
+             case BotState::Online:
+             {
++                if (m && m->IsInWorld() && m->GetCurrentCinematicEntry())
++                    EndCinematic(m);
+                 if (m && b.refresh && m->IsInWorld() && !m->IsBeingTeleported())
+                 {
+                     // A bot's first teleports can leave its visible list stale (no client moves it

@@ -1,0 +1,278 @@
+--- a/include/bg3le_plugin.h
++++ b/include/bg3le_plugin.h
+@@ -107,6 +107,19 @@
+      * -> "Running" only where bg3le hooks that state). Any thread. Newer than
+      * game_state: check host->size. */
+     int (*state_gate_can_hold)(const char* from, const char* to);
++
++    /* The game's VkDevice (the first one made through bg3le's vkCreateDevice),
++     * or NULL before it exists. Any thread. Newer than state_gate_can_hold:
++     * check host->size.
++     *
++     * Early plugins: a plugin a mod lists under "EarlyNativePlugins" in its
++     * Config.json (besides "NativePlugins"), or one in the plugins folder with
++     * a file <name>.early beside it, is initialised before the game makes its
++     * Vulkan objects: on the game's first vkCreatePipelineCache or
++     * vkCreateSwapchainKHR (its device table is complete then), on that
++     * thread, before the engine's event loop. Every other plugin still starts
++     * with the event loop. */
++    void* (*vk_device)(void);
+ } bg3le_host;
+ 
+ /* Exported by every plugin. Return 0 on success. Anything else reports it as
+--- a/src/plugins.cpp
++++ b/src/plugins.cpp
+@@ -57,6 +57,10 @@
+ 
+ std::recursive_mutex g_mutex;
+ std::vector<std::unique_ptr<bg3le_plugin>> g_plugins;
++// Loading itself (early, on a render thread, and the rest on the main thread): one at a time.
++std::mutex g_load_mutex;
++std::atomic<void*> g_vk_device{nullptr};  // vulkan_forward.cpp's vkCreateDevice
++std::atomic<bool> g_early_done{false};
+ struct Handler {
+     bg3le_plugin* owner;
+     bg3le_event_handler fn;
+@@ -229,6 +233,8 @@
+     return server ? server_game_state() : client_game_state();
+ }
+ 
++void* host_vk_device() { return g_vk_device.load(std::memory_order_acquire); }
++
+ int host_state_gate_can_hold(const char* from, const char* to) {
+     if (from != nullptr && to != nullptr && std::strcmp(from, "PrepareRunning") == 0
+         && std::strcmp(to, "Running") == 0) {
+@@ -274,6 +280,7 @@
+     host_add_state_gate,
+     host_game_state,
+     host_state_gate_can_hold,
++    host_vk_device,
+ };
+ 
+ bg3le_plugin* find_plugin(const char* name) {
+@@ -328,7 +335,7 @@
+ // Mods/<Folder>/ScriptExtender/Config.json lists under "NativePlugins",
+ // taken from Mods/<Name>/. Only names the archive itself declares load, so a
+ // stray library dropped in the folder does not.
+-std::vector<std::string> mod_plugin_files() {
++std::vector<std::string> mod_plugin_files(std::vector<std::string>* early = nullptr) {
+     std::vector<std::string> out;
+     char const* home = std::getenv("HOME");
+     if (home == nullptr) return out;
+@@ -346,7 +353,7 @@
+         const std::string folder = mods + "/" + pak.substr(0, pak.size() - 4);
+         struct stat st{};
+         if (::stat(folder.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+-        std::vector<std::string> names;
++        std::vector<std::string> names, early_names;
+         bg3le::pak_read(
+             (mods + "/" + pak).c_str(),
+             [](char const* name) {
+@@ -359,6 +366,9 @@
+                 for (std::string const& n : json_string_array(std::string(data, size), "NativePlugins")) {
+                     names.push_back(n);
+                 }
++                for (std::string const& n : json_string_array(std::string(data, size), "EarlyNativePlugins")) {
++                    early_names.push_back(n);
++                }
+             });
+         for (std::string const& n : names) {
+             if (n.empty() || n.find('/') != std::string::npos || n[0] == '.' || !ends_with(n, ".so")) {
+@@ -374,6 +384,9 @@
+             }
+             logf("plugins: %s ships %s", pak.c_str(), file.c_str());
+             out.push_back(file);
++            if (early != nullptr && std::find(early_names.begin(), early_names.end(), n) != early_names.end()) {
++                early->push_back(file);
++            }
+         }
+     }
+     return out;
+@@ -381,16 +394,11 @@
+ 
+ }  // namespace
+ 
+-// On the game's first SDL_PollEvent: the engine and its allocator are up.
+-void plugins_load() {
+-    static bool done = false;
+-    if (done) return;
+-    done = true;
+-    // However loading ends, frame handlers are then published and closed.
+-    struct Publish {
+-        ~Publish() { g_frames_ready.store(true, std::memory_order_release); }
+-    } publish;
++namespace {
+ 
++// Every plugin file in load order: the plugins folder's, then the ones mods ship; `early` gets the
++// early ones (a mod's "EarlyNativePlugins", or <name>.early beside it in the plugins folder).
++std::vector<std::string> plugin_files(std::vector<std::string>* early) {
+     const std::string dir = plugins_dir();
+     DIR* d = dir.empty() ? nullptr : ::opendir(dir.c_str());
+     std::vector<std::string> files;
+@@ -402,9 +410,16 @@
+         ::closedir(d);
+     }
+     std::sort(files.begin(), files.end());
++    if (early != nullptr) {
++        for (std::string const& file : files) {
++            struct stat st{};
++            if (::stat((file.substr(0, file.size() - 3) + ".early").c_str(), &st) == 0) early->push_back(file);
++        }
++    }
+     // Then the ones mods ship beside their archives, in the mods' name order;
+     // one already in the plugins folder under the same name is not loaded twice.
+-    for (std::string const& file : mod_plugin_files()) {
++    std::vector<std::string> mod_early;
++    for (std::string const& file : mod_plugin_files(&mod_early)) {
+         bool twice = false;
+         for (std::string const& have : files) twice = twice || base_name(have) == base_name(file);
+         if (twice) {
+@@ -413,9 +428,21 @@
+             continue;
+         }
+         files.push_back(file);
++        if (early != nullptr && std::find(mod_early.begin(), mod_early.end(), file) != mod_early.end()) early->push_back(file);
+     }
++    return files;
++}
++
++bool loaded_already(std::string const& file) {
++    std::lock_guard<std::recursive_mutex> held(g_mutex);
++    for (auto const& p : g_plugins) {
++        if (p->file == file) return true;
++    }
++    return false;
++}
+ 
+-    for (std::string const& file : files) {
++void load_one(std::string const& file) {
++    {
+         auto plugin = std::make_unique<bg3le_plugin>();
+         bg3le_plugin* p = plugin.get();
+         p->file = file;
+@@ -431,14 +458,14 @@
+         if (handle == nullptr) {
+             p->error = ::dlerror();
+             statusf("WARNING: plugin %s did not load: %s", p->name.c_str(), p->error.c_str());
+-            continue;
++            return;
+         }
+         using Init = int (*)(const bg3le_host*, bg3le_plugin*);
+         auto init = reinterpret_cast<Init>(::dlsym(handle, "bg3le_plugin_init"));
+         if (init == nullptr) {
+             p->error = "no bg3le_plugin_init";
+             statusf("WARNING: plugin %s has no bg3le_plugin_init; ignored", p->name.c_str());
+-            continue;
++            return;
+         }
+         int rc = init(&g_host, p);
+         if (rc != 0) {
+@@ -456,7 +483,7 @@
+                                                [p](StateGate const& h) { return h.owner == p; }),
+                                 g_state_gates.end());
+             statusf("WARNING: plugin %s failed to start (%s)", p->name.c_str(), p->error.c_str());
+-            continue;
++            return;
+         }
+         p->loaded = true;
+         for (auto const& [id, value] : p->saved) {
+@@ -472,6 +499,45 @@
+     }
+ }
+ 
++}  // namespace
++
++// vulkan_forward.cpp: the game's device, once made.
++void plugins_set_vk_device(void* device) {
++    void* none = nullptr;
++    g_vk_device.compare_exchange_strong(none, device, std::memory_order_acq_rel);
++}
++
++// The early plugins (bg3le_plugin.h, vk_device): on the game's first vkCreatePipelineCache or
++// vkCreateSwapchainKHR, on that thread, before the game makes its Vulkan objects (WOW-BG3 patch
++// 0005: its render plugin must see the pipelines BG3 makes before its event loop starts).
++void plugins_load_early() {
++    if (g_early_done.load(std::memory_order_acquire)) return;
++    std::lock_guard<std::mutex> loading(g_load_mutex);
++    if (g_early_done.exchange(true, std::memory_order_acq_rel)) return;
++    std::vector<std::string> early;
++    plugin_files(&early);
++    for (std::string const& file : early) {
++        logf("plugins: %s starts early (device %p)", file.c_str(), g_vk_device.load());
++        load_one(file);
++    }
++}
++
++// On the game's first SDL_PollEvent: the engine and its allocator are up.
++void plugins_load() {
++    static bool done = false;
++    if (done) return;
++    done = true;
++    // However loading ends, frame handlers are then published and closed.
++    struct Publish {
++        ~Publish() { g_frames_ready.store(true, std::memory_order_release); }
++    } publish;
++    std::lock_guard<std::mutex> loading(g_load_mutex);
++    g_early_done.store(true, std::memory_order_release);  // too late for early ones: they start now
++    for (std::string const& file : plugin_files(nullptr)) {
++        if (!loaded_already(file)) load_one(file);
++    }
++}
++
+ // Whether a plugin kept the event from the game.
+ bool plugins_dispatch_event(SDL_Event* event) {
+     for (Handler const& h : g_handlers) {
+--- a/src/vulkan_forward.cpp
++++ b/src/vulkan_forward.cpp
+@@ -126,6 +126,11 @@
+ // The physical device the game renders with, for the swapchain check below.
+ static VkPhysicalDevice g_physical = VK_NULL_HANDLE;
+ 
++namespace bg3le {
++void plugins_set_vk_device(void* device);  // src/plugins.cpp
++void plugins_load_early();                 // src/plugins.cpp (WOW-BG3 patch 0005)
++}  // namespace bg3le
++
+ extern "C" VkResult vkCreateDevice(VkPhysicalDevice phys,
+                                    VkDeviceCreateInfo const* info,
+                                    VkAllocationCallbacks const* alloc,
+@@ -136,18 +141,25 @@
+     // The first is the game's; a layer such as lsfg-vk may make its own later.
+     if (g_physical == VK_NULL_HANDLE) g_physical = phys;
+     const Fn take = hooked<Fn>(next);
+-    if (take != nullptr && take != (Fn)&vkCreateDevice) return take(phys, info, alloc, out);
+-    return next(phys, info, alloc, out);
++    VkResult r = take != nullptr && take != (Fn)&vkCreateDevice ? take(phys, info, alloc, out) : next(phys, info, alloc, out);
++    if (r == VK_SUCCESS && out != nullptr && phys == g_physical) bg3le::plugins_set_vk_device((void*)*out);
++    return r;
+ }
+ 
+ BG3LE_FORWARD(void, vkDestroyDevice,
+               (VkDevice dev, VkAllocationCallbacks const* alloc),
+               (dev, alloc))
+ 
+-BG3LE_FORWARD(VkResult, vkCreatePipelineCache,
+-              (VkDevice dev, VkPipelineCacheCreateInfo const* info,
+-               VkAllocationCallbacks const* alloc, VkPipelineCache* out),
+-              (dev, info, alloc, out))
++// The game's first pipeline cache comes before its first pipeline: early plugins start here.
++extern "C" VkResult vkCreatePipelineCache(VkDevice dev, VkPipelineCacheCreateInfo const* info,
++                                          VkAllocationCallbacks const* alloc, VkPipelineCache* out) {
++    using Fn = VkResult (*)(VkDevice, VkPipelineCacheCreateInfo const*, VkAllocationCallbacks const*, VkPipelineCache*);
++    static const Fn next = real<Fn>("vkCreatePipelineCache");
++    bg3le::plugins_load_early();
++    const Fn take = hooked<Fn>(next);
++    if (take != nullptr && take != (Fn)&vkCreatePipelineCache) return take(dev, info, alloc, out);
++    return next(dev, info, alloc, out);
++}
+ 
+ // An HDR swapchain is also made copyable, which the overlay's compositor
+ // needs to read the game's frame (src/vendor/imgui_hdr.cpp).
+@@ -158,6 +170,7 @@
+     using Fn = VkResult (*)(VkDevice, VkSwapchainCreateInfoKHR const*,
+                             VkAllocationCallbacks const*, VkSwapchainKHR*);
+     static const Fn next = real<Fn>("vkCreateSwapchainKHR");
++    bg3le::plugins_load_early();  // in case the game made no pipeline cache first (patch 0005)
+     using Caps = VkResult (*)(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR*);
+     static const Caps caps = real<Caps>("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+ 

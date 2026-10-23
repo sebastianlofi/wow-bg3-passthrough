@@ -1,0 +1,915 @@
+WOW-BG3 benilla patch 0031: WoW's sound reaches the desktop reliably.
+On Linux the output is a PulseAudio stream to the desktop's sound server (PipeWire's pipewire-pulse
+or PulseAudio; libpulse loaded at runtime, no new crate) instead of cpal's ALSA, which on PipeWire
+is pipewire-alsa: its per-cycle copy ran inside benilla's own nice-5, non-realtime unit from a
+23 ms ring at 44.1 kHz, dropped 11 ms about every second even idle (209 PipeWire xruns in 2 min on
+the desktop), and under load wedged cpal on the POLLERR (0030 rebuilt the stream each time).
+The server now holds an 85 ms queue for WoW and runs the per-cycle work in its own realtime thread;
+48 kHz float stereo (no resampling), it follows the default output, server underflows are counted
+and reported, a lost server reconnects. The device queue counts toward the 100 ms mix-ahead.
+cpal's ALSA stays as the fallback (no server socket, or WOW_AUDIO_OUTPUT=alsa). World mode logs
+when WoW's output mutes or unmutes with BG3's own sound.
+diff --git a/crates/benilla-app/src/sound/output/mod.rs b/crates/benilla-app/src/sound/output/mod.rs
+--- a/crates/benilla-app/src/sound/output/mod.rs
++++ b/crates/benilla-app/src/sound/output/mod.rs
+@@ -1,8 +1,8 @@
+ //! The output stream: benilla's own kira backend, the same code on every platform. It owns
+ //! everything between kira's render and the speaker: the device, the IO callback, the render
+-//! thread and the meters. The one platform seam is `device` (`coreaudio.rs` on macOS, `cpal.rs`
+-//! elsewhere), which finds the default output, opens a stream and hands the callback one buffer
+-//! per cycle.
++//! thread and the meters. The one platform seam is `device` (`coreaudio.rs` on macOS, `linux.rs`
++//! on Linux, `cpal.rs` elsewhere), which finds the default output, opens a stream and hands the
++//! callback one buffer per cycle.
+ //!
+ //! ## Mix ahead, copy on the deadline
+ //!
+@@ -32,7 +32,11 @@
+ #[cfg(target_os = "macos")]
+ #[path = "coreaudio.rs"]
+ mod device;
+-#[cfg(not(target_os = "macos"))]
++// WOW-BG3 (patch 0031): on Linux a stream to the desktop's sound server, cpal's ALSA its fallback.
++#[cfg(target_os = "linux")]
++#[path = "linux.rs"]
++mod device;
++#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+ #[path = "cpal.rs"]
+ mod device;
+ 
+@@ -53,6 +57,12 @@
+ /// How long an unopenable device waits before the next attempt.
+ const REOPEN_EVERY: Duration = Duration::from_secs(1);
+ 
++/// WOW-BG3 (patch 0031): the shortest ring when the device holds a queue of its own (Linux's
++/// sound-server stream), which counts toward the mix-ahead: the ring still covers a render pass
++/// that runs late against the IO thread, and a catch-up write of two requests.
++#[cfg(target_os = "linux")]
++const MIN_RING_MS: u32 = 50;
++
+ /// How long the main thread waits for the IO closure to hand the ring consumer back after a
+ /// stream drops; the stop is synchronous, so this is a defence.
+ const HANDBACK_WAIT: Duration = Duration::from_millis(250);
+@@ -314,6 +324,12 @@
+         // Guaranteed slack is the ring minus one device buffer (the IOProc drains a buffer's
+         // worth per wake before the render thread tops up), so the ring is sized for both.
+         let ahead_frames = ms_to_frames(self.settings.mix_ahead_ms, self.sample_rate);
++        // WOW-BG3 (patch 0031): a device queue (`latency_frames`, the sound server's for the Linux
++        // stream; zero through cpal) is mix-ahead already, so the ring holds only the rest.
++        #[cfg(target_os = "linux")]
++        let ahead_frames = ahead_frames
++            .saturating_sub(device.latency_frames as usize)
++            .max(ms_to_frames(MIN_RING_MS, self.sample_rate));
+         let ring_frames = ahead_frames + buffer_frames as usize;
+         let (producer, consumer) = RingBuffer::<f32>::new(ring_frames * 2);
+ 
+diff --git a/crates/benilla-app/src/sound/output/cpal.rs b/crates/benilla-app/src/sound/output/cpal.rs
+--- a/crates/benilla-app/src/sound/output/cpal.rs
++++ b/crates/benilla-app/src/sound/output/cpal.rs
+@@ -10,6 +10,9 @@
+ //! - Realtime: no workgroups; [`set_realtime`] is `SCHED_FIFO` on unix and MMCSS on Windows.
+ //!
+ //! An unsupported target compiles to cpal's Null host, reports no device and runs silent.
++//!
++//! WOW-BG3 (patch 0031): on Linux this is `linux.rs`'s fallback route (no sound server socket, or
++//! `WOW_AUDIO_OUTPUT=alsa`); its shared items are `pub(crate)` so `linux.rs` can pass them on.
+ 
+ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+ use std::sync::Arc;
+@@ -20,7 +23,7 @@
+ use cpal::{FromSample, SizedSample};
+ 
+ /// kira mixes stereo; [`spread`] puts it over whatever the device takes.
+-pub(super) const CHANNELS: u32 = 2;
++pub(crate) const CHANNELS: u32 = 2;
+ 
+ /// How often [`Listeners`] re-reads the default output device, kira's own cadence off macOS.
+ const WATCH_EVERY: Duration = Duration::from_millis(500);
+@@ -31,7 +34,7 @@
+ 
+ /// Nanoseconds on a monotonic clock. cpal's `StreamInstant` is host-defined, so the meters ride
+ /// [`Instant`] and the lead comes from a difference of stream instants.
+-pub(super) fn now_ns() -> u64 {
++pub(crate) fn now_ns() -> u64 {
+     static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+     EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+ }
+@@ -120,7 +123,7 @@
+ 
+ /// What the IO callback sees each cycle: the interleaved stereo buffer to fill and the time its
+ /// first frame reaches the DAC.
+-pub(super) struct Cycle<'a> {
++pub(crate) struct Cycle<'a> {
+     pub buffer: &'a mut [f32],
+     pub frames: usize,
+     /// When the first frame is due, ns on the [`now_ns`] clock; zero with no usable timestamp.
+@@ -334,7 +337,7 @@
+ /// The flags the device watch raises and the main thread polls, shaped as `coreaudio.rs`'s;
+ /// [`Notices::overloads`] stays zero here.
+ #[derive(Default)]
+-pub(super) struct Notices {
++pub(crate) struct Notices {
+     pub default_changed: AtomicBool,
+     pub device_died: AtomicBool,
+     pub rate_changed: AtomicBool,
+@@ -427,7 +430,7 @@
+ }
+ 
+ /// The render thread's realtime standing, released on drop.
+-pub(super) struct Realtime {
++pub(crate) struct Realtime {
+     #[cfg(windows)]
+     _task: mmcss::Task,
+ }
+@@ -440,7 +443,7 @@
+ /// - Windows: MMCSS task "Pro Audio" at `AVRT_PRIORITY_CRITICAL`.
+ ///
+ /// `period_ns` is only for macOS's time-constraint policy.
+-pub(super) fn set_realtime(_period_ns: u64) -> Result<Realtime> {
++pub(crate) fn set_realtime(_period_ns: u64) -> Result<Realtime> {
+     #[cfg(all(unix, not(target_os = "macos")))]
+     {
+         // SAFETY: a POSIX call on the calling thread with a zeroed `sched_param`, zeroed since
+diff --git a/crates/benilla-app/src/sound/mod.rs b/crates/benilla-app/src/sound/mod.rs
+--- a/crates/benilla-app/src/sound/mod.rs
++++ b/crates/benilla-app/src/sound/mod.rs
+@@ -217,6 +217,17 @@
+     }
+     *last = Some(open);
+     if let Some(mixer) = out.mixer.as_mut() {
++        // WOW-BG3 (patch 0031): say so in world mode, where the gate follows BG3's own mute.
++        if crate::wowbg3_lead::hide_self() && !config.background_sound {
++            if open {
++                info!("sound: WoW's output on (BG3's own sound is on)");
++            } else {
++                info!(
++                    "sound: WoW's output muted with BG3's own sound (BG3's window lost focus, or \
++                     its master volume is 0)"
++                );
++            }
++        }
+         mixer.set_output_gate(open);
+     }
+ }
+diff --git a/crates/benilla-app/src/sound/output/linux.rs b/crates/benilla-app/src/sound/output/linux.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/sound/output/linux.rs
+@@ -0,0 +1,757 @@
++//! The Linux half of [`super`] (WOW-BG3 patch 0031): WoW's sound goes to the
++//! desktop's sound server as a PulseAudio stream (libpulse, loaded at runtime: PipeWire's
++//! pipewire-pulse or PulseAudio itself), with cpal's ALSA (`cpal.rs`) as the fallback when no
++//! server socket is found, or always under `WOW_AUDIO_OUTPUT=alsa`. Same surface as `cpal.rs`
++//! ([`Device`], [`Stream`], [`Cycle`], [`Notices`], [`Listeners`], [`set_realtime`],
++//! [`now_ns`]).
++//!
++//! Why not cpal's ALSA on a PipeWire desktop (a desktop session: no WoW sound and
++//! the output rebuilt every 3-60 s): ALSA's `default` there is pipewire-alsa, which runs WoW's
++//! PipeWire stream inside benilla's own process. Every graph cycle (10-21 ms) the plugin's data
++//! thread must copy the next quantum out of the ALSA ring, which cpal sizes at two 512-frame
++//! periods (23 ms at 44.1 kHz) and which cpal's own IO thread refills. benilla's unit runs at
++//! nice 5 under a 400% CPU quota without realtime (rtkit grants it only inside a login session),
++//! so a throttled or preempted moment (14-24 ms seen inside the IO callback) empties that ring;
++//! the plugin then flags an xrun that only `snd_pcm_prepare` clears and reports it as POLLERR,
++//! which cpal 0.17.1 never answers with a prepare (patch 0030 rebuilt the whole stream instead, a
++//! new PipeWire node each time). As a Pulse client the per-cycle work runs in the sound server's
++//! own realtime thread, from a queue the server holds for us ([`QUEUE_REQUESTS`] requests of
++//! [`MIN_REQUEST_FRAMES`], 85 ms): benilla only tops it up, and may be that late without a gap.
++//! The stream is 48 kHz float stereo, the desktop graph's own rate, so nothing resamples it, and
++//! it follows the default output (a headset switched off or on) as any desktop stream does.
++//!
++//! Where it connects: `$PULSE_SERVER` when set, else the `pulse/native` socket in
++//! `$PIPEWIRE_RUNTIME_DIR` (world mode's units point that at the desktop's `/run/user/1000` while
++//! their `$XDG_RUNTIME_DIR` is gamescope's), else in `$XDG_RUNTIME_DIR`. `$PIPEWIRE_NODE` names
++//! the sink (the harness's private null sinks); unset, the server's default output.
++
++use std::ffi::{c_char, c_int, c_void, CStr, CString};
++use std::os::unix::fs::FileTypeExt;
++use std::path::Path;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, OnceLock};
++use std::time::{Duration, Instant};
++
++use anyhow::{bail, Result};
++
++/// cpal's ALSA device layer: the fallback route, and the shared surface ([`Cycle`], [`Notices`],
++/// [`now_ns`], [`set_realtime`]). Its own workgroup stubs are unused here.
++#[allow(dead_code)]
++#[path = "cpal.rs"]
++mod cpal_alsa;
++
++pub(super) use cpal_alsa::{now_ns, set_realtime, Cycle, Notices, CHANNELS};
++
++/// The rate the Pulse stream asks for: PipeWire's default graph rate (the only one the test
++/// desktop allows), so the server does not resample WoW. `$WOW_AUDIO_RATE` overrides.
++const PULSE_RATE: u32 = 48_000;
++
++/// The smallest request (minreq) the stream takes, frames: one default PipeWire quantum, so
++/// WoW's stream does not shrink the whole graph's cycle (early requests make the node's latency
++/// this). A larger `$WOW_IO_BUFFER` raises it.
++const MIN_REQUEST_FRAMES: u32 = 1024;
++
++/// The queue the server holds for us (tlength), in requests: 85 ms at 48 kHz. benilla's threads
++/// may stall that long, less one request and one graph cycle, before the server runs dry.
++const QUEUE_REQUESTS: u32 = 4;
++
++/// How often the writer reports the server's underflows (when there were any).
++const UNDERFLOW_REPORT_EVERY: Duration = Duration::from_secs(10);
++
++// ---------------------------------------------------------------------------------------------
++// Device
++
++/// One output as opened: the Pulse stream's target, or a cpal device.
++#[derive(Clone)]
++pub(super) struct Device {
++    pub name: String,
++    /// The rate we render at; for Pulse the stream's own, which the server converts if it must.
++    pub sample_rate: u32,
++    /// The request sizes we accept, frames.
++    pub buffer_range: (u32, u32),
++    /// For Pulse the queue the server holds for us: the mix-ahead counts it (`mod.rs`).
++    pub latency_frames: u32,
++    pub safety_frames: u32,
++    route: Route,
++}
++
++#[derive(Clone)]
++enum Route {
++    Pulse(PulseTarget),
++    Alsa(cpal_alsa::Device),
++}
++
++impl std::fmt::Debug for Device {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Device")
++            .field("name", &self.name)
++            .field("sample_rate", &self.sample_rate)
++            .field("buffer_range", &self.buffer_range)
++            .field("latency_frames", &self.latency_frames)
++            .finish()
++    }
++}
++
++/// The desktop's sound server as a Pulse stream when one answers, else cpal's ALSA default.
++pub(super) fn default_output() -> Result<Device> {
++    // Prime the clock's epoch on the main thread, not first in the audio thread.
++    now_ns();
++    if std::env::var("WOW_AUDIO_OUTPUT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("alsa")) {
++        return alsa_output();
++    }
++    match pulse_target() {
++        Ok(target) => Ok(pulse_output(target)),
++        Err(why) => {
++            static TOLD: AtomicBool = AtomicBool::new(false);
++            if !TOLD.swap(true, Ordering::Relaxed) {
++                bevy::log::info!("audio: no PulseAudio/PipeWire stream ({why}); ALSA through cpal");
++            }
++            alsa_output()
++        }
++    }
++}
++
++fn alsa_output() -> Result<Device> {
++    let d = cpal_alsa::default_output()?;
++    Ok(Device {
++        name: d.name.clone(),
++        sample_rate: d.sample_rate,
++        buffer_range: d.buffer_range,
++        latency_frames: d.latency_frames,
++        safety_frames: d.safety_frames,
++        route: Route::Alsa(d),
++    })
++}
++
++fn pulse_rate() -> u32 {
++    std::env::var("WOW_AUDIO_RATE")
++        .ok()
++        .and_then(|v| v.trim().parse::<u32>().ok())
++        .filter(|r| (8000..=192_000).contains(r))
++        .unwrap_or(PULSE_RATE)
++}
++
++fn pulse_output(target: PulseTarget) -> Device {
++    let where_ = match &target.sink {
++        Some(sink) => format!("sink {}", sink.to_string_lossy()),
++        None => "the default output".to_string(),
++    };
++    Device {
++        name: format!("Pulse stream to {where_} ({})", target.label),
++        sample_rate: pulse_rate(),
++        buffer_range: (64, 8192),
++        latency_frames: MIN_REQUEST_FRAMES * QUEUE_REQUESTS,
++        safety_frames: 0,
++        route: Route::Pulse(target),
++    }
++}
++
++/// Where the Pulse stream connects; an error when libpulse or a server socket is missing.
++#[derive(Clone)]
++struct PulseTarget {
++    /// `None`: libpulse's own choice (`$PULSE_SERVER`).
++    server: Option<CString>,
++    sink: Option<CString>,
++    label: String,
++}
++
++fn pulse_target() -> std::result::Result<PulseTarget, String> {
++    Pa::get()?;
++    let sink = std::env::var("PIPEWIRE_NODE")
++        .ok()
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .and_then(|s| CString::new(s).ok());
++    if std::env::var_os("PULSE_SERVER").is_some_and(|v| !v.is_empty()) {
++        return Ok(PulseTarget {
++            server: None,
++            sink,
++            label: "$PULSE_SERVER".to_string(),
++        });
++    }
++    for var in ["PIPEWIRE_RUNTIME_DIR", "XDG_RUNTIME_DIR"] {
++        let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) else {
++            continue;
++        };
++        let socket = Path::new(&dir).join("pulse").join("native");
++        if std::fs::metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
++            let label = socket.display().to_string();
++            let server = CString::new(format!("unix:{label}")).map_err(|e| e.to_string())?;
++            return Ok(PulseTarget {
++                server: Some(server),
++                sink,
++                label,
++            });
++        }
++    }
++    Err("no pulse/native socket in $PIPEWIRE_RUNTIME_DIR or $XDG_RUNTIME_DIR, no $PULSE_SERVER".into())
++}
++
++// ---------------------------------------------------------------------------------------------
++// Stream
++
++/// A running output stream. Dropping it stops the stream and drops the callback.
++pub(super) struct Stream {
++    inner: Inner,
++}
++
++enum Inner {
++    Pulse(PulseStream),
++    Alsa(cpal_alsa::Stream),
++}
++
++impl Stream {
++    /// The frames one [`Cycle`] carries: the Pulse request size, or cpal's last callback.
++    pub(super) fn buffer_frames(&self) -> u32 {
++        match &self.inner {
++            Inner::Pulse(s) => s.request_frames,
++            Inner::Alsa(s) => s.buffer_frames(),
++        }
++    }
++
++    /// Open `device` with cycles of about `buffer_frames` and start it. `on_cycle` runs on the
++    /// stream's own thread and must not block. A lost stream raises `notices.device_died`.
++    pub(super) fn open<F>(
++        device: &Device,
++        buffer_frames: u32,
++        notices: &Arc<Notices>,
++        on_cycle: F,
++    ) -> Result<Self>
++    where
++        F: FnMut(Cycle<'_>) + Send + 'static,
++    {
++        match &device.route {
++            Route::Alsa(d) => cpal_alsa::Stream::open(d, buffer_frames, notices, on_cycle)
++                .map(|s| Self {
++                    inner: Inner::Alsa(s),
++                }),
++            Route::Pulse(target) => {
++                PulseStream::open(target, device.sample_rate, buffer_frames, notices, on_cycle)
++                    .map(|s| Self {
++                        inner: Inner::Pulse(s),
++                    })
++            }
++        }
++    }
++}
++
++/// The Pulse stream and its writer thread.
++struct PulseStream {
++    conn: Arc<Conn>,
++    stop: Arc<AtomicBool>,
++    thread: Option<std::thread::JoinHandle<()>>,
++    request_frames: u32,
++}
++
++impl PulseStream {
++    fn open<F>(
++        target: &PulseTarget,
++        rate: u32,
++        buffer_frames: u32,
++        notices: &Arc<Notices>,
++        on_cycle: F,
++    ) -> Result<Self>
++    where
++        F: FnMut(Cycle<'_>) + Send + 'static,
++    {
++        let request = buffer_frames.clamp(MIN_REQUEST_FRAMES, 8192);
++        let conn = Arc::new(Conn::open(target, rate, request)?);
++        let stop = Arc::new(AtomicBool::new(false));
++        let thread = {
++            let conn = Arc::clone(&conn);
++            let stop = Arc::clone(&stop);
++            let notices = Arc::clone(notices);
++            std::thread::Builder::new()
++                .name("audio-pulse".into())
++                .spawn(move || write_loop(&conn, &stop, &notices, request as usize, on_cycle))?
++        };
++        Ok(Self {
++            conn,
++            stop,
++            thread: Some(thread),
++            request_frames: request,
++        })
++    }
++}
++
++impl Drop for PulseStream {
++    fn drop(&mut self) {
++        // Stop first, then wake the writer out of its wait under the loop's lock, so the wake
++        // cannot fall between its stop check and its wait.
++        self.stop.store(true, Ordering::Release);
++        self.conn.wake();
++        if let Some(thread) = self.thread.take() {
++            let _ = thread.join();
++        }
++        // The last `Conn` reference goes with `self`: the stream and connection close here.
++    }
++}
++
++/// The writer: wait until the server asks for a request's worth, render it through `on_cycle`
++/// (outside the loop's lock), write it. Ends on `stop` or a lost stream (`device_died`); the
++/// callback drops with it, which hands the ring back (`mod.rs`).
++fn write_loop<F>(conn: &Conn, stop: &AtomicBool, notices: &Notices, frames: usize, mut on_cycle: F)
++where
++    F: FnMut(Cycle<'_>),
++{
++    let pa = conn.pa;
++    let bytes = frames * FRAME_BYTES as usize;
++    let mut stereo = vec![0f32; frames * CHANNELS as usize];
++    let mut report_at = Instant::now() + UNDERFLOW_REPORT_EVERY;
++    let mut underflows_told = 0u64;
++    // SAFETY: `conn`'s objects live until the last `Conn` reference drops, after this thread
++    // ends; every call on them below is made holding the loop's lock, as libpulse requires.
++    let lost = unsafe {
++        (pa.ml_lock)(conn.ml);
++        let lost = loop {
++            if stop.load(Ordering::Acquire) {
++                break None;
++            }
++            if (pa.ctx_get_state)(conn.ctx) != PA_CONTEXT_READY
++                || (pa.st_get_state)(conn.stream) != PA_STREAM_READY
++            {
++                break Some(pa.error((pa.ctx_errno)(conn.ctx)));
++            }
++            if (pa.st_writable_size)(conn.stream) < bytes {
++                (pa.ml_wait)(conn.ml);
++                continue;
++            }
++            // When this request's first frame plays: the stream's latency covers what is queued.
++            // None before the first timing update, or while the server has run dry (negative).
++            let mut usec = 0u64;
++            let mut negative: c_int = 0;
++            let due = if (pa.st_get_latency)(conn.stream, &mut usec, &mut negative) == 0
++                && negative == 0
++                && usec > 0
++            {
++                now_ns() + usec.saturating_mul(1000)
++            } else {
++                0
++            };
++            (pa.ml_unlock)(conn.ml);
++            on_cycle(Cycle {
++                buffer: &mut stereo,
++                frames,
++                output_time_ns: due,
++            });
++            let now = Instant::now();
++            if now >= report_at {
++                report_at = now + UNDERFLOW_REPORT_EVERY;
++                let total = (*conn.events).underflows.load(Ordering::Relaxed);
++                if total > underflows_told {
++                    bevy::log::warn!(
++                        "audio: the sound server ran out of WoW's sound {} time(s) in the last \
++                         {}s (WoW's threads fell more than its queue behind); stream kept",
++                        total - underflows_told,
++                        UNDERFLOW_REPORT_EVERY.as_secs(),
++                    );
++                    underflows_told = total;
++                }
++            }
++            (pa.ml_lock)(conn.ml);
++            let wrote = (pa.st_write)(
++                conn.stream,
++                stereo.as_ptr().cast(),
++                bytes,
++                std::ptr::null_mut(),
++                0,
++                PA_SEEK_RELATIVE,
++            );
++            if wrote < 0 {
++                break Some(pa.error((pa.ctx_errno)(conn.ctx)));
++            }
++        };
++        (pa.ml_unlock)(conn.ml);
++        lost
++    };
++    if let Some(why) = lost {
++        bevy::log::warn!("audio: output stream lost (sound server: {why})");
++        notices.device_died.store(true, Ordering::Release);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// libpulse, loaded at runtime
++
++type Ptr = *mut c_void;
++type NotifyCb = unsafe extern "C" fn(Ptr, Ptr);
++type RequestCb = unsafe extern "C" fn(Ptr, usize, Ptr);
++
++/// `pa_sample_spec`.
++#[repr(C)]
++struct SampleSpec {
++    format: c_int,
++    rate: u32,
++    channels: u8,
++}
++
++/// `pa_buffer_attr`, bytes; `u32::MAX` is the server's choice.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct BufferAttr {
++    maxlength: u32,
++    tlength: u32,
++    prebuf: u32,
++    minreq: u32,
++    fragsize: u32,
++}
++
++// From libpulse's `def.h` and `sample.h` (ABI-stable since 0.9).
++const PA_SAMPLE_FLOAT32LE: c_int = 5;
++const PA_CONTEXT_NOAUTOSPAWN: c_int = 0x1;
++const PA_CONTEXT_READY: c_int = 4;
++const PA_STREAM_READY: c_int = 2;
++const PA_STREAM_INTERPOLATE_TIMING: c_int = 0x2;
++const PA_STREAM_AUTO_TIMING_UPDATE: c_int = 0x8;
++/// The server asks for each request as soon as it is free (`minreq`), and PipeWire's
++/// pipewire-pulse then gives the node a latency of one request rather than most of the queue.
++const PA_STREAM_EARLY_REQUESTS: c_int = 0x4000;
++const PA_SEEK_RELATIVE: c_int = 0;
++
++/// One float stereo frame, bytes.
++const FRAME_BYTES: u32 = CHANNELS * std::mem::size_of::<f32>() as u32;
++
++/// `PA_CONTEXT_IS_GOOD`, `PA_STREAM_IS_GOOD`.
++fn context_good(state: c_int) -> bool {
++    (1..=4).contains(&state)
++}
++fn stream_good(state: c_int) -> bool {
++    (1..=2).contains(&state)
++}
++
++/// The libpulse calls the stream makes, from `libpulse.so.0` (dlopen: no build-time library,
++/// and a desktop without it falls back to ALSA).
++struct Pa {
++    ml_new: unsafe extern "C" fn() -> Ptr,
++    ml_free: unsafe extern "C" fn(Ptr),
++    ml_start: unsafe extern "C" fn(Ptr) -> c_int,
++    ml_stop: unsafe extern "C" fn(Ptr),
++    ml_lock: unsafe extern "C" fn(Ptr),
++    ml_unlock: unsafe extern "C" fn(Ptr),
++    ml_wait: unsafe extern "C" fn(Ptr),
++    ml_signal: unsafe extern "C" fn(Ptr, c_int),
++    ml_get_api: unsafe extern "C" fn(Ptr) -> Ptr,
++    ctx_new: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
++    ctx_set_state_callback: unsafe extern "C" fn(Ptr, Option<NotifyCb>, Ptr),
++    ctx_connect: unsafe extern "C" fn(Ptr, *const c_char, c_int, Ptr) -> c_int,
++    ctx_get_state: unsafe extern "C" fn(Ptr) -> c_int,
++    ctx_errno: unsafe extern "C" fn(Ptr) -> c_int,
++    ctx_disconnect: unsafe extern "C" fn(Ptr),
++    ctx_unref: unsafe extern "C" fn(Ptr),
++    st_new: unsafe extern "C" fn(Ptr, *const c_char, *const SampleSpec, Ptr) -> Ptr,
++    st_set_state_callback: unsafe extern "C" fn(Ptr, Option<NotifyCb>, Ptr),
++    st_set_write_callback: unsafe extern "C" fn(Ptr, Option<RequestCb>, Ptr),
++    st_set_underflow_callback: unsafe extern "C" fn(Ptr, Option<NotifyCb>, Ptr),
++    st_connect_playback:
++        unsafe extern "C" fn(Ptr, *const c_char, *const BufferAttr, c_int, Ptr, Ptr) -> c_int,
++    st_get_state: unsafe extern "C" fn(Ptr) -> c_int,
++    st_writable_size: unsafe extern "C" fn(Ptr) -> usize,
++    st_write: unsafe extern "C" fn(Ptr, *const c_void, usize, Ptr, i64, c_int) -> c_int,
++    st_get_latency: unsafe extern "C" fn(Ptr, *mut u64, *mut c_int) -> c_int,
++    st_get_buffer_attr: unsafe extern "C" fn(Ptr) -> *const BufferAttr,
++    st_disconnect: unsafe extern "C" fn(Ptr) -> c_int,
++    st_unref: unsafe extern "C" fn(Ptr),
++    strerror: unsafe extern "C" fn(c_int) -> *const c_char,
++}
++
++impl Pa {
++    /// libpulse, loaded once; the error says why not.
++    fn get() -> std::result::Result<&'static Pa, String> {
++        static PA: OnceLock<std::result::Result<Pa, String>> = OnceLock::new();
++        PA.get_or_init(|| {
++            // SAFETY: dlopen/dlsym on a NUL-terminated name; each symbol is cast to the
++            // signature libpulse's headers give it.
++            unsafe { Pa::load() }
++        })
++        .as_ref()
++        .map_err(String::clone)
++    }
++
++    // Each `sym!` is typed by the field it fills.
++    #[allow(clippy::missing_transmute_annotations)]
++    unsafe fn load() -> std::result::Result<Pa, String> {
++        let lib = libc::dlopen(c"libpulse.so.0".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
++        if lib.is_null() {
++            let why = libc::dlerror();
++            return Err(if why.is_null() {
++                "libpulse.so.0 not loadable".to_string()
++            } else {
++                CStr::from_ptr(why).to_string_lossy().into_owned()
++            });
++        }
++        macro_rules! sym {
++            ($name:literal) => {{
++                let p = libc::dlsym(lib, concat!($name, "\0").as_ptr().cast());
++                if p.is_null() {
++                    return Err(format!("libpulse.so.0 has no {}", $name));
++                }
++                std::mem::transmute::<*mut c_void, _>(p)
++            }};
++        }
++        Ok(Pa {
++            ml_new: sym!("pa_threaded_mainloop_new"),
++            ml_free: sym!("pa_threaded_mainloop_free"),
++            ml_start: sym!("pa_threaded_mainloop_start"),
++            ml_stop: sym!("pa_threaded_mainloop_stop"),
++            ml_lock: sym!("pa_threaded_mainloop_lock"),
++            ml_unlock: sym!("pa_threaded_mainloop_unlock"),
++            ml_wait: sym!("pa_threaded_mainloop_wait"),
++            ml_signal: sym!("pa_threaded_mainloop_signal"),
++            ml_get_api: sym!("pa_threaded_mainloop_get_api"),
++            ctx_new: sym!("pa_context_new"),
++            ctx_set_state_callback: sym!("pa_context_set_state_callback"),
++            ctx_connect: sym!("pa_context_connect"),
++            ctx_get_state: sym!("pa_context_get_state"),
++            ctx_errno: sym!("pa_context_errno"),
++            ctx_disconnect: sym!("pa_context_disconnect"),
++            ctx_unref: sym!("pa_context_unref"),
++            st_new: sym!("pa_stream_new"),
++            st_set_state_callback: sym!("pa_stream_set_state_callback"),
++            st_set_write_callback: sym!("pa_stream_set_write_callback"),
++            st_set_underflow_callback: sym!("pa_stream_set_underflow_callback"),
++            st_connect_playback: sym!("pa_stream_connect_playback"),
++            st_get_state: sym!("pa_stream_get_state"),
++            st_writable_size: sym!("pa_stream_writable_size"),
++            st_write: sym!("pa_stream_write"),
++            st_get_latency: sym!("pa_stream_get_latency"),
++            st_get_buffer_attr: sym!("pa_stream_get_buffer_attr"),
++            st_disconnect: sym!("pa_stream_disconnect"),
++            st_unref: sym!("pa_stream_unref"),
++            strerror: sym!("pa_strerror"),
++        })
++    }
++
++    fn error(&self, code: c_int) -> String {
++        // SAFETY: `pa_strerror` returns a static string or null.
++        let p = unsafe { (self.strerror)(code) };
++        if p.is_null() {
++            format!("error {code}")
++        } else {
++            // SAFETY: non-null, NUL-terminated, static.
++            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
++        }
++    }
++}
++
++/// What libpulse's callbacks reach (their userdata): the loop to signal, the underflow count.
++struct Events {
++    pa: &'static Pa,
++    ml: Ptr,
++    underflows: AtomicU64,
++}
++
++/// Every callback but the underflow one just wakes whoever waits on the loop.
++unsafe extern "C" fn on_notify(_object: Ptr, userdata: Ptr) {
++    let events = &*(userdata as *const Events);
++    (events.pa.ml_signal)(events.ml, 0);
++}
++
++unsafe extern "C" fn on_request(_stream: Ptr, _bytes: usize, userdata: Ptr) {
++    let events = &*(userdata as *const Events);
++    (events.pa.ml_signal)(events.ml, 0);
++}
++
++unsafe extern "C" fn on_underflow(_stream: Ptr, userdata: Ptr) {
++    let events = &*(userdata as *const Events);
++    events.underflows.fetch_add(1, Ordering::Relaxed);
++}
++
++/// A threaded main loop, its context and the playback stream; closed on drop.
++struct Conn {
++    pa: &'static Pa,
++    ml: Ptr,
++    ctx: Ptr,
++    stream: Ptr,
++    events: *mut Events,
++}
++
++// SAFETY: libpulse objects are used only under the threaded loop's lock (`ml_lock`), which any
++// thread may take; `Conn` frees them once, on its last drop.
++unsafe impl Send for Conn {}
++unsafe impl Sync for Conn {}
++
++impl Conn {
++    /// Connect to `target` and create a 48 kHz float stereo playback stream whose server queue
++    /// holds [`QUEUE_REQUESTS`] requests of `request` frames. Blocks until both are ready.
++    fn open(target: &PulseTarget, rate: u32, request: u32) -> Result<Conn> {
++        let pa = Pa::get().map_err(anyhow::Error::msg)?;
++        // SAFETY: the libpulse calls follow its threaded-loop contract: set up before the loop
++        // starts, then only under its lock; every object is owned by `conn` from creation, so an
++        // early return frees what was made.
++        unsafe {
++            let ml = (pa.ml_new)();
++            if ml.is_null() {
++                bail!("pa_threaded_mainloop_new failed");
++            }
++            let events = Box::into_raw(Box::new(Events {
++                pa,
++                ml,
++                underflows: AtomicU64::new(0),
++            }));
++            let mut conn = Conn {
++                pa,
++                ml,
++                ctx: std::ptr::null_mut(),
++                stream: std::ptr::null_mut(),
++                events,
++            };
++            conn.ctx = (pa.ctx_new)((pa.ml_get_api)(ml), c"benilla".as_ptr());
++            if conn.ctx.is_null() {
++                bail!("pa_context_new failed");
++            }
++            (pa.ctx_set_state_callback)(conn.ctx, Some(on_notify), events.cast());
++            let server = target.server.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
++            if (pa.ctx_connect)(conn.ctx, server, PA_CONTEXT_NOAUTOSPAWN, std::ptr::null_mut()) < 0
++            {
++                bail!("connecting to {}: {}", target.label, pa.error((pa.ctx_errno)(conn.ctx)));
++            }
++            if (pa.ml_start)(ml) < 0 {
++                bail!("pa_threaded_mainloop_start failed");
++            }
++            (pa.ml_lock)(ml);
++            let made = conn.make_stream(target, rate, request);
++            (pa.ml_unlock)(ml);
++            let granted = made?;
++            let ms = |bytes: u32| f64::from(bytes / FRAME_BYTES) * 1000.0 / f64::from(rate);
++            bevy::log::info!(
++                "audio: Pulse stream on {}: {rate} Hz float stereo, server queue {:.0} ms, \
++                 requests of {:.1} ms, playback starts at {:.0} ms",
++                target.label,
++                ms(granted.tlength),
++                ms(granted.minreq),
++                ms(granted.prebuf),
++            );
++            Ok(conn)
++        }
++    }
++
++    /// Under the loop's lock: wait for the context, then create and connect the stream; the
++    /// buffer attributes the server granted.
++    unsafe fn make_stream(&mut self, target: &PulseTarget, rate: u32, request: u32) -> Result<BufferAttr> {
++        let pa = self.pa;
++        loop {
++            let state = (pa.ctx_get_state)(self.ctx);
++            if state == PA_CONTEXT_READY {
++                break;
++            }
++            if !context_good(state) {
++                bail!("connecting to {}: {}", target.label, pa.error((pa.ctx_errno)(self.ctx)));
++            }
++            (pa.ml_wait)(self.ml);
++        }
++        let spec = SampleSpec {
++            format: PA_SAMPLE_FLOAT32LE,
++            rate,
++            channels: CHANNELS as u8,
++        };
++        self.stream = (pa.st_new)(self.ctx, c"World of Warcraft".as_ptr(), &spec, std::ptr::null_mut());
++        if self.stream.is_null() {
++            bail!("pa_stream_new: {}", pa.error((pa.ctx_errno)(self.ctx)));
++        }
++        let events = self.events.cast();
++        (pa.st_set_state_callback)(self.stream, Some(on_notify), events);
++        (pa.st_set_write_callback)(self.stream, Some(on_request), events);
++        (pa.st_set_underflow_callback)(self.stream, Some(on_underflow), events);
++        let attr = BufferAttr {
++            maxlength: u32::MAX,
++            tlength: request * QUEUE_REQUESTS * FRAME_BYTES,
++            prebuf: u32::MAX,
++            minreq: request * FRAME_BYTES,
++            fragsize: u32::MAX,
++        };
++        let sink = target.sink.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
++        let flags = PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_EARLY_REQUESTS;
++        if (pa.st_connect_playback)(self.stream, sink, &attr, flags, std::ptr::null_mut(), std::ptr::null_mut()) < 0 {
++            bail!("pa_stream_connect_playback: {}", pa.error((pa.ctx_errno)(self.ctx)));
++        }
++        loop {
++            let state = (pa.st_get_state)(self.stream);
++            if state == PA_STREAM_READY {
++                break;
++            }
++            if !stream_good(state) {
++                bail!("opening the stream: {}", pa.error((pa.ctx_errno)(self.ctx)));
++            }
++            (pa.ml_wait)(self.ml);
++        }
++        let granted = (pa.st_get_buffer_attr)(self.stream);
++        Ok(if granted.is_null() { attr } else { *granted })
++    }
++
++    /// Wake whoever waits on the loop (the writer, for its stop check).
++    fn wake(&self) {
++        // SAFETY: the loop lives as long as `self`; signal under its lock.
++        unsafe {
++            (self.pa.ml_lock)(self.ml);
++            (self.pa.ml_signal)(self.ml, 0);
++            (self.pa.ml_unlock)(self.ml);
++        }
++    }
++}
++
++impl Drop for Conn {
++    fn drop(&mut self) {
++        let pa = self.pa;
++        // SAFETY: the last reference: no writer thread is left. Callbacks are cleared and the
++        // objects released under the lock; the loop thread is stopped before it and `events` are
++        // freed. Stopping or freeing a loop that never started is allowed.
++        unsafe {
++            (pa.ml_lock)(self.ml);
++            if !self.stream.is_null() {
++                (pa.st_set_state_callback)(self.stream, None, std::ptr::null_mut());
++                (pa.st_set_write_callback)(self.stream, None, std::ptr::null_mut());
++                (pa.st_set_underflow_callback)(self.stream, None, std::ptr::null_mut());
++                (pa.st_disconnect)(self.stream);
++                (pa.st_unref)(self.stream);
++            }
++            if !self.ctx.is_null() {
++                (pa.ctx_set_state_callback)(self.ctx, None, std::ptr::null_mut());
++                (pa.ctx_disconnect)(self.ctx);
++                (pa.ctx_unref)(self.ctx);
++            }
++            (pa.ml_unlock)(self.ml);
++            (pa.ml_stop)(self.ml);
++            (pa.ml_free)(self.ml);
++            drop(Box::from_raw(self.events));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Listeners
++
++/// The device watch: cpal's poll on the ALSA route. A Pulse stream needs none: the server moves
++/// it to a new default output itself, and a lost server ends the writer (`device_died`).
++pub(super) struct Listeners {
++    _alsa: Option<cpal_alsa::Listeners>,
++}
++
++impl Listeners {
++    pub(super) fn arm(device: &Device, notices: Arc<Notices>) -> Self {
++        Self {
++            _alsa: match &device.route {
++                Route::Alsa(d) => Some(cpal_alsa::Listeners::arm(d, notices)),
++                Route::Pulse(_) => None,
++            },
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// No audio workgroups off macOS; `set_realtime` (cpal.rs) is the whole story.
++
++pub(super) struct Workgroup;
++
++impl Workgroup {
++    pub(super) fn of_device(_device: &Device) -> Option<Self> {
++        None
++    }
++}
++
++pub(super) struct Joined;
++
++impl Joined {
++    pub(super) fn join(_group: Workgroup) -> Result<Self> {
++        bail!("no audio workgroups on this platform")
++    }
++}

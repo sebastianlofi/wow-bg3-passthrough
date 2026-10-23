@@ -1,0 +1,36 @@
+WOW-BG3 vmangos patch 0018: a vendor's wares listed from afar.
+
+`.wowbg3 vendor list CHAR NPC` (it changes nothing) now answers for any living vendor within 100 yd,
+not only one in WoW's interaction range, so the BG3 side fills a vendor's stand-in before its trade
+screen opens (a playtest report: wares took long to appear). Buy and sell keep WoW's checks.
+
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index ae5708c..022ff9f 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -502,6 +502,8 @@ namespace
+             out.Add(l);
+     }
+ 
++    float const VENDOR_LIST_RANGE = 100.0f;                 // 0018: yards, a vendor seen from afar
++
+     Creature* Vendor(Player* m, std::string const& s, char const*& why)
+     {
+         why = nullptr;
+@@ -904,6 +906,16 @@ namespace
+         std::string const head = "WOWBG3 vendor " + name + " " + (a.size() > 4 ? a[4] : std::string("-")) + " ";
+         char const* why = nullptr;
+         Creature* v = a.size() > 4 ? Vendor(m, a[4], why) : nullptr;
++        // 0018: the list alone (it changes nothing) needs no interaction range: any living vendor the
++        // member can see (VENDOR_LIST_RANGE), so BG3 fills a vendor's stand-in with its wares before its
++        // trade screen opens. Buying and selling keep WoW's rules (range, faction).
++        if (!v && sub == "list" && a.size() > 4)
++        {
++            ObjectGuid g;
++            Creature* c = ParseGuid(a[4], g) && g.IsAnyTypeCreature() ? m->GetMap()->GetAnyTypeCreature(g) : nullptr;
++            if (c && c->IsAlive() && c->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_VENDOR) && m->IsWithinDistInMap(c, VENDOR_LIST_RANGE))
++                v = c;
++        }
+         if (!v)
+             return out.Add(head + "refused " + (why ? why : "usage"));
+         if (sub == "list")

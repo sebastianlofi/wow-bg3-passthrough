@@ -1,0 +1,85 @@
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -882,6 +882,9 @@
+             if let Some(last) = path.last() {
+                 f.walk_to = Some(wow_to_bevy(*last));
+             }
++        } else if f.world {
++            // World mode: the bridge streams every stand-in's position (`actor` lines, about 3 a
++            // second); BG3's paths arrive once the action is over and would replay it late.
+         } else if let Some(h) = by_id.get(actor).and_then(|g| f.held.get_mut(g)) {
+             h.track.extend(path.iter().map(|p| wow_to_bevy(*p)));
+         }
+@@ -1011,23 +1014,56 @@
+     mut units: Query<(Entity, &Guid, &mut Transform), Without<SelfPlayer>>,
+     mut swings: MessageWriter<SwingMessage>,
+     mut play_seq: ResMut<PlaySeq>,
++    mut trace_t: Local<f32>,
+ ) {
+     if f.held.is_empty() {
+         return;
+     }
+     let dt = time.delta_secs();
+     let victim = me.single().ok();
++    // Desktop test 2 (models lag or never move): every 2 s one line per held mob.
++    *trace_t += dt;
++    let trace = *trace_t >= 2.0;
++    if trace {
++        *trace_t = 0.0;
++    }
++    let mut seen: HashSet<u64> = HashSet::new();
+     for (entity, g, mut tf) in &mut units {
+         let Some(h) = f.held.get_mut(&g.0) else {
+             continue;
+         };
++        seen.insert(g.0);
+         h.since += dt;
++        if let Some(prev) = h.at {
++            // Something other than this system moved the model since the last frame.
++            if prev.distance(tf.translation) > 0.5 {
++                info!(
++                    "wowbg3 hold: {} guid {:#x} moved by another system {:.1} yd",
++                    h.id,
++                    g.0,
++                    prev.distance(tf.translation)
++                );
++            }
++        }
++        if trace {
++            info!(
++                "wowbg3 hold: {} guid {:#x} model {:.1?} goal {:?} track {} strikes {} behind {:.1} yd",
++                h.id,
++                g.0,
++                tf.translation,
++                h.goal.map(|v| [v.x as i32, v.y as i32, v.z as i32]),
++                h.track.len(),
++                h.strikes.len(),
++                h.goal.map_or(0.0, |v| v.distance(tf.translation))
++            );
++        }
+         let at = h.at.unwrap_or(tf.translation);
+         let next = h.track.front().copied().or(h.goal);
+         let mut moved = at;
+         if let Some(next) = next {
+-            let step = MOB_SPEED * dt;
+             let d = next - at;
++            // Catch up within about half a second when far behind (a Dash, a late update).
++            let step = MOB_SPEED.max(d.length() * 2.0) * dt;
+             if d.length() <= step {
+                 moved = next;
+                 h.track.pop_front();
+@@ -1064,6 +1100,13 @@
+         }
+         tf.translation = moved;
+     }
++    if trace {
++        for (guid, h) in &f.held {
++            if !seen.contains(guid) {
++                info!("wowbg3 hold: {} guid {guid:#x} has no unit in benilla", h.id);
++            }
++        }
++    }
+ }
+ 
+ /// `WOW_BG3_M5=1`: the bridge's server requests (`server-cmd.txt`: `SEQ .wowbg3 ...` per line,

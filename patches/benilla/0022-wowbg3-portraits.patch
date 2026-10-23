@@ -1,0 +1,655 @@
+diff --git a/crates/benilla-app/src/portrait/mod.rs b/crates/benilla-app/src/portrait/mod.rs
+--- a/crates/benilla-app/src/portrait/mod.rs
++++ b/crates/benilla-app/src/portrait/mod.rs
+@@ -62,12 +62,16 @@
+ pub(crate) use light::{material_variant, VariantLane};
+ use light::{model_pane_light, studio_light, BoothLight};
+ pub(crate) mod test_bake;
++// WOW-BG3: WoW creature portraits for BG3's stand-ins, baked in one more round-portrait slot and
++// written as WebP (local fork, not upstream benilla).
++mod webp;
++pub(crate) mod wowbg3;
+ 
+ /// The round portrait slots, each with its own layer and camera. `"npc"` is an interaction
+ /// window's NPC ([`crate::ui_session::InteractNpc`]); `"targettarget"` resolves only while drawn,
+ /// and so do a party member's pet, `"partypetN"`, and the loot source `SetLootPortrait` binds
+ /// ([`benilla_ui::script::LOOT_PORTRAIT_UNIT`]).
+-const SLOTS: [&str; 14] = [
++const SLOTS: [&str; 15] = [
+     "player",
+     "target",
+     "targettarget",
+@@ -82,6 +86,8 @@
+     "partypet3",
+     "partypet4",
+     benilla_ui::script::LOOT_PORTRAIT_UNIT,
++    // WOW-BG3: the mirrored mob `wowbg3::drive` is baking for BG3 (none without a link dir).
++    wowbg3::SLOT,
+ ];
+ /// The character window's full-body pane: the dressed player, sampled square.
+ const PAPERDOLL_SLOT: &str = "paperdoll";
+@@ -679,6 +685,8 @@
+     bakes: ResMut<'w, PortraitBakes>,
+     images: ResMut<'w, Assets<Image>>,
+     targets: Query<'w, 's, (&'static BoothCam, &'static mut RenderTarget)>,
++    /// WOW-BG3: the subject of the stand-in portrait slot.
++    wowbg3: Res<'w, wowbg3::WowBg3Portraits>,
+ }
+ 
+ /// Tags a booth camera with its slot token (not the M2 rig, `benilla_assets::PortraitCamera`).
+@@ -773,6 +781,7 @@
+             .init_resource::<BoothPanes>()
+             .init_resource::<GxAspect>()
+             .init_resource::<BoothLight>()
++            .init_resource::<wowbg3::WowBg3Portraits>()
+             .add_systems(Startup, setup_booths)
+             // The variant-cache reaper: booth twins die with their world source material.
+             .add_systems(Update, (light::reap_dead_variants, feed_gx_aspect))
+@@ -811,6 +820,8 @@
+                     .chain()
+                     .after(GluePreviewFeed),
+             )
++            // WOW-BG3: the stand-in portraits, after the gate settled this frame's booths.
++            .add_systems(Update, wowbg3::drive.after(gate_booth_cameras))
+             // Re-face each booth's eye-glow cards to its own camera.
+             .add_systems(Update, booth::face_booth_billboards)
+             // Push each booth part's sampled `MatAnim` alpha, after the sampler.
+@@ -1354,6 +1365,8 @@
+                         .and_then(|g| party.index.0.get(&g).copied())
+                 })
+                 .flatten(),
++            // WOW-BG3: a mirrored mob whose portrait BG3 needs.
++            wowbg3::SLOT => party.wowbg3.subject,
+             // A party member's pet, gated on the UI drawing it as `"targettarget"` is: a slot's
+             // frame ships hidden, and an undrawn one would bake for nothing.
+             tok if tok.starts_with("partypet") => {
+diff --git a/crates/benilla-app/src/portrait/webp.rs b/crates/benilla-app/src/portrait/webp.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/portrait/webp.rs
+@@ -0,0 +1,333 @@
++//! A small lossless WebP (VP8L) encoder for the WOW-BG3 portraits: BG3's custom
++//! character icon is a WebP image (`eoc::CustomIconComponent`), so the baked WoW portraits go out
++//! in that container. Subtract-green and predictor transforms (a mode per 16 x 16 block, chosen
++//! from left, top, their average, select and clamp-add-subtract), one prefix-code group, no back
++//! references and no colour cache: plain, and readable by any WebP decoder (libwebp in BG3).
++//! Format: RFC 9649 (WebP), section 3 (lossless bitstream).
++
++use std::collections::BinaryHeap;
++use std::cmp::Reverse;
++
++/// Encodes `rgba` (`width * height` RGBA8 pixels, rows top to bottom) as a lossless WebP file.
++/// Alpha is written as is; `opaque` ignores it (every pixel 255) and leaves it out of the header.
++pub(crate) fn encode_lossless(width: u32, height: u32, rgba: &[u8], opaque: bool) -> Vec<u8> {
++    assert!(width >= 1 && height >= 1 && width <= 16384 && height <= 16384);
++    let (w, h) = (width as usize, height as usize);
++    assert_eq!(rgba.len(), w * h * 4);
++    // ARGB, green subtracted from red and blue.
++    let mut argb: Vec<u32> = rgba
++        .chunks_exact(4)
++        .map(|p| {
++            let a = if opaque { 255 } else { p[3] as u32 };
++            let g = p[1] as u32;
++            let r = (p[0] as u32).wrapping_sub(g) & 0xff;
++            let b = (p[2] as u32).wrapping_sub(g) & 0xff;
++            (a << 24) | (r << 16) | (g << 8) | b
++        })
++        .collect();
++    // Predictor: one mode per block, the one with the smallest residuals.
++    const BITS: u32 = 4;
++    let block = 1usize << BITS;
++    let (bw_, bh_) = (w.div_ceil(block), h.div_ceil(block));
++    let mut modes = vec![MODES[0]; bw_ * bh_];
++    for by in 0..bh_ {
++        for bx in 0..bw_ {
++            let mut best = (u64::MAX, MODES[0]);
++            for &m in &MODES {
++                let mut cost = 0u64;
++                for y in by * block..((by + 1) * block).min(h) {
++                    for x in bx * block..((bx + 1) * block).min(w) {
++                        let r = sub_pixels(argb[y * w + x], predict(&argb, w, x, y, m));
++                        cost += [0, 8, 16, 24].iter().map(|s| {
++                            let v = ((r >> s) & 0xff) as i32;
++                            v.min(256 - v) as u64
++                        }).sum::<u64>();
++                    }
++                }
++                if cost < best.0 {
++                    best = (cost, m);
++                }
++            }
++            modes[by * bw_ + bx] = best.1;
++        }
++    }
++    // Residuals, from the originals (the decoder predicts from what it has rebuilt: the same).
++    let mut res = vec![0u32; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            let m = modes[(y >> BITS) * bw_ + (x >> BITS)];
++            res[y * w + x] = sub_pixels(argb[y * w + x], predict(&argb, w, x, y, m));
++        }
++    }
++    argb.clear();
++
++    let mut bw = BitWriter::default();
++    bw.put(0x2f, 8);
++    bw.put(width - 1, 14);
++    bw.put(height - 1, 14);
++    bw.put(u32::from(!opaque), 1);
++    bw.put(0, 3);
++    // Transforms, in the order applied (the decoder undoes them backwards).
++    bw.put(1, 1);
++    bw.put(2, 2); // subtract green
++    bw.put(1, 1);
++    bw.put(0, 2); // predictor
++    bw.put(BITS - 2, 3);
++    let mode_image: Vec<u32> = modes.iter().map(|&m| 0xff00_0000 | ((m as u32) << 8)).collect();
++    write_image(&mut bw, &mode_image, false);
++    bw.put(0, 1); // no more transforms
++    write_image(&mut bw, &res, true);
++    let data = bw.finish();
++
++    let pad = data.len() & 1;
++    let mut out = Vec::with_capacity(data.len() + 21);
++    out.extend_from_slice(b"RIFF");
++    out.extend_from_slice(&((4 + 8 + data.len() + pad) as u32).to_le_bytes());
++    out.extend_from_slice(b"WEBP");
++    out.extend_from_slice(b"VP8L");
++    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
++    out.extend_from_slice(&data);
++    if pad == 1 {
++        out.push(0);
++    }
++    out
++}
++
++/// The predictor modes tried per block: L, T, average of L and T, select, clamp-add-subtract-full.
++/// None reads the top-right pixel, whose rightmost-column rule this encoder need not model.
++const MODES: [u8; 5] = [1, 2, 7, 11, 12];
++
++fn predict(p: &[u32], w: usize, x: usize, y: usize, mode: u8) -> u32 {
++    if x == 0 && y == 0 {
++        return 0xff00_0000;
++    }
++    if y == 0 {
++        return p[x - 1];
++    }
++    if x == 0 {
++        return p[(y - 1) * w];
++    }
++    let l = p[y * w + x - 1];
++    let t = p[(y - 1) * w + x];
++    let tl = p[(y - 1) * w + x - 1];
++    match mode {
++        1 => l,
++        2 => t,
++        7 => average2(l, t),
++        11 => select(l, t, tl),
++        12 => clamp_add_subtract_full(l, t, tl),
++        _ => unreachable!(),
++    }
++}
++
++fn average2(a: u32, b: u32) -> u32 {
++    (((a ^ b) & 0xfefe_fefe) >> 1) + (a & b)
++}
++
++fn channel(v: u32, s: u32) -> i32 {
++    ((v >> s) & 0xff) as i32
++}
++
++fn select(l: u32, t: u32, tl: u32) -> u32 {
++    let mut pl = 0;
++    let mut pt = 0;
++    for s in [24, 16, 8, 0] {
++        let p = channel(l, s) + channel(t, s) - channel(tl, s);
++        pl += (p - channel(l, s)).abs();
++        pt += (p - channel(t, s)).abs();
++    }
++    if pl < pt { l } else { t }
++}
++
++fn clamp_add_subtract_full(a: u32, b: u32, c: u32) -> u32 {
++    let mut out = 0;
++    for s in [24, 16, 8, 0] {
++        let v = (channel(a, s) + channel(b, s) - channel(c, s)).clamp(0, 255) as u32;
++        out |= v << s;
++    }
++    out
++}
++
++fn sub_pixels(a: u32, b: u32) -> u32 {
++    let ag = 0x00ff_00ffu32.wrapping_add(a & 0xff00_ff00).wrapping_sub(b & 0xff00_ff00);
++    let rb = 0xff00_ff00u32.wrapping_add(a & 0x00ff_00ff).wrapping_sub(b & 0x00ff_00ff);
++    (ag & 0xff00_ff00) | (rb & 0x00ff_00ff)
++}
++
++/// An image's entropy-coded data: no colour cache, one prefix-code group (the main image says so
++/// with its meta-code bit), the five codes, then each pixel as green, red, blue, alpha literals.
++fn write_image(bw: &mut BitWriter, px: &[u32], main: bool) {
++    bw.put(0, 1); // no colour cache
++    if main {
++        bw.put(0, 1); // no meta prefix codes
++    }
++    let mut hist = [vec![0u32; 280], vec![0u32; 256], vec![0u32; 256], vec![0u32; 256], vec![0u32; 40]];
++    for &p in px {
++        hist[0][((p >> 8) & 0xff) as usize] += 1;
++        hist[1][((p >> 16) & 0xff) as usize] += 1;
++        hist[2][(p & 0xff) as usize] += 1;
++        hist[3][(p >> 24) as usize] += 1;
++    }
++    let mut codes = Vec::with_capacity(5);
++    for h in &hist {
++        let lens = write_code(bw, h);
++        codes.push((canonical(&lens), lens));
++    }
++    for &p in px {
++        for (k, s) in [(0usize, 8u32), (1, 16), (2, 0), (3, 24)] {
++            let v = ((p >> s) & 0xff) as usize;
++            let (c, l) = (&codes[k].0, &codes[k].1);
++            bw.put(c[v], l[v] as u32);
++        }
++    }
++}
++
++/// Writes the prefix code for a histogram and returns the code lengths the pixels are written with
++/// (all zero for a code of one symbol, which takes no bits).
++fn write_code(bw: &mut BitWriter, freq: &[u32]) -> Vec<u8> {
++    let used: Vec<usize> = (0..freq.len()).filter(|&i| freq[i] > 0).collect();
++    if used.len() <= 1 {
++        // Simple code, one symbol (a literal under 256).
++        let s = used.first().copied().unwrap_or(0) as u32;
++        bw.put(1, 1);
++        bw.put(0, 1);
++        if s < 2 {
++            bw.put(0, 1);
++            bw.put(s, 1);
++        } else {
++            bw.put(1, 1);
++            bw.put(s, 8);
++        }
++        return vec![0; freq.len()];
++    }
++    let lens = limited_lengths(freq, 15);
++    bw.put(0, 1); // normal code
++    let mut clfreq = [0u32; 19];
++    for &l in &lens {
++        clfreq[l as usize] += 1;
++    }
++    let cl_lens = limited_lengths(&clfreq, 7);
++    const ORDER: [usize; 19] = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
++    let mut n = 19;
++    while n > 4 && cl_lens[ORDER[n - 1]] == 0 {
++        n -= 1;
++    }
++    bw.put((n - 4) as u32, 4);
++    for &o in &ORDER[..n] {
++        bw.put(cl_lens[o] as u32, 3);
++    }
++    bw.put(0, 1); // every symbol of the alphabet has a length
++    if cl_lens.iter().filter(|&&l| l > 0).count() > 1 {
++        let cl_codes = canonical(&cl_lens);
++        for &l in &lens {
++            bw.put(cl_codes[l as usize], cl_lens[l as usize] as u32);
++        }
++    } // else one code length for every symbol: the decoder reads it with no bits
++    lens
++}
++
++/// Huffman code lengths no longer than `limit` (frequencies flattened until they fit). Two or more
++/// used symbols give a complete code; one used symbol gets length 1.
++fn limited_lengths(freq: &[u32], limit: u8) -> Vec<u8> {
++    let mut f: Vec<u64> = freq.iter().map(|&x| x as u64).collect();
++    loop {
++        let lens = huffman_lengths(&f);
++        if lens.iter().all(|&l| l <= limit) {
++            return lens;
++        }
++        for x in f.iter_mut().filter(|x| **x > 0) {
++            *x = (*x >> 1) | 1;
++        }
++    }
++}
++
++fn huffman_lengths(f: &[u64]) -> Vec<u8> {
++    let used: Vec<usize> = (0..f.len()).filter(|&i| f[i] > 0).collect();
++    let mut lens = vec![0u8; f.len()];
++    match used.len() {
++        0 => return lens,
++        1 => {
++            lens[used[0]] = 1;
++            return lens;
++        }
++        _ => {}
++    }
++    let mut parent = vec![usize::MAX; 2 * used.len()];
++    let mut heap = BinaryHeap::new();
++    for (k, &i) in used.iter().enumerate() {
++        heap.push(Reverse((f[i], k)));
++    }
++    let mut next = used.len();
++    while heap.len() > 1 {
++        let Reverse((w1, a)) = heap.pop().unwrap();
++        let Reverse((w2, b)) = heap.pop().unwrap();
++        parent[a] = next;
++        parent[b] = next;
++        heap.push(Reverse((w1 + w2, next)));
++        next += 1;
++    }
++    let root = next - 1;
++    for (k, &i) in used.iter().enumerate() {
++        let (mut d, mut x) = (0u8, k);
++        while x != root {
++            x = parent[x];
++            d += 1;
++        }
++        lens[i] = d;
++    }
++    lens
++}
++
++/// Canonical codes for the lengths, bit-reversed for the LSB-first writer (as libwebp's).
++fn canonical(lens: &[u8]) -> Vec<u32> {
++    let max = lens.iter().copied().max().unwrap_or(0) as usize;
++    let mut count = vec![0u32; max + 1];
++    for &l in lens.iter().filter(|&&l| l > 0) {
++        count[l as usize] += 1;
++    }
++    let mut next = vec![0u32; max + 1];
++    let mut code = 0u32;
++    for bits in 1..=max {
++        code = (code + count[bits - 1]) << 1;
++        next[bits] = code;
++    }
++    lens.iter()
++        .map(|&l| {
++            if l == 0 {
++                return 0;
++            }
++            let c = next[l as usize];
++            next[l as usize] += 1;
++            c.reverse_bits() >> (32 - l as u32)
++        })
++        .collect()
++}
++
++#[derive(Default)]
++struct BitWriter {
++    out: Vec<u8>,
++    acc: u64,
++    n: u32,
++}
++
++impl BitWriter {
++    fn put(&mut self, v: u32, bits: u32) {
++        if bits == 0 {
++            return;
++        }
++        debug_assert!(bits == 32 || v >> bits == 0);
++        self.acc |= (v as u64) << self.n;
++        self.n += bits;
++        while self.n >= 8 {
++            self.out.push(self.acc as u8);
++            self.acc >>= 8;
++            self.n -= 8;
++        }
++    }
++    fn finish(mut self) -> Vec<u8> {
++        if self.n > 0 {
++            self.out.push(self.acc as u8);
++        }
++        self.out
++    }
++}
+diff --git a/crates/benilla-app/src/portrait/wowbg3.rs b/crates/benilla-app/src/portrait/wowbg3.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/portrait/wowbg3.rs
+@@ -0,0 +1,247 @@
++//! WOW-BG3 (local fork, not upstream benilla): WoW creature portraits for BG3.
++//!
++//! In world mode each WoW mob near the player has a BG3 stand-in, and BG3's turn order shows a
++//! character's portrait from its custom icon (`eoc::CustomIconComponent`, a WebP image, the
++//! component Tav's own portrait lives in), which the mod (`Portraits.lua`) fills from the files
++//! written here. One more round-portrait booth slot, [`SLOT`], bakes each mirrored mob's model as
++//! WoW's target frame shows it (the model's portrait camera, the booth's studio light, 256²; see
++//! the parent module), once per display id per run. The settled bake is read back as
++//! `WOW_BOOTH_DUMP` does (`Screenshot::image`, the sRGB encode of
++//! [`super::test_bake::encode_target_readback`]) and written as
++//! `$WOW_BG3_LINK_DIR/portraits/<display id>.webp` (lossless, [`super::webp`]), and
++//! `portraits/guids.txt` lists `<guid hex> <display id>` for every mirrored mob whose display has a
++//! file. The mirrored mobs are the bridge's (`mirrored.txt`, `m <guid hex>` lines).
++//!
++//! Off unless `WOW_BG3_LINK_DIR` is set. Logs `wowbg3 portrait:` lines.
++
++use std::collections::{BTreeMap, HashMap, HashSet};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++use bevy::prelude::*;
++use bevy::render::view::window::screenshot::{Screenshot, ScreenshotCaptured};
++
++use super::{Booths, BOOTH_SETTLE_FRAMES};
++
++/// The booth slot the stand-in portraits bake in.
++pub(super) const SLOT: &str = "wowbg3";
++
++/// Frames the settled booth is held awake before the shot: a sleeping booth's target reads back
++/// empty (see `WOW_BOOTH_DUMP`).
++const WAKE_LEAD: u32 = 3;
++/// A bake that never settles is dropped after this long (wall seconds) and tried again later.
++const BAKE_TIMEOUT: f64 = 20.0;
++/// A readback that never arrives is dropped after this long.
++const SHOT_TIMEOUT: f64 = 10.0;
++/// A display whose bake failed is tried again after this long.
++const RETRY_AFTER: f64 = 120.0;
++
++#[derive(Resource)]
++pub(crate) struct WowBg3Portraits {
++    dir: Option<PathBuf>,
++    /// The unit the booth bakes now, read by `sync_portraits`.
++    pub(super) subject: Option<Entity>,
++    job: Option<Job>,
++    /// Display ids written this run.
++    written: HashSet<u32>,
++    /// Display ids whose bake failed, and when (wall seconds).
++    failed: HashMap<u32, f64>,
++    mirrored: Vec<u64>,
++    /// What guids.txt holds now.
++    listed: BTreeMap<u64, u32>,
++    frame: u64,
++    /// Readbacks the observers finished: display id, file size or why not.
++    shots: Arc<Mutex<Vec<(u32, Result<usize, String>)>>>,
++}
++
++impl Default for WowBg3Portraits {
++    fn default() -> Self {
++        let dir = std::env::var_os("WOW_BG3_LINK_DIR").map(PathBuf::from);
++        if let Some(d) = &dir {
++            let _ = std::fs::create_dir_all(d.join("portraits"));
++        }
++        Self {
++            dir,
++            subject: None,
++            job: None,
++            written: HashSet::new(),
++            failed: HashMap::new(),
++            mirrored: Vec::new(),
++            listed: BTreeMap::new(),
++            frame: 0,
++            shots: Arc::new(Mutex::new(Vec::new())),
++        }
++    }
++}
++
++struct Job {
++    guid: u64,
++    display: u32,
++    entity: Entity,
++    since: f64,
++    stage: Stage,
++}
++
++enum Stage {
++    /// Waiting for `sync_portraits` to bake the subject and the gate to settle it; `armed` once the
++    /// bake has woken the booth.
++    Baking { armed: bool },
++    /// Holding the settled booth awake for the shot.
++    Waking(u32),
++    /// The readback is in flight.
++    Shooting,
++}
++
++fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
++    let tmp = path.with_extension("tmp");
++    std::fs::write(&tmp, bytes)?;
++    std::fs::rename(&tmp, path)
++}
++
++/// After [`super::gate_booth_cameras`]: picks the next mirrored mob without a portrait, follows its
++/// bake, shoots the settled booth and keeps `guids.txt`.
++pub(super) fn drive(
++    mut commands: Commands,
++    mut state: ResMut<WowBg3Portraits>,
++    mut booths: ResMut<Booths>,
++    index: Res<crate::net::GuidIndex>,
++    ents: Query<&crate::net::NetEntity>,
++    time: Res<Time<bevy::time::Real>>,
++) {
++    let Some(dir) = state.dir.clone() else {
++        return;
++    };
++    state.frame += 1;
++    let now = time.elapsed_secs_f64();
++    let finished: Vec<_> = state.shots.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
++    for (id, result) in finished {
++        match result {
++            Ok(bytes) => {
++                info!("wowbg3 portrait: display {id} written ({bytes} bytes)");
++                state.written.insert(id);
++                state.failed.remove(&id);
++            }
++            Err(why) => {
++                warn!("wowbg3 portrait: display {id} not written: {why}");
++                state.failed.insert(id, now);
++            }
++        }
++        if state.job.as_ref().is_some_and(|j| j.display == id) {
++            state.job = None;
++            state.subject = None;
++        }
++    }
++    if state.frame % 30 == 3 {
++        let text = std::fs::read_to_string(dir.join("mirrored.txt")).unwrap_or_default();
++        state.mirrored = text
++            .lines()
++            .filter_map(|l| l.strip_prefix("m "))
++            .filter_map(|g| u64::from_str_radix(g.trim(), 16).ok())
++            .collect();
++    }
++    let display_of = |guid: u64| -> Option<(Entity, u32)> {
++        let e = *index.0.get(&guid)?;
++        Some((e, ents.get(e).ok()?.display_id?))
++    };
++    if state.frame % 30 == 4 {
++        let listed: BTreeMap<u64, u32> = state
++            .mirrored
++            .iter()
++            .filter_map(|&g| display_of(g).map(|(_, d)| (g, d)))
++            .filter(|(_, d)| state.written.contains(d))
++            .collect();
++        if listed != state.listed {
++            let text: String = listed.iter().map(|(g, d)| format!("{g:016x} {d}\n")).collect();
++            match write_atomic(&dir.join("portraits").join("guids.txt"), text.as_bytes()) {
++                Ok(()) => state.listed = listed,
++                Err(e) => warn!("wowbg3 portrait: cannot write guids.txt: {e}"),
++            }
++        }
++    }
++    let Some(booth) = booths.0.get_mut(SLOT) else {
++        return;
++    };
++    let Some(mut job) = state.job.take() else {
++        // The next mirrored mob whose display has no portrait yet.
++        let next = state.mirrored.iter().find_map(|&g| {
++            let (e, d) = display_of(g)?;
++            let blocked = state.written.contains(&d) || state.failed.get(&d).is_some_and(|t| now - t < RETRY_AFTER);
++            (!blocked).then_some((g, e, d))
++        });
++        if let Some((guid, entity, display)) = next {
++            // Forget the last bake, so this subject bakes even at an identical look.
++            booth.baked = None;
++            state.subject = Some(entity);
++            state.job = Some(Job {
++                guid,
++                display,
++                entity,
++                since: now,
++                stage: Stage::Baking { armed: false },
++            });
++        } else {
++            state.subject = None;
++        }
++        return;
++    };
++    if ents.get(job.entity).is_err() {
++        // The mob went away mid-bake; it is picked again when it comes back.
++        state.subject = None;
++        return;
++    }
++    let timeout = match job.stage {
++        Stage::Shooting => BAKE_TIMEOUT + SHOT_TIMEOUT,
++        _ => BAKE_TIMEOUT,
++    };
++    if now - job.since > timeout {
++        warn!(
++            "wowbg3 portrait: display {} (guid {:016x}) gave up after {timeout:.0} s",
++            job.display, job.guid
++        );
++        state.failed.insert(job.display, now);
++        state.subject = None;
++        return;
++    }
++    match job.stage {
++        Stage::Baking { armed } => {
++            let busy = booth.wake > 0 || !booth.pending.is_empty() || booth.pipes_settling;
++            if busy {
++                job.stage = Stage::Baking { armed: true };
++            } else if armed && booth.baked.is_some() {
++                job.stage = Stage::Waking(0);
++            }
++        }
++        Stage::Waking(n) => {
++            booth.wake = booth.wake.max(BOOTH_SETTLE_FRAMES);
++            if n + 1 < WAKE_LEAD {
++                job.stage = Stage::Waking(n + 1);
++            } else {
++                let path = dir.join("portraits").join(format!("{}.webp", job.display));
++                let shots = state.shots.clone();
++                let display = job.display;
++                commands
++                    .spawn(Screenshot::image(booth.target.clone()))
++                    .observe(move |shot: On<ScreenshotCaptured>| {
++                        let result = (|| -> Result<usize, String> {
++                            let img = super::test_bake::encode_target_readback(&shot.image)
++                                .ok_or("unexpected target format")?;
++                            let size = img.texture_descriptor.size;
++                            let rgba = img.data.as_ref().ok_or("no pixels")?;
++                            let webp = super::webp::encode_lossless(size.width, size.height, rgba, true);
++                            write_atomic(&path, &webp).map_err(|e| e.to_string())?;
++                            Ok(webp.len())
++                        })();
++                        if let Ok(mut s) = shots.lock() {
++                            s.push((display, result));
++                        }
++                    });
++                job.stage = Stage::Shooting;
++            }
++        }
++        Stage::Shooting => {
++            // Keep the gate open until the readback lands.
++            booth.wake = booth.wake.max(1);
++        }
++    }
++    state.job = Some(job);
++}

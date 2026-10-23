@@ -1,0 +1,169 @@
+--- a/crates/benilla-app/src/player/view_subject.rs
++++ b/crates/benilla-app/src/player/view_subject.rs
+@@ -30,6 +30,16 @@
+     pub(crate) feet: Vec3,
+     /// Its framing pivot height above the feet, as [`head_height`] gives it.
+     pub(crate) pivot_height: f32,
++}
++
++impl ViewSubject {
++    /// WOW-BG3 (local fork, patch 0040, Far Sight): the point WoW's world is seen from, the
++    /// far-sight subject's feet while the view is out on one, else `own` (our body). World mode
++    /// moves the view onto the party member the player controls (a server-side bot character), so
++    /// everything that streams or lists the world round the viewer asks this, not the body.
++    pub(crate) fn point(&self, own: Vec3) -> Vec3 {
++        self.remote.map_or(own, |r| r.feet)
++    }
+ }
+ 
+ impl RemoteView {
+--- a/crates/benilla-app/src/player/world_focus.rs
++++ b/crates/benilla-app/src/player/world_focus.rs
+@@ -16,7 +16,11 @@
+     rig: Option<Res<super::CameraControl>>,
+     screen: Option<Res<crate::loading_screen::LoadingScreen>>,
+     store: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
++    subject: Option<Res<super::ViewSubject>>,
+ ) {
++    // Patch 0040 (Far Sight): with the view out on another character the body is not the
++    // viewer: the eye's surroundings (interiors, water) are judged from the camera, as in free-fly.
++    let view_out = subject.as_deref().is_some_and(|s| s.remote.is_some());
+     // Drunk and ghost are whole-screen effects of our own character, so they read `SelfPlayer`,
+     // not the body we drive: possessing a boar does not sober you up.
+     let (drunk, ghost) = match store.single() {
+@@ -30,7 +34,7 @@
+     // `WOW_GHOST_PROBE` overrides the flag the death light and the DeathClouds sky both read.
+     let ghost = crate::death::ghost_probe().unwrap_or(ghost);
+     let body = match player.as_deref() {
+-        Some(p) if p.active && !p.detached => Viewer {
++        Some(p) if p.active && !p.detached && !view_out => Viewer {
+             at: Some(p.pos),
+             move_flags: p.move_flags(),
+             planar_speed: p.planar_speed(),
+@@ -56,8 +60,27 @@
+     mut player: Option<ResMut<Player>>,
+     roster: Option<Res<crate::char_select::Roster>>,
+     cinematic: Option<Res<crate::cinematic::Cinematic>>,
++    subject: Option<Res<super::ViewSubject>>,
+     mut was_flying: Local<bool>,
++    mut was_out: Local<bool>,
+ ) {
++    // Patch 0040 (Far Sight): the view out on another character (Mind Vision, or world mode's
++    // controlled party member hundreds of yards from our body) streams the world round the eye,
++    // which sits on that character; the body keeps its own place (and the zone authority).
++    let remote = subject.as_deref().and_then(|s| s.remote);
++    let view_out = remote.is_some();
++    if view_out != *was_out {
++        *was_out = view_out;
++        match (remote, player.as_deref()) {
++            (Some(r), Some(p)) => info!(
++                "far sight: the view is out on {:?} at WoW {:?}, {:.0} yd from the body; the world streams round the eye",
++                r.entity,
++                benilla_assets::coords::bevy_to_wow(r.feet).map(|v| v.round()),
++                r.feet.distance(p.pos)
++            ),
++            _ => info!("far sight: the view is back on the body"),
++        }
++    }
+     let entry = roster
+         .as_deref()
+         .and_then(crate::char_select::Roster::pending_entry);
+@@ -82,7 +105,7 @@
+         Some(p) if p.active => {
+             let wow = benilla_assets::coords::bevy_to_wow(p.pos);
+             let paced = !p.settling && !p.world_stale;
+-            if p.detached || flying {
++            if p.detached || flying || view_out {
+                 ViewFocus::detached(wow, paced)
+             } else {
+                 ViewFocus::body(wow, paced)
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -952,6 +952,7 @@
+     factions: Option<Res<Factions>>,
+     reps: Option<Res<Reputations>>,
+     names: Option<Res<crate::names::NameCache>>,
++    subject: Option<Res<crate::player::ViewSubject>>,
+ ) {
+     f.frame += 1;
+     let empty = Reputations(Vec::new());
+@@ -960,6 +961,9 @@
+         return;
+     };
+     let my_guid = my_guid.0;
++    // Patch 0040 (Far Sight): mobs are listed, packed and pulled round the point WoW is seen
++    // from (the controlled party member while the view is out on it), not the body.
++    let seen_from = subject.as_deref().map_or(player.pos, |s| s.point(player.pos));
+     let name_of = |store: &ObjectStore| {
+         store
+             .0
+@@ -1010,7 +1014,7 @@
+         );
+         let mut near = HashSet::new();
+         for (g, store, tf) in &units {
+-            if player.pos.distance(tf.translation) > MIRROR_RANGE {
++            if seen_from.distance(tf.translation) > MIRROR_RANGE {
+                 continue;
+             }
+             let Some(reaction) = reaction(store, my_store, factions.as_deref(), reps) else {
+@@ -1055,7 +1059,7 @@
+                 .push((g.0, tf.translation, hostile, store.0.object_entry().unwrap_or(0)));
+             if store.0.unit_target() == Some(my_guid)
+                 && store.0.unit_flags() & UNIT_FLAG_IN_COMBAT != 0
+-                && player.pos.distance(tf.translation) <= PACK_RANGE
++                && seen_from.distance(tf.translation) <= PACK_RANGE
+                 && !frozen.contains(&g.0)
+             {
+                 s.in_combat.push(g.0);
+@@ -1086,7 +1090,7 @@
+                 let Some((_, _, tf)) = unit_of(guid) else {
+                     continue;
+                 };
+-                let distance = player.pos.distance(tf.translation);
++                let distance = seen_from.distance(tf.translation);
+                 if distance > PULL_RANGE {
+                     say(
+                         &mut chat,
+@@ -1105,7 +1109,7 @@
+             }
+             // Attacking a mob that is not in the fight provokes it: it joins.
+             Event::Swing(guid) => {
+-                if unit_of(guid).is_some_and(|(_, _, tf)| player.pos.distance(tf.translation) <= PACK_RANGE) {
++                if unit_of(guid).is_some_and(|(_, _, tf)| seen_from.distance(tf.translation) <= PACK_RANGE) {
+                     join.push(guid);
+                 }
+             }
+--- a/crates/benilla-app/src/player/controller.rs
++++ b/crates/benilla-app/src/player/controller.rs
+@@ -198,8 +198,10 @@
+     // latches only once resolved) and spares a possessed mover, which sets the same field.
+     let mover = state::MoverInput {
+         dead,
++        // WOW-BG3 (patch 0040, Far Sight): in world mode the body is BG3's character's, which
++        // keeps walking while the view is out on another party member; never frozen by it.
+         view_is_out: state::view_is_out(
+-            player.foreign_mover.is_none(),
++            player.foreign_mover.is_none() && !crate::wowbg3_lead::hide_self(),
+             view_subject.remote.is_some(),
+         ),
+     };
+--- a/crates/benilla-app/src/minimap/wowbg3.rs
++++ b/crates/benilla-app/src/minimap/wowbg3.rs
+@@ -97,6 +97,7 @@
+     catalog: Option<Res<MapCatalogRes>>,
+     player: Res<Player>,
+     time: Res<Time<bevy::time::Real>>,
++    subject: Option<Res<crate::player::ViewSubject>>,
+ ) {
+     let Some(dir) = st.dir.clone() else {
+         return;
+@@ -132,7 +133,8 @@
+     if player.pos == Vec3::ZERO {
+         return;
+     }
+-    let wow = bevy_to_wow(player.pos);
++    // Patch 0040 (Far Sight): the tiles round the point WoW is seen from.
++    let wow = bevy_to_wow(subject.as_deref().map_or(player.pos, |s| s.point(player.pos)));
+     let (tx, ty) = world_to_tile(wow[0], wow[1]);
+     let key = Key { map: map.0, tx, ty };
+     if st.shown == Some(key) {

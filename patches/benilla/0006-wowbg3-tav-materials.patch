@@ -1,0 +1,1179 @@
+WOW-BG3 benilla patch 0006: Tav's BG3 surface detail under WoW's light (on top of 0001-0005).
+
+- wowbg3_tav.rs: per-vertex normals and tangents from BG3's qtangent frames (axes picked by the
+  faces and the UV gradients; the quaternion's sign flips mirrored halves), tangents skinned on
+  the CPU, triangles re-wound for the mirrored mapping; tavtex.txt's normal and surface maps
+  (TVT flag 4 linear, normal mips renormalised) on a WoW model material marked TAV_SURFACE; a
+  new plan keeps persisting meshes' looks and hides new meshes until their maps arrive.
+  Knobs: WOW_BG3_TAV_SPEC (highlight, 0.5), WOW_BG3_TAV_NORMAL_Y=flip, WOW_BG3_TAV_MAPS=off.
+- materials.rs: TAV_SURFACE_MARKER (clutter_fade.z bit 14), a WowModelKey axis that sets the
+  WOW_TAV_SURFACE shader def.
+- wow_model.wgsl: vertex tangents passed through (only Tav's meshes carry them); under
+  WOW_TAV_SURFACE the normal-mapped normal, occlusion on the ambient term and a restrained GGX
+  highlight of the sun from roughness and metalness.
+
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index 8c4295d..3073b3f 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -9,12 +9,25 @@
+ //! pose: `v = Σ wᵢ·Pᵢ·[p, 1]` with the palette's 3×4 rows, then the object's world transform
+ //! (BG3 metres), then world mode's mapping into WoW (`WorldMode.lua`: mirrored, yards), then
+ //! Bevy's axes. The ground lock (`wowbg3_lead`) lowers her with the camera, so her feet meet WoW's
+-//! ground. Untextured for now: a clay figure in WoW's light.
++//! ground. Textured from `tavtex.py`'s bakes (patch 0006, below).
+ //!
+ //! File layouts are documented in the layer; every record is decoded defensively (a short or
+ //! foreign file is ignored).
++//!
++//! Patch 0006 (her BG3 surface detail under WoW's light, "as long as it looks close to
++//! the original"): `link/tools/tavtex.py` bakes per material an albedo, a tangent-space normal map
++//! and a surface map (R occlusion, G roughness, B metalness), listed in `tavtex.txt` as
++//! `<mesh key> <albedo> <flags> <normal or -> <surface>`. Each mesh gets per-vertex tangents from
++//! BG3's qtangent frames (axes picked by the faces and the UV gradients, handedness from the UV
++//! winding) and a WoW model material whose base carries the maps (`WOW_TAV_SURFACE` in
++//! `wow_model.wgsl`): same sun, ambient, shade and fog as before, with the mapped normal, the
++//! occlusion on the ambient and a restrained GGX highlight. Her triangles are re-wound for the
++//! mirrored mapping so her outside faces are front faces. A new plan (an attachment coming or
++//! going) keeps every persisting mesh's look, and new meshes stay hidden until their maps arrive,
++//! so she no longer flashes untextured.
+ 
+-use std::path::PathBuf;
++use std::collections::{HashMap, HashSet};
++use std::path::{Path, PathBuf};
+ use std::time::{Instant, SystemTime, UNIX_EPOCH};
+ 
+ use benilla_assets::coords::wow_to_bevy;
+@@ -30,6 +43,13 @@ use bevy::prelude::*;
+ const YD: f32 = 0.9144;
+ /// A pose older than this hides Tav (BG3 stopped writing them: world mode off or BG3 gone).
+ const STALE_SECS: f64 = 1.0;
++/// A mesh of a new plan with no maps after this long is drawn untextured (the baker is behind).
++const FALLBACK_SECS: f32 = 12.0;
++
++/// `.tvt` and `tavtex.txt` flags: alpha test, hidden, linear data (normal and surface maps).
++pub(crate) const TVT_ALPHA_TEST: u32 = 1;
++pub(crate) const TVT_HIDDEN: u32 = 2;
++pub(crate) const TVT_LINEAR: u32 = 4;
+ 
+ /// One mesh as copied: bind-pose positions and normals (model space, metres), uv0, skin.
+ pub(crate) struct TavMesh {
+@@ -39,6 +59,9 @@ pub(crate) struct TavMesh {
+     pub(crate) part: u32,
+     pub(crate) pos: Vec<Vec3>,
+     pub(crate) nrm: Vec<Vec3>,
++    /// Bind-pose tangents (model space, along +U); `w` = the handedness that makes
++    /// `w · (N × T)` follow +V in BG3's space ([`qtangent_frames`]).
++    pub(crate) tan: Vec<[f32; 4]>,
+     pub(crate) uv: Vec<[f32; 2]>,
+     pub(crate) weights: Vec<[f32; 4]>,
+     pub(crate) bones: Vec<[u8; 4]>,
+@@ -91,34 +114,83 @@ fn quat_axes(q: [f32; 4]) -> [Vec3; 3] {
+     ]
+ }
+ 
+-/// The normal each qtangent encodes. Which axis of the frame is the normal (and its sign) is
+-/// settled per mesh by agreement with the faces, not assumed.
+-fn qtangent_normals(pos: &[Vec3], qt: &[[f32; 4]], idx: &[u32]) -> Vec<Vec3> {
+-    let axes: Vec<[Vec3; 3]> = qt.iter().map(|q| quat_axes(*q)).collect();
+-    let mut face = vec![Vec3::ZERO; pos.len()];
++/// Per-vertex normal and tangent from BG3's qtangent frames. Which axis of the frame is the
++/// normal (and its sign) is settled per mesh by agreement with the faces, which axis follows +U by
++/// agreement with the triangles' UV gradients, never assumed; so is whether the quaternion's sign
++/// flips an axis per vertex (in BG3's meshes it flips the normal: mirrored halves carry w < 0).
++/// The tangent's `w` makes `w · (N × T)` follow +V, the way the green of BG3's normal maps points
++/// (image down), from the vertex's own UV gradient (the mesh's majority where that is degenerate).
++pub(crate) fn qtangent_frames(pos: &[Vec3], uv: &[[f32; 2]], qt: &[[f32; 4]], idx: &[u32]) -> (Vec<Vec3>, Vec<[f32; 4]>) {
++    let n = pos.len().min(uv.len()).min(qt.len());
++    let axes: Vec<[Vec3; 3]> = qt[..n].iter().map(|q| quat_axes(*q)).collect();
++    let qsign: Vec<f32> = qt[..n].iter().map(|q| if q[3] < 0.0 { -1.0 } else { 1.0 }).collect();
++    let mut face = vec![Vec3::ZERO; n];
++    let mut dpdu = vec![Vec3::ZERO; n];
++    let mut dpdv = vec![Vec3::ZERO; n];
+     for t in idx.chunks_exact(3) {
+         let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+-        if a >= pos.len() || b >= pos.len() || c >= pos.len() {
++        if a >= n || b >= n || c >= n {
+             continue;
+         }
+-        let n = (pos[b] - pos[a]).cross(pos[c] - pos[a]);
+-        face[a] += n;
+-        face[b] += n;
+-        face[c] += n;
++        let (e1, e2) = (pos[b] - pos[a], pos[c] - pos[a]);
++        let f = e1.cross(e2);
++        let (d1, d2) = (Vec2::from(uv[b]) - Vec2::from(uv[a]), Vec2::from(uv[c]) - Vec2::from(uv[a]));
++        let det = d1.x * d2.y - d1.y * d2.x;
++        let (gu, gv) = if det.abs() > 1e-12 {
++            ((e1 * d2.y - e2 * d1.y) / det, (e2 * d1.x - e1 * d2.x) / det)
++        } else {
++            (Vec3::ZERO, Vec3::ZERO)
++        };
++        for v in [a, b, c] {
++            face[v] += f;
++            dpdu[v] += gu;
++            dpdv[v] += gv;
++        }
+     }
+-    let mut score = [0.0f32; 3];
+-    let mut sign = [0.0f32; 3];
+-    for (ax, f) in axes.iter().zip(&face) {
+-        let f = f.normalize_or_zero();
+-        for k in 0..3 {
+-            let d = ax[k].dot(f);
+-            score[k] += d.abs();
+-            sign[k] += d;
++    // (axis, sign, per-vertex quaternion sign) that best follows `dirs`.
++    let pick = |dirs: &[Vec3], exclude: Option<usize>| -> (usize, f32, bool) {
++        let mut best = (2usize, 1.0f32, false, -1.0f32);
++        for k in (0..3).filter(|k| Some(*k) != exclude) {
++            let (mut abs, mut plain, mut signed) = (0.0f32, 0.0f32, 0.0f32);
++            for v in 0..n {
++                let x = axes[v][k].dot(dirs[v].normalize_or_zero());
++                abs += x.abs();
++                plain += x;
++                signed += x * qsign[v];
++            }
++            if abs > best.3 {
++                let per_vertex = signed.abs() > plain.abs();
++                let sum = if per_vertex { signed } else { plain };
++                best = (k, if sum < 0.0 { -1.0 } else { 1.0 }, per_vertex, abs);
++            }
++        }
++        (best.0, best.1, best.2)
++    };
++    let (kn, sn, qn) = pick(&face, None);
++    let (kt, st, qtt) = pick(&dpdu, Some(kn));
++    let mut nrm = Vec::with_capacity(n);
++    let mut tan = Vec::with_capacity(n);
++    let mut hands = Vec::with_capacity(n);
++    let mut majority = 0.0f32;
++    for v in 0..n {
++        let nv = axes[v][kn] * sn * if qn { qsign[v] } else { 1.0 };
++        let tv = axes[v][kt] * st * if qtt { qsign[v] } else { 1.0 };
++        let gv = dpdv[v].normalize_or_zero();
++        let h = nv.cross(tv).dot(gv);
++        if h.abs() > 1e-3 {
++            majority += h.signum();
+         }
++        hands.push(h);
++        nrm.push(nv);
++        tan.push(tv);
+     }
+-    let k = (0..3).max_by(|a, b| score[*a].total_cmp(&score[*b])).unwrap_or(2);
+-    let s = if sign[k] < 0.0 { -1.0 } else { 1.0 };
+-    axes.iter().map(|ax| ax[k] * s).collect()
++    let fallback = if majority < 0.0 { -1.0 } else { 1.0 };
++    let tan = tan
++        .into_iter()
++        .zip(hands)
++        .map(|(t, h)| [t.x, t.y, t.z, if h.abs() > 1e-3 { h.signum() } else { fallback }])
++        .collect();
++    (nrm, tan)
+ }
+ 
+ fn half(bits: u16) -> f32 {
+@@ -175,7 +247,7 @@ pub(crate) fn decode_mesh(b: &[u8]) -> Option<MeshFile> {
+         if uvsrc.len() < vc * uvstride {
+             return None;
+         }
+-        let uv = (0..vc)
++        let uv: Vec<[f32; 2]> = (0..vc)
+             .map(|v| {
+                 let o = v * uvstride + uvoff;
+                 let h = |k: usize| half(u16::from_le_bytes([uvsrc[o + 2 * k], uvsrc[o + 1 + 2 * k]]));
+@@ -205,8 +277,8 @@ pub(crate) fn decode_mesh(b: &[u8]) -> Option<MeshFile> {
+         if idx.iter().any(|i| *i as usize >= vc) {
+             return None;
+         }
+-        let nrm = qtangent_normals(&pos, &qt, &idx);
+-        meshes.push(TavMesh { key, kind, part, pos, nrm, uv, weights, bones, idx, skin_from: None });
++        let (nrm, tan) = qtangent_frames(&pos, &uv, &qt, &idx);
++        meshes.push(TavMesh { key, kind, part, pos, nrm, tan, uv, weights, bones, idx, skin_from: None });
+     }
+     borrow_skin(&mut meshes);
+     Some(MeshFile { seq, centre, wow, meshes })
+@@ -291,10 +363,19 @@ fn bg3_dir_to_bevy(d: Vec3) -> Vec3 {
+     wow_to_bevy([-d.z, d.x, d.y]) - wow_to_bevy([0.0, 0.0, 0.0])
+ }
+ 
+-/// Skins one mesh into BG3 world space: positions and normals.
+-pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut Vec<Vec3>) {
++/// The sign of the BG3-to-Bevy mapping's determinant: −1 for world mode's mirrored mapping, which
++/// turns BG3's winding and flips a tangent frame's handedness.
++pub(crate) fn mapping_det_sign() -> f32 {
++    let (x, y, z) = (bg3_dir_to_bevy(Vec3::X), bg3_dir_to_bevy(Vec3::Y), bg3_dir_to_bevy(Vec3::Z));
++    if x.cross(y).dot(z) < 0.0 { -1.0 } else { 1.0 }
++}
++
++/// Skins one mesh into BG3 world space: positions, normals and tangents (which rotate like the
++/// normals and scale like the positions).
++pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut Vec<Vec3>, tan: &mut Vec<Vec3>) {
+     pos.clear();
+     nrm.clear();
++    tan.clear();
+     let q = Quat::from_xyzw(p.world[0], p.world[1], p.world[2], p.world[3]).normalize();
+     let t = Vec3::new(p.world[4], p.world[5], p.world[6]);
+     let s = Vec3::new(p.world[7], p.world[8], p.world[9]);
+@@ -302,8 +383,9 @@ pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut
+     let skinned = !m.weights.is_empty() && !p.palette.is_empty();
+     for v in 0..m.pos.len() {
+         let (mut lp, mut ln) = (m.pos[v], m.nrm[v]);
++        let mut lt = m.tan.get(v).map_or(Vec3::X, |t| Vec3::new(t[0], t[1], t[2]));
+         if skinned {
+-            let (mut sp, mut sn) = (Vec3::ZERO, Vec3::ZERO);
++            let (mut sp, mut sn, mut st) = (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO);
+             for k in 0..4 {
+                 let w = m.weights[v][k];
+                 if w <= 0.0 {
+@@ -315,12 +397,15 @@ pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut
+                 let r2 = Vec3::new(b[8], b[9], b[10]);
+                 sp += w * Vec3::new(r0.dot(lp) + b[3], r1.dot(lp) + b[7], r2.dot(lp) + b[11]);
+                 sn += w * Vec3::new(r0.dot(ln), r1.dot(ln), r2.dot(ln));
++                st += w * Vec3::new(r0.dot(lt), r1.dot(lt), r2.dot(lt));
+             }
+             lp = sp;
+             ln = sn;
++            lt = st;
+         }
+         pos.push(q * (lp * s) + t);
+         nrm.push((q * (ln / s)).normalize_or_zero());
++        tan.push((q * (lt * s)).normalize_or_zero());
+     }
+ }
+ 
+@@ -328,8 +413,28 @@ struct Part {
+     key: u64,
+     entity: Entity,
+     mesh: Handle<Mesh>,
++    /// Its look is in place: maps from `tavtex.txt`, or deliberately hidden.
++    dressed: bool,
++}
++
++/// What a mesh key last looked like, carried over plans so a persisting mesh never flashes.
++#[derive(Clone)]
++enum Look {
++    Shown(Handle<WowModelMaterial>),
++    Hidden,
+ }
+ 
++/// A baked texture's use: sRGB albedo, or linear data (normals renormalised in every mip).
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub(crate) enum Role {
++    Albedo,
++    Normal,
++    Data,
++}
++
++/// One material's maps: albedo, normal, surface files and the alpha test.
++type LookKey = (String, Option<String>, Option<String>, bool);
++
+ #[derive(Resource)]
+ struct TavDraw {
+     dir: PathBuf,
+@@ -337,16 +442,31 @@ struct TavDraw {
+     mesh_mtime: Option<SystemTime>,
+     file: Option<MeshFile>,
+     root: Option<Entity>,
++    /// The previous plan's figure, shown until the new one has its first pose.
++    old_root: Option<Entity>,
+     parts: Vec<Part>,
+     last_pose: u32,
+     last_pose_at: Option<Instant>,
+     cache: MaterialCache,
+     material: Option<Handle<WowModelMaterial>>,
+-    scratch: (Vec<Vec3>, Vec<Vec3>),
++    scratch: (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>),
+     logged: u64,
+     /// `tavtex.txt` (link/tools/tavtex.py): its stamp, and the textures loaded so far by file.
+     tex_stamp: Option<(SystemTime, u32)>,
+-    textures: std::collections::HashMap<String, (Handle<Image>, u32)>,
++    textures: HashMap<(String, Role), Handle<Image>>,
++    looks: HashMap<u64, Look>,
++    surface_mats: HashMap<LookKey, Handle<WowModelMaterial>>,
++    /// When the current plan's meshes were built, and whether its fallback ran.
++    plan_at: Option<Instant>,
++    fallback_done: bool,
++    /// [`mapping_det_sign`].
++    det_sign: f32,
++    /// `WOW_BG3_TAV_SPEC`: the highlight's strength (0 none).
++    spec: f32,
++    /// `WOW_BG3_TAV_NORMAL_Y=flip`: the normal maps' green read the other way.
++    flip_y: bool,
++    /// `WOW_BG3_TAV_MAPS=off`: albedo only, as before patch 0006.
++    maps: bool,
+ }
+ 
+ pub(crate) fn build(app: &mut App) {
+@@ -354,26 +474,52 @@ pub(crate) fn build(app: &mut App) {
+         return;
+     }
+     let dir = std::env::var_os("WOW_BG3_TAV_DIR").map_or_else(|| PathBuf::from("/tmp/wowbg3/tav"), PathBuf::from);
+-    info!("wowbg3 tav: drawing BG3's character from {dir:?}");
++    let spec = std::env::var("WOW_BG3_TAV_SPEC")
++        .ok()
++        .and_then(|v| v.trim().parse::<f32>().ok())
++        .filter(|v| v.is_finite() && *v >= 0.0)
++        .unwrap_or(0.5);
++    let flip_y = std::env::var("WOW_BG3_TAV_NORMAL_Y").is_ok_and(|v| v == "flip");
++    let maps = std::env::var("WOW_BG3_TAV_MAPS").map_or(true, |v| v != "off");
++    let det_sign = mapping_det_sign();
++    info!(
++        "wowbg3 tav: drawing BG3's character from {dir:?} (surface maps {}, highlight {spec}, normal green {}, mapping det {det_sign})",
++        if maps { "on" } else { "off" },
++        if flip_y { "flipped" } else { "as baked" }
++    );
+     app.insert_resource(TavDraw {
+         dir,
+         frame: 0,
+         mesh_mtime: None,
+         file: None,
+         root: None,
++        old_root: None,
+         parts: Vec::new(),
+         last_pose: 0,
+         last_pose_at: None,
+         cache: MaterialCache::default(),
+         material: None,
+-        scratch: (Vec::new(), Vec::new()),
++        scratch: (Vec::new(), Vec::new(), Vec::new()),
+         logged: 0,
+         tex_stamp: None,
+-        textures: std::collections::HashMap::new(),
++        textures: HashMap::new(),
++        looks: HashMap::new(),
++        surface_mats: HashMap::new(),
++        plan_at: None,
++        fallback_done: false,
++        det_sign,
++        spec,
++        flip_y,
++        maps,
+     })
+     .add_systems(Update, (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes)));
+ }
+ 
++/// The triangles in the other winding.
++pub(crate) fn rewind(idx: &[u32]) -> Vec<u32> {
++    idx.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect()
++}
++
+ fn load_meshes(
+     mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+@@ -397,9 +543,11 @@ fn load_meshes(
+         warn!("wowbg3 tav: {path:?} did not decode");
+         return;
+     };
+-    // Rebuild: the old figure goes, the new one comes up hidden until its first pose.
++    // Rebuild: the new figure comes up hidden until its first pose; the old one stays until then.
+     if let Some(root) = d.root.take() {
+-        commands.entity(root).despawn();
++        if let Some(older) = d.old_root.replace(root) {
++            commands.entity(older).despawn();
++        }
+     }
+     d.parts.clear();
+     let material = d.material.clone().unwrap_or_else(|| {
+@@ -409,7 +557,7 @@ fn load_meshes(
+             &mut materials,
+             None,
+             ModelBlend::Opaque,
+-            true, // two-sided: BG3's winding through the mirrored mapping is not trusted yet
++            true, // two-sided: cloth and hair cards show their backs
+             false,
+             false,
+             false,
+@@ -441,25 +589,43 @@ fn load_meshes(
+         ))
+         .id();
+     let mut parts = Vec::new();
++    let (mut kept, mut waiting) = (0, 0);
+     for m in &file.meshes {
+         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; m.pos.len()]);
+         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; m.pos.len()]);
+         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uv.clone());
+-        mesh.insert_indices(Indices::U32(m.idx.clone()));
++        mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0f32, 0.0, 0.0, 1.0]; m.pos.len()]);
++        // The mirrored mapping turns the winding: re-wind so her outside faces are front faces.
++        let idx = if d.det_sign < 0.0 { rewind(&m.idx) } else { m.idx.clone() };
++        mesh.insert_indices(Indices::U32(idx));
+         let handle = meshes.add(mesh);
+-        let entity = commands.spawn((
++        // A mesh key the last plan had keeps its look; a new one waits hidden for its maps.
++        let (look, visibility, dressed) = match d.looks.get(&m.key) {
++            Some(Look::Shown(h)) => (h.clone(), Visibility::Inherited, true),
++            Some(Look::Hidden) => (material.clone(), Visibility::Hidden, true),
++            None => (material.clone(), Visibility::Hidden, false),
++        };
++        if dressed {
++            kept += 1;
++        } else {
++            waiting += 1;
++        }
++        let entity = commands
++            .spawn((
+                 Mesh3d(handle.clone()),
+-                MeshMaterial3d(material.clone()),
++                MeshMaterial3d(look),
+                 MeshTag(0),
+                 Transform::default(),
+                 NoFrustumCulling,
++                visibility,
+                 ChildOf(root),
+-            )).id();
+-        parts.push(Part { key: m.key, entity, mesh: handle });
++            ))
++            .id();
++        parts.push(Part { key: m.key, entity, mesh: handle, dressed });
+     }
+     info!(
+-        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals",
++        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals; {kept} keep their look, {waiting} wait for maps",
+         file.seq,
+         file.meshes.len(),
+         file.meshes.iter().map(|m| m.pos.len()).sum::<usize>(),
+@@ -470,38 +636,75 @@ fn load_meshes(
+     d.root = Some(root);
+     d.file = Some(file);
+     d.last_pose = 0;
++    d.plan_at = Some(Instant::now());
++    d.fallback_done = false;
++}
++
++/// One mip level down: 2x2 box averages of the bytes (albedo: sRGB bytes; surface data: linear).
++fn box_mip(prev: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
++    let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
++    let mut next = vec![0u8; nw * nh * 4];
++    for y in 0..nh {
++        for x in 0..nw {
++            for c in 0..4 {
++                let at = |xx: usize, yy: usize| prev[((yy.min(ch - 1)) * cw + xx.min(cw - 1)) * 4 + c] as u32;
++                let s = at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1);
++                next[(y * nw + x) * 4 + c] = ((s + 2) / 4) as u8;
++            }
++        }
++    }
++    (next, nw, nh)
++}
++
++/// One mip level down for a normal map (RGB = n·½ + ½): the box average of the vectors,
++/// renormalised, so detail fades toward the surface normal instead of shortening.
++pub(crate) fn normal_mip(prev: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize, usize) {
++    let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
++    let mut next = vec![0u8; nw * nh * 4];
++    for y in 0..nh {
++        for x in 0..nw {
++            let mut v = Vec3::ZERO;
++            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
++                let o = ((2 * y + dy).min(ch - 1) * cw + (2 * x + dx).min(cw - 1)) * 4;
++                v += Vec3::new(prev[o] as f32, prev[o + 1] as f32, prev[o + 2] as f32) / 127.5 - Vec3::ONE;
++            }
++            let l = v.length();
++            let v = if l > 1e-6 { v / l } else { Vec3::Z };
++            let o = (y * nw + x) * 4;
++            for (c, val) in [v.x, v.y, v.z].into_iter().enumerate() {
++                next[o + c] = ((val * 0.5 + 0.5) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
++            }
++            next[o + 3] = 255;
++        }
++    }
++    (next, nw, nh)
+ }
+ 
+ /// A baked texture as a mipmapped, anisotropically filtered image (sharp up close, calm at a
+-/// distance). Mips are 2x2 box averages of the sRGB bytes.
+-fn tav_image(w: u32, h: u32, px: &[u8]) -> Image {
++/// distance): the albedo in sRGB, normal and surface maps as linear data.
++fn tvt_image(w: u32, h: u32, px: &[u8], role: Role) -> Image {
+     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+     let mut data = px.to_vec();
+     let (mut cw, mut ch, mut levels) = (w as usize, h as usize, 1u32);
+     let mut prev = px.to_vec();
+     while cw > 1 || ch > 1 {
+-        let (nw, nh) = ((cw / 2).max(1), (ch / 2).max(1));
+-        let mut next = vec![0u8; nw * nh * 4];
+-        for y in 0..nh {
+-            for x in 0..nw {
+-                for c in 0..4 {
+-                    let at = |xx: usize, yy: usize| prev[((yy.min(ch - 1)) * cw + xx.min(cw - 1)) * 4 + c] as u32;
+-                    let s = at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1);
+-                    next[(y * nw + x) * 4 + c] = ((s + 2) / 4) as u8;
+-                }
+-            }
+-        }
++        let (next, nw, nh) = if role == Role::Normal { normal_mip(&prev, cw, ch) } else { box_mip(&prev, cw, ch) };
+         data.extend_from_slice(&next);
+         prev = next;
+         cw = nw;
+         ch = nh;
+         levels += 1;
+     }
++    let format = if role == Role::Albedo {
++        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb
++    } else {
++        bevy::render::render_resource::TextureFormat::Rgba8Unorm
++    };
+     let mut image = Image::new(
+         bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+         bevy::render::render_resource::TextureDimension::D2,
+         px.to_vec(),
+-        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
++        format,
+         RenderAssetUsages::RENDER_WORLD,
+     );
+     image.data = Some(data);
+@@ -518,7 +721,7 @@ fn tav_image(w: u32, h: u32, px: &[u8]) -> Image {
+     image
+ }
+ 
+-/// Decodes a `.tvt` texture (`TVT1`, width, height, flags; RGBA8 sRGB rows).
++/// Decodes a `.tvt` texture (`TVT1`, width, height, flags; RGBA8 rows).
+ pub(crate) fn decode_tvt(b: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
+     if b.get(0..4)? != b"TVT1" {
+         return None;
+@@ -529,9 +732,129 @@ pub(crate) fn decode_tvt(b: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
+     Some((w, h, flags, b.get(16..16 + n)?))
+ }
+ 
+-/// Puts the baked textures (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested
+-/// where the material cuts out (hair, fur, lace), hidden where WoW cannot draw it (tear lines,
+-/// lash shadows).
++/// One `tavtex.txt` line: `<mesh key> <albedo> <flags> [<normal or -> <surface or ->]`; an albedo
++/// of `-` (or flag 2) hides the mesh (BG3's VFX parts).
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) struct TexLine {
++    pub(crate) key: u64,
++    pub(crate) albedo: Option<String>,
++    pub(crate) flags: u32,
++    pub(crate) normal: Option<String>,
++    pub(crate) surface: Option<String>,
++}
++
++pub(crate) fn parse_tex_line(line: &str) -> Option<TexLine> {
++    let f: Vec<&str> = line.split_whitespace().collect();
++    if f.len() < 3 {
++        return None;
++    }
++    let file = |i: usize| f.get(i).filter(|s| **s != "-").map(|s| s.to_string());
++    Some(TexLine {
++        key: u64::from_str_radix(f[0], 16).ok()?,
++        albedo: file(1),
++        flags: f[2].parse().ok()?,
++        normal: file(3),
++        surface: file(4),
++    })
++}
++
++impl TexLine {
++    pub(crate) fn hidden(&self) -> bool {
++        self.flags & TVT_HIDDEN != 0 || self.albedo.is_none()
++    }
++}
++
++/// A `.tvt` as an image for one role, loaded once per file and role.
++fn load_tvt(
++    textures: &mut HashMap<(String, Role), Handle<Image>>,
++    images: &mut Assets<Image>,
++    dir: &Path,
++    file: &str,
++    role: Role,
++    logged: &mut HashSet<String>,
++) -> Option<Handle<Image>> {
++    if let Some(h) = textures.get(&(file.to_string(), role)) {
++        return Some(h.clone());
++    }
++    let decoded = std::fs::read(dir.join(file)).ok().and_then(|raw| {
++        let (w, h, flags, px) = decode_tvt(&raw)?;
++        // Normal and surface maps are linear data (flag 4); an albedo is sRGB.
++        if (role != Role::Albedo) != (flags & TVT_LINEAR != 0) && logged.insert(file.to_string()) {
++            warn!("wowbg3 tav: {file} flags {flags} do not match its use as {role:?}");
++        }
++        Some(tvt_image(w, h, px, role))
++    });
++    let Some(image) = decoded else {
++        if logged.insert(file.to_string()) {
++            warn!("wowbg3 tav: {file} did not load");
++        }
++        return None;
++    };
++    let handle = images.add(image);
++    textures.insert((file.to_string(), role), handle.clone());
++    Some(handle)
++}
++
++/// Her material for one set of maps: the WoW model material she always had (lit, two-sided, scene
++/// fog, the entity lane), whose base also carries BG3's normal map and the surface map as
++/// occlusion and metallic-roughness (glTF layout), marked for `WOW_TAV_SURFACE`.
++#[allow(clippy::too_many_arguments)]
++fn tav_material(
++    cache: &mut MaterialCache,
++    materials: &mut Assets<WowModelMaterial>,
++    light: &bevy::render::render_resource::Buffer,
++    albedo: Handle<Image>,
++    alpha_test: bool,
++    normal: Option<Handle<Image>>,
++    surface: Option<Handle<Image>>,
++    flip_y: bool,
++    spec: f32,
++) -> Handle<WowModelMaterial> {
++    let plain = model_material(
++        cache,
++        materials,
++        Some(albedo),
++        if alpha_test { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
++        true,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        false,
++        FogPolicy::Scene,
++        false,
++        ShadeSel::Lit,
++        0,
++        None,
++        None,
++        None,
++        None,
++        false,
++        false,
++        light,
++        None,
++    );
++    benilla_world::model_render::lazy::realize(materials, plain.id());
++    let Some(mut m) = materials.get(&plain).cloned() else { return plain };
++    let has_surface = surface.is_some();
++    m.base.normal_map_texture = normal;
++    m.base.flip_normal_map_y = flip_y;
++    m.base.occlusion_texture = surface.clone();
++    m.base.metallic_roughness_texture = surface;
++    // With a surface map these scale its G and B; without one, a plain dielectric.
++    m.base.perceptual_roughness = if has_surface { 1.0 } else { 0.6 };
++    m.base.metallic = if has_surface { 1.0 } else { 0.0 };
++    m.base.reflectance = spec;
++    let markers = m.extension.clutter_fade.z as u32 | benilla_assets::materials::TAV_SURFACE_MARKER;
++    m.extension.clutter_fade.z = markers as f32;
++    materials.add(m)
++}
++
++/// Puts the baked maps (link/tools/tavtex.py, `tavtex.txt`) on her meshes: alpha-tested where the
++/// material cuts out (hair, fur, lace), hidden where WoW cannot draw it (tear lines, lash shadows,
++/// BG3's VFX parts).
+ fn load_textures(
+     mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+@@ -543,6 +866,17 @@ fn load_textures(
+         return;
+     }
+     let Some(light) = light else { return };
++    // A mesh whose maps never came (the baker behind or failing) is drawn untextured after a while.
++    if !d.fallback_done && d.plan_at.is_some_and(|t| t.elapsed().as_secs_f32() > FALLBACK_SECS) {
++        d.fallback_done = true;
++        let bare: Vec<Entity> = d.parts.iter().filter(|p| !p.dressed).map(|p| p.entity).collect();
++        for e in &bare {
++            commands.entity(*e).insert(Visibility::Inherited);
++        }
++        if !bare.is_empty() {
++            warn!("wowbg3 tav: {} meshes had no maps after {FALLBACK_SECS} s: drawn untextured", bare.len());
++        }
++    }
+     let path = d.dir.join("tavtex.txt");
+     let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
+     let Some(seq) = d.file.as_ref().map(|f| f.seq) else { return };
+@@ -556,61 +890,80 @@ fn load_textures(
+         return; // the baker has not caught up with this plan yet
+     }
+     d.tex_stamp = Some((mtime, seq));
+-    let mut applied = 0;
++    let (mut applied, mut hidden, mut mapped) = (0, 0, 0);
++    let mut logged = HashSet::new();
++    let TavDraw { dir, cache, textures, looks, surface_mats, parts, spec, flip_y, maps, .. } = &mut *d;
+     for line in lines {
+-        let f: Vec<&str> = line.split_whitespace().collect();
+-        if f.len() < 3 {
+-            continue;
+-        }
+-        let (Ok(key), Ok(flags)) = (u64::from_str_radix(f[0], 16), f[2].parse::<u32>()) else { continue };
+-        let Some(part) = d.parts.iter().find(|p| p.key == key).map(|p| p.entity) else { continue };
+-        if flags & 2 != 0 {
+-            commands.entity(part).insert(Visibility::Hidden);
++        let Some(t) = parse_tex_line(line) else { continue };
++        let Some(part) = parts.iter_mut().find(|p| p.key == t.key) else { continue };
++        if t.hidden() {
++            commands.entity(part.entity).insert(Visibility::Hidden);
++            looks.insert(t.key, Look::Hidden);
++            part.dressed = true;
++            hidden += 1;
+             continue;
+         }
+-        let file = f[1].to_string();
+-        if !d.textures.contains_key(&file) {
+-            let Ok(raw) = std::fs::read(d.dir.join(&file)) else { continue };
+-            let Some((w, h, fl, px)) = decode_tvt(&raw) else { continue };
+-            let image = tav_image(w, h, px);
+-            let handle = images.add(image);
+-            d.textures.insert(file.clone(), (handle, fl));
+-        }
+-        let (handle, _) = d.textures[&file].clone();
+-        let TavDraw { cache, .. } = &mut *d;
+-        let material = model_material(
+-            cache,
+-            &mut materials,
+-            Some(handle),
+-            if flags & 1 != 0 { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
+-            true,
+-            false,
+-            false,
+-            false,
+-            false,
+-            false,
+-            false,
+-            false,
+-            FogPolicy::Scene,
+-            false,
+-            ShadeSel::Lit,
+-            0,
+-            None,
+-            None,
+-            None,
+-            None,
+-            false,
+-            false,
+-            &light.0,
+-            None,
++        let Some(albedo) = t.albedo.clone() else { continue };
++        let alpha_test = t.flags & TVT_ALPHA_TEST != 0;
++        let key: LookKey = (
++            albedo.clone(),
++            t.normal.clone().filter(|_| *maps),
++            t.surface.clone().filter(|_| *maps),
++            alpha_test,
+         );
+-        commands.entity(part).insert((MeshMaterial3d(material), Visibility::Inherited));
++        let material = match surface_mats.get(&key) {
++            Some(h) => h.clone(),
++            None => {
++                let Some(a) = load_tvt(textures, &mut images, dir.as_path(), &albedo, Role::Albedo, &mut logged) else { continue };
++                let n = key.1.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Normal, &mut logged));
++                let s = key.2.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Data, &mut logged));
++                let h = if *maps {
++                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec)
++                } else {
++                    model_material(
++                        cache,
++                        &mut materials,
++                        Some(a),
++                        if alpha_test { ModelBlend::AlphaTest } else { ModelBlend::Opaque },
++                        true,
++                        false,
++                        false,
++                        false,
++                        false,
++                        false,
++                        false,
++                        false,
++                        FogPolicy::Scene,
++                        false,
++                        ShadeSel::Lit,
++                        0,
++                        None,
++                        None,
++                        None,
++                        None,
++                        false,
++                        false,
++                        &light.0,
++                        None,
++                    )
++                };
++                surface_mats.insert(key.clone(), h.clone());
++                h
++            }
++        };
++        if key.1.is_some() {
++            mapped += 1;
++        }
++        commands.entity(part.entity).insert((MeshMaterial3d(material.clone()), Visibility::Inherited));
++        looks.insert(t.key, Look::Shown(material));
++        part.dressed = true;
+         applied += 1;
+     }
+-    info!("wowbg3 tav: textures for plan {seq} on {applied} meshes");
++    info!("wowbg3 tav: maps for plan {seq} on {applied} meshes ({mapped} normal-mapped), {hidden} hidden");
+ }
+ 
+ fn apply_pose(
++    mut commands: Commands,
+     mut d: ResMut<TavDraw>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut roots: Query<(&mut Transform, &mut Visibility)>,
+@@ -626,6 +979,13 @@ fn apply_pose(
+         if *vis != Visibility::Hidden && d.last_pose_at.is_none_or(|t| t.elapsed().as_secs_f32() > 0.5) {
+             *vis = Visibility::Hidden;
+         }
++        // The old figure stands in for a new plan's first pose, not for a stale stream.
++        let stale = pose.as_ref().is_none_or(|p| (now - p.time).abs() >= STALE_SECS);
++        if stale {
++            if let Some(old) = d.old_root.take() {
++                commands.entity(old).despawn();
++            }
++        }
+         return;
+     }
+     let pose = pose.unwrap();
+@@ -634,6 +994,8 @@ fn apply_pose(
+     }
+     d.last_pose = pose.frame;
+     d.last_pose_at = Some(Instant::now());
++    let det = d.det_sign;
++    let old_root = d.old_root.take();
+     let TavDraw { file, parts, scratch, logged, .. } = &mut *d;
+     let Some(file) = file.as_ref() else { return };
+     // Her root: the first mesh's object origin, mapped; the ground lock lowers her with the camera.
+@@ -645,7 +1007,10 @@ fn apply_pose(
+     if *vis != Visibility::Inherited {
+         *vis = Visibility::Inherited;
+     }
+-    let (pos, nrm) = scratch;
++    if let Some(old) = old_root {
++        commands.entity(old).despawn();
++    }
++    let (pos, nrm, tan) = scratch;
+     for (m, part) in file.meshes.iter().zip(parts.iter()) {
+         debug_assert_eq!(m.key, part.key);
+         let want = m.skin_from.unwrap_or(m.key);
+@@ -653,16 +1018,26 @@ fn apply_pose(
+         if !m.weights.is_empty() && rec.palette.is_empty() {
+             continue;
+         }
+-        pose_mesh(m, rec, pos, nrm);
++        pose_mesh(m, rec, pos, nrm, tan);
+         let lift = Vec3::Y * crate::wowbg3_lead::ground_lock();
+         let p: Vec<[f32; 3]> = pos
+             .iter()
+             .map(|v| (wow_to_bevy(bg3_to_wow(*v, file.centre, file.wow)) - lift - origin).to_array())
+             .collect();
+         let n: Vec<[f32; 3]> = nrm.iter().map(|v| bg3_dir_to_bevy(*v).normalize_or_zero().to_array()).collect();
++        // Tangents map like normals; the mirror flips their frame's handedness.
++        let t: Vec<[f32; 4]> = tan
++            .iter()
++            .zip(&m.tan)
++            .map(|(v, b)| {
++                let v = bg3_dir_to_bevy(*v).normalize_or_zero();
++                [v.x, v.y, v.z, b[3] * det]
++            })
++            .collect();
+         if let Some(mesh) = meshes.get_mut(&part.mesh) {
+             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
+             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
++            mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, t);
+         }
+     }
+     *logged += 1;
+@@ -725,14 +1100,106 @@ mod tests {
+             world: [0.0, 0.0, 0.0, 1.0, 5.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+             palette: vec![[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 0.0]],
+         };
+-        let (mut p, mut n) = (Vec::new(), Vec::new());
+-        pose_mesh(m, &rec, &mut p, &mut n);
++        let (mut p, mut n, mut t) = (Vec::new(), Vec::new(), Vec::new());
++        pose_mesh(m, &rec, &mut p, &mut n, &mut t);
+         assert!((p[1] - Vec3::new(6.0, 2.0, 0.0)).length() < 1e-3);
++        // A degenerate UV (all three at one point): the tangent falls back to the frame's X.
++        assert!((t[0] - Vec3::X).length() < 1e-4);
+         let mut bad = mesh_file();
+         bad.truncate(bad.len() - 1);
+         assert!(decode_mesh(&bad).is_none());
+     }
+ 
++    /// A quad in the XY plane, u along +X, v along −Y (image down is −Y), faces wound for +Z.
++    fn quad(x0: f32, q: [f32; 4], mirrored: bool) -> (Vec<Vec3>, Vec<[f32; 2]>, Vec<[f32; 4]>, Vec<u32>) {
++        let pos = vec![
++            Vec3::new(x0, 0.0, 0.0),
++            Vec3::new(x0 + 1.0, 0.0, 0.0),
++            Vec3::new(x0 + 1.0, 1.0, 0.0),
++            Vec3::new(x0, 1.0, 0.0),
++        ];
++        let uv = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
++        let idx = if mirrored { vec![0, 2, 1, 0, 3, 2] } else { vec![0, 1, 2, 0, 2, 3] };
++        (pos, uv, vec![q; 4], idx)
++    }
++
++    #[test]
++    fn decodes_tangent_frames() {
++        // Identity frames: X follows +U, Z is the normal (+Z, the faces' side).
++        let (pos, uv, qt, idx) = quad(0.0, [0.0, 0.0, 0.0, 1.0], false);
++        let (n, t) = qtangent_frames(&pos, &uv, &qt, &idx);
++        assert!((n[0] - Vec3::Z).length() < 1e-5);
++        assert!((Vec3::new(t[0][0], t[0][1], t[0][2]) - Vec3::X).length() < 1e-5);
++        // N × T = +Y while +V runs along −Y: handedness −1.
++        assert_eq!(t[0][3], -1.0);
++        // A frame turned 90° about Z (its X runs along +Y, its Y along −X): the axis that follows
++        // +U is its Y with a minus sign, still found.
++        let r = std::f32::consts::FRAC_1_SQRT_2;
++        let (pos, uv, qt, idx) = quad(0.0, [0.0, 0.0, r, r], false);
++        let (n, t) = qtangent_frames(&pos, &uv, &qt, &idx);
++        assert!((n[1] - Vec3::Z).length() < 1e-5);
++        assert!((Vec3::new(t[1][0], t[1][1], t[1][2]) - Vec3::X).length() < 1e-5);
++        // A mirrored half (w < 0, faces wound the other way) beside a plain one: the quaternion's
++        // sign flips the normal per vertex.
++        let (mut pos, mut uv, mut qt, mut idx) = quad(0.0, [0.0, 0.0, 0.0, 1.0], false);
++        let (p2, u2, q2, i2) = quad(2.0, [0.0, 0.0, 0.0, -1.0], true);
++        idx.extend(i2.iter().map(|i| i + 4));
++        pos.extend(p2);
++        uv.extend(u2);
++        qt.extend(q2);
++        let (n, t) = qtangent_frames(&pos, &uv, &qt, &idx);
++        assert!((n[0] - Vec3::Z).length() < 1e-5 && (n[4] + Vec3::Z).length() < 1e-5);
++        // Its handedness turns with it: (−Z) × X = −Y, which follows +V.
++        assert_eq!((t[0][3], t[4][3]), (-1.0, 1.0));
++    }
++
++    #[test]
++    fn rewinds_for_the_mirrored_mapping() {
++        // World mode's mapping is a mirror: BG3's winding comes out turned.
++        assert_eq!(mapping_det_sign(), -1.0);
++        assert_eq!(rewind(&[0, 1, 2, 3, 4, 5]), vec![0, 2, 1, 3, 5, 4]);
++    }
++
++    #[test]
++    fn reads_tavtex_lines_and_tvt_flags() {
++        let l = parse_tex_line("395ee6bf100 /c/a.tvt 1 /c/a-n.tvt /c/a-s.tvt").expect("parses");
++        assert_eq!(l.key, 0x395ee6bf100);
++        assert_eq!((l.albedo.as_deref(), l.flags), (Some("/c/a.tvt"), TVT_ALPHA_TEST));
++        assert_eq!((l.normal.as_deref(), l.surface.as_deref()), (Some("/c/a-n.tvt"), Some("/c/a-s.tvt")));
++        assert!(!l.hidden());
++        let l = parse_tex_line("3961a01e940 /c/b.tvt 0 - /c/b-s.tvt").expect("parses");
++        assert_eq!((l.normal, l.surface.as_deref()), (None, Some("/c/b-s.tvt")));
++        // BG3's VFX parts: hidden, by the flag or by having no albedo.
++        assert!(parse_tex_line("3961a01e880 - 2 - -").expect("parses").hidden());
++        assert!(parse_tex_line("3961a01e880 /c/c.tvt 2 - -").expect("parses").hidden());
++        // The 0004 three-column form still reads.
++        let l = parse_tex_line("42 /c/d.tvt 0").expect("parses");
++        assert_eq!((l.normal, l.surface), (None, None));
++        assert!(parse_tex_line("zz /c/d.tvt 0").is_none());
++        // A linear 2x1 map.
++        let mut b = b"TVT1".to_vec();
++        for v in [2u32, 1, TVT_LINEAR] {
++            b.extend_from_slice(&v.to_le_bytes());
++        }
++        b.extend_from_slice(&[128, 128, 255, 255, 0, 0, 0, 0]);
++        let (w, h, flags, px) = decode_tvt(&b).expect("decodes");
++        assert_eq!((w, h, flags & TVT_LINEAR, px.len()), (2, 1, TVT_LINEAR, 8));
++        assert!(decode_tvt(&b[..20]).is_none());
++    }
++
++    #[test]
++    fn renormalises_normal_mips() {
++        // Two texels tilted ±45° about Y average to straight up, at full length.
++        let enc = |v: Vec3| [((v.x * 0.5 + 0.5) * 255.0).round() as u8, ((v.y * 0.5 + 0.5) * 255.0).round() as u8, ((v.z * 0.5 + 0.5) * 255.0).round() as u8, 255];
++        let r = std::f32::consts::FRAC_1_SQRT_2;
++        let mut px = Vec::new();
++        px.extend(enc(Vec3::new(r, 0.0, r)));
++        px.extend(enc(Vec3::new(-r, 0.0, r)));
++        let (mip, w, h) = normal_mip(&px, 2, 1);
++        assert_eq!((w, h), (1, 1));
++        assert!((mip[2] as i32 - 255).abs() <= 1 && (mip[0] as i32 - 128).abs() <= 1, "{mip:?}");
++    }
++
+     #[test]
+     fn maps_like_world_mode() {
+         // WorldMode.lua toWow: BG3 one metre +x from the centre is one yard-ish +y in WoW.
+diff --git a/crates/benilla-assets/src/materials.rs b/crates/benilla-assets/src/materials.rs
+index 14aef4f..10f411c 100644
+--- a/crates/benilla-assets/src/materials.rs
++++ b/crates/benilla-assets/src/materials.rs
+@@ -34,6 +34,11 @@ pub const WDL_WGSL: &str = include_str!("shaders/wdl.wgsl");
+ /// with `VANILLA_ALPHA_KEY` in `shaders/wow_model.wgsl`.
+ pub const VANILLA_ALPHA_KEY_REF: f32 = 224.0 / 255.0;
+ 
++/// `clutter_fade.z` marker bit 14 (WOW-BG3 local fork, patch 0006): a surface of BG3's character
++/// (`wowbg3_tav`), which `wow_model.wgsl` lights with the base material's normal, occlusion and
++/// metallic-roughness maps (`WOW_TAV_SURFACE`) under the same WoW light; a `WowModelKey` axis.
++pub const TAV_SURFACE_MARKER: u32 = 1 << 14;
++
+ /// `StandardMaterial` plus the per-tile layer-blend extension.
+ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
+ 
+@@ -64,6 +69,8 @@ pub struct WowModelKey {
+     /// The WMO-skybox lane (`clutter_fade.z` bit 13, `model_render::SKY_DEPTH_MARKER`), a key axis
+     /// because only this model's depth is pinned.
+     sky_depth: bool,
++    /// A WOW-BG3 Tav surface ([`TAV_SURFACE_MARKER`], bit 14).
++    tav_surface: bool,
+     // The WMO batch order is deliberately not a key axis (a pipeline per batch index stalls a
+     // city's first sight): the file-order layering (`0x6b4f10`/`0x6b5190`) rides `sun_scale.y`.
+ }
+@@ -82,6 +89,7 @@ impl From<&WowModelExt> for WowModelKey {
+             zfill: markers & 0x200 != 0,
+             far_side: markers & 0x800 != 0,
+             sky_depth: markers & 0x2000 != 0,
++            tav_surface: markers & TAV_SURFACE_MARKER != 0,
+         }
+     }
+ }
+@@ -214,6 +222,12 @@ impl MaterialExtension for WowModelExt {
+                 ds.bias.constant = 0;
+             }
+         }
++        if key.bind_group_data.tav_surface {
++            descriptor.vertex.shader_defs.push("WOW_TAV_SURFACE".into());
++            if let Some(fragment) = descriptor.fragment.as_mut() {
++                fragment.shader_defs.push("WOW_TAV_SURFACE".into());
++            }
++        }
+         if key.bind_group_data.fade && !key.bind_group_data.sky_depth {
+             // A fading model's near cards occlude its far ones; the sky never writes depth.
+             if let Some(ds) = descriptor.depth_stencil.as_mut() {
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+index f84ff88..157bb4f 100644
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -8,6 +8,9 @@
+ // the tuft, which the reference writes onto the clutter vertex.
+ // Not built: a specular term (the M2 per-material shininess is only inferred) and the WMO
+ // per-group authored colour.
++// WOW-BG3 (local fork, patch 0006): `WOW_TAV_SURFACE` (`clutter_fade.z` bit 14) lights BG3's
++// character (wowbg3_tav) with her own surface maps under the same WoW light: the normal-mapped
++// normal, occlusion on the ambient term and a restrained GGX highlight of the sun.
+ 
+ #import bevy_pbr::{
+     pbr_fragment::pbr_input_from_standard_material,
+@@ -116,6 +119,10 @@ struct WowVsOut {
+ #ifdef VERTEX_UVS_B
+     @location(3) uv_b: vec2<f32>,
+ #endif
++#ifdef VERTEX_TANGENTS
++    // Only Tav's meshes carry tangents (wowbg3_tav), for her normal maps.
++    @location(4) world_tangent: vec4<f32>,
++#endif
+ #ifdef VERTEX_COLORS
+     @location(5) color: vec4<f32>,
+ #endif
+@@ -233,6 +240,9 @@ struct WowVertex {
+ #ifdef VERTEX_UVS_B
+     @location(3) uv_b: vec2<f32>,
+ #endif
++#ifdef VERTEX_TANGENTS
++    @location(4) tangent: vec4<f32>,
++#endif
+ #ifdef VERTEX_COLORS
+     @location(5) color: vec4<f32>,
+ #endif
+@@ -336,6 +346,20 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
+     );
+ #endif
+ #endif
++#ifdef VERTEX_TANGENTS
++#ifdef WOW_RIG_SKIN
++    out.world_tangent = vec4<f32>(
++        wow_normalize((frame_from_local * vec4<f32>(vertex.tangent.xyz, 0.0)).xyz),
++        vertex.tangent.w,
++    );
++#else
++    out.world_tangent = mesh_functions::mesh_tangent_local_to_world(
++        mesh_world_from_local,
++        vertex.tangent,
++        vertex.instance_index
++    );
++#endif
++#endif
+ 
+ #ifdef VERTEX_POSITIONS
+     // Precision: camera-relative to clip space; `clip_from_world × p_world` cancels
+@@ -416,6 +440,25 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
+     return out;
+ }
+ 
++#ifdef WOW_TAV_SURFACE
++// GGX (Trowbridge-Reitz) with Smith-Schlick visibility and Schlick Fresnel, times N·L.
++fn tav_ggx(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, perceptual_roughness: f32, f0: vec3<f32>) -> vec3<f32> {
++    let a = perceptual_roughness * perceptual_roughness;
++    let a2 = a * a;
++    let H = normalize(L + V);
++    let nl = max(dot(N, L), 0.0);
++    let nv = max(dot(N, V), 1e-4);
++    let nh = max(dot(N, H), 0.0);
++    let vh = max(dot(V, H), 0.0);
++    let d = nh * nh * (a2 - 1.0) + 1.0;
++    let D = a2 / (3.14159265 * d * d);
++    let k = a * 0.5;
++    let vis = 0.25 / ((nl * (1.0 - k) + k) * (nv * (1.0 - k) + k));
++    let F = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - vh, 5.0);
++    return D * vis * F * nl;
++}
++#endif
++
+ @fragment
+ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     // The UI model tile's cell clip: the reference gives each `<Model>` pane its widget rect as the
+@@ -472,6 +515,9 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+ #ifdef VERTEX_UVS_B
+     vo.uv_b = in.uv_b;
+ #endif
++#ifdef VERTEX_TANGENTS
++    vo.world_tangent = in.world_tangent;
++#endif
+ #ifdef VERTEX_COLORS
+     vo.color = in.color;
+ #endif
+@@ -572,7 +618,13 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     let is_clutter = m.clutter_fade.w > 0.5;
+     let L = -normalize(wow_light.light_sun.xyz);
+     // `wow_normalize`: an authored zero normal reaches here on the unskinned lane.
++#ifdef WOW_TAV_SURFACE
++    // A Tav surface: the normal Bevy mapped from the base material's normal map and the mesh
++    // tangents (flipped on back faces like `world_normal`, which the line below undoes alike).
++    let n_m2 = wow_normalize(pbr_input.N);
++#else
+     let n_m2 = wow_normalize(pbr_input.world_normal);
++#endif
+     // Bevy negates `world_normal` on back faces of double-sided materials (foliage, every WMO
+     // face); the reference never enables GL_LIGHT_MODEL_TWO_SIDE (`0x59ce30`), so undo it.
+     let n_lit = select(-n_m2, n_m2, is_front);
+@@ -673,7 +725,17 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     // The authored-rig lane (`ShadeSel::Rig`, glue scenes): the scene's lights are folded into
+     // probe slot 0 of the material's own buffer, which `lit_m2_interior` already evaluated (tag 0).
+     let is_rig = m.sun_scale.x >= 1.5;
+-    let lit = select(select(lit_exterior, lit_interior, is_interior), lit_m2_interior, is_rig);
++    var lit = select(select(lit_exterior, lit_interior, is_interior), lit_m2_interior, is_rig);
++#ifdef WOW_TAV_SURFACE
++    // BG3's occlusion (the surface map's R, Bevy's `diffuse_occlusion`) darkens the ambient term
++    // only; the sun keeps its own, whose shadow is the entity shade.
++    let tav_ambient = select(
++        wow_light.light_ambient.rgb,
++        vec3<f32>(wow_light.sh_c10_r.w, wow_light.sh_c10_g.w, wow_light.sh_c10_b.w),
++        use_doodad_shade,
++    );
++    lit = max(lit - (1.0 - pbr_input.diffuse_occlusion.r) * tav_ambient, vec3<f32>(0.0));
++#endif
+     // Gamma-space albedo: lighting runs on the authored byte values. `m.tint` plus its mat-anim
+     // delta is the animated M2Color tint.
+     let anim_tint = m.tint.rgb + wow_light.matanim[u32(m.anim_slots.y)].xyz;
+@@ -757,6 +819,22 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+         let unlit_sum = unlit_c * inst_tint + highlight;
+         unlit_rgb = unlit_tex * clamp(unlit_sum, vec3<f32>(0.0), vec3<f32>(1.0));
+     }
++#ifdef WOW_TAV_SURFACE
++    // A restrained GGX highlight of WoW's sun on BG3's roughness and metalness (the surface map's
++    // G and B through the base material): the sun colour at the entity's lit or shaded intensity,
++    // Fresnel from 4% (dielectric) to the albedo (metal), a metal's diffuse halved since nothing
++    // here reflects an environment. Its strength is the base material's `reflectance`.
++    {
++        let metal = clamp(pbr_input.material.metallic, 0.0, 1.0);
++        let rough = clamp(pbr_input.material.perceptual_roughness, 0.08, 1.0);
++        let V = normalize(view.world_position.xyz - in.world_position.xyz);
++        let f0 = mix(vec3<f32>(0.04), albedo, metal);
++        let sun_on = select(0.0, 1.0, wow_light.light_sun.w > 0.5);
++        let spec = tav_ggx(n_lit, V, L, rough, f0) * wow_light.light_diffuse.rgb
++            * (intensity * sun_on * pbr_input.material.reflectance.x);
++        lit_rgb = lit_rgb * (1.0 - 0.5 * metal) + min(spec, vec3<f32>(1.0));
++    }
++#endif
+     var rgb = select(lit_rgb, unlit_rgb, is_emissive);
+     // An M2 Mod or Mod2x batch draws the bare texel: the reference zeroes its tint·M2Color term and
+     // forces the primary colour to the blend identity (`0x70c507`/`0x70c5b8`), so neither the

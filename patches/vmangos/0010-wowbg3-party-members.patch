@@ -1,0 +1,2414 @@
+diff --git a/src/game/CMakeLists.txt b/src/game/CMakeLists.txt
+index c38f32e..71f0f5c 100644
+--- a/src/game/CMakeLists.txt
++++ b/src/game/CMakeLists.txt
+@@ -47,6 +47,7 @@ set (game_SRCS
+     Weather.cpp
+     World.cpp
+     WowBg3Fights.cpp
++    WowBg3Party.cpp
+     AI/BasicAI.cpp
+     AI/CreatureAI.cpp
+     AI/CreatureAIRegistry.cpp
+@@ -288,6 +289,7 @@ set (game_SRCS
+     Weather.h
+     World.h
+     WowBg3Fights.h
++    WowBg3Party.h
+     WorldStates.h
+     AI/BasicAI.h
+     AI/CreatureAI.h
+diff --git a/src/game/Chat/Chat.cpp b/src/game/Chat/Chat.cpp
+index d77f46f..e66f6a8 100644
+--- a/src/game/Chat/Chat.cpp
++++ b/src/game/Chat/Chat.cpp
+@@ -1259,6 +1259,7 @@ ChatCommand * ChatHandler::getCommandTable()
+         { "recall",         SEC_MODERATOR,      false, &ChatHandler::HandleRecallCommand,              "", nullptr },
+         { "save",           SEC_PLAYER,         false, &ChatHandler::HandleSaveCommand,                "", nullptr },
+         { "saveall",        SEC_ADMINISTRATOR,  true,  &ChatHandler::HandleSaveAllCommand,             "", nullptr },
++        { "wowbg3",         SEC_CONSOLE,        true,  &ChatHandler::HandleWowBg3Command,              "", nullptr },
+         { "kick",           SEC_TICKETMASTER,   true,  &ChatHandler::HandleKickPlayerCommand,          "", nullptr },
+         { "ban",            SEC_TICKETMASTER,   true, nullptr,                                         "", banCommandTable      },
+         { "unban",          SEC_ADMINISTRATOR,  true, nullptr,                                         "", unbanCommandTable    },
+diff --git a/src/game/Chat/Chat.h b/src/game/Chat/Chat.h
+index 4adb2e0..41023f2 100644
+--- a/src/game/Chat/Chat.h
++++ b/src/game/Chat/Chat.h
+@@ -1043,6 +1043,7 @@ class ChatHandler
+ 
+         //! Development Commands
+         bool HandleSaveAllCommand(char* args);
++        bool HandleWowBg3Command(char* args);   // WOW-BG3 0010: console `wowbg3 NAME VERB ...`
+         bool HandleDebugMoveCommand(char* args);
+ 
+         Player*   GetSelectedPlayer() const;
+diff --git a/src/game/Handlers/CharacterHandler.cpp b/src/game/Handlers/CharacterHandler.cpp
+index cdabf42..2176725 100644
+--- a/src/game/Handlers/CharacterHandler.cpp
++++ b/src/game/Handlers/CharacterHandler.cpp
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "Common.h"
++#include "WowBg3Party.h"
+ #include "Database/DatabaseEnv.h"
+ #include "WorldPacket.h"
+ #include "SharedDefines.h"
+@@ -475,7 +476,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
+         pCurrChar = new Player(this);
+         pCurrChar->GetMotionMaster()->Initialize();
+ 
+-        if (GetBot() && !sPlayerBotMgr.IsSavingAllowed())
++        // WOW-BG3 (0010): a party bot is saved like a player (its XP, items and place).
++        if (GetBot() && !sPlayerBotMgr.IsSavingAllowed() && !WowBg3::IsPartyBot(this))
+             pCurrChar->m_saveDisabled = true;
+     }
+ 
+diff --git a/src/game/Handlers/MiscHandler.cpp b/src/game/Handlers/MiscHandler.cpp
+index 7c289e1..6764226 100644
+--- a/src/game/Handlers/MiscHandler.cpp
++++ b/src/game/Handlers/MiscHandler.cpp
+@@ -20,6 +20,8 @@
+  */
+ 
+ #include "Common.h"
++#include "WowBg3Fights.h"
++#include "Chat.h"
+ #include "Language.h"
+ #include "Database/DatabaseEnv.h"
+ #include "Database/DatabaseImpl.h"
+@@ -52,6 +54,13 @@ void WorldSession::HandleRepopRequestOpcode(NullClientPacket const& /*packet*/)
+     if (_player->IsAlive() || _player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST))
+         return;
+ 
++    // WOW-BG3 (0010): BG3 death rules, the body stays where it fell until BG3 revives it.
++    if (WowBg3::KeepsBody(_player))
++    {
++        ChatHandler(this).SendSysMessage("WOWBG3 release refused");
++        return;
++    }
++
+     // the world update order is sessions, players, creatures
+     // the netcode runs in parallel with all of these
+     // creatures can kill players
+diff --git a/src/game/Objects/Player.cpp b/src/game/Objects/Player.cpp
+index c45726e..24987e9 100644
+--- a/src/game/Objects/Player.cpp
++++ b/src/game/Objects/Player.cpp
+@@ -24,6 +24,7 @@
+ #include <sstream>
+ 
+ #include "Player.h"
++#include "WowBg3Fights.h"
+ #include "Bag.h"
+ #include "Language.h"
+ #include "Database/DatabaseEnv.h"
+@@ -1294,8 +1295,14 @@ void Player::Update(uint32 update_diff, uint32 p_time)
+     {
+         if (p_time >= m_deathTimer)
+         {
+-            BuildPlayerRepop();
+-            ScheduleRepopAtGraveyard();
++            // WOW-BG3 (0010): a party character keeps its body (BG3 death rules), no graveyard.
++            if (WowBg3::KeepsBody(this))
++                m_deathTimer = CORPSE_REPOP_TIME;
++            else
++            {
++                BuildPlayerRepop();
++                ScheduleRepopAtGraveyard();
++            }
+         }
+         else
+             m_deathTimer -= p_time;
+diff --git a/src/game/PlayerBots/PlayerBotMgr.cpp b/src/game/PlayerBots/PlayerBotMgr.cpp
+index 4475bdc..c637500 100644
+--- a/src/game/PlayerBots/PlayerBotMgr.cpp
++++ b/src/game/PlayerBots/PlayerBotMgr.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "Policies/SingletonImp.h"
+ #include "PlayerBotMgr.h"
++#include "WowBg3Party.h"
+ #include "ObjectMgr.h"
+ #include "World.h"
+ #include "WorldSession.h"
+@@ -248,8 +249,9 @@ void PlayerBotMgr::Update(uint32 diff)
+ 
+                 DeleteBot(iter);
+ 
++                // WOW-BG3 (0010): a party bot is saved at logout like a player.
+                 if (WorldSession* sess = sWorld.FindSession(iter->second->accountId))
+-                    sess->LogoutPlayer(m_confAllowSaving);
++                    sess->LogoutPlayer(m_confAllowSaving || WowBg3::IsPartyBot(sess));
+ 
+                 iter->second->requestRemoval = false;
+ 
+diff --git a/src/game/Server/WorldSession.cpp b/src/game/Server/WorldSession.cpp
+index e1d7935..c612355 100644
+--- a/src/game/Server/WorldSession.cpp
++++ b/src/game/Server/WorldSession.cpp
+@@ -27,6 +27,7 @@
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
+ #include "WowBg3Fights.h"
++#include "WowBg3Party.h"
+ #include "Player.h"
+ #include "ObjectMgr.h"
+ #include "Group.h"
+@@ -88,7 +89,7 @@ WorldSession::~WorldSession()
+ {
+     // unload player if not unloaded
+     if (_player)
+-        LogoutPlayer(!m_bot || sPlayerBotMgr.IsSavingAllowed());
++        LogoutPlayer(!m_bot || sPlayerBotMgr.IsSavingAllowed() || WowBg3::IsPartyBot(this));  // WOW-BG3 0010
+ 
+     // If have unclosed socket, close it
+     if (m_socket)
+@@ -476,7 +477,7 @@ bool WorldSession::Update(PacketFilter& updater)
+     {
+         if (m_bot != nullptr && m_bot->state == PB_STATE_OFFLINE)
+         {
+-            LogoutPlayer(sPlayerBotMgr.IsSavingAllowed());
++            LogoutPlayer(sPlayerBotMgr.IsSavingAllowed() || WowBg3::IsPartyBot(this));  // WOW-BG3 0010
+             return false;
+         }
+ 
+diff --git a/src/game/World.cpp b/src/game/World.cpp
+index b5771f9..68b04c1 100644
+--- a/src/game/World.cpp
++++ b/src/game/World.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include "World.h"
+ #include "WowBg3Fights.h"
++#include "WowBg3Party.h"
+ #include "Database/DatabaseEnv.h"
+ #include "Config/Config.h"
+ #include "Platform/Define.h"
+@@ -3186,6 +3187,8 @@ bool World::CanSkipQueue(WorldSession const* sess)
+ {
+     if (sess->GetSecurity() > SEC_PLAYER)
+         return true;
++    if (WowBg3::IsPartyBot(sess))                           // WOW-BG3 0010: party bots never wait in the login queue
++        return true;
+     uint32 grace_period = getConfig(CONFIG_UINT32_LOGIN_QUEUE_GRACE_PERIOD_SECS);
+     if (!grace_period)
+         return false;
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index aece50d..d622991 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -26,7 +26,11 @@
+ // code can call back into the hooks).
+ 
+ #include "WowBg3Fights.h"
++#include "WowBg3Party.h"
+ #include "Chat.h"
++#include "CellImpl.h"
++#include "GridNotifiers.h"
++#include "GridNotifiersImpl.h"
+ #include "Creature.h"
+ #include "CreatureAI.h"
+ #include "Log.h"
+@@ -51,6 +55,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <list>
+ #include <memory>
+ #include <mutex>
+ #include <shared_mutex>
+@@ -78,6 +83,10 @@ namespace
+     size_t const CLOSED_KEPT   = 64;                        // finished encounter ids kept per player
+     size_t const MAX_PROVOKED  = 64;                        // provoked NPCs at once, every player together
+     uint32 const SHOWN_HOSTILE = 168;                       // FactionTemplate "Enemy": hostile to players only
++    float const AREA_MAX_RANGE = 200.0f;                    // yards, hold
++    size_t const AREA_MAX_SPOTS = 8;                        // positions per hold
++    size_t const AREA_MAX_MOBS = 400;                       // per hold
++    uint32 const AREA_MS       = 60 * MINUTE * IN_MILLISECONDS;   // a hold not renewed lets go
+ 
+     struct Mob
+     {
+@@ -116,8 +125,18 @@ namespace
+         }
+     };
+ 
++    // 0010: creatures held in place around the party while BG3 is in turn-based mode
++    // outside a fight (`hold` / `unhold`).
++    struct Area
++    {
++        std::string id;
++        std::vector<Mob> mobs;
++        uint32 last = 0;                                    // last `hold` with this id
++    };
++
+     struct Fighter
+     {
++        std::vector<Area> areas;
+         bool armed = false;
+         bool sight = false;                                     // BG3 decides proximity aggro (`arm sight`)
+         bool sightAlive = false;                                // seen alive since sight mode went on
+@@ -352,8 +371,7 @@ namespace
+ 
+     void Say(Player* player, std::string const& line)
+     {
+-        if (player && player->GetSession())
+-            ChatHandler(player->GetSession()).SendSysMessage(line.c_str());
++        SayTo(player, line);                                // 0010: a bot's lines go to the server log
+     }
+ 
+     // `WOWBG3 mob <enc|-> <guid> <entry> <level> <hp> <maxhp> <mindmg> <maxdmg> <attack ms> <x> <y> <z> <why>`
+@@ -437,7 +455,8 @@ namespace
+     {
+         if (!p || !p->IsInWorld())
+             return "offline";
+-        if (!p->IsAlive())
++        // 0010, BG3 rules: a dead hero's fight goes on while a party bot on its map lives.
++        if (!p->IsAlive() && !LivingMember(p))
+             return "dead";
+         if (p->IsTaxiFlying())
+             return "taxi";
+@@ -455,9 +474,11 @@ namespace
+             return "controlled";
+         if (c->IsInEvadeMode())
+             return "evading";
+-        if (!p->IsValidAttackTarget(c))
++        // 0010: a dead hero's party bot judges it (a dead player can attack nothing).
++        Player const* judge = p->IsAlive() ? p : LivingMember(p);
++        if (!(judge ? judge : p)->IsValidAttackTarget(c))
+             return "friendly";
+-        if (claim && !p->IsWithinDistInMap(c, CLAIM_RANGE))
++        if (claim && !NearParty(p, c, CLAIM_RANGE))           // 0010: the hero or one of its party bots
+             return "far";
+         if (c->HasLootRecipient() && !c->IsTappedBy(p))
+             return "tapped";
+@@ -518,7 +539,7 @@ namespace
+             }
+         }
+         RefreshFaction(c);
+-        Say(c->GetMap()->GetPlayer(owner), "WOWBG3 release " + enc + " " + Hex(guid) + " immune");
++        Say(ObjectAccessor::FindPlayer(owner), "WOWBG3 release " + enc + " " + Hex(guid) + " immune");
+     }
+ 
+     // Send the `mob ... aggro` line once for a mob the server held by itself.
+@@ -545,7 +566,7 @@ namespace
+             }
+         }
+         if (send)
+-            Say(c->GetMap()->GetPlayer(owner), MobLine(enc, c, "aggro"));
++            Say(ObjectAccessor::FindPlayer(owner), MobLine(enc, c, "aggro"));
+     }
+ 
+     // ---- commands (world thread) ----
+@@ -925,7 +946,7 @@ namespace
+             }
+             return out.Add(head + "gone 0 0");
+         }
+-        if (p->GetMapId() != map || p->GetInstanceId() != instance || !p->IsWithinDistInMap(c, DAMAGE_RANGE))
++        if (p->GetMapId() != map || p->GetInstanceId() != instance || !NearParty(p, c, DAMAGE_RANGE))
+             return out.Add(head + "refused far");
+ 
+         uint32 const maxHealth = c->GetMaxHealth();
+@@ -938,7 +959,9 @@ namespace
+         if (target < health)
+         {
+             ++t_bridgeDamage;
+-            p->DealDamage(c, health - uint32(target), nullptr, SPELL_DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
++            // 0010: a dead hero's party bot deals it (same group: the hero's tap, kill credit, XP).
++            Player* attacker = p->IsAlive() ? p : LivingMember(p);
++            (attacker ? attacker : p)->DealDamage(c, health - uint32(target), nullptr, SPELL_DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+             --t_bridgeDamage;
+         }
+ 
+@@ -1009,7 +1032,7 @@ namespace
+         if (!c || !c->IsAlive())
+             return out.Add(head + "gone");
+         if (p->GetMapId() != map || p->GetInstanceId() != instance ||
+-            p->GetDistance(x, y, z, SizeFactor::None) > PLACE_RANGE)
++            (p->GetDistance(x, y, z, SizeFactor::None) > PLACE_RANGE && !NearParty(p, c, PLACE_RANGE)))
+             return out.Add(head + "refused far");
+         if (c->GetDistance(x, y, z, SizeFactor::None) < 0.5f)
+             return out.Add(head + "ok same");
+@@ -1217,11 +1240,219 @@ namespace
+         out.Add("WOWBG3 faction " + side + " " + std::to_string(p->GetFactionTemplateId()) + " " + std::to_string(mine.size()));
+     }
+ 
+-    void Execute(WorldSession* session, std::string const& text)
++    // ---- 0010: hold area (turn-based mode outside fights) ----
++
++    // Creatures (not pets, totems or player-owned) within r yards of (x, y, z) on map m.
++    struct InCircle
++    {
++        float x, y, z, r;
++        bool operator()(Creature* c) { return c->IsWithinDist3d(x, y, z, r, SizeFactor::None); }
++    };
++
++    void CollectAround(Map* m, float x, float y, float z, float r, std::vector<Creature*>& out)
++    {
++        std::list<Creature*> found;
++        InCircle check{ x, y, z, r };
++        MaNGOS::CreatureListSearcher<InCircle> searcher(found, check);
++        TypeContainerVisitor<MaNGOS::CreatureListSearcher<InCircle>, GridTypeMapContainer> visitor(searcher);
++        CellPair pair(MaNGOS::ComputeCellPair(x, y));
++        Cell cell(pair);
++        cell.SetNoCreate();
++        cell.Visit(pair, visitor, *m, x, y, r);
++        for (Creature* c : found)
++            out.push_back(c);
++    }
++
++    // hold HID R SPOT [SPOT...]: SPOT is a party member's name or X,Y,Z on the sender's map.
++    // Every living creature and NPC within R yards of a spot is held in place (the hidden stun
++    // of 0008, no AI, patrols stop mid-path) until `unhold HID`, logout or an hour without a
++    // renewal. The same HID again adds what is around the spots now (the party moved).
++    void HoldArea(Player* p, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const hid = a[2];
++        std::string const head = "WOWBG3 hold " + hid + " ";
++        if (!ValidId(hid))
++            return out.Add(head + "refused usage");
++        char* end = nullptr;
++        double r = strtod(a[3].c_str(), &end);
++        if (!end || *end || !(r > 0.0) || r > AREA_MAX_RANGE)
++            return out.Add(head + "refused badrange");
++        if (a.size() - 4 > AREA_MAX_SPOTS)
++            return out.Add(head + "refused toomany");
++        std::vector<Creature*> found;
++        for (size_t i = 4; i < a.size(); ++i)
++        {
++            std::string const& item = a[i];
++            if (item.find(',') != std::string::npos)
++            {
++                std::vector<std::string> xyz = Split(item, ',');
++                float v[3];
++                if (xyz.size() != 3)
++                    return out.Add(head + "refused badpos " + item);
++                for (int k = 0; k < 3; ++k)
++                {
++                    char* e = nullptr;
++                    double d = strtod(xyz[k].c_str(), &e);
++                    if (!e || *e || !std::isfinite(d) || std::fabs(d) > 100000.0)
++                        return out.Add(head + "refused badpos " + item);
++                    v[k] = float(d);
++                }
++                CollectAround(p->GetMap(), v[0], v[1], v[2], float(r), found);
++            }
++            else
++            {
++                char const* why = nullptr;
++                Player* m = FindMember(p, item, why);
++                if (!m)
++                    return out.Add(head + "refused " + std::string(why) + " " + item);
++                CollectAround(m->GetMap(), m->GetPositionX(), m->GetPositionY(), m->GetPositionZ(), float(r), found);
++            }
++        }
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        uint32 const now = WorldTimer::getMSTime();
++        std::vector<Creature*> fresh;
++        uint32 skipped = 0, total = 0;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            Area* area = nullptr;
++            for (Area& x : f.areas)
++                if (x.id == hid)
++                    area = &x;
++            if (!area)
++            {
++                f.areas.emplace_back();
++                area = &f.areas.back();
++                area->id = hid;
++            }
++            area->last = now;
++            for (Creature* c : found)
++            {
++                if (!c->IsInWorld() || !c->IsAlive() || c->IsPet() || c->IsTotem() || c->GetCharmerOrOwnerGuid().IsPlayer())
++                    continue;
++                ObjectGuid const g = c->GetObjectGuid();
++                bool mine = false;
++                for (Mob const& m : area->mobs)
++                    mine = mine || m.guid == g;
++                if (mine)
++                    continue;
++                auto it = g_held.find(g);
++                if ((it != g_held.end() && it->second != pg) || area->mobs.size() >= AREA_MAX_MOBS)
++                {
++                    ++skipped;                              // another player's fight holds it
++                    continue;
++                }
++                Mob m;
++                m.guid = g;
++                m.map = c->GetMapId();
++                m.instance = c->GetInstanceId();
++                m.since = now;
++                area->mobs.push_back(m);
++                Hold(g, pg);
++                fresh.push_back(c);
++            }
++        }
++        // Stun outside the lock; a stun-immune creature cannot be held.
++        std::vector<ObjectGuid> immune;
++        for (Creature* c : fresh)
++        {
++            c->StopMoving();
++            if (!Freeze(c))
++                immune.push_back(c->GetObjectGuid());
++        }
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            for (Area& x : f.areas)
++            {
++                if (x.id != hid)
++                    continue;
++                for (ObjectGuid g : immune)
++                {
++                    for (auto it = x.mobs.begin(); it != x.mobs.end(); ++it)
++                    {
++                        if (it->guid == g)
++                        {
++                            x.mobs.erase(it);
++                            break;
++                        }
++                    }
++                    if (!f.FindPending(g) && !(f.active && f.active->Find(g)))
++                        Unhold(g);
++                }
++                total = uint32(x.mobs.size());
++            }
++        }
++        out.Add(head + "ok " + std::to_string(fresh.size() - immune.size()) + " " + std::to_string(total) + " " +
++            std::to_string(skipped + immune.size()));
++    }
++
++    // Callers hold the write lock: lets go of an area's creatures that no fight and no other
++    // area of this player holds; they are thawed (without evade: patrols go on) by the caller.
++    void ReleaseArea(ObjectGuid pg, Fighter& f, Area const& area, std::vector<Release>& releases)
++    {
++        for (Mob const& m : area.mobs)
++        {
++            auto it = g_held.find(m.guid);
++            if (it == g_held.end() || it->second != pg)
++                continue;
++            if (f.FindPending(m.guid) || (f.active && f.active->Find(m.guid)))
++                continue;                                   // a fight holds it now
++            bool other = false;
++            for (Area const& x : f.areas)
++            {
++                if (&x == &area)
++                    continue;
++                for (Mob const& y : x.mobs)
++                    other = other || y.guid == m.guid;
++            }
++            if (other)
++                continue;
++            Unhold(m.guid);
++            releases.push_back({ pg, "-", m.guid, m.map, m.instance, false, nullptr });
++        }
++    }
++
++    // unhold HID | unhold all
++    void UnholdArea(Player* p, std::string const& hid, Out& out)
++    {
++        std::vector<Release> releases;
++        uint32 areas = 0;
++        {
++            WriteLock lock(g_lock);
++            auto fit = g_fighters.find(p->GetObjectGuid());
++            if (fit != g_fighters.end())
++            {
++                Fighter& f = fit->second;
++                for (auto it = f.areas.begin(); it != f.areas.end();)
++                {
++                    if (hid != "all" && it->id != hid)
++                    {
++                        ++it;
++                        continue;
++                    }
++                    ReleaseArea(p->GetObjectGuid(), f, *it, releases);
++                    it = f.areas.erase(it);
++                    ++areas;
++                }
++            }
++        }
++        ApplyReleases(releases);
++        if (!areas && hid != "all")
++            return out.Add("WOWBG3 unhold " + hid + " unknown");
++        out.Add("WOWBG3 unhold " + hid + " ok " + std::to_string(releases.size()));
++    }
++
++    // Held areas of players who left, to thaw at the next tick (logout may run while maps update).
++    std::vector<Release> g_thawLater;
++
++    // ---- 0010: BG3 death rules ----
++    std::mutex g_bodyLock;
++    std::unordered_set<uint64> g_keepBody;                  // died through `health ... 0`, until revived
++
++    void Execute(Player* p, std::string const& text, std::vector<std::string>& lines)
+     {
+-        Player* p = session->GetPlayer();
+-        if (!p)
+-            return;
+         std::vector<std::string> a = Split(text, ' ');
+         std::string const verb = a.size() > 1 ? a[1] : "";
+         Out out;
+@@ -1245,12 +1476,14 @@ namespace
+             Place(p, a[2], a[3], a[4], a[5], a[6], out);
+         else if (verb == "faction" && a.size() == 3 && (a[2] == "horde" || a[2] == "alliance" || a[2] == "own"))
+             Faction(p, a[2], out);
+-        else
++        else if (verb == "hold" && a.size() >= 5)
++            HoldArea(p, a, out);
++        else if (verb == "unhold" && a.size() == 3)
++            UnholdArea(p, a[2], out);
++        else if (!ExecuteParty(p, a, out.lines))
+             out.Add("WOWBG3 refused usage " + (verb.empty() ? std::string("-") : verb));
+-
+-        ChatHandler handler(session);
+-        for (std::string const& line : out.lines)
+-            handler.SendSysMessage(line.c_str());
++        for (std::string& l : out.lines)
++            lines.push_back(std::move(l));
+     }
+ }
+ 
+@@ -1342,6 +1575,18 @@ void OnCreatureEnterCombat(Creature* creature, Unit* enemy)
+     Player* p = enemy->GetCharmerOrOwnerPlayerOrPlayerItself();
+     if (!p || !p->IsInWorld() || !p->IsAlive())
+         return;
++    // 0010: a mob that turns on one of the hero's party bots is the hero's (a BG3 party fight).
++    if (AnyBots())
++    {
++        ObjectGuid const owner = BotOwner(p);
++        if (!owner.IsEmpty())
++        {
++            Player* o = ObjectAccessor::FindPlayer(owner);
++            if (!o || !o->IsInWorld())                      // a dead hero still owns its party's fights
++                return;
++            p = o;
++        }
++    }
+     ObjectGuid const guid = creature->GetObjectGuid();
+     ObjectGuid const pg = p->GetObjectGuid();
+ 
+@@ -1430,9 +1675,16 @@ bool SuppressesSightAggro(Creature const* creature, Unit const* moving)
+     Player const* p = moving->GetCharmerOrOwnerPlayerOrPlayerItself();
+     if (!p || !p->IsAlive())
+         return false;
++    ObjectGuid who = p->GetObjectGuid();
++    if (AnyBots())                                          // 0010: a party bot is in its owner's sight mode
++    {
++        ObjectGuid const owner = BotOwner(p);
++        if (!owner.IsEmpty())
++            who = owner;
++    }
+     {
+         ReadLock lock(g_lock);
+-        auto it = g_fighters.find(p->GetObjectGuid());
++        auto it = g_fighters.find(who);
+         if (it == g_fighters.end() || !it->second.sight)
+             return false;
+     }
+@@ -1452,15 +1704,57 @@ bool HandleChat(WorldSession* session, std::string const& text)
+     {
+         WorldSession* s = world->FindSession(accountId);
+         if (s && s->GetGUID() == sessionGuid && s->GetPlayer() && s->GetPlayer()->IsInWorld())
+-            Execute(s, txt);
++        {
++            std::vector<std::string> lines;
++            Execute(s->GetPlayer(), txt, lines);
++            ChatHandler handler(s);
++            for (std::string const& line : lines)
++                handler.SendSysMessage(line.c_str());
++        }
+     });
+     return true;
+ }
+ 
++void Run(Player* player, std::string const& text, std::vector<std::string>& out)
++{
++    if (player && player->IsInWorld())
++        Execute(player, text, out);
++}
++
++bool KeepsBody(Player const* player)
++{
++    if (!player)
++        return false;
++    if (AnyBots() && !BotOwner(player).IsEmpty())
++        return true;                                        // a party bot never releases
++    {
++        std::lock_guard<std::mutex> lock(g_bodyLock);
++        if (g_keepBody.count(player->GetObjectGuid().GetRawValue()))
++            return true;
++    }
++    if (!g_armedCount.load(std::memory_order_relaxed))
++        return false;
++    ReadLock lock(g_lock);
++    auto it = g_fighters.find(player->GetObjectGuid());
++    return it != g_fighters.end() && it->second.armed;      // world mode: BG3's death rules
++}
++
++void KeepBody(Player const* player, bool keep)
++{
++    if (!player)
++        return;
++    std::lock_guard<std::mutex> lock(g_bodyLock);
++    if (keep)
++        g_keepBody.insert(player->GetObjectGuid().GetRawValue());
++    else
++        g_keepBody.erase(player->GetObjectGuid().GetRawValue());
++}
++
+ void OnLogout(Player* player)
+ {
+     if (!player)
+         return;
++    OnOwnerLogout(player);                                  // 0010: its party bots log out too
+     std::vector<Release> releases;
+     {
+         WriteLock lock(g_lock);
+@@ -1468,6 +1762,10 @@ void OnLogout(Player* player)
+         if (it == g_fighters.end())
+             return;
+         Fighter& f = it->second;
++        // 0010: held areas, thawed at the next tick (without evade).
++        for (Area const& area : f.areas)
++            ReleaseArea(player->GetObjectGuid(), f, area, g_thawLater);
++        f.areas.clear();
+         SetArmed(f, false);
+         SetSight(f, false);
+         for (Mob const& m : f.pending)
+@@ -1501,11 +1799,39 @@ void OnLogout(Player* player)
+ 
+ void Update(uint32 diff)
+ {
++    UpdateParty(diff);                                      // 0010: bots, feeds, Far Sight
++
+     g_tickTimer += diff;
+     if (g_tickTimer < TICK_MS)
+         return;
+     g_tickTimer = 0;
+ 
++    // 0010: held areas of players who left, and areas not renewed for an hour.
++    {
++        std::vector<Release> thaw;
++        {
++            WriteLock lock(g_lock);
++            thaw.swap(g_thawLater);
++            uint32 const now = WorldTimer::getMSTime();
++            for (auto& kv : g_fighters)
++            {
++                Fighter& f = kv.second;
++                for (auto it = f.areas.begin(); it != f.areas.end();)
++                {
++                    if (WorldTimer::getMSTimeDiff(it->last, now) > AREA_MS)
++                    {
++                        ReleaseArea(kv.first, f, *it, thaw);
++                        it = f.areas.erase(it);
++                    }
++                    else
++                        ++it;
++                }
++            }
++        }
++        for (Release const& r : thaw)
++            Thaw(FindMob(r.map, r.instance, r.mob), false);
++    }
++
+     // A death ends sight mode (normal WoW aggro again until the client sends `arm
+     // sight`, which it may do at once, while dead: that waits for the resurrection).
+     if (g_sightCount.load(std::memory_order_relaxed))
+@@ -1529,7 +1855,7 @@ void Update(uint32 diff)
+                 if (!sg.second)
+                     alive.push_back(sg.first);
+             }
+-            else if (sg.second)
++            else if (sg.second && !LivingMember(p))         // 0010: sight stays while the party lives
+                 died.push_back(p);
+         }
+         if (!died.empty() || !alive.empty())
+@@ -1603,7 +1929,9 @@ void Update(uint32 diff)
+     for (Check const& c : checks)
+     {
+         Player* p = ObjectAccessor::FindPlayer(c.player);
+-        bool const playerOk = p && p->IsInWorld() && p->IsAlive() && p->GetMapId() == c.map && p->GetInstanceId() == c.instance;
++        // 0010: the encounter lasts while anyone of the party lives (BG3 ends it when all are down).
++        bool const playerOk = p && p->IsInWorld() && (p->IsAlive() || LivingMember(p)) &&
++            p->GetMapId() == c.map && p->GetInstanceId() == c.instance;
+         Creature* mob = FindMob(c.map, c.instance, c.mob, p);
+         bool const mobOk = mob && mob->IsAlive();
+         char const* why = nullptr;
+diff --git a/src/game/WowBg3Fights.h b/src/game/WowBg3Fights.h
+index 7729142..9a46189 100644
+--- a/src/game/WowBg3Fights.h
++++ b/src/game/WowBg3Fights.h
+@@ -28,6 +28,7 @@
+ 
+ #include "Common.h"
+ #include <string>
++#include <vector>
+ 
+ class Creature;
+ class Object;
+@@ -85,6 +86,16 @@ namespace WowBg3
+ 
+     // World::Update, in the exclusive session phase: timeouts and cleanup.
+     void Update(uint32 diff);
++
++    // 0010: runs one `.wowbg3 ...` line as `player` (world thread, no map updates) and
++    // collects the reply lines (the console's `wowbg3 NAME ...` uses it).
++    void Run(Player* player, std::string const& text, std::vector<std::string>& out);
++
++    // 0010, BG3 death rules: true when `player` keeps its body when dead (no release to a
++    // graveyard, by request or by the 6 minute timer): a party bot, a player in world mode
++    // (armed), or a character killed through `health ... 0` until it is revived.
++    bool KeepsBody(Player const* player);
++    void KeepBody(Player const* player, bool keep);
+ }
+ 
+ #endif
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+new file mode 100644
+index 0000000..361e315
+--- /dev/null
++++ b/src/game/WowBg3Party.cpp
+@@ -0,0 +1,1551 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++// WOW-BG3 (local patch 0010): party members as WoW characters. See WowBg3Party.h
++// and `AI Context/m5-server-handoff.md` ("Party verbs") in the WOW-BG3 project.
++//
++// Threads: verbs, the tick and logout run on the world thread while no map
++// updates. BotOwner, AnyBots and IsPartyBot are also called from map threads
++// (aggro and sight hooks), so the bot table is behind a shared mutex and no game
++// code runs while it is held.
++
++#include "WowBg3Party.h"
++#include "WowBg3Fights.h"
++#include "AccountMgr.h"
++#include "Camera.h"
++#include "Chat.h"
++#include "Corpse.h"
++#include "Creature.h"
++#include "DBCStores.h"
++#include "Group.h"
++#include "Log.h"
++#include "Map.h"
++#include "MapManager.h"
++#include "MoveMap.h"
++#include "MoveSpline.h"
++#include "ObjectAccessor.h"
++#include "ObjectMgr.h"
++#include "Player.h"
++#include "PlayerBots/PlayerBotAI.h"
++#include "PlayerBots/PlayerBotMgr.h"
++#include "SharedDefines.h"
++#include "Utilities/Random.h"
++#include "World.h"
++#include "WorldSession.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <shared_mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace WowBg3
++{
++namespace
++{
++    size_t const MAX_BOTS        = MAX_GROUP_SIZE - 1;       // per owner: one normal WoW group
++    uint32 const TICK_MS         = 200;
++    uint32 const ACCOUNT_WAIT_MS = 15 * IN_MILLISECONDS;     // account row to appear
++    uint32 const CREATE_WAIT_MS  = 1500;                     // new character rows committed before login
++    uint32 const LOGIN_WAIT_MS   = 30 * IN_MILLISECONDS;     // login to arrival
++    float const ARRIVED_YARDS    = 5.0f;
++    float const FEED_MAX_RANGE   = 250.0f;
++    uint32 const FEED_MIN_MS     = 200;
++    char const BOT_ACCOUNT_PREFIX[] = "WB3B";                // bot accounts: WB3B + character name
++
++    // The verbs' replies: every line starts `WOWBG3 `.
++    struct Out
++    {
++        std::vector<std::string>& lines;
++        void Add(std::string const& s) { lines.push_back(s); }
++    };
++
++    std::string Hex(ObjectGuid guid)
++    {
++        char buf[24];
++        snprintf(buf, sizeof(buf), "%016llX", (unsigned long long)guid.GetRawValue());
++        return buf;
++    }
++
++    std::string Fmt(char const* format, ...) ATTR_PRINTF(1, 2);
++    std::string Fmt(char const* format, ...)
++    {
++        char buf[512];
++        va_list ap;
++        va_start(ap, format);
++        vsnprintf(buf, sizeof(buf), format, ap);
++        va_end(ap);
++        return buf;
++    }
++
++    bool ParseFloat(std::string const& s, float& out)
++    {
++        if (s.empty() || s.size() > 24)
++            return false;
++        char* end = nullptr;
++        double v = strtod(s.c_str(), &end);
++        if (!end || *end || !std::isfinite(v) || std::fabs(v) > 100000.0)
++            return false;
++        out = float(v);
++        return true;
++    }
++
++    bool ParseUInt(std::string const& s, uint32& out, uint32 max = 0xFFFFFFFFu)
++    {
++        if (s.empty() || s.size() > 10)
++            return false;
++        for (char c : s)
++            if (!isdigit((unsigned char)c))
++                return false;
++        unsigned long long v = strtoull(s.c_str(), nullptr, 10);
++        if (v > max)
++            return false;
++        out = uint32(v);
++        return true;
++    }
++
++    std::string Lower(std::string s)
++    {
++        for (char& c : s)
++            c = char(tolower((unsigned char)c));
++        return s;
++    }
++
++    std::string Upper(std::string s)
++    {
++        for (char& c : s)
++            c = char(toupper((unsigned char)c));
++        return s;
++    }
++
++    // ---- bots ----
++
++    enum class BotState
++    {
++        Account,                                            // waiting for its account row
++        Create,                                             // character rows written, waiting to log in
++        Loading,                                            // PlayerBotMgr is logging it in
++        Arriving,                                           // in world, teleported to its spot
++        Online,
++        Removing                                            // saved, logging out
++    };
++
++    char const* StateName(BotState s)
++    {
++        switch (s)
++        {
++            case BotState::Account:  return "loading";
++            case BotState::Create:   return "loading";
++            case BotState::Loading:  return "loading";
++            case BotState::Arriving: return "loading";
++            case BotState::Online:   return "online";
++            case BotState::Removing: return "removing";
++        }
++        return "?";
++    }
++
++    struct Spot
++    {
++        bool set = false;
++        uint32 map = 0;
++        float x = 0, y = 0, z = 0, o = 0;
++    };
++
++    struct Bot
++    {
++        std::string name;
++        ObjectGuid guid;                                    // empty until the character exists
++        ObjectGuid owner;
++        uint32 account = 0;
++        uint8 race = 0, cls = 0, gender = 0;
++        BotState state = BotState::Account;
++        uint32 since = 0;                                   // state entered (ms)
++        Spot spot;                                          // where it should stand after login
++        bool teleported = false;
++        bool refresh = false;                               // visibility to redo after a move
++        bool follow = true;                                 // its level follows the hero's
++    };
++
++    std::vector<ObjectGuid> g_puppets;                      // console test puppets (world thread)
++
++    std::shared_timed_mutex g_botLock;
++    std::vector<Bot> g_bots;                                // small: a few per owner
++    std::unordered_map<uint64, uint64> g_botOwner;          // online/loading bot guid -> owner guid
++    std::atomic<uint32> g_botCount(0);
++
++    typedef std::unique_lock<std::shared_timed_mutex> WriteLock;
++    typedef std::shared_lock<std::shared_timed_mutex> ReadLock;
++
++    // Callers hold the write lock.
++    Bot* FindBotByName(std::string const& lname)
++    {
++        for (Bot& b : g_bots)
++            if (Lower(b.name) == lname)
++                return &b;
++        return nullptr;
++    }
++
++    void IndexBot(Bot const& b)
++    {
++        if (!b.guid.IsEmpty())
++            g_botOwner[b.guid.GetRawValue()] = b.owner.GetRawValue();
++        g_botCount.store(uint32(g_botOwner.size()), std::memory_order_relaxed);
++    }
++
++    void UnindexBot(ObjectGuid guid)
++    {
++        g_botOwner.erase(guid.GetRawValue());
++        g_botCount.store(uint32(g_botOwner.size()), std::memory_order_relaxed);
++    }
++
++    // Our bot AI: a puppet. It only acknowledges teleports (PlayerBotAI); BG3 moves it.
++    class PartyBotPuppetAI : public PlayerBotAI
++    {
++    public:
++        PartyBotPuppetAI() : PlayerBotAI(nullptr) {}
++    };
++
++    // ---- members ----
++
++    // The owner itself (`self` or its own name) or one of its online bots.
++    Player* Member(Player* owner, std::string const& name, char const*& why)
++    {
++        why = nullptr;
++        std::string const lname = Lower(name);
++        if (lname == "self" || lname == Lower(owner->GetName()))
++            return owner;
++        ObjectGuid guid;
++        BotState state = BotState::Account;
++        {
++            ReadLock lock(g_botLock);
++            for (Bot const& b : g_bots)
++            {
++                if (Lower(b.name) == lname && b.owner == owner->GetObjectGuid())
++                {
++                    guid = b.guid;
++                    state = b.state;
++                    break;
++                }
++            }
++        }
++        if (guid.IsEmpty() && state == BotState::Account)
++        {
++            why = "unknown";
++            return nullptr;
++        }
++        Player* m = guid.IsEmpty() ? nullptr : ObjectAccessor::FindPlayer(guid);
++        if (!m || !m->IsInWorld() || state == BotState::Removing)
++        {
++            why = "offline";
++            return nullptr;
++        }
++        return m;
++    }
++
++    std::string BotLine(Bot const& b, Player* m)
++    {
++        if (m && m->IsInWorld())
++            return Fmt("WOWBG3 bot %s %s %s %u %.2f %.2f %.2f %.3f %u %u %u", b.name.c_str(), StateName(b.state), Hex(b.guid).c_str(),
++                m->GetMapId(), m->GetPositionX(), m->GetPositionY(), m->GetPositionZ(), m->GetOrientation(),
++                m->GetLevel(), m->GetHealth(), m->GetMaxHealth());
++        return Fmt("WOWBG3 bot %s %s %s - - - - - - - -", b.name.c_str(), StateName(b.state), b.guid.IsEmpty() ? "-" : Hex(b.guid).c_str());
++    }
++
++    // An account of its own per bot (a WoW account holds one online character at a time).
++    // Creates it (asynchronously) when missing; 0 until it exists.
++    uint32 BotAccount(std::string const& name, bool create)
++    {
++        std::string const acc = BOT_ACCOUNT_PREFIX + Upper(name);
++        if (uint32 id = sAccountMgr.GetId(acc))
++            return id;
++        if (create)
++        {
++            static char const chars[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
++            std::string pass;
++            for (int i = 0; i < 16; ++i)
++                pass += chars[urand(0, sizeof(chars) - 2)];
++            AccountOpResult r = sAccountMgr.CreateAccount(acc, pass);
++            if (r != AOR_OK && r != AOR_NAME_ALREDY_EXIST)
++                sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WOWBG3: could not create bot account %s (%u)", acc.c_str(), uint32(r));
++        }
++        return 0;
++    }
++
++    bool IsBotAccount(uint32 accountId)
++    {
++        std::string acc;
++        return sAccountMgr.GetName(accountId, acc) && acc.compare(0, sizeof(BOT_ACCOUNT_PREFIX) - 1, BOT_ACCOUNT_PREFIX) == 0;
++    }
++
++    // The character rows for a new bot (as the client's character creation would write them).
++    ObjectGuid CreateCharacter(Bot const& b)
++    {
++        uint8 skin, face, hairStyle, hairColor, facialHair;
++        Player::SelectRandomAppearance(b.race, b.gender, hairStyle, hairColor, face, facialHair, skin);
++        WorldSession session(b.account, nullptr, SEC_PLAYER, 0, LOCALE_enUS);
++        uint32 const low = sObjectMgr.GeneratePlayerLowGuid();
++        if (!Player::SaveNewPlayer(&session, low, b.name, b.race, b.cls, b.gender, skin, face, hairStyle, hairColor, facialHair))
++            return ObjectGuid();
++        LoginDatabase.PExecute("REPLACE INTO `realmcharacters` (`numchars`, `acctid`, `realmid`) VALUES (1, %u, %u)", b.account, realmID);
++        return ObjectGuid(HIGHGUID_PLAYER, low);
++    }
++
++    void JoinParty(Player* owner, Player* bot)
++    {
++        if (!owner || !bot || owner == bot)
++            return;
++        ::Group* group = owner->GetGroup();
++        if (!group)
++        {
++            group = new ::Group;
++            if (!group->Create(owner->GetObjectGuid(), owner->GetName()))
++            {
++                delete group;
++                return;
++            }
++            sObjectMgr.AddGroup(group);
++        }
++        if (bot->GetGroup() == group)
++            return;
++        if (bot->GetGroup())
++            bot->RemoveFromGroup();
++        if (group->IsFull())
++            return;
++        group->AddMember(bot->GetObjectGuid(), bot->GetName());
++    }
++
++    void FollowLevel(Player* owner, Player* bot)
++    {
++        if (!owner || !bot || bot->GetLevel() == owner->GetLevel())
++            return;
++        bot->GiveLevel(owner->GetLevel());
++        bot->InitTalentForLevel();
++        bot->SetUInt32Value(PLAYER_XP, 0);
++    }
++
++    void Refresh(Player* m)
++    {
++        m->GetCamera().UpdateVisibilityForOwner();
++        m->UpdateObjectVisibility();
++    }
++
++    Spot NextTo(Player* owner)
++    {
++        Spot s;
++        s.set = true;
++        s.map = owner->GetMapId();
++        float const a = owner->GetOrientation() + float(M_PI);   // a step behind the owner
++        s.x = owner->GetPositionX() + 1.5f * std::cos(a);
++        s.y = owner->GetPositionY() + 1.5f * std::sin(a);
++        s.z = owner->GetPositionZ();
++        s.o = owner->GetOrientation();
++        return s;
++    }
++
++    bool ParseSpot(std::vector<std::string> const& a, size_t i, Player* owner, Spot& s)
++    {
++        // X Y Z [MAP [O]]
++        if (a.size() < i + 3)
++            return false;
++        if (!ParseFloat(a[i], s.x) || !ParseFloat(a[i + 1], s.y) || !ParseFloat(a[i + 2], s.z))
++            return false;
++        s.map = owner->GetMapId();
++        s.o = owner->GetOrientation();
++        if (a.size() > i + 3 && !ParseUInt(a[i + 3], s.map, 10000))
++            return false;
++        if (a.size() > i + 4 && !ParseFloat(a[i + 4], s.o))
++            return false;
++        if (a.size() > i + 5)
++            return false;
++        if (!MapManager::IsValidMapCoord(s.map, s.x, s.y, s.z, s.o))
++            return false;
++        s.set = true;
++        return true;
++    }
++
++    // bot add NAME RACE CLASS GENDER [X Y Z [MAP [O]]]
++    void BotAdd(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string name = a[3];
++        std::string const head = "WOWBG3 bot " + name + " ";
++        uint32 race = 0, cls = 0, gender = 0;
++        if (!ParseUInt(a[4], race, 255) || !ParseUInt(a[5], cls, 255) || !ParseUInt(a[6], gender, 1))
++            return out.Add(head + "refused usage");
++        Spot spot;
++        if (a.size() > 7 && !ParseSpot(a, 7, owner, spot))
++            return out.Add(head + "refused badpos");
++        if (!normalizePlayerName(name) || ObjectMgr::CheckPlayerName(name, true) != CHAR_NAME_SUCCESS)
++            return out.Add(head + "refused badname");
++        if (Lower(name) == Lower(owner->GetName()))
++            return out.Add(head + "refused self");
++        ChrRacesEntry const* raceEntry = sChrRacesStore.LookupEntry(race);
++        if (!raceEntry || raceEntry->HasFlag(CHRRACES_FLAGS_NOT_PLAYABLE) || !sChrClassesStore.LookupEntry(cls) ||
++            !sObjectMgr.GetPlayerInfo(race, cls))
++            return out.Add(head + "refused badrace");
++        if (!spot.set)
++            spot = NextTo(owner);
++
++        ObjectGuid const og = owner->GetObjectGuid();
++        uint32 const now = WorldTimer::getMSTime();
++        ObjectGuid existing = sObjectMgr.GetPlayerGuidByName(name);
++        {
++            WriteLock lock(g_botLock);
++            if (Bot* b = FindBotByName(Lower(name)))
++            {
++                if (b->owner != og)
++                    return out.Add(head + "refused owned");
++                if (b->state == BotState::Removing)
++                    return out.Add(head + "refused busy");
++                if (b->state != BotState::Online)
++                {
++                    b->spot = spot;
++                    b->teleported = false;
++                    return out.Add(head + "loading " + (b->guid.IsEmpty() ? std::string("-") : Hex(b->guid)) + " again");
++                }
++                // Online already: answer again, and move it if a place was given.
++                b->spot = spot;
++                b->teleported = false;
++                if (a.size() > 7)
++                {
++                    b->state = BotState::Arriving;
++                    b->since = now;
++                }
++                ObjectGuid const g = b->guid;
++                lock.unlock();
++                Player* m = ObjectAccessor::FindPlayer(g);
++                ReadLock rl(g_botLock);
++                for (Bot const& x : g_bots)
++                    if (x.guid == g)
++                        return out.Add(BotLine(x, m));
++                return;
++            }
++            size_t mine = 0;
++            for (Bot const& b : g_bots)
++                if (b.owner == og)
++                    ++mine;
++            if (mine >= MAX_BOTS)
++                return out.Add(head + "refused toomany");
++        }
++
++        Bot b;
++        b.name = name;
++        b.owner = og;
++        b.race = uint8(race);
++        b.cls = uint8(cls);
++        b.gender = uint8(gender);
++        b.spot = spot;
++        b.since = now;
++        char const* how = "created";
++        if (!existing.IsEmpty())
++        {
++            // An existing character: ours only if it lives on a bot account.
++            uint32 const acc = sObjectMgr.GetPlayerAccountIdByGUID(existing);
++            if (!acc || !IsBotAccount(acc))
++                return out.Add(head + "refused taken");
++            if (Player* online = ObjectAccessor::FindPlayer(existing))
++            {
++                (void)online;
++                return out.Add(head + "refused online");
++            }
++            b.guid = existing;
++            b.account = acc;
++            if (PlayerCacheData const* d = sObjectMgr.GetPlayerDataByGUID(existing.GetCounter()))
++            {
++                b.race = d->uiRace;
++                b.cls = d->uiClass;
++                b.gender = d->uiGender;
++            }
++            b.state = BotState::Create;
++            b.since = now - CREATE_WAIT_MS;                 // nothing to wait for
++            how = "existing";
++        }
++        else
++        {
++            b.account = BotAccount(name, true);
++            b.state = BotState::Account;
++        }
++        {
++            WriteLock lock(g_botLock);
++            g_bots.push_back(b);
++            IndexBot(b);
++        }
++        out.Add(head + "loading " + (b.guid.IsEmpty() ? std::string("-") : Hex(b.guid)) + " " + how +
++            Fmt(" %u %u %u", uint32(b.race), uint32(b.cls), uint32(b.gender)));
++    }
++
++    // Saved now, logged out by PlayerBotMgr within its update interval.
++    bool StartRemoval(Bot& b, Player* m)
++    {
++        b.state = BotState::Removing;
++        b.since = WorldTimer::getMSTime();
++        if (!m)
++            return false;
++        // PlayerBotMgr logs it out within its update interval; the logout saves it (0010 hook).
++        if (PlayerBotEntry* e = m->GetSession()->GetBot())
++            e->requestRemoval = true;
++        return true;
++    }
++
++    void BotRemove(Player* owner, std::string const& name, Out& out)
++    {
++        std::string const head = "WOWBG3 bot " + name + " ";
++        ObjectGuid g;
++        {
++            ReadLock lock(g_botLock);
++            for (Bot const& b : g_bots)
++                if (Lower(b.name) == Lower(name) && b.owner == owner->GetObjectGuid())
++                    g = b.guid;
++        }
++        Player* m = g.IsEmpty() ? nullptr : ObjectAccessor::FindPlayerNotInWorld(g);
++        WriteLock lock(g_botLock);
++        for (auto it = g_bots.begin(); it != g_bots.end(); ++it)
++        {
++            if (Lower(it->name) != Lower(name) || it->owner != owner->GetObjectGuid())
++                continue;
++            if (it->state == BotState::Removing)
++                return out.Add(head + "removing " + Hex(it->guid));
++            if (it->state == BotState::Account || (it->state == BotState::Create && !m))
++            {
++                // Not logged in yet: just forget the request.
++                std::string const gs = it->guid.IsEmpty() ? std::string("-") : Hex(it->guid);
++                UnindexBot(it->guid);
++                g_bots.erase(it);
++                return out.Add(head + "offline " + gs);
++            }
++            if (!StartRemoval(*it, m) && it->state != BotState::Loading)
++            {
++                std::string const gs = Hex(it->guid);
++                UnindexBot(it->guid);
++                g_bots.erase(it);
++                return out.Add(head + "offline " + gs);
++            }
++            return out.Add(head + "removing " + Hex(it->guid));
++        }
++        out.Add(head + "refused unknown");
++    }
++
++    void BotList(Player* owner, Out& out)
++    {
++        std::vector<std::pair<Bot, Player*>> mine;
++        {
++            ReadLock lock(g_botLock);
++            for (Bot const& b : g_bots)
++                if (b.owner == owner->GetObjectGuid())
++                    mine.push_back({ b, nullptr });
++        }
++        for (auto& bp : mine)
++        {
++            bp.second = bp.first.guid.IsEmpty() ? nullptr : ObjectAccessor::FindPlayer(bp.first.guid);
++            out.Add(BotLine(bp.first, bp.second));
++        }
++        out.Add("WOWBG3 bots " + std::to_string(mine.size()));
++    }
++
++    // move MEMBER X Y Z [MAP [O]]: the owner or a bot, anywhere (near or far teleport).
++    void Move(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 move " + a[2] + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        Spot s;
++        if (!ParseSpot(a, 3, owner, s))
++            return out.Add(head + "refused badpos");
++        if (m->IsTaxiFlying())
++            return out.Add(head + "refused taxi");
++        if (m->IsBeingTeleported())
++            return out.Add(head + "refused busy");
++        bool const near = m->GetMapId() == s.map;
++        if (m != owner)
++        {
++            WriteLock lock(g_botLock);
++            for (Bot& b : g_bots)
++            {
++                if (b.guid == m->GetObjectGuid())
++                {
++                    b.spot = s;
++                    b.teleported = true;
++                    b.refresh = true;
++                }
++            }
++        }
++        if (!m->TeleportTo(s.map, s.x, s.y, s.z, s.o, TELE_TO_NOT_LEAVE_COMBAT | TELE_TO_NOT_UNSUMMON_PET))
++            return out.Add(head + "refused failed");
++        out.Add(Fmt("WOWBG3 move %s ok %u %.2f %.2f %.2f %s", a[2].c_str(), s.map, s.x, s.y, s.z, near ? "near" : "far"));
++    }
++
++    // ---- Far Sight ----
++
++    std::mutex g_viewLock;
++    std::unordered_map<uint64, uint64> g_views;             // owner -> member it views (not itself)
++
++    void View(Player* owner, std::string const& name, Out& out)
++    {
++        std::string const head = "WOWBG3 view " + name + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, name, why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        Camera& cam = owner->GetCamera();
++        if (m == owner)
++        {
++            cam.ResetView();
++            std::lock_guard<std::mutex> lock(g_viewLock);
++            g_views.erase(owner->GetObjectGuid().GetRawValue());
++            return out.Add(head + "ok " + Hex(owner->GetObjectGuid()));
++        }
++        if (!owner->IsInMap(m))
++            return out.Add(head + "refused map");
++        cam.SetView(m);
++        if (cam.GetBody() != m)
++            return out.Add(head + "refused failed");
++        {
++            std::lock_guard<std::mutex> lock(g_viewLock);
++            g_views[owner->GetObjectGuid().GetRawValue()] = m->GetObjectGuid().GetRawValue();
++        }
++        out.Add(head + "ok " + Hex(m->GetObjectGuid()));
++    }
++
++    // ---- per-member creature feed ----
++
++    struct Seen
++    {
++        uint32 entry = 0, level = 0, hp = 0, maxhp = 0, faction = 0, display = 0, npcflags = 0;
++        uint8 react = 0;
++        float x = 0, y = 0, z = 0, o = 0;
++        std::string flags;
++    };
++
++    struct Feed
++    {
++        ObjectGuid owner;
++        ObjectGuid member;
++        std::string memberName;
++        float range = 100.0f;
++        uint32 interval = 500;
++        uint32 elapsed = 0;
++        uint32 seq = 0;
++        std::unordered_map<uint64, Seen> seen;
++    };
++
++    std::vector<Feed> g_feeds;                              // world thread only
++
++    std::string Flags(Creature* c, Player* m)
++    {
++        std::string f;
++        if (!c->IsAlive()) f += 'd';
++        if (c->IsInCombat()) f += 'c';
++        if (IsHeld(c)) f += 'h';
++        if (c->IsInEvadeMode()) f += 'e';
++        if (c->IsAlive() && (c->IsMoving() || !c->movespline->Finalized())) f += 'm';
++        if (c->IsAlive() && m->IsValidAttackTarget(c)) f += 'a';
++        if (c->HasLootRecipient() && !c->IsTappedBy(m)) f += 't';
++        if (c->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE)) f += 'l';
++        if (c->IsPet() || c->IsTotem() || c->GetCharmerOrOwnerGuid().IsPlayer()) f += 'p';
++        if (c->GetCreatureType() == CREATURE_TYPE_CRITTER) f += 'k';
++        return f.empty() ? "-" : f;
++    }
++
++    Seen Look(Creature* c, Player* m)
++    {
++        Seen s;
++        s.entry = c->GetEntry();
++        s.level = c->GetLevel();
++        s.hp = c->GetHealth();
++        s.maxhp = c->GetMaxHealth();
++        s.faction = c->GetFactionTemplateId();
++        s.display = c->GetDisplayId();
++        s.npcflags = c->GetUInt32Value(UNIT_NPC_FLAGS);
++        s.react = uint8(c->GetReactionTo(m));
++        s.x = c->GetPositionX();
++        s.y = c->GetPositionY();
++        s.z = c->GetPositionZ();
++        s.o = c->GetOrientation();
++        s.flags = Flags(c, m);
++        return s;
++    }
++
++    // `WOWBG3 cr MEMBER GUID ENTRY LEVEL HP MAXHP REACT FACTION GROUP X Y Z O DISPLAY NPCFLAGS FLAGS NAME`
++    std::string CreatureLine(std::string const& member, Creature* c, Seen const& s)
++    {
++        FactionTemplateEntry const* ft = c->GetFactionTemplateEntry();
++        return Fmt("WOWBG3 cr %s %s %u %u %u %u %u %u %u %.2f %.2f %.2f %.3f %u %X %s %s",
++            member.c_str(), Hex(c->GetObjectGuid()).c_str(), s.entry, s.level, s.hp, s.maxhp, uint32(s.react),
++            s.faction, ft ? ft->ourMask : 0u, s.x, s.y, s.z, s.o, s.display, s.npcflags, s.flags.c_str(), c->GetName());
++    }
++
++    // What the member's client would see: its visible list (WoW's own visibility, grid
++    // and phase rules, from the member's own view point), creatures only, within range.
++    std::vector<Creature*> Around(Player* m, float range)
++    {
++        std::vector<Creature*> list;
++        Map* map = m->GetMap();
++        std::vector<ObjectGuid> guids;
++        {
++            std::shared_lock<std::shared_timed_mutex> lock(m->m_visibleGUIDs_lock);
++            for (ObjectGuid const& g : m->m_visibleGUIDs)
++                if (g.IsCreatureOrPet())
++                    guids.push_back(g);
++        }
++        for (ObjectGuid const& g : guids)
++        {
++            Creature* c = map->GetAnyTypeCreature(g);
++            if (c && c->IsInWorld() && (range <= 0.0f || m->IsWithinDist(c, range, false)))
++                list.push_back(c);
++        }
++        return list;
++    }
++
++    // near MEMBER [RANGE]
++    void Near(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 near " + a[2] + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        // RANGE `all`: the whole visible list, wherever its view point is (Far Sight).
++        float range = 100.0f;
++        if (a.size() > 3 && a[3] == "all")
++            range = 0.0f;
++        else if (a.size() > 3 && (!ParseFloat(a[3], range) || range <= 0 || range > FEED_MAX_RANGE))
++            return out.Add(head + "refused usage");
++        std::vector<Creature*> list = Around(m, range);
++        out.Add(Fmt("WOWBG3 near %s %s %u %.2f %.2f %.2f %u", a[2].c_str(), Hex(m->GetObjectGuid()).c_str(), m->GetMapId(),
++            m->GetPositionX(), m->GetPositionY(), m->GetPositionZ(), uint32(list.size())));
++        for (Creature* c : list)
++            out.Add(CreatureLine(a[2], c, Look(c, m)));
++    }
++
++    // feed MEMBER on [RANGE [MS]] | feed MEMBER off | feed off
++    void FeedVerb(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        ObjectGuid const og = owner->GetObjectGuid();
++        if (a.size() == 3 && a[2] == "off")
++        {
++            size_t n = 0;
++            for (auto it = g_feeds.begin(); it != g_feeds.end();)
++            {
++                if (it->owner == og)
++                {
++                    it = g_feeds.erase(it);
++                    ++n;
++                }
++                else
++                    ++it;
++            }
++            return out.Add("WOWBG3 feed all off " + std::to_string(n));
++        }
++        std::string const head = "WOWBG3 feed " + a[2] + " ";
++        if (a.size() < 4 || (a[3] != "on" && a[3] != "off"))
++            return out.Add(head + "refused usage");
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (a[3] == "off")
++        {
++            for (auto it = g_feeds.begin(); it != g_feeds.end(); ++it)
++            {
++                if (it->owner == og && Lower(it->memberName) == Lower(a[2]))
++                {
++                    g_feeds.erase(it);
++                    return out.Add(head + "off");
++                }
++            }
++            return out.Add(head + "off");
++        }
++        if (!m)
++            return out.Add(head + "refused " + why);
++        float range = 100.0f;
++        uint32 interval = 500;
++        if (a.size() > 4 && (!ParseFloat(a[4], range) || range <= 0 || range > FEED_MAX_RANGE))
++            return out.Add(head + "refused usage");
++        if (a.size() > 5 && (!ParseUInt(a[5], interval, 60000) || interval < FEED_MIN_MS))
++            return out.Add(head + "refused usage");
++        if (a.size() > 6)
++            return out.Add(head + "refused usage");
++        Feed* f = nullptr;
++        for (Feed& x : g_feeds)
++            if (x.owner == og && x.member == m->GetObjectGuid())
++                f = &x;
++        if (!f)
++        {
++            g_feeds.emplace_back();
++            f = &g_feeds.back();
++            f->owner = og;
++            f->member = m->GetObjectGuid();
++        }
++        f->memberName = a[2];
++        f->range = range;
++        f->interval = interval;
++        f->elapsed = interval;                              // first full snapshot at the next tick
++        f->seen.clear();
++        out.Add(Fmt("WOWBG3 feed %s on %s %.0f %u", a[2].c_str(), Hex(m->GetObjectGuid()).c_str(), range, interval));
++    }
++
++    bool Changed(Seen const& a, Seen const& b)
++    {
++        return a.entry != b.entry || a.level != b.level || a.hp != b.hp || a.maxhp != b.maxhp || a.faction != b.faction ||
++            a.display != b.display || a.npcflags != b.npcflags || a.react != b.react || a.flags != b.flags ||
++            std::fabs(a.x - b.x) > 0.3f || std::fabs(a.y - b.y) > 0.3f || std::fabs(a.z - b.z) > 0.3f ||
++            std::fabs(a.o - b.o) > 0.1f;
++    }
++
++    // Every interval: the creatures that changed (`cr`), left (`crgone`), then `tick`.
++    void UpdateFeeds(uint32 diff)
++    {
++        for (auto it = g_feeds.begin(); it != g_feeds.end();)
++        {
++            Feed& f = *it;
++            Player* owner = ObjectAccessor::FindPlayer(f.owner);
++            Player* m = ObjectAccessor::FindPlayer(f.member);
++            if (!owner)
++            {
++                it = g_feeds.erase(it);
++                continue;
++            }
++            if (!m || !m->IsInWorld())
++            {
++                SayTo(owner, "WOWBG3 feed " + f.memberName + " off gone");
++                it = g_feeds.erase(it);
++                continue;
++            }
++            f.elapsed += diff;
++            if (f.elapsed < f.interval)
++            {
++                ++it;
++                continue;
++            }
++            f.elapsed = 0;
++            ++f.seq;
++            std::unordered_map<uint64, Seen> now;
++            std::vector<std::string> lines;
++            for (Creature* c : Around(m, f.range))
++            {
++                uint64 const key = c->GetObjectGuid().GetRawValue();
++                Seen s = Look(c, m);
++                auto old = f.seen.find(key);
++                if (old == f.seen.end() || Changed(old->second, s))
++                    lines.push_back(CreatureLine(f.memberName, c, s));
++                else
++                    s = old->second;                        // keep the last sent values as the reference
++                now.emplace(key, s);
++            }
++            for (auto const& kv : f.seen)
++                if (now.find(kv.first) == now.end())
++                    lines.push_back("WOWBG3 crgone " + f.memberName + " " + Hex(ObjectGuid(kv.first)));
++            f.seen.swap(now);
++            lines.push_back(Fmt("WOWBG3 tick %s %u %u %u %.2f %.2f %.2f", f.memberName.c_str(), f.seq, uint32(f.seen.size()),
++                m->GetMapId(), m->GetPositionX(), m->GetPositionY(), m->GetPositionZ()));
++            for (std::string const& l : lines)
++                SayTo(owner, l);
++            ++it;
++        }
++    }
++
++    // ---- death (BG3 rules) ----
++
++    // health MEMBER HP MAX: the member's WoW HP as a fraction of its max; 0 kills it in place
++    // (an environmental-style death: no killer, the usual durability loss, body kept).
++    void Health(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 health " + a[2] + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        uint32 hp = 0, max = 0;
++        if (!ParseUInt(a[3], hp) || !ParseUInt(a[4], max) || max == 0 || hp > max)
++            return out.Add(head + "refused badhp");
++        uint32 const maxHealth = m->GetMaxHealth();
++        if (!m->IsAlive())
++            return out.Add(head + "dead 0 " + std::to_string(maxHealth));
++        uint64 target = (uint64(maxHealth) * hp * 2 + max) / (uint64(max) * 2);
++        if (hp > 0 && target == 0)
++            target = 1;
++        if (target > maxHealth)
++            target = maxHealth;
++        if (target > 0)
++        {
++            if (m->GetHealth() != uint32(target))
++                m->SetHealth(uint32(target));
++            return out.Add(head + "ok " + std::to_string(m->GetHealth()) + " " + std::to_string(maxHealth));
++        }
++        KeepBody(m, true);
++        m->DealDamage(m, m->GetHealth(), nullptr, SELF_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
++        if (m->IsAlive())
++            return out.Add(head + "ok " + std::to_string(m->GetHealth()) + " " + std::to_string(maxHealth));
++        m->DurabilityLossAll(0.10f, false);
++        out.Add(head + "died 0 " + std::to_string(maxHealth));
++    }
++
++    // revive MEMBER [HP MAX]: back to life where the body lies (BG3's revive), at that
++    // fraction of max HP (default full). A ghost (released before this rule) is brought
++    // back to its corpse first when it is on the same map.
++    void Revive(Player* owner, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 revive " + a[2] + " ";
++        char const* why = nullptr;
++        Player* m = Member(owner, a[2], why);
++        if (!m)
++            return out.Add(head + "refused " + why);
++        uint32 hp = 1, max = 1;
++        if (a.size() == 5 && (!ParseUInt(a[3], hp) || !ParseUInt(a[4], max) || max == 0 || hp == 0 || hp > max))
++            return out.Add(head + "refused badhp");
++        if (a.size() != 3 && a.size() != 5)
++            return out.Add(head + "refused usage");
++        if (m->IsAlive())
++            return out.Add(head + "alive " + std::to_string(m->GetHealth()) + " " + std::to_string(m->GetMaxHealth()));
++        if (m->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST))
++        {
++            if (Corpse* corpse = m->GetCorpse())
++                if (corpse->GetMapId() == m->GetMapId())
++                    m->NearTeleportTo(corpse->GetPositionX(), corpse->GetPositionY(), corpse->GetPositionZ(), corpse->GetOrientation());
++        }
++        m->ResurrectPlayer(1.0f, false);
++        m->SpawnCorpseBones();
++        uint32 const maxHealth = m->GetMaxHealth();
++        uint64 target = (uint64(maxHealth) * hp * 2 + max) / (uint64(max) * 2);
++        if (target == 0)
++            target = 1;
++        if (target > maxHealth)
++            target = maxHealth;
++        m->SetHealth(uint32(target));
++        KeepBody(m, false);
++        out.Add(head + "ok " + std::to_string(m->GetHealth()) + " " + std::to_string(maxHealth));
++    }
++
++    // ---- levels (console) ----
++
++    // level NAME: `WOWBG3 level NAME LEVEL XP online|offline` (offline: the stored level).
++    // level NAME N: an online party bot to level N (1-60, also down), XP 0; it stops following
++    // the hero's level until `level NAME follow`.
++    void Level(std::vector<std::string> const& a, Out& out)
++    {
++        std::string name = a[2];
++        normalizePlayerName(name);
++        std::string const head = "WOWBG3 level " + name + " ";
++        ObjectGuid const g = sObjectMgr.GetPlayerGuidByName(name);
++        if (g.IsEmpty())
++            return out.Add(head + "refused unknown");
++        Player* m = ObjectAccessor::FindPlayer(g);
++        if (a.size() == 3)
++        {
++            if (m)
++                return out.Add(head + std::to_string(m->GetLevel()) + " " + std::to_string(m->GetUInt32Value(PLAYER_XP)) + " online");
++            PlayerCacheData const* d = sObjectMgr.GetPlayerDataByGUID(g.GetCounter());
++            return out.Add(head + std::to_string(d ? d->uiLevel : 0) + " - offline");
++        }
++        uint32 level = 0;
++        bool const follow = a[3] == "follow";
++        if (!follow && (!ParseUInt(a[3], level, 255) || level < 1 || level > sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL)))
++            return out.Add(head + "refused badlevel");
++        ObjectGuid owner;
++        {
++            WriteLock lock(g_botLock);
++            for (Bot& b : g_bots)
++            {
++                if (b.guid == g)
++                {
++                    owner = b.owner;
++                    b.follow = follow;
++                }
++            }
++        }
++        if (owner.IsEmpty())
++            return out.Add(head + "refused notbot");
++        if (!m)
++            return out.Add(head + "refused offline");
++        if (follow)
++        {
++            FollowLevel(ObjectAccessor::FindPlayer(owner), m);
++            return out.Add(head + "follow " + std::to_string(m->GetLevel()));
++        }
++        if (m->GetLevel() != level)
++        {
++            m->GiveLevel(level);
++            m->InitTalentForLevel();
++        }
++        m->SetUInt32Value(PLAYER_XP, 0);
++        out.Add(head + "ok " + std::to_string(m->GetLevel()));
++    }
++
++    // ---- movement map tiles written while the server runs ----
++
++    // mmtile MAP X Y [reload]: the tile file mmaps/MMMYYXX.mmtile (X, Y as MoveMapGenerator's
++    // --tile X,Y) into the running server's navigation mesh. Runs while no map updates, so no
++    // path query reads the mesh meanwhile.
++    void MmTile(std::vector<std::string> const& a, size_t i, Out& out)
++    {
++        uint32 map = 0, x = 0, y = 0;
++        if (a.size() < i + 3 || a.size() > i + 4 || !ParseUInt(a[i], map, 10000) || !ParseUInt(a[i + 1], x, 63) ||
++            !ParseUInt(a[i + 2], y, 63) || (a.size() == i + 4 && a[i + 3] != "reload"))
++            return out.Add("WOWBG3 mmtile refused usage");
++        std::string const head = Fmt("WOWBG3 mmtile %u %u %u ", map, x, y);
++        if (!sMapStorage.LookupEntry<MapEntry>(map))
++            return out.Add(head + "refused badmap");
++        char file[64];
++        snprintf(file, sizeof(file), "mmaps/%03u%02u%02u.mmtile", map, y, x);
++        std::string const path = sWorld.GetDataPath() + file;
++        if (FILE* fh = fopen(path.c_str(), "rb"))
++            fclose(fh);
++        else
++            return out.Add(head + "missing");
++        MMAP::MMapManager* mgr = MMAP::MMapFactory::createOrGetMMapManager();
++        bool const reload = a.size() == i + 4;
++        uint32 const before = mgr->getLoadedTilesCount();
++        if (reload)
++            mgr->unloadMap(map, int32(x), int32(y));
++        bool const loaded = mgr->loadMap(map, int32(x), int32(y));
++        if (loaded)
++            return out.Add(head + (reload ? "reloaded " : "loaded ") + std::to_string(mgr->getLoadedTilesCount()));
++        // false: already in the mesh, or the file is not a valid tile (the server log says which)
++        if (mgr->getLoadedTilesCount() == before && !reload)
++            return out.Add(head + "already " + std::to_string(before));
++        out.Add(head + "failed");
++    }
++}
++
++// ---- hooks ----
++
++Player* LivingMember(Player const* owner)
++{
++    if (!owner || !AnyBots())
++        return nullptr;
++    std::vector<ObjectGuid> mine;
++    {
++        ReadLock lock(g_botLock);
++        for (Bot const& b : g_bots)
++            if (b.owner == owner->GetObjectGuid() && b.state == BotState::Online)
++                mine.push_back(b.guid);
++    }
++    for (ObjectGuid g : mine)
++    {
++        Player* m = ObjectAccessor::FindPlayer(g);
++        if (m && m->IsInWorld() && m->IsAlive() && m->GetMapId() == owner->GetMapId() &&
++            m->GetInstanceId() == owner->GetInstanceId())
++            return m;
++    }
++    return nullptr;
++}
++
++Player* FindMember(Player* owner, std::string const& name, char const*& why)
++{
++    return Member(owner, name, why);
++}
++
++ObjectGuid BotOwner(Player const* player)
++{
++    if (!player || !g_botCount.load(std::memory_order_relaxed))
++        return ObjectGuid();
++    ReadLock lock(g_botLock);
++    auto it = g_botOwner.find(player->GetObjectGuid().GetRawValue());
++    return it == g_botOwner.end() ? ObjectGuid() : ObjectGuid(it->second);
++}
++
++bool AnyBots()
++{
++    return g_botCount.load(std::memory_order_relaxed) != 0;
++}
++
++bool IsPartyBot(WorldSession const* session)
++{
++    PlayerBotEntry* e = session ? session->GetBot() : nullptr;
++    return e && e->ai && dynamic_cast<PartyBotPuppetAI*>(e->ai.get()) != nullptr;
++}
++
++bool NearParty(Player* p, WorldObject const* target, float range)
++{
++    if (p->IsWithinDistInMap(target, range))
++        return true;
++    if (!AnyBots())
++        return false;
++    std::vector<ObjectGuid> mine;
++    {
++        ReadLock lock(g_botLock);
++        for (Bot const& b : g_bots)
++            if (b.owner == p->GetObjectGuid() && b.state == BotState::Online)
++                mine.push_back(b.guid);
++    }
++    for (ObjectGuid g : mine)
++    {
++        Player* m = ObjectAccessor::FindPlayer(g);
++        if (m && m->IsInWorld() && m->IsWithinDistInMap(target, range))
++            return true;
++    }
++    return false;
++}
++
++void SayTo(Player* player, std::string const& line)
++{
++    if (!player || !player->GetSession())
++        return;
++    if (player->GetSession()->GetBot())
++    {
++        // Nobody reads a bot's chat: the console tests read the server log.
++        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "WOWBG3 to %s: %s", player->GetName(), line.c_str());
++        return;
++    }
++    ChatHandler(player->GetSession()).SendSysMessage(line.c_str());
++}
++
++bool ExecuteParty(Player* p, std::vector<std::string> const& a, std::vector<std::string>& lines)
++{
++    Out out{ lines };
++    std::string const verb = a.size() > 1 ? a[1] : "";
++    std::string const sub = a.size() > 2 ? a[2] : "";
++    if (verb == "bot" && sub == "add" && a.size() >= 7 && a.size() <= 12)
++        BotAdd(p, a, out);
++    else if (verb == "bot" && sub == "remove" && a.size() == 4)
++        BotRemove(p, a[3], out);
++    else if (verb == "bot" && sub == "list" && a.size() == 3)
++        BotList(p, out);
++    else if (verb == "move" && a.size() >= 6 && a.size() <= 8)
++        Move(p, a, out);
++    else if (verb == "view" && a.size() == 3)
++        View(p, a[2], out);
++    else if (verb == "near" && (a.size() == 3 || a.size() == 4))
++        Near(p, a, out);
++    else if (verb == "feed" && a.size() >= 3 && a.size() <= 6)
++        FeedVerb(p, a, out);
++    else if (verb == "health" && a.size() == 5)
++        Health(p, a, out);
++    else if (verb == "revive" && (a.size() == 3 || a.size() == 5))
++        Revive(p, a, out);
++    else if (verb == "mmtile")
++        MmTile(a, 2, out);
++    else
++        return false;
++    return true;
++}
++
++bool ExecuteGlobal(std::vector<std::string> const& a, std::vector<std::string>& lines)
++{
++    Out out{ lines };
++    std::string const verb = a.size() > 1 ? a[1] : "";
++    if (verb == "mmtile")
++        MmTile(a, 2, out);
++    else if (verb == "level" && (a.size() == 3 || a.size() == 4))
++        Level(a, out);
++    else if ((verb == "login" || verb == "logout") && a.size() == 3)
++    {
++        // Console test tool: an offline character (any account not online) logged in or out
++        // as a puppet with no client, to stand in for a hero in server tests.
++        std::string name = a[2];
++        normalizePlayerName(name);
++        ObjectGuid const g = sObjectMgr.GetPlayerGuidByName(name);
++        if (g.IsEmpty())
++            out.Add("WOWBG3 " + verb + " " + name + " refused unknown");
++        else if (verb == "login")
++        {
++            if (ObjectAccessor::FindPlayer(g))
++                out.Add("WOWBG3 login " + name + " online " + Hex(g));
++            else if (sPlayerBotMgr.AddBot(g.GetCounter(), false, new PartyBotPuppetAI()))
++            {
++                g_puppets.push_back(g);
++                out.Add("WOWBG3 login " + name + " loading " + Hex(g));
++            }
++            else
++                out.Add("WOWBG3 login " + name + " refused busy");
++        }
++        else
++        {
++            Player* p = ObjectAccessor::FindPlayerNotInWorld(g);
++            PlayerBotEntry* e = p ? p->GetSession()->GetBot() : nullptr;
++            if (!e || !BotOwner(p).IsEmpty())
++                out.Add("WOWBG3 logout " + name + " refused notpuppet");
++            else
++            {
++                e->requestRemoval = true;
++                out.Add("WOWBG3 logout " + name + " ok " + Hex(g));
++            }
++        }
++    }
++    else
++        return false;
++    return true;
++}
++
++void OnOwnerLogout(Player* owner)
++{
++    if (!owner)
++        return;
++    ObjectGuid const og = owner->GetObjectGuid();
++    {
++        std::lock_guard<std::mutex> lock(g_viewLock);
++        g_views.erase(og.GetRawValue());
++    }
++    for (auto it = g_feeds.begin(); it != g_feeds.end();)
++        it = it->owner == og ? g_feeds.erase(it) : it + 1;
++    if (!AnyBots() && g_bots.empty())
++        return;
++    std::vector<ObjectGuid> mine;
++    {
++        ReadLock lock(g_botLock);
++        for (Bot const& b : g_bots)
++            if (b.owner == og && !b.guid.IsEmpty())
++                mine.push_back(b.guid);
++    }
++    std::vector<std::pair<ObjectGuid, Player*>> found;
++    for (ObjectGuid g : mine)
++        found.push_back({ g, ObjectAccessor::FindPlayerNotInWorld(g) });
++    WriteLock lock(g_botLock);
++    for (auto it = g_bots.begin(); it != g_bots.end();)
++    {
++        if (it->owner != og)
++        {
++            ++it;
++            continue;
++        }
++        Player* m = nullptr;
++        for (auto const& f : found)
++            if (f.first == it->guid)
++                m = f.second;
++        if (it->state == BotState::Removing || (it->state == BotState::Loading && !m))
++        {
++            ++it;                                           // the tick finishes these
++            continue;
++        }
++        if (m && StartRemoval(*it, m))
++        {
++            ++it;
++            continue;
++        }
++        UnindexBot(it->guid);
++        it = g_bots.erase(it);
++    }
++}
++
++void UpdateParty(uint32 diff)
++{
++    static uint32 timer = 0;
++    timer += diff;
++    if (timer < TICK_MS)
++        return;
++    uint32 const elapsed = timer;
++    timer = 0;
++
++    UpdateFeeds(elapsed);
++
++    // Far Sight ended by itself (the member logged out or changed map): tell the owner.
++    {
++        std::vector<std::pair<uint64, uint64>> views;
++        {
++            std::lock_guard<std::mutex> lock(g_viewLock);
++            views.assign(g_views.begin(), g_views.end());
++        }
++        for (auto const& v : views)
++        {
++            Player* owner = ObjectAccessor::FindPlayer(ObjectGuid(v.first));
++            if (owner && owner->IsInWorld() && owner->GetCamera().GetBody() &&
++                owner->GetCamera().GetBody()->GetObjectGuid().GetRawValue() == v.second)
++                continue;
++            {
++                std::lock_guard<std::mutex> lock(g_viewLock);
++                g_views.erase(v.first);
++            }
++            if (owner)
++                SayTo(owner, "WOWBG3 view self reset");
++        }
++    }
++
++    // A far teleport waits for the client's MSG_MOVE_WORLDPORT_ACK, and a bot has no client
++    // (PlayerBotAI acks only while in a map, which a far teleport has just left): ack it here.
++    {
++        std::vector<ObjectGuid> all = g_puppets;
++        {
++            ReadLock lock(g_botLock);
++            for (Bot const& b : g_bots)
++                if (!b.guid.IsEmpty())
++                    all.push_back(b.guid);
++        }
++        for (ObjectGuid g : all)
++        {
++            Player* m = ObjectAccessor::FindPlayerNotInWorld(g);
++            if (m && m->IsBeingTeleportedFar() && m->GetSession() && m->GetSession()->GetBot() &&
++                !m->GetSession()->PlayerLoading())
++                m->GetSession()->HandleMoveWorldportAck();
++        }
++        g_puppets.erase(std::remove_if(g_puppets.begin(), g_puppets.end(),
++            [](ObjectGuid g) { return !ObjectAccessor::FindPlayerNotInWorld(g); }), g_puppets.end());
++    }
++
++    if (g_bots.empty())
++        return;
++
++    uint32 const now = WorldTimer::getMSTime();
++    std::vector<Bot> snapshot;
++    {
++        ReadLock lock(g_botLock);
++        snapshot = g_bots;
++    }
++
++    struct Change
++    {
++        std::string name;
++        BotState state;
++        ObjectGuid guid;
++        uint32 account;
++        bool erase;
++        bool teleported;
++        bool refreshed = false;
++    };
++    std::vector<Change> changes;
++    std::vector<std::pair<ObjectGuid, std::string>> says;  // owner, line
++
++    for (Bot const& b : snapshot)
++    {
++        Player* owner = ObjectAccessor::FindPlayer(b.owner);
++        uint32 const age = WorldTimer::getMSTimeDiff(b.since, now);
++        // Not-in-world too: a bot in a far teleport is between maps for a moment.
++        Player* m = b.guid.IsEmpty() ? nullptr : ObjectAccessor::FindPlayerNotInWorld(b.guid);
++        switch (b.state)
++        {
++            case BotState::Account:
++            {
++                uint32 const acc = BotAccount(b.name, false);
++                if (acc)
++                {
++                    Bot nb = b;
++                    nb.account = acc;
++                    ObjectGuid const g = CreateCharacter(nb);
++                    if (g.IsEmpty())
++                    {
++                        says.push_back({ b.owner, "WOWBG3 bot " + b.name + " failed create" });
++                        changes.push_back({ b.name, b.state, b.guid, acc, true, false });
++                    }
++                    else
++                        changes.push_back({ b.name, BotState::Create, g, acc, false, false });
++                }
++                else if (age > ACCOUNT_WAIT_MS)
++                {
++                    says.push_back({ b.owner, "WOWBG3 bot " + b.name + " failed account" });
++                    changes.push_back({ b.name, b.state, b.guid, 0, true, false });
++                }
++                break;
++            }
++            case BotState::Create:
++            {
++                if (age < CREATE_WAIT_MS)
++                    break;
++                if (!owner)
++                {
++                    changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
++                    break;
++                }
++                if (sPlayerBotMgr.AddBot(b.guid.GetCounter(), false, new PartyBotPuppetAI()))
++                    changes.push_back({ b.name, BotState::Loading, b.guid, b.account, false, false });
++                else if (age > LOGIN_WAIT_MS)
++                {
++                    says.push_back({ b.owner, "WOWBG3 bot " + b.name + " failed login" });
++                    changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
++                }
++                break;
++            }
++            case BotState::Loading:
++            {
++                if (m && m->IsInWorld())
++                {
++                    changes.push_back({ b.name, BotState::Arriving, b.guid, b.account, false, false });
++                    break;
++                }
++                if (age > LOGIN_WAIT_MS)
++                {
++                    says.push_back({ b.owner, "WOWBG3 bot " + b.name + " failed login" });
++                    if (m)
++                        if (PlayerBotEntry* e = m->GetSession()->GetBot())
++                            e->requestRemoval = true;
++                    changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
++                }
++                break;
++            }
++            case BotState::Arriving:
++            {
++                if (!m || !m->IsInWorld())
++                {
++                    if (age > LOGIN_WAIT_MS)
++                        changes.push_back({ b.name, BotState::Online, b.guid, b.account, false, b.teleported });
++                    break;
++                }
++                if (!b.teleported && b.spot.set)
++                {
++                    if (!m->TeleportTo(b.spot.map, b.spot.x, b.spot.y, b.spot.z, b.spot.o, TELE_TO_NOT_LEAVE_COMBAT | TELE_TO_NOT_UNSUMMON_PET))
++                        says.push_back({ b.owner, "WOWBG3 bot " + b.name + " teleport failed" });
++                    changes.push_back({ b.name, BotState::Arriving, b.guid, b.account, false, true });
++                    break;
++                }
++                bool const there = !b.spot.set || (m->GetMapId() == b.spot.map &&
++                    m->GetDistance(b.spot.x, b.spot.y, b.spot.z) < ARRIVED_YARDS);
++                if (m->IsBeingTeleported() || (!there && age < LOGIN_WAIT_MS))
++                    break;
++                // Arrived: one of the owner's party, at the owner's level.
++                JoinParty(owner, m);
++                if (b.follow)
++                    FollowLevel(owner, m);
++                Refresh(m);
++                changes.push_back({ b.name, BotState::Online, b.guid, b.account, false, true });
++                Bot shown = b;
++                shown.state = BotState::Online;
++                says.push_back({ b.owner, BotLine(shown, m) });
++                break;
++            }
++            case BotState::Online:
++            {
++                if (m && b.refresh && m->IsInWorld() && !m->IsBeingTeleported())
++                {
++                    // A bot's first teleports can leave its visible list stale (no client moves it
++                    // again): what it sees, and who sees it, from where it stands now.
++                    Refresh(m);
++                    changes.push_back({ b.name, b.state, b.guid, b.account, false, b.teleported, true });
++                }
++                if (!m)
++                {
++                    says.push_back({ b.owner, "WOWBG3 bot " + b.name + " offline " + Hex(b.guid) });
++                    changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
++                    break;
++                }
++                if (owner && m && m->IsInWorld() && !m->IsBeingTeleported())
++                {
++                    if (b.follow)
++                        FollowLevel(owner, m);
++                    if (!m->GetGroup() || m->GetGroup() != owner->GetGroup())
++                        JoinParty(owner, m);
++                }
++                if (!owner && m)
++                {
++                    // The owner went without a logout hook (should not happen): log the bot out too.
++                    if (PlayerBotEntry* e = m->GetSession()->GetBot())
++                        e->requestRemoval = true;
++                    changes.push_back({ b.name, BotState::Removing, b.guid, b.account, false, false });
++                }
++                break;
++            }
++            case BotState::Removing:
++            {
++                if (!m)
++                {
++                    says.push_back({ b.owner, "WOWBG3 bot " + b.name + " offline " + Hex(b.guid) });
++                    changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
++                }
++                else if (age > LOGIN_WAIT_MS)
++                {
++                    if (PlayerBotEntry* e = m->GetSession()->GetBot())
++                        e->requestRemoval = true;
++                }
++                break;
++            }
++        }
++    }
++
++    if (!changes.empty())
++    {
++        WriteLock lock(g_botLock);
++        for (Change const& c : changes)
++        {
++            for (auto it = g_bots.begin(); it != g_bots.end(); ++it)
++            {
++                if (it->name != c.name)
++                    continue;
++                if (c.erase)
++                {
++                    // Only if nothing newer happened to it meanwhile (a verb on the world thread
++                    // cannot run during this tick, so the state is the one the snapshot saw).
++                    UnindexBot(it->guid);
++                    g_bots.erase(it);
++                    break;
++                }
++                if (it->state != c.state)
++                    it->since = now;
++                if (c.refreshed)
++                    it->refresh = false;
++                it->state = c.state;
++                it->guid = c.guid;
++                it->account = c.account;
++                it->teleported = c.teleported;
++                IndexBot(*it);
++                break;
++            }
++        }
++    }
++    for (auto const& s : says)
++        SayTo(ObjectAccessor::FindPlayer(s.first), s.second);
++}
++
++bool HandleConsole(ChatHandler* handler, char const* args)
++{
++    std::string text = args ? args : "";
++    std::vector<std::string> a;
++    {
++        std::string cur;
++        for (char c : text)
++        {
++            if (c == ' ' || c == '\t')
++            {
++                if (!cur.empty())
++                    a.push_back(cur);
++                cur.clear();
++            }
++            else
++                cur += c;
++        }
++        if (!cur.empty())
++            a.push_back(cur);
++    }
++    if (a.size() < 2)
++    {
++        handler->SendSysMessage("wowbg3 NAME VERB ... (as the online character NAME) or wowbg3 - VERB ...");
++        return true;
++    }
++    std::vector<std::string> lines;
++    std::string const name = a[0];
++    // The verb line as a client would send it: `.wowbg3 VERB ...`.
++    std::string line = ".wowbg3";
++    for (size_t i = 1; i < a.size(); ++i)
++        line += " " + a[i];
++    if (name == "-")
++    {
++        std::vector<std::string> v = a;
++        v[0] = ".wowbg3";
++        if (!ExecuteGlobal(v, lines))
++            lines.push_back("WOWBG3 refused usage " + a[1]);
++    }
++    else
++    {
++        std::string n = name;
++        normalizePlayerName(n);
++        Player* p = ObjectAccessor::FindPlayerByName(n.c_str());
++        if (!p || !p->IsInWorld())
++            lines.push_back("WOWBG3 refused offline " + name);
++        else
++            Run(p, line, lines);
++    }
++    for (std::string const& l : lines)
++        handler->SendSysMessage(l.c_str());
++    return true;
++}
++}
++
++bool ChatHandler::HandleWowBg3Command(char* args)
++{
++    return WowBg3::HandleConsole(this, args);
++}
+diff --git a/src/game/WowBg3Party.h b/src/game/WowBg3Party.h
+new file mode 100644
+index 0000000..b57ff9a
+--- /dev/null
++++ b/src/game/WowBg3Party.h
+@@ -0,0 +1,80 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++// WOW-BG3 (local patch 0010, not upstream VMaNGOS): every BG3 party member is a
++// WoW character. The member a human plays is that human's own character; every
++// other member is a server-side bot (a real Player with no client, through
++// PlayerBotMgr) owned by the hero's character. `.wowbg3` verbs (see
++// WowBg3Fights.h) create, log in, move, group, level and log out those bots,
++// report the creatures around any member (the per-member feed), point the
++// hero's camera at a member (Far Sight), kill and revive members in place
++// (BG3 death rules: no release, no graveyard) and load movement map tiles
++// written while the server runs. Protocol: `AI Context/m5-server-handoff.md`
++// in the WOW-BG3 project.
++
++#ifndef MANGOS_WOWBG3_PARTY_H
++#define MANGOS_WOWBG3_PARTY_H
++
++#include "Common.h"
++#include "ObjectGuid.h"
++#include <string>
++#include <vector>
++
++class ChatHandler;
++class Player;
++class WorldObject;
++class WorldSession;
++
++namespace WowBg3
++{
++    // Verbs this module knows (world thread, no map updates). False: not ours.
++    bool ExecuteParty(Player* p, std::vector<std::string> const& a, std::vector<std::string>& out);
++
++    // Verbs that need no character (`wowbg3 - VERB` on the console): mmtile.
++    bool ExecuteGlobal(std::vector<std::string> const& a, std::vector<std::string>& out);
++
++    // World::Update tick (world thread): bot logins, arrivals, level follow, feeds.
++    void UpdateParty(uint32 diff);
++
++    // The owner's character leaves: its bots are saved and logged out.
++    void OnOwnerLogout(Player* owner);
++
++    // The owner of this party bot, or an empty guid when `player` is not one. Any thread.
++    ObjectGuid BotOwner(Player const* player);
++    bool AnyBots();
++
++    // True for a session that runs one of our party bots (saved like a player).
++    bool IsPartyBot(WorldSession const* session);
++
++    // The owner itself (`self` or its name) or one of its online bots; else nullptr and why
++    // (`unknown`, `offline`).
++    Player* FindMember(Player* owner, std::string const& name, char const*& why);
++
++    // A living online bot of `owner` on the owner's map and instance (any thread), else nullptr.
++    Player* LivingMember(Player const* owner);
++
++    // True when `p` or one of its online bots is within `range` of `target` (same map).
++    bool NearParty(Player* p, WorldObject const* target, float range);
++
++    // Sends `line` to a player (a bot's lines go to the server log instead).
++    void SayTo(Player* player, std::string const& line);
++
++    // Console: `wowbg3 NAME VERB ...` runs a verb as the online character NAME
++    // (or `wowbg3 - VERB ...` for verbs that need none) and prints the replies.
++    bool HandleConsole(ChatHandler* handler, char const* args);
++}
++
++#endif

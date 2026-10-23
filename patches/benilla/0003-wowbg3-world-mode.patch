@@ -1,0 +1,1033 @@
+diff --git a/crates/benilla-app/src/creature_anim/events.rs b/crates/benilla-app/src/creature_anim/events.rs
+index e20bf8f..94c2c31 100644
+--- a/crates/benilla-app/src/creature_anim/events.rs
++++ b/crates/benilla-app/src/creature_anim/events.rs
+@@ -123,9 +123,21 @@ pub(super) fn fire_anim_events(
+     mut out: MessageWriter<AnimSoundEvent>,
+     anim_data: Option<Res<AnimData>>,
+     names: Res<crate::names::NameCache>,
++    // WOW-BG3 (local fork): the own character is voiced by BG3 in world mode.
++    own: (Query<(), With<crate::net::Embodied>>, Query<&ChildOf>),
+ ) {
+     let catalog = anim_data.as_deref().map(|d| &d.0);
++    let hide_self = crate::wowbg3_lead::hide_self();
+     for (entity, anims, player, drv, parked, store, world, pose) in &units {
++        if hide_self {
++            let mut root = entity;
++            while let Ok(c) = own.1.get(root) {
++                root = c.parent();
++            }
++            if own.0.contains(root) {
++                continue;
++            }
++        }
+         // A parked unit's tracks are not scanned, as the reference's second walk never ticks it
+         // (`0x683dd0` skips `0x710b90`), unless its template carries `MORE_AUDIBLE` (the
+         // `0x607da0` re-link); a missing template reads not audible (`0x623b70`). Dropping the
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 36122a0..0c76c03 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -189,6 +189,8 @@ mod world_state_ui;
+ // WOW-BG3 fork: the link to the hidden BG3 (camera stream).
+ mod wowbg3;
+ mod wowbg3_fight;
++mod wowbg3_frames;
++mod wowbg3_lead;
+ 
+ use bevy::prelude::*;
+ 
+diff --git a/crates/benilla-app/src/player/camera.rs b/crates/benilla-app/src/player/camera.rs
+index 1993dab..37690af 100644
+--- a/crates/benilla-app/src/player/camera.rs
++++ b/crates/benilla-app/src/player/camera.rs
+@@ -1311,7 +1311,10 @@ pub(crate) fn apply_self_model_fade(
+     mut reauthor: ResMut<benilla_world::interior::InteriorReauthor>,
+     mut was_fading: Local<bool>,
+ ) {
+-    let fading = rig.self_fade_alpha < 1.0;
++    // WOW-BG3 (local fork): in world mode BG3 draws the own character; hide ours as the
++    // first-person fade does.
++    let self_fade = if crate::wowbg3_lead::hide_self() { 0.0 } else { rig.self_fade_alpha };
++    let fading = self_fade < 1.0;
+     if !fading && !*was_fading {
+         // Steady opaque: nothing to author and nothing to release.
+         return;
+@@ -1322,7 +1325,7 @@ pub(crate) fn apply_self_model_fade(
+     };
+     // Our own aura translucency (stealth, invisibility, ghost) multiplies in, since this system
+     // writes the self body's alpha last; the release fires only once the product is opaque.
+-    let feather = rig.self_fade_alpha * crate::aura_visual::root_alpha(aura);
++    let feather = self_fade * crate::aura_visual::root_alpha(aura);
+     // The walked set names the anchors that belong to this model, for the card pass.
+     let mut walked = EntityHashSet::default();
+     apply_self_fade_to_descendants(
+diff --git a/crates/benilla-app/src/target/hover.rs b/crates/benilla-app/src/target/hover.rs
+index 904d4bd..315114d 100644
+--- a/crates/benilla-app/src/target/hover.rs
++++ b/crates/benilla-app/src/target/hover.rs
+@@ -39,7 +39,7 @@ pub(super) fn update_pick_occlusion(
+     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
+         return;
+     };
+-    let Some(cursor) = window.cursor_position() else {
++    let Some(cursor) = window.cursor_position().or_else(super::hover_probe::external) else {
+         return;
+     };
+     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+@@ -256,7 +256,7 @@ pub(super) fn update_hover(
+     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
+         return;
+     };
+-    let Some(cursor) = window.cursor_position() else {
++    let Some(cursor) = window.cursor_position().or_else(super::hover_probe::external) else {
+         return;
+     };
+     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+diff --git a/crates/benilla-app/src/target/hover_probe.rs b/crates/benilla-app/src/target/hover_probe.rs
+index 415cd78..e9a52b9 100644
+--- a/crates/benilla-app/src/target/hover_probe.rs
++++ b/crates/benilla-app/src/target/hover_probe.rs
+@@ -62,13 +62,28 @@ fn aim() -> Option<Aim> {
+     })
+ }
+ 
++/// WOW-BG3 (local fork): a pointer fed from outside the window, BG3's cursor in world mode
++/// (`crate::wowbg3_lead`). It aims like the probe, wherever the window has no OS cursor.
++static EXTERNAL: std::sync::Mutex<Option<Vec2>> = std::sync::Mutex::new(None);
++
++pub(crate) fn set_external(point: Option<Vec2>) {
++    *EXTERNAL.lock().unwrap_or_else(|e| e.into_inner()) = point;
++}
++
++pub(crate) fn external() -> Option<Vec2> {
++    *EXTERNAL.lock().unwrap_or_else(|e| e.into_inner())
++}
++
+ /// Whether the probe is armed: one `OnceLock` read, cheap per frame.
+ pub(super) fn armed() -> bool {
+-    aim().is_some()
++    aim().is_some() || external().is_some()
+ }
+ 
+ /// The point to pick from this frame; the caller uses it only where the real cursor is absent.
+ pub(super) fn point(window: &Window, frame: u64) -> Option<Vec2> {
++    if let Some(p) = external() {
++        return Some(p);
++    }
+     let (w, h) = (window.width(), window.height());
+     match aim()? {
+         Aim::Centre => Some(Vec2::new(w / 2.0, h / 2.0)),
+diff --git a/crates/benilla-app/src/target/mod.rs b/crates/benilla-app/src/target/mod.rs
+index 308ddf5..4cf4c15 100644
+--- a/crates/benilla-app/src/target/mod.rs
++++ b/crates/benilla-app/src/target/mod.rs
+@@ -22,7 +22,7 @@ pub(crate) mod cursor_mode;
+ mod flash;
+ mod highlight;
+ pub(crate) mod hover;
+-mod hover_probe;
++pub(crate) mod hover_probe;
+ 
+ /// The hover probe's aim for a cursorless window, as this frame's pick published it.
+ pub(crate) fn hover_probe_point() -> Option<bevy::math::Vec2> {
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index e76cb4b..94cb1a0 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -32,6 +32,9 @@ impl Plugin for WowBg3Plugin {
+         info!("wowbg3: streaming the world camera to {:?}", dir);
+         // Fights: Young Wolf pulls become BG3 fights (`wowbg3_fight`).
+         crate::wowbg3_fight::build(app, PathBuf::from(&dir));
++        // World mode: BG3 leads the camera, WoW frames go to BG3's compositor.
++        crate::wowbg3_lead::build(app, PathBuf::from(&dir));
++        crate::wowbg3_frames::build(app);
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+new file mode 100644
+index 0000000..b92a6df
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -0,0 +1,429 @@
++//! WOW-BG3 (local fork): hand every rendered WoW frame to the hidden BG3's compositor.
++//! With `WOW_BG3_FRAMES=<file>` (normally `/tmp/wowbg3/wowframe.bin`) a colour image and the
++//! world camera's depth after the main pass are copied back every frame and written in place
++//! into two slot files beside that name (`wowframe.a.bin`, `wowframe.b.bin`, alternating, so a
++//! reader always finds one whole). The BG3 Vulkan layer (`bg3/capture`) reads them and draws
++//! WoW's world behind BG3's characters, effects and UI.
++//!
++//! File layout (little endian): a 64-byte header then colour rows then depth rows.
++//! `WBF1`, seq u32, width u32, height u32, colour format u32 (wgpu `TextureFormat` as listed in
++//! `format_code`), colour bytes per row u32, depth bytes per row u32 (Depth32Float, reverse-Z:
++//! 0 = nothing drew), near f32 (the projection's near plane, yards; reverse infinite: view z =
++//! near / depth), depth offset f32 at 32 (yards to add to WoW's view z for the distance from
++//! BG3's eye: the lead camera's ground lock and clearance move WoW's eye), seq again at 56, pad.
++//! A reader copies while seq == seq2 before and after.
++//! MSAA must be off (`WOW_MSAA=off`); a multisampled frame is not copied.
++//!
++//! The colour is normally the player-UI camera's target just after its quads (the world with
++//! benilla's UI over it, in the gamma bytes WoW shows, so chat, minimap and dialogs reach BG3's
++//! window too); `WOW_BG3_FRAMES_SOURCE=world` takes the world camera's tonemapped colour instead.
++
++use std::fs::OpenOptions;
++use std::sync::Mutex;
++
++use bevy::core_pipeline::core_2d::graph::{Core2d, Node2d};
++use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
++use bevy::ui_render::graph::NodeUi;
++use bevy::ecs::query::QueryItem;
++use bevy::prelude::*;
++use bevy::render::extract_component::{ExtractComponent, ExtractComponentPlugin};
++use bevy::render::render_graph::{
++    NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
++};
++use bevy::render::render_resource::{
++    Buffer, BufferDescriptor, BufferUsages, Extent3d, MapMode, Origin3d, TexelCopyBufferInfo,
++    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureFormat, TextureUsages,
++};
++use bevy::render::renderer::{RenderContext, RenderDevice};
++use bevy::render::view::{ExtractedView, ViewDepthTexture, ViewTarget};
++use bevy::render::{Render, RenderApp, RenderSystems};
++
++use benilla_world::view::WorldCamera;
++
++pub(crate) const HEADER: usize = 64;
++
++pub(crate) fn format_code(f: TextureFormat) -> Option<(u32, u32)> {
++    // (code, bytes per texel)
++    match f {
++        TextureFormat::Rgba8Unorm => Some((1, 4)),
++        TextureFormat::Rgba8UnormSrgb => Some((2, 4)),
++        TextureFormat::Bgra8Unorm => Some((3, 4)),
++        TextureFormat::Bgra8UnormSrgb => Some((4, 4)),
++        TextureFormat::Rgba16Float => Some((5, 8)),
++        TextureFormat::Rgb10a2Unorm => Some((6, 4)),
++        _ => None,
++    }
++}
++
++/// The header for one frame.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn header(seq: u32, w: u32, h: u32, code: u32, cbpr: u32, dbpr: u32, near: f32, zoff: f32) -> [u8; HEADER] {
++    let mut out = [0u8; HEADER];
++    out[0..4].copy_from_slice(b"WBF1");
++    for (i, v) in [seq, w, h, code, cbpr, dbpr].iter().enumerate() {
++        out[4 + 4 * i..8 + 4 * i].copy_from_slice(&v.to_le_bytes());
++    }
++    out[28..32].copy_from_slice(&near.to_le_bytes());
++    out[32..36].copy_from_slice(&zoff.to_le_bytes());
++    out[56..60].copy_from_slice(&seq.to_le_bytes());
++    out
++}
++
++pub(crate) fn build(app: &mut App) {
++    let Some(path) = std::env::var_os("WOW_BG3_FRAMES") else {
++        return;
++    };
++    let ui = std::env::var("WOW_BG3_FRAMES_SOURCE").map_or(true, |v| v != "world");
++    info!("wowbg3: world frames to {:?} (colour from the {} camera)", path, if ui { "player-UI" } else { "world" });
++    let sink = FrameSink::new(path.into());
++    sink.inner.lock().unwrap().ui_source = ui;
++    app.insert_resource(sink)
++        .add_systems(Update, (arm, arm_ui))
++        .add_plugins(ExtractComponentPlugin::<FrameExportView>::default())
++        .add_plugins(ExtractComponentPlugin::<FrameExportUi>::default());
++    let sink = app.world().resource::<FrameSink>().clone_handle();
++    let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
++        warn!("wowbg3 frames: no render app");
++        return;
++    };
++    render_app
++        .insert_resource(sink)
++        .add_systems(
++            Render,
++            (
++                prepare.in_set(RenderSystems::PrepareResources),
++                publish.after(RenderSystems::Render),
++            ),
++        )
++        .add_render_graph_node::<ViewNodeRunner<DepthNode>>(Core3d, DepthLabel)
++        .add_render_graph_edges(Core3d, (Node3d::MainOpaquePass, DepthLabel, Node3d::MainTransmissivePass))
++        .add_render_graph_node::<ViewNodeRunner<ColorNode>>(Core3d, ColorLabel)
++        .add_render_graph_edges(Core3d, (Node3d::Tonemapping, ColorLabel, Node3d::EndMainPassPostProcessing))
++        .add_render_graph_node::<ViewNodeRunner<UiColorNode>>(Core2d, UiColorLabel)
++        .add_render_graph_edges(Core2d, (Node2d::EndMainPass, UiColorLabel, Node2d::Upscaling))
++        .add_render_graph_edge(Core2d, NodeUi::UiPass, UiColorLabel);
++}
++
++#[derive(Resource)]
++struct FrameSink {
++    inner: std::sync::Arc<Mutex<SinkState>>,
++}
++
++struct SinkState {
++    path: std::path::PathBuf,
++    files: [Option<std::fs::File>; 2],
++    seq: u32,
++    color: Option<(Buffer, u32, u32, u32, TextureFormat)>, // buffer, bpr, w, h, format
++    depth: Option<(Buffer, u32)>,                        // buffer, bpr
++    color_copied: bool,
++    depth_copied: bool,
++    warned: bool,
++    ui_source: bool,
++}
++
++impl FrameSink {
++    fn new(path: std::path::PathBuf) -> Self {
++        FrameSink {
++            inner: std::sync::Arc::new(Mutex::new(SinkState {
++                path,
++                files: [None, None],
++                seq: 0,
++                color: None,
++                depth: None,
++                color_copied: false,
++                depth_copied: false,
++                warned: false,
++                ui_source: true,
++            })),
++        }
++    }
++    fn clone_handle(&self) -> Self {
++        FrameSink {
++            inner: self.inner.clone(),
++        }
++    }
++}
++
++#[derive(Component, Clone, Copy, ExtractComponent)]
++struct FrameExportView;
++
++/// The player-UI camera, whose target is the colour source by default.
++#[derive(Component, Clone, Copy, ExtractComponent)]
++struct FrameExportUi;
++
++fn arm_ui(
++    mut done: Local<bool>,
++    sink: Res<FrameSink>,
++    cam: Query<Entity, With<crate::ui_pass::PlayerUiCamera>>,
++    mut commands: Commands,
++) {
++    if *done || !sink.inner.lock().unwrap().ui_source {
++        return;
++    }
++    let Ok(entity) = cam.single() else { return };
++    commands.entity(entity).insert((
++        FrameExportUi,
++        bevy::camera::CameraMainTextureUsages::default().with(TextureUsages::COPY_SRC),
++    ));
++    *done = true;
++}
++
++/// The world camera gets COPY_SRC on its depth and main textures, once.
++fn arm(
++    mut done: Local<bool>,
++    mut cam: Query<(Entity, &mut Camera3d, &Msaa), With<WorldCamera>>,
++    mut commands: Commands,
++) {
++    if *done {
++        return;
++    }
++    let Ok((entity, mut camera, msaa)) = cam.single_mut() else {
++        return;
++    };
++    if *msaa != Msaa::Off {
++        error!("wowbg3 frames: MSAA is {msaa:?}; run with WOW_MSAA=off. No frames are exported.");
++        *done = true;
++        return;
++    }
++    camera.depth_texture_usages = (TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC).into();
++    commands.entity(entity).insert((
++        FrameExportView,
++        bevy::camera::CameraMainTextureUsages::default().with(TextureUsages::COPY_SRC),
++    ));
++    *done = true;
++}
++
++fn prepare(
++    sink: Res<FrameSink>,
++    views: Query<(&ViewTarget, &ViewDepthTexture), With<FrameExportView>>,
++    ui_views: Query<&ViewTarget, With<FrameExportUi>>,
++    device: Res<RenderDevice>,
++) {
++    let Ok((target, depth)) = views.single() else { return };
++    let mut s = sink.inner.lock().unwrap();
++    s.color_copied = false;
++    s.depth_copied = false;
++    let source = if s.ui_source {
++        let Ok(ui) = ui_views.single() else { return };
++        ui
++    } else {
++        target
++    };
++    let tex = source.main_texture();
++    let size = tex.size();
++    let format = tex.format();
++    let Some((_, bpt)) = format_code(format) else {
++        if !s.warned {
++            s.warned = true;
++            warn!("wowbg3 frames: main texture format {format:?} not handled");
++        }
++        return;
++    };
++    let cbpr = RenderDevice::align_copy_bytes_per_row(size.width as usize * bpt as usize) as u32;
++    let fits = s
++        .color
++        .as_ref()
++        .is_some_and(|c| c.1 == cbpr && c.2 == size.width && c.3 == size.height && c.4 == format);
++    if !fits {
++        let buffer = device.create_buffer(&BufferDescriptor {
++            label: Some("wowbg3_color_readback"),
++            size: u64::from(cbpr) * u64::from(size.height),
++            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        s.color = Some((buffer, cbpr, size.width, size.height, format));
++    }
++    let dsize = depth.texture.size();
++    let dbpr = RenderDevice::align_copy_bytes_per_row(dsize.width as usize * 4) as u32;
++    if s.depth.as_ref().is_none_or(|d| d.1 != dbpr) || !fits {
++        let buffer = device.create_buffer(&BufferDescriptor {
++            label: Some("wowbg3_depth_readback"),
++            size: u64::from(dbpr) * u64::from(dsize.height),
++            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        s.depth = Some((buffer, dbpr));
++    }
++}
++
++#[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
++struct DepthLabel;
++#[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
++struct ColorLabel;
++#[derive(RenderLabel, Debug, Clone, Copy, PartialEq, Eq, Hash)]
++struct UiColorLabel;
++
++#[derive(Default)]
++struct DepthNode;
++impl ViewNode for DepthNode {
++    type ViewQuery = (&'static ViewDepthTexture, &'static FrameExportView);
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        rc: &mut RenderContext,
++        (depth, _): QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let Some(sink) = world.get_resource::<FrameSink>() else { return Ok(()) };
++        let mut s = sink.inner.lock().unwrap();
++        if !depth.texture.usage().contains(TextureUsages::COPY_SRC) {
++            return Ok(());
++        }
++        let Some((buffer, bpr)) = s.depth.as_ref().map(|d| (d.0.clone(), d.1)) else { return Ok(()) };
++        let size = depth.texture.size();
++        rc.command_encoder().copy_texture_to_buffer(
++            TexelCopyTextureInfo { texture: &depth.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::DepthOnly },
++            TexelCopyBufferInfo {
++                buffer: &buffer,
++                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(size.height) },
++            },
++            Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
++        );
++        s.depth_copied = true;
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++struct ColorNode;
++impl ViewNode for ColorNode {
++    type ViewQuery = (&'static ViewTarget, &'static FrameExportView);
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        rc: &mut RenderContext,
++        (target, _): QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let Some(sink) = world.get_resource::<FrameSink>() else { return Ok(()) };
++        let mut s = sink.inner.lock().unwrap();
++        if !s.ui_source {
++            copy_color(&mut s, rc, target);
++        }
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++struct UiColorNode;
++impl ViewNode for UiColorNode {
++    type ViewQuery = (&'static ViewTarget, &'static FrameExportUi);
++    fn run(
++        &self,
++        _graph: &mut RenderGraphContext,
++        rc: &mut RenderContext,
++        (target, _): QueryItem<Self::ViewQuery>,
++        world: &World,
++    ) -> Result<(), NodeRunError> {
++        let Some(sink) = world.get_resource::<FrameSink>() else { return Ok(()) };
++        let mut s = sink.inner.lock().unwrap();
++        if s.ui_source {
++            copy_color(&mut s, rc, target);
++        }
++        Ok(())
++    }
++}
++
++fn copy_color(s: &mut SinkState, rc: &mut RenderContext, target: &ViewTarget) {
++    let tex = target.main_texture();
++    if !tex.usage().contains(TextureUsages::COPY_SRC) {
++        return;
++    }
++    let Some((buffer, bpr, w, h, format)) = s.color.as_ref().map(|c| (c.0.clone(), c.1, c.2, c.3, c.4)) else {
++        return;
++    };
++    if tex.size().width != w || tex.size().height != h || tex.format() != format {
++        return;
++    }
++    rc.command_encoder().copy_texture_to_buffer(
++        TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
++        TexelCopyBufferInfo {
++            buffer: &buffer,
++            layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
++        },
++        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
++    );
++    s.color_copied = true;
++}
++
++/// Map both copies back (blocking: one frame of latency is the price of simplicity) and write
++/// them into the shared file in place, framed by the sequence number.
++fn publish(sink: Res<FrameSink>, views: Query<&ExtractedView, With<FrameExportView>>, device: Res<RenderDevice>) {
++    let mut s = sink.inner.lock().unwrap();
++    if !(s.color_copied && s.depth_copied) {
++        return;
++    }
++    let (Some(color), Some(depth)) = (s.color.clone(), s.depth.clone()) else { return };
++    let Ok(view) = views.single() else { return };
++    // Reverse infinite perspective: clip z = near, so view z = near / depth.
++    let near = view.clip_from_view.w_axis.z;
++    color.0.slice(..).map_async(MapMode::Read, |_| {});
++    depth.0.slice(..).map_async(MapMode::Read, |_| {});
++    if device.poll(bevy::render::render_resource::PollType::wait_indefinitely()).is_err() {
++        return;
++    }
++    s.seq = s.seq.wrapping_add(1).max(1);
++    let slot = (s.seq % 2) as usize;
++    if s.files[slot].is_none() {
++        let mut o = OpenOptions::new();
++        o.read(true).write(true).create(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            o.mode(0o644);
++        }
++        let path = s.path.with_extension(if slot == 0 { "a.bin" } else { "b.bin" });
++        match o.open(&path) {
++            Ok(f) => s.files[slot] = Some(f),
++            Err(e) => {
++                if !s.warned {
++                    s.warned = true;
++                    warn!("wowbg3 frames: cannot open {:?}: {e}", path);
++                }
++                color.0.unmap();
++                depth.0.unmap();
++                return;
++            }
++        }
++    }
++    let (code, _) = format_code(color.4).unwrap_or((0, 4));
++    let hdr = header(s.seq, color.2, color.3, code, color.1, depth.1, near, crate::wowbg3_lead::depth_offset());
++    let mut torn = hdr;
++    torn[56..60].copy_from_slice(&0u32.to_le_bytes());
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::FileExt;
++        if let Some(f) = s.files[slot].as_ref() {
++            let cbytes = color.0.slice(..).get_mapped_range();
++            let dbytes = depth.0.slice(..).get_mapped_range();
++            // seq2 = 0 while the rows change, the real seq once they are whole.
++            let ok = f.write_all_at(&torn, 0).is_ok()
++                && f.write_all_at(&cbytes, HEADER as u64).is_ok()
++                && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok()
++                && f.write_all_at(&hdr, 0).is_ok();
++            drop(cbytes);
++            drop(dbytes);
++            if !ok {
++                s.files[slot] = None;
++            }
++        }
++    }
++    color.0.unmap();
++    depth.0.unmap();
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn header_layout() {
++        let h = header(9, 1280, 720, 4, 5120, 5120, 0.1, -2.5);
++        assert_eq!(&h[0..4], b"WBF1");
++        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 9);
++        assert_eq!(u32::from_le_bytes(h[8..12].try_into().unwrap()), 1280);
++        assert_eq!(u32::from_le_bytes(h[56..60].try_into().unwrap()), 9);
++        assert!((f32::from_le_bytes(h[28..32].try_into().unwrap()) - 0.1).abs() < 1e-7);
++        assert_eq!(f32::from_le_bytes(h[32..36].try_into().unwrap()), -2.5);
++    }
++}
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+new file mode 100644
+index 0000000..14d605a
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -0,0 +1,445 @@
++//! WOW-BG3 (local fork): BG3 owns the camera. With `WOW_BG3_LEAD=1` the world camera takes
++//! BG3's pose and vertical field of view every frame from `$WOW_BG3_LINK_DIR/bg3cam.bin`, which
++//! the `wowbg3` bg3le plugin writes in its lead mode (`Arena --mode Lead`), already mapped into
++//! WoW world coordinates. benilla's own camera still runs underneath; this system overwrites the
++//! result just before transforms propagate, so its collision and smoothing never show.
++//!
++//! Record (96 bytes, little endian): `BGC1`, seq u32, eye[3], forward[3], up[3] f32 (WoW world,
++//! yards), vertical fov f32 (radians), aspect f32, pad, time f64, seq again u32 (equal when the
++//! record is whole), pad, BG3's projection terms. A record older than half a second is ignored
++//! and benilla's own camera shows again.
++//!
++//! In the same mode the WoW character follows BG3's: `tav.bin` (written by `WorldMode.lua`:
++//! `TAV1`, seq, WoW xyz, BG3 xyz, yaw, flags, seq again) gives where Tav stands, and the
++//! character walks there with Click to Move (normal movement the server sees). The own model is
++//! hidden (the first-person fade at alpha 0) and its animation sounds are muted (BG3 draws and
++//! voices the character instead).
++//!
++//! Ground lock: BG3's arena floor and WoW's terrain disagree by up to a few yards in height, so
++//! the camera is lowered by Tav's height above the WoW character (eased, at most 4 yd, only
++//! while the two stand together): Tav's feet then meet WoW's ground in the composite.
++//!
++//! Ground clearance: BG3's camera knows nothing of WoW's hills and can sit inside one. Then the
++//! eye slides toward Tav along its line of sight until it clears WoW's terrain (what WoW's own
++//! camera collision does); Tav stays where she was on screen, the world around her zooms a bit.
++//!
++//! Pointer (clicks on WoW's people and things go to WoW): `bg3input.bin` (written by
++//! `WorldMode.lua`: `BGI1`, seq, cursor x, y and BG3's window width, height as f32, left clicks
++//! so far u32, seq again) aims WoW's mouseover where BG3's cursor is, so WoW's tooltips and
++//! highlights follow it. A BG3 left click over WoW's UI is a left click there (chat tabs, minimap,
++//! gossip and quest buttons); over a WoW unit, corpse or object it is WoW's right click (talk,
++//! loot, quests, attack). Elsewhere it is BG3's alone. `wowhover.bin` (`WBH1`, seq, flags: 1 over
++//! WoW's UI, 2 over a WoW unit or object, seq again) tells BG3 which clicks WoW will take.
++
++use std::fs::File;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++use std::time::Instant;
++
++use benilla_assets::coords::wow_to_bevy;
++use benilla_world::view::WorldCamera;
++use bevy::camera::Projection;
++use bevy::prelude::*;
++
++static HIDE_SELF: AtomicBool = AtomicBool::new(false);
++/// How far (yards, along the view) WoW's eye sits ahead of BG3's after the ground lock and
++/// clearance, as f32 bits: the compositor adds it to WoW's depth.
++static DEPTH_OFFSET: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) fn depth_offset() -> f32 {
++    f32::from_bits(DEPTH_OFFSET.load(Ordering::Relaxed))
++}
++
++/// True in lead mode: the own character is drawn and voiced by BG3, not by benilla.
++pub(crate) fn hide_self() -> bool {
++    HIDE_SELF.load(Ordering::Relaxed)
++}
++
++#[derive(Resource)]
++struct TavFollow {
++    path: PathBuf,
++    last_seq: u32,
++    armed: Option<Vec3>,
++    armed_at: Option<Instant>,
++    walk_to: Option<Vec3>,
++    frame: u64,
++    /// Tav's last position (Bevy coordinates), for the ground lock.
++    tav: Option<Vec3>,
++    /// The ground lock's eased offset (yards, Bevy +Y up).
++    lock: f32,
++}
++
++/// Decodes `tav.bin`: (seq, WoW position).
++pub(crate) fn decode_tav(rec: &[u8]) -> Option<(u32, [f32; 3])> {
++    if rec.len() < 44 || &rec[0..4] != b"TAV1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let seq = u(4);
++    let p = [f(8), f(12), f(16)];
++    (seq != 0 && seq == u(40) && p.iter().all(|v| v.is_finite())).then_some((seq, p))
++}
++
++fn read_tav(
++    mut t: ResMut<TavFollow>,
++    player: Res<crate::player::Player>,
++    (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
++) {
++    t.frame += 1;
++    if t.frame % 4 != 0 || !player.active {
++        return;
++    }
++    let Ok(raw) = std::fs::read(&t.path) else { return };
++    let Some((seq, wow)) = decode_tav(&raw) else { return };
++    if seq == t.last_seq {
++        return;
++    }
++    t.last_seq = seq;
++    let at = wow_to_bevy(wow);
++    // Tav walking is the player at the keyboard too (WoW's idle clock).
++    if t.tav.is_some_and(|p| p.distance(at) > 0.3) {
++        idle.stamp_present(time.elapsed());
++    }
++    t.tav = Some(at);
++    // Re-arm only when Tav moved on or the walk had time to finish: an arm cancels the last.
++    let far = Vec2::new(at.x - player.pos.x, at.z - player.pos.z).length() > 1.5;
++    let moved = t.armed.is_none_or(|a| a.distance(at) > 1.0);
++    let stale = t.armed_at.is_none_or(|i| i.elapsed().as_secs_f32() > 1.0);
++    if far && (moved || stale) {
++        t.walk_to = Some(at);
++        t.armed = Some(at);
++        t.armed_at = Some(Instant::now());
++    }
++}
++
++fn walk_after_tav(mut t: ResMut<TavFollow>, mut auto: crate::player::AutoMove) {
++    if let Some(at) = t.walk_to.take() {
++        auto.walk_to_ground_bg3(at);
++    }
++}
++
++/// The own character's model: hidden at the root (its parts inherit).
++fn hide_own_model(mut me: Query<&mut Visibility, With<crate::net::Embodied>>) {
++    for mut v in &mut me {
++        if *v != Visibility::Hidden {
++            *v = Visibility::Hidden;
++        }
++    }
++}
++
++#[derive(Resource)]
++struct LeadStream {
++    path: PathBuf,
++    file: Option<File>,
++    retry: u32,
++    last_seq: u32,
++    last_at: Option<Instant>,
++    pose: Option<LeadPose>,
++    frames: u64,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct LeadPose {
++    pub(crate) eye: [f32; 3],
++    pub(crate) forward: [f32; 3],
++    pub(crate) up: [f32; 3],
++    pub(crate) fovy: f32,
++}
++
++/// Decodes one record; `None` when it is torn, not ours or not finite.
++pub(crate) fn decode(rec: &[u8]) -> Option<(u32, LeadPose)> {
++    if rec.len() < 72 || &rec[0..4] != b"BGC1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let seq = u(4);
++    if seq == 0 || seq != u(64) {
++        return None;
++    }
++    let pose = LeadPose {
++        eye: [f(8), f(12), f(16)],
++        forward: [f(20), f(24), f(28)],
++        up: [f(32), f(36), f(40)],
++        fovy: f(44),
++    };
++    let all = pose.eye.iter().chain(&pose.forward).chain(&pose.up).chain([&pose.fovy]);
++    if all.clone().any(|v| !v.is_finite()) || !(0.05..3.0).contains(&pose.fovy) {
++        return None;
++    }
++    Some((seq, pose))
++}
++
++#[derive(Resource)]
++struct PointerLink {
++    input: PathBuf,
++    hover: PathBuf,
++    last_seq: u32,
++    clicks: Option<u32>,
++    release: Option<(MouseButton, u8)>,
++    hover_flags: u32,
++    hover_seq: u32,
++}
++
++/// Decodes `bg3input.bin`: (seq, cursor, BG3's window size, clicks).
++pub(crate) fn decode_input(rec: &[u8]) -> Option<(u32, Vec2, Vec2, u32)> {
++    if rec.len() < 32 || &rec[0..4] != b"BGI1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
++    let seq = u(4);
++    let (at, size) = (Vec2::new(f(8), f(12)), Vec2::new(f(16), f(20)));
++    let ok = seq != 0 && seq == u(28) && at.is_finite() && size.x >= 1.0 && size.y >= 1.0;
++    ok.then_some((seq, at, size, u(24)))
++}
++
++#[allow(clippy::too_many_arguments)]
++fn forward_pointer(
++    mut link: ResMut<PointerLink>,
++    windows: Query<(Entity, &Window), With<bevy::window::PrimaryWindow>>,
++    over_ui: Res<crate::ui_script::PointerOverUi>,
++    hovered: Res<crate::target::Hovered>,
++    object: Res<crate::target::HoveredObject>,
++    mut buttons: MessageWriter<bevy::input::mouse::MouseButtonInput>,
++    (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
++) {
++    use bevy::input::mouse::MouseButtonInput;
++    use bevy::input::ButtonState;
++    let Ok((window_entity, window)) = windows.single() else { return };
++    // A press injected last frame is released two frames later, as a short real click.
++    if let Some((button, frames)) = link.release {
++        if frames == 0 {
++            buttons.write(MouseButtonInput { button, state: ButtonState::Released, window: window_entity });
++            link.release = None;
++        } else {
++            link.release = Some((button, frames - 1));
++        }
++    }
++    // Tell BG3 what WoW has under the pointer (changes only).
++    let flags = u32::from(over_ui.0) | (u32::from(hovered.any().is_some() || object.target.is_some()) << 1);
++    if flags != link.hover_flags || link.hover_seq == 0 {
++        link.hover_flags = flags;
++        link.hover_seq = link.hover_seq.wrapping_add(1).max(1);
++        let mut rec = [0u8; 16];
++        rec[0..4].copy_from_slice(b"WBH1");
++        rec[4..8].copy_from_slice(&link.hover_seq.to_le_bytes());
++        rec[8..12].copy_from_slice(&flags.to_le_bytes());
++        rec[12..16].copy_from_slice(&link.hover_seq.to_le_bytes());
++        let tmp = link.hover.with_extension("tmp");
++        if std::fs::write(&tmp, rec).is_ok() {
++            let _ = std::fs::rename(&tmp, &link.hover);
++        }
++    }
++    let Ok(raw) = std::fs::read(&link.input) else { return };
++    let Some((seq, at, size, clicks)) = decode_input(&raw) else { return };
++    if seq == link.last_seq {
++        return;
++    }
++    link.last_seq = seq;
++    // The player is at BG3's mouse: WoW's idle clock (auto-AFK at 5 min, logout at 30) restarts.
++    idle.stamp_present(time.elapsed());
++    let point = at * Vec2::new(window.width() / size.x, window.height() / size.y);
++    crate::target::hover_probe::set_external(Some(point));
++    let first = link.clicks.is_none();
++    let new_click = link.clicks.is_some_and(|c| c != clicks);
++    link.clicks = Some(clicks);
++    if first || !new_click || link.release.is_some() {
++        return;
++    }
++    let button = if over_ui.0 {
++        MouseButton::Left
++    } else if hovered.any().is_some() || object.target.is_some() {
++        MouseButton::Right
++    } else {
++        return;
++    };
++    info!("wowbg3 pointer: BG3 click at {point:?} goes to WoW as {button:?}");
++    buttons.write(MouseButtonInput { button, state: ButtonState::Pressed, window: window_entity });
++    link.release = Some((button, 1));
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    app.insert_resource(PointerLink {
++        input: dir.join("bg3input.bin"),
++        hover: dir.join("wowhover.bin"),
++        last_seq: 0,
++        clicks: None,
++        release: None,
++        hover_flags: 0,
++        hover_seq: 0,
++    })
++    .add_systems(PreUpdate, forward_pointer.before(bevy::input::InputSystems));
++    info!("wowbg3: BG3 leads the camera ({:?})", dir.join("bg3cam.bin"));
++    HIDE_SELF.store(true, Ordering::Relaxed);
++    app.insert_resource(TavFollow {
++        path: dir.join("tav.bin"),
++        last_seq: 0,
++        armed: None,
++        armed_at: None,
++        walk_to: None,
++        frame: 0,
++        tav: None,
++        lock: 0.0,
++    })
++    .add_systems(Update, (read_tav, walk_after_tav.after(read_tav)))
++    .add_systems(
++        PostUpdate,
++        hide_own_model.before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
++    );
++    app.insert_resource(LeadStream {
++        path: dir.join("bg3cam.bin"),
++        file: None,
++        retry: 0,
++        last_seq: 0,
++        last_at: None,
++        pose: None,
++        frames: 0,
++    })
++    .add_systems(
++        PostUpdate,
++        follow_bg3.before(bevy::transform::TransformSystems::Propagate),
++    );
++}
++
++fn follow_bg3(
++    mut s: ResMut<LeadStream>,
++    mut t: ResMut<TavFollow>,
++    player: Res<crate::player::Player>,
++    world: benilla_world::world_point::WorldPoint,
++    mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
++) {
++    if s.file.is_none() {
++        if s.retry > 0 {
++            s.retry -= 1;
++            return;
++        }
++        s.retry = 60;
++        match File::open(&s.path) {
++            Ok(f) => s.file = Some(f),
++            Err(_) => return,
++        }
++    }
++    let mut rec = [0u8; 96];
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::FileExt;
++        let ok = s.file.as_ref().is_some_and(|f| f.read_exact_at(&mut rec, 0).is_ok());
++        if !ok {
++            s.file = None;
++            return;
++        }
++    }
++    if let Some((seq, pose)) = decode(&rec) {
++        if seq != s.last_seq {
++            s.last_seq = seq;
++            s.last_at = Some(Instant::now());
++            s.pose = Some(pose);
++        }
++    }
++    let fresh = s.last_at.is_some_and(|t| t.elapsed().as_secs_f32() < 0.5);
++    let Some(pose) = s.pose.filter(|_| fresh) else {
++        return;
++    };
++    let Ok((mut tf, mut proj)) = cam.single_mut() else {
++        return;
++    };
++    let mut eye = wow_to_bevy(pose.eye);
++    // Ground lock (see the module notes).
++    let want = match t.tav {
++        Some(tav) if player.active && Vec2::new(tav.x - player.pos.x, tav.z - player.pos.z).length() < 3.0 => {
++            (tav.y - player.pos.y).clamp(-4.0, 4.0)
++        }
++        _ => t.lock,
++    };
++    t.lock += (want - t.lock) * 0.1;
++    eye.y -= t.lock;
++    // Ground clearance (see the module notes): toward Tav's chest, at most 90% of the way.
++    if let Some(tav) = t.tav {
++        let target = tav - Vec3::Y * t.lock + Vec3::Y * 1.5;
++        let clear = |p: Vec3| world.terrain_height_under(p).is_none_or(|g| p.y > g + 0.6);
++        if !clear(eye) {
++            for i in 1..=18 {
++                let p = eye.lerp(target, i as f32 * 0.05);
++                if clear(p) {
++                    eye = p;
++                    break;
++                }
++            }
++        }
++    }
++    // Directions map like points without the translation (the mapping is linear).
++    let fwd = wow_to_bevy(pose.forward);
++    let up = wow_to_bevy(pose.up);
++    if fwd.length_squared() < 1e-6 {
++        return;
++    }
++    let moved = (eye - wow_to_bevy(pose.eye)).dot(fwd.normalize());
++    DEPTH_OFFSET.store(moved.to_bits(), Ordering::Relaxed);
++    tf.translation = eye;
++    tf.look_to(fwd, if up.length_squared() > 1e-6 { up } else { Vec3::Y });
++    if let Projection::Perspective(p) = proj.as_mut() {
++        p.fov = pose.fovy;
++    }
++    s.frames += 1;
++    if s.frames % 600 == 1 {
++        info!("wowbg3 lead: camera at {eye:?} looking {fwd:?}, fov {:.3}, ground lock {:.2}", pose.fovy, t.lock);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn decodes_whole_records_only() {
++        let mut rec = [0u8; 96];
++        rec[0..4].copy_from_slice(b"BGC1");
++        rec[4..8].copy_from_slice(&7u32.to_le_bytes());
++        rec[64..68].copy_from_slice(&7u32.to_le_bytes());
++        for (i, v) in [-8840.0f32, -140.0, 85.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.8, 1.77]
++            .iter()
++            .enumerate()
++        {
++            rec[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        let (seq, pose) = decode(&rec).unwrap();
++        assert_eq!(seq, 7);
++        assert_eq!(pose.eye, [-8840.0, -140.0, 85.0]);
++        assert!((pose.fovy - 0.8).abs() < 1e-6);
++        rec[64..68].copy_from_slice(&8u32.to_le_bytes());
++        assert!(decode(&rec).is_none(), "torn record accepted");
++    }
++
++    #[test]
++    fn decodes_input() {
++        let mut rec = [0u8; 32];
++        rec[0..4].copy_from_slice(b"BGI1");
++        rec[4..8].copy_from_slice(&5u32.to_le_bytes());
++        for (i, v) in [640.0f32, 300.0, 1280.0, 720.0].iter().enumerate() {
++            rec[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        rec[24..28].copy_from_slice(&2u32.to_le_bytes());
++        rec[28..32].copy_from_slice(&5u32.to_le_bytes());
++        let (seq, at, size, clicks) = decode_input(&rec).unwrap();
++        assert_eq!((seq, at, size, clicks), (5, Vec2::new(640.0, 300.0), Vec2::new(1280.0, 720.0), 2));
++        rec[28..32].copy_from_slice(&6u32.to_le_bytes());
++        assert!(decode_input(&rec).is_none());
++    }
++
++    #[test]
++    fn decodes_tav() {
++        let mut rec = [0u8; 44];
++        rec[0..4].copy_from_slice(b"TAV1");
++        rec[4..8].copy_from_slice(&3u32.to_le_bytes());
++        rec[8..12].copy_from_slice(&(-8843.5f32).to_le_bytes());
++        rec[40..44].copy_from_slice(&3u32.to_le_bytes());
++        assert_eq!(decode_tav(&rec).unwrap().1[0], -8843.5);
++        rec[40..44].copy_from_slice(&4u32.to_le_bytes());
++        assert!(decode_tav(&rec).is_none());
++    }
++}

@@ -1,0 +1,6 @@
+## Interface: 11200
+## Title: WOW-BG3 world layout
+## Notes: World mode (the BG3 window is the game): keeps WoW's chat, minimap and menu buttons clear of BG3's HUD and hides the rest.
+## Author: WOW-BG3
+Settings.lua
+WowBg3Layout.lua

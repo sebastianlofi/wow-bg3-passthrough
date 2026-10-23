@@ -1,0 +1,52 @@
+diff --git a/src/game/Group/Group.cpp b/src/game/Group/Group.cpp
+index 2b56afd..986d77a 100644
+--- a/src/game/Group/Group.cpp
++++ b/src/game/Group/Group.cpp
+@@ -28,6 +28,7 @@
+ #include "ObjectMgr.h"
+ #include "ObjectGuid.h"
+ #include "Group.h"
++#include "WowBg3Party.h"
+ #include "Formulas.h"
+ #include "ObjectAccessor.h"
+ #include "BattleGround.h"
+@@ -1294,6 +1295,10 @@ void Group::GetDataForXPAtKill(Unit const* victim, uint32& count, uint32& sum_le
+         if (!member || !member->IsAlive() || !member->IsInWorld())                  // only for alive
+             continue;
+ 
++        // WOW-BG3 (0014): a hero's party bots take no share of kill XP; the hero levels at solo speed.
++        if (!WowBg3::BotOwner(member).IsEmpty())
++            continue;
++
+         // will proccesed later
+         if (member == additional)
+             continue;
+@@ -1305,7 +1310,7 @@ void Group::GetDataForXPAtKill(Unit const* victim, uint32& count, uint32& sum_le
+         GetDataForXPAtKill_helper(member, victim, sum_level, member_with_max_level, not_gray_member_with_max_level);
+     }
+ 
+-    if (additional)
++    if (additional && WowBg3::BotOwner(additional).IsEmpty())
+     {
+         if (additional->IsAtGroupRewardDistance(victim))    // at req. distance
+         {
+@@ -2396,14 +2401,17 @@ void Group::RewardGroupAtKill(Unit* pVictim, Player* pPlayerTap)
+             if (!pGroupGuy->IsAtGroupRewardDistance(pVictim))
+                 continue;                               // member (alive or dead) or his corpse at req. distance
+ 
+-            RewardGroupAtKill_helper(pGroupGuy, pVictim, count, PvP, group_rate, sum_level, is_dungeon, not_gray_member_with_max_level, member_with_max_level, xp);
++            // WOW-BG3 (0014): a party bot gets no XP (reputation and quest credit as WoW gives them).
++            RewardGroupAtKill_helper(pGroupGuy, pVictim, count, PvP, group_rate, sum_level, is_dungeon,
++                WowBg3::BotOwner(pGroupGuy).IsEmpty() ? not_gray_member_with_max_level : nullptr, member_with_max_level, xp);
+         }
+ 
+         if (pPlayerTap)
+         {
+             // member (alive or dead) or his corpse at req. distance
+             if (pPlayerTap->IsAtGroupRewardDistance(pVictim))
+-                RewardGroupAtKill_helper(pPlayerTap, pVictim, count, PvP, group_rate, sum_level, is_dungeon, not_gray_member_with_max_level, member_with_max_level, xp);
++                RewardGroupAtKill_helper(pPlayerTap, pVictim, count, PvP, group_rate, sum_level, is_dungeon,
++                    WowBg3::BotOwner(pPlayerTap).IsEmpty() ? not_gray_member_with_max_level : nullptr, member_with_max_level, xp);
+         }
+     }
+ }

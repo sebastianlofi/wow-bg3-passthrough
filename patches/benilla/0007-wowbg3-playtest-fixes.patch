@@ -1,0 +1,1051 @@
+WOW-BG3 benilla patch 0007: fixes from the first desktop playtest (on top of 0001-0006).
+
+- wowbg3_tav.rs: Tav's pose blended between BG3's last two records at WoW's frame rate, one BG3
+  frame back on BG3's capture clock (palettes and object transforms, at most a quarter frame of
+  extrapolation); her cut-outs (hair, fur, lace) cut at BG3's 0.5 instead of WoW's 224/255, with
+  coverage-preserving mips; her root published as TavFeet after her pose (set TavPose).
+  Knobs: WOW_BG3_TAV_SMOOTH=off, WOW_BG3_TAV_TRACE=<frames>, WOW_BG3_TAV_CUTOFF=<0..1>.
+- blob_shadow.rs: in world mode the own (hidden) body's blob shadow lies under Tav, at her root
+  of the same frame, ordered after her pose.
+- wowbg3_lead.rs: bg3input.bin BGI2 (right clicks) besides BGI1; a BG3 right click over a WoW
+  unit, corpse or object is WoW's right click (interact), over WoW's UI a right click there; out
+  of reach the hidden body walks there (Click to Move's walk, on in world mode) and holds while
+  the walk or the NPC window lasts (20 yd leash). WOW_BG3_INPUT=<file> for tests.
+- player/approach.rs: Approach::toward_object(), for that hold.
+- target/hover.rs, target/hover_probe.rs, ui_script/input.rs: BG3's cursor (the external
+  pointer, world mode only) wins over benilla's own window cursor for the picks and the UI feed.
+
+diff --git a/crates/benilla-app/src/blob_shadow.rs b/crates/benilla-app/src/blob_shadow.rs
+index 79857a7..af9359e 100644
+--- a/crates/benilla-app/src/blob_shadow.rs
++++ b/crates/benilla-app/src/blob_shadow.rs
+@@ -30,6 +30,11 @@
+ //!
+ //! Each shadow's triangles are rebuilt only when [`ShadowKey`] moves and copied onto the effect
+ //! stream every shown frame.
++//!
++//! WOW-BG3 (local fork, patch 0007): in world mode BG3's character stands in for the own
++//! body, which is hidden (`wowbg3_lead`); the own shadow lies under her instead, at her root this
++//! frame ([`crate::wowbg3_tav::TavFeet`], set by her pose before this runs), never under the
++//! hidden body that walks after her.
+ 
+ use benilla_assets::ModelAnimations;
+ use benilla_protocol::EntityKind;
+@@ -90,7 +95,9 @@ impl Plugin for BlobShadowPlugin {
+                 (sync_shadows, update_shadows)
+                     .chain()
+                     // After net motion and input, so the decal follows this frame's transforms.
+-                    .after(WorldStage::Input),
++                    .after(WorldStage::Input)
++                    // WOW-BG3: and after BG3's character took this frame's pose.
++                    .after(crate::wowbg3_tav::TavPose),
+             )
+             // After the frame's stream clear.
+             .add_systems(PostUpdate, push_shadows.after(begin_effect_frame));
+@@ -177,6 +184,8 @@ fn update_shadows(
+     // reference uses for a mounted unit is untraced.
+     mount_anims: Query<(&NetEntity, &ModelAnimations), With<crate::entities::mount::MountBody>>,
+     mut shadows: Query<(&BlobShadow, &mut ShadowKey, &mut ShadowVerts)>,
++    // WOW-BG3: where BG3's character stands this frame, in world mode (module docs).
++    tav: Option<Res<crate::wowbg3_tav::TavFeet>>,
+     // A once-a-second census of shadows and why the hidden ones hid, at
+     // `RUST_LOG=benilla_app::blob_shadow=debug` (a `benilla::` filter matches nothing).
+     mut census_at: Local<f32>,
+@@ -199,8 +208,20 @@ fn update_shadows(
+             n_no_owner += 1;
+             continue;
+         };
++        // WOW-BG3: the own body is hidden in world mode and BG3's character stands in for it.
++        let stand_in = if is_self && crate::wowbg3_lead::hide_self() {
++            match tav.as_deref().and_then(|t| t.0) {
++                Some(feet) => Some(feet),
++                None => {
++                    hide(&mut key, &mut verts);
++                    continue;
++                }
++            }
++        } else {
++            None
++        };
+         // The visibility deviation (module docs): an undrawn owner casts nothing.
+-        if !drawn.is_none_or(|v| v.get()) {
++        if stand_in.is_none() && !drawn.is_none_or(|v| v.get()) {
+             hide(&mut key, &mut verts);
+             n_undrawn += 1;
+             continue;
+@@ -237,13 +258,14 @@ fn update_shadows(
+         }
+         // The unit's render alpha from the root, which also tells a pending appear fade (zero)
+         // from a settled unit, and carries the first-person fade.
+-        let alpha = unit_alpha.get(shadow.owner);
++        let alpha = if stand_in.is_some() { 1.0 } else { unit_alpha.get(shadow.owner) };
+         if alpha <= 0.0 {
+             hide(&mut key, &mut verts);
+             continue;
+         }
++        let feet = stand_in.unwrap_or(unit.translation);
+         let next = ShadowKey {
+-            feet: unit.translation,
++            feet,
+             rotation: unit.rotation,
+             box_min: bmin,
+             box_max: bmax,
+@@ -272,7 +294,7 @@ fn update_shadows(
+         // Vertically `+(h/2)` up, `-(5/3)(h/2)` down (`[0xcea60c]`, `[0xcea610]`).
+         let half_v = (bmax.y - bmin.y) * 0.5;
+         let frame = DecalFrame {
+-            center: unit.translation,
++            center: feet,
+             sin: 0.0,
+             cos: 1.0,
+             min_x,
+@@ -327,8 +349,8 @@ fn update_shadows(
+                 z_min,
+                 z_max,
+                 z_max - z_min,
+-                unit.translation.x,
+-                unit.translation.z,
++                feet.x,
++                feet.z,
+                 unit.rotation
+                     .to_euler(bevy::math::EulerRot::YXZ)
+                     .0
+@@ -337,9 +359,9 @@ fn update_shadows(
+             debug!(
+                 "self shadow: feet y {:.3}, box y [{:.3}, {:.3}], {} verts, vert y [{:.3}, \
+                  {:.3}]",
+-                unit.translation.y,
+-                unit.translation.y + frame.min_y,
+-                unit.translation.y + frame.max_y,
++                feet.y,
++                feet.y + frame.min_y,
++                feet.y + frame.max_y,
+                 verts.0.len(),
+                 y_min,
+                 y_max
+diff --git a/crates/benilla-app/src/player/approach.rs b/crates/benilla-app/src/player/approach.rs
+index 93dc433..69a3f93 100644
+--- a/crates/benilla-app/src/player/approach.rs
++++ b/crates/benilla-app/src/player/approach.rs
+@@ -149,6 +149,12 @@ impl Approach {
+         self.goal = None;
+     }
+ 
++    /// WOW-BG3 (local fork): a walk to an object's verb (talk, loot, use, skin) is in flight, which
++    /// world mode's follow of BG3's character must not cancel (`wowbg3_lead`).
++    pub(crate) fn toward_object(&self) -> bool {
++        self.goal.as_ref().is_some_and(|g| matches!(g.toward, Toward::Object { .. }))
++    }
++
+     #[cfg(test)]
+     pub(crate) fn stop_distance(&self) -> Option<f32> {
+         self.goal.as_ref().map(|g| g.stop)
+diff --git a/crates/benilla-app/src/target/hover.rs b/crates/benilla-app/src/target/hover.rs
+index 315114d..7de85f9 100644
+--- a/crates/benilla-app/src/target/hover.rs
++++ b/crates/benilla-app/src/target/hover.rs
+@@ -39,7 +39,7 @@ pub(super) fn update_pick_occlusion(
+     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
+         return;
+     };
+-    let Some(cursor) = window.cursor_position().or_else(super::hover_probe::external) else {
++    let Some(cursor) = super::hover_probe::pointer(window) else {
+         return;
+     };
+     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+@@ -256,7 +256,7 @@ pub(super) fn update_hover(
+     let (Ok((camera, cam_tf)), Ok(window)) = (camera.single(), window.single()) else {
+         return;
+     };
+-    let Some(cursor) = window.cursor_position().or_else(super::hover_probe::external) else {
++    let Some(cursor) = super::hover_probe::pointer(window) else {
+         return;
+     };
+     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+@@ -604,7 +604,7 @@ pub(super) fn update_hovered_object(
+     if yielded {
+         return;
+     }
+-    let Some(cursor) = window.cursor_position().or(probe_aim) else {
++    let Some(cursor) = super::hover_probe::pointer(window).or(probe_aim) else {
+         return;
+     };
+     if pickable.is_empty() {
+diff --git a/crates/benilla-app/src/target/hover_probe.rs b/crates/benilla-app/src/target/hover_probe.rs
+index e9a52b9..e646015 100644
+--- a/crates/benilla-app/src/target/hover_probe.rs
++++ b/crates/benilla-app/src/target/hover_probe.rs
+@@ -74,6 +74,13 @@ pub(crate) fn external() -> Option<Vec2> {
+     *EXTERNAL.lock().unwrap_or_else(|e| e.into_inner())
+ }
+ 
++/// The pointer the picks and the UI feed aim with. WOW-BG3 (patch 0007): BG3's cursor wins over
++/// this window's own, since BG3's window is where the player points in world mode (and a headless
++/// window's compositor cursor never moves); with no external pointer it is the window's.
++pub(crate) fn pointer(window: &Window) -> Option<Vec2> {
++    external().or_else(|| window.cursor_position())
++}
++
+ /// Whether the probe is armed: one `OnceLock` read, cheap per frame.
+ pub(super) fn armed() -> bool {
+     aim().is_some() || external().is_some()
+diff --git a/crates/benilla-app/src/ui_script/input.rs b/crates/benilla-app/src/ui_script/input.rs
+index ebd1d41..dcc16ec 100644
+--- a/crates/benilla-app/src/ui_script/input.rs
++++ b/crates/benilla-app/src/ui_script/input.rs
+@@ -147,8 +147,7 @@ pub(super) fn feed_ui_input(
+     // ── Mouse ── A cursor off the window skips only the mouse feed.
+     // The headless hover probe's aim stands in for a missing cursor, so `PointerOverUi` rises and
+     // falls over a panel in an automated run as it does for a person; a real pointer always wins.
+-    if let Some(cursor) = window
+-        .cursor_position()
++    if let Some(cursor) = crate::target::hover_probe::pointer(window)
+         .or_else(crate::target::hover_probe_point)
+         .filter(|_| !synthetic)
+     {
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index a5a996d..397053f 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -30,6 +30,14 @@
+ //! gossip and quest buttons); over a WoW unit, corpse or object it is WoW's right click (talk,
+ //! loot, quests, attack). Elsewhere it is BG3's alone. `wowhover.bin` (`WBH1`, seq, flags: 1 over
+ //! WoW's UI, 2 over a WoW unit or object, seq again) tells BG3 which clicks WoW will take.
++//!
++//! Patch 0007: `bg3input.bin` may be `BGI2` (36 bytes and a pad: `BGI2`, seq, cursor x, y, BG3's
++//! window width, height as f32, left clicks, right clicks u32, seq again), which carries BG3's
++//! right clicks too: a new right click over a WoW unit, corpse or object is WoW's right click on
++//! it (talk, vendor, quests, loot), over WoW's UI a right click there; elsewhere BG3's own.
++//! Out of reach, the own (hidden) body walks there (Click to Move's walk, always on in world
++//! mode) and holds at the NPC while the walk or the window it opened lasts, unless BG3's
++//! character goes more than 20 yd away. `WOW_BG3_INPUT=<file>` reads another input file (tests).
+ 
+ use std::fs::File;
+ use std::path::PathBuf;
+@@ -148,10 +156,29 @@ fn read_tav(
+     }
+ }
+ 
+-fn walk_after_tav(mut t: ResMut<TavFollow>, mut auto: crate::player::AutoMove) {
+-    if let Some(at) = t.walk_to.take() {
+-        auto.walk_to_ground_bg3(at);
++/// How far BG3's character may get from the own body before an interaction walk or an open NPC
++/// window stops holding the body there (yd).
++const INTERACT_LEASH: f32 = 20.0;
++
++fn walk_after_tav(
++    mut t: ResMut<TavFollow>,
++    mut auto: crate::player::AutoMove,
++    open: Option<Res<crate::ui_session::InteractNpc>>,
++    player: Res<crate::player::Player>,
++) {
++    // World mode (patch 0007): BG3's character is what the player steers, so the own (hidden) body
++    // walks to the NPC, body or object a BG3 click interacts with, as Click to Move would.
++    if !auto.approach.enabled {
++        auto.approach.enabled = true;
+     }
++    let Some(at) = t.walk_to.take() else { return };
++    // That walk, and the window it opens, hold the body there until Tav has gone on.
++    let away = Vec2::new(at.x - player.pos.x, at.z - player.pos.z).length();
++    let window_open = open.is_some_and(|o| o.0.is_some());
++    if (auto.approach.toward_object() || window_open) && away < INTERACT_LEASH {
++        return;
++    }
++    auto.walk_to_ground_bg3(at);
+ }
+ 
+ /// The own character's model: hidden at the root (its parts inherit).
+@@ -212,22 +239,43 @@ struct PointerLink {
+     hover: PathBuf,
+     last_seq: u32,
+     clicks: Option<u32>,
++    /// BG3's right clicks so far (`BGI2`; `None` until the first such record).
++    right_clicks: Option<u32>,
+     release: Option<(MouseButton, u8)>,
+     hover_flags: u32,
+     hover_seq: u32,
+ }
+ 
+-/// Decodes `bg3input.bin`: (seq, cursor, BG3's window size, clicks).
+-pub(crate) fn decode_input(rec: &[u8]) -> Option<(u32, Vec2, Vec2, u32)> {
+-    if rec.len() < 32 || &rec[0..4] != b"BGI1" {
++/// One `bg3input.bin` record.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct BgInput {
++    pub(crate) seq: u32,
++    /// BG3's cursor and window size (px).
++    pub(crate) at: Vec2,
++    pub(crate) size: Vec2,
++    /// Left clicks so far, and right clicks (`BGI2` only).
++    pub(crate) left: u32,
++    pub(crate) right: Option<u32>,
++}
++
++/// Decodes `bg3input.bin`, `BGI1` or `BGI2`; `None` when torn, foreign or not finite.
++pub(crate) fn decode_input(rec: &[u8]) -> Option<BgInput> {
++    let (len, right, again) = match rec.get(0..4)? {
++        b"BGI1" => (32, None, 28),
++        b"BGI2" => (36, Some(28), 32),
++        _ => return None,
++    };
++    if rec.len() < len {
+         return None;
+     }
+     let u = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
+     let f = |o: usize| f32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
+     let seq = u(4);
+     let (at, size) = (Vec2::new(f(8), f(12)), Vec2::new(f(16), f(20)));
+-    let ok = seq != 0 && seq == u(28) && at.is_finite() && size.x >= 1.0 && size.y >= 1.0;
+-    ok.then_some((seq, at, size, u(24)))
++    // `BGI2` names 40 bytes: the seq again after the clicks, or after a pad.
++    let whole = seq == u(again) || (again == 32 && rec.len() >= 40 && seq == u(36));
++    let ok = seq != 0 && whole && at.is_finite() && size.x >= 1.0 && size.y >= 1.0;
++    ok.then_some(BgInput { seq, at, size, left: u(24), right: right.map(u) })
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -268,29 +316,40 @@ fn forward_pointer(
+         }
+     }
+     let Ok(raw) = std::fs::read(&link.input) else { return };
+-    let Some((seq, at, size, clicks)) = decode_input(&raw) else { return };
+-    if seq == link.last_seq {
++    let Some(input) = decode_input(&raw) else { return };
++    if input.seq == link.last_seq {
+         return;
+     }
+-    link.last_seq = seq;
++    link.last_seq = input.seq;
+     // The player is at BG3's mouse: WoW's idle clock (auto-AFK at 5 min, logout at 30) restarts.
+     idle.stamp_present(time.elapsed());
+-    let point = at * Vec2::new(window.width() / size.x, window.height() / size.y);
++    let point = input.at * Vec2::new(window.width() / input.size.x, window.height() / input.size.y);
+     crate::target::hover_probe::set_external(Some(point));
+-    let first = link.clicks.is_none();
+-    let new_click = link.clicks.is_some_and(|c| c != clicks);
+-    link.clicks = Some(clicks);
+-    if first || !new_click || link.release.is_some() {
++    let new_left = link.clicks.is_some_and(|c| c != input.left);
++    let new_right = link.right_clicks.zip(input.right).is_some_and(|(a, b)| a != b);
++    link.clicks = Some(input.left);
++    link.right_clicks = input.right;
++    if !(new_left || new_right) || link.release.is_some() {
+         return;
+     }
+-    let button = if over_ui.0 {
+-        MouseButton::Left
+-    } else if hovered.any().is_some() || object.target.is_some() {
+-        MouseButton::Right
+-    } else {
+-        return;
++    let over_world = hovered.any().is_some() || object.target.is_some();
++    let button = match (over_ui.0, over_world) {
++        // A right click over WoW's UI is a right click there; a left one a left one.
++        (true, _) => {
++            if new_right {
++                MouseButton::Right
++            } else {
++                MouseButton::Left
++            }
++        }
++        // Over a WoW unit, corpse or object either button is WoW's right click: interact.
++        (false, true) => MouseButton::Right,
++        (false, false) => return,
+     };
+-    info!("wowbg3 pointer: BG3 click at {point:?} goes to WoW as {button:?}");
++    info!(
++        "wowbg3 pointer: BG3 {} click at {point:?} goes to WoW as {button:?}",
++        if new_right { "right" } else { "left" }
++    );
+     buttons.write(MouseButtonInput { button, state: ButtonState::Pressed, window: window_entity });
+     link.release = Some((button, 1));
+ }
+@@ -299,11 +358,13 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+     if std::env::var_os("WOW_BG3_LEAD").is_none() {
+         return;
+     }
++    let input = std::env::var_os("WOW_BG3_INPUT").map_or_else(|| dir.join("bg3input.bin"), PathBuf::from);
+     app.insert_resource(PointerLink {
+-        input: dir.join("bg3input.bin"),
++        input,
+         hover: dir.join("wowhover.bin"),
+         last_seq: 0,
+         clicks: None,
++        right_clicks: None,
+         release: None,
+         hover_flags: 0,
+         hover_seq: 0,
+@@ -463,12 +524,31 @@ mod tests {
+         }
+         rec[24..28].copy_from_slice(&2u32.to_le_bytes());
+         rec[28..32].copy_from_slice(&5u32.to_le_bytes());
+-        let (seq, at, size, clicks) = decode_input(&rec).unwrap();
+-        assert_eq!((seq, at, size, clicks), (5, Vec2::new(640.0, 300.0), Vec2::new(1280.0, 720.0), 2));
++        let i = decode_input(&rec).unwrap();
++        assert_eq!((i.seq, i.at, i.size, i.left, i.right), (5, Vec2::new(640.0, 300.0), Vec2::new(1280.0, 720.0), 2, None));
+         rec[28..32].copy_from_slice(&6u32.to_le_bytes());
+         assert!(decode_input(&rec).is_none());
+     }
+ 
++    #[test]
++    fn decodes_input_with_right_clicks() {
++        // BGI2: 36 bytes and a pad, right clicks at 28, seq again at 32.
++        let mut rec = [0u8; 40];
++        rec[0..4].copy_from_slice(b"BGI2");
++        rec[4..8].copy_from_slice(&9u32.to_le_bytes());
++        for (i, v) in [100.0f32, 200.0, 1280.0, 800.0].iter().enumerate() {
++            rec[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        rec[24..28].copy_from_slice(&4u32.to_le_bytes());
++        rec[28..32].copy_from_slice(&3u32.to_le_bytes());
++        rec[32..36].copy_from_slice(&9u32.to_le_bytes());
++        let i = decode_input(&rec).unwrap();
++        assert_eq!((i.seq, i.at, i.size, i.left, i.right), (9, Vec2::new(100.0, 200.0), Vec2::new(1280.0, 800.0), 4, Some(3)));
++        assert!(decode_input(&rec[..35]).is_none(), "short record");
++        rec[32..36].copy_from_slice(&10u32.to_le_bytes());
++        assert!(decode_input(&rec).is_none(), "torn record");
++    }
++
+     #[test]
+     fn decodes_tav() {
+         let mut rec = [0u8; 44];
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index 3073b3f..87f20d5 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -25,6 +25,20 @@
+ //! mirrored mapping so her outside faces are front faces. A new plan (an attachment coming or
+ //! going) keeps every persisting mesh's look, and new meshes stay hidden until their maps arrive,
+ //! so she no longer flashes untextured.
++//!
++//! Patch 0007 (the first desktop playtest: she looked low fps and soft next to WoW's
++//! world, her shadow trailed her):
++//! - Smoothing: BG3 sends a pose per BG3 frame (21 fps on his desktop); WoW draws at 60. The last
++//!   two pose records are blended at `now − one BG3 frame` on BG3's own capture clock (bone
++//!   palettes and object transforms; a quarter frame of extrapolation at most), so she moves
++//!   every WoW frame about one BG3 frame behind ([`blend_pose`]). `WOW_BG3_TAV_SMOOTH=off` draws
++//!   each record as it comes, as before; `WOW_BG3_TAV_TRACE=<frames>` logs her root per frame
++//!   while she walks.
++//! - Cut-outs: hair, fur and lace are cut at BG3's 0.5, not WoW's 224/255, which ate their soft
++//!   strands, and their mips keep the cut-out's coverage, so they stay full at a distance
++//!   (`WOW_BG3_TAV_CUTOFF` overrides the cut-off).
++//! - Shadow: her root this frame is [`TavFeet`], where the own (hidden) body's blob shadow lies
++//!   (`blob_shadow`), computed after her pose ([`TavPose`]).
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::path::{Path, PathBuf};
+@@ -45,6 +59,13 @@ const YD: f32 = 0.9144;
+ const STALE_SECS: f64 = 1.0;
+ /// A mesh of a new plan with no maps after this long is drawn untextured (the baker is behind).
+ const FALLBACK_SECS: f32 = 12.0;
++/// BG3's alpha-test reference for its cut-out materials (hair cards, fur, lace).
++const BG3_CUTOFF: f32 = 0.5;
++/// How far past the newest record the blend may run when BG3 is late, in BG3 frames.
++const MAX_EXTRAPOLATION: f64 = 0.25;
++/// The BG3 frame interval assumed until records have been timed (s), and its bounds.
++const START_INTERVAL: f64 = 1.0 / 30.0;
++const INTERVAL_RANGE: (f64, f64) = (1.0 / 240.0, 0.2);
+ 
+ /// `.tvt` and `tavtex.txt` flags: alpha test, hidden, linear data (normal and surface maps).
+ pub(crate) const TVT_ALPHA_TEST: u32 = 1;
+@@ -78,6 +99,7 @@ pub(crate) struct MeshFile {
+     pub(crate) meshes: Vec<TavMesh>,
+ }
+ 
++#[derive(Clone)]
+ pub(crate) struct PoseRec {
+     pub(crate) key: u64,
+     pub(crate) flags: u32,
+@@ -409,6 +431,89 @@ pub(crate) fn pose_mesh(m: &TavMesh, p: &PoseRec, pos: &mut Vec<Vec3>, nrm: &mut
+     }
+ }
+ 
++/// Two pose records blended at `t` (0 = `a`, 1 = `b`, above 1 extrapolated): object rotations by
++/// normalised lerp along the shorter arc, translations, scales and bone palettes (3×4 rows)
++/// linearly, record by record (by mesh key). A record or palette only in `b` is `b`'s.
++pub(crate) fn blend_pose(a: &PoseFile, b: &PoseFile, t: f32) -> Vec<PoseRec> {
++    let lerp = |x: f32, y: f32| x + (y - x) * t;
++    b.recs
++        .iter()
++        .map(|rb| {
++            let Some(ra) = a.recs.iter().find(|r| r.key == rb.key && r.flags & 1 == rb.flags & 1) else {
++                return PoseRec { key: rb.key, flags: rb.flags, world: rb.world, palette: rb.palette.clone() };
++            };
++            let mut world = rb.world;
++            let (qa, qb) = (Vec4::from_slice(&ra.world[0..4]), Vec4::from_slice(&rb.world[0..4]));
++            let qa = if qa.dot(qb) < 0.0 { -qa } else { qa };
++            let q = (qa + (qb - qa) * t).normalize_or_zero();
++            world[0..4].copy_from_slice(&q.to_array());
++            for k in 4..10 {
++                world[k] = lerp(ra.world[k], rb.world[k]);
++            }
++            let palette = if ra.palette.len() == rb.palette.len() {
++                ra.palette
++                    .iter()
++                    .zip(&rb.palette)
++                    .map(|(ma, mb)| std::array::from_fn(|k| lerp(ma[k], mb[k])))
++                    .collect()
++            } else {
++                rb.palette.clone()
++            };
++            PoseRec { key: rb.key, flags: rb.flags, world, palette }
++        })
++        .collect()
++}
++
++/// Where between the last two records to draw at `now` (BG3's clock: seconds since the epoch):
++/// one smoothed BG3 frame back, as a fraction of the pair's span, extrapolating at most
++/// [`MAX_EXTRAPOLATION`].
++pub(crate) fn blend_at(prev_time: f64, last_time: f64, now: f64, interval: f64) -> f32 {
++    let span = last_time - prev_time;
++    if !(span > 1e-4) {
++        return 1.0;
++    }
++    (((now - interval) - prev_time) / span).clamp(0.0, 1.0 + MAX_EXTRAPOLATION) as f32
++}
++
++/// The last two pose records of the current plan and the smoothed BG3 frame interval.
++struct PoseTrack {
++    prev: Option<PoseFile>,
++    last: Option<PoseFile>,
++    interval: f64,
++    /// What was skinned last: (previous frame, last frame, blend); unchanged skips the skinning.
++    drawn: Option<(u32, u32, f32)>,
++}
++
++impl PoseTrack {
++    fn new() -> Self {
++        Self { prev: None, last: None, interval: START_INTERVAL, drawn: None }
++    }
++
++    /// Takes a record (newer than the last one).
++    fn push(&mut self, p: PoseFile) {
++        if let Some(last) = &self.last {
++            let dt = p.time - last.time;
++            if dt > INTERVAL_RANGE.0 && dt < INTERVAL_RANGE.1 {
++                self.interval += (dt - self.interval) * 0.1;
++            }
++        }
++        self.prev = self.last.replace(p);
++        // A record from before the previous one (BG3's clock went back) blends nothing.
++        if self.prev.as_ref().zip(self.last.as_ref()).is_some_and(|(a, b)| b.time <= a.time) {
++            self.prev = None;
++        }
++    }
++}
++
++/// Tav's root this frame (Bevy world, at her feet; `None` while she is not drawn): the own body's
++/// blob shadow lies there (`blob_shadow`), so it follows the same pose as her mesh.
++#[derive(Resource, Default, Clone, Copy)]
++pub(crate) struct TavFeet(pub(crate) Option<Vec3>);
++
++/// The system that poses Tav; a reader of [`TavFeet`] runs after it.
++#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
++pub(crate) struct TavPose;
++
+ struct Part {
+     key: u64,
+     entity: Entity,
+@@ -428,6 +533,8 @@ enum Look {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub(crate) enum Role {
+     Albedo,
++    /// An albedo whose alpha is cut at [`TavDraw::cutoff`]: its mips keep the cut's coverage.
++    Cutout,
+     Normal,
+     Data,
+ }
+@@ -447,9 +554,19 @@ struct TavDraw {
+     parts: Vec<Part>,
+     last_pose: u32,
+     last_pose_at: Option<Instant>,
++    track: PoseTrack,
++    /// `WOW_BG3_TAV_SMOOTH=off`: every record drawn as it comes, unblended.
++    smooth: bool,
++    /// `WOW_BG3_TAV_TRACE=<n>`: her root logged for n WoW frames while she walks (moved within
++    /// the last second), and the skinning's cost over them (µs total, skins).
++    trace: u32,
++    skin_cost: (u128, u32),
++    /// The root last seen and the WoW frame it last moved on, for the trace's walking gate.
++    trace_root: (Vec3, u64),
++    /// The alpha test of her cut-out materials ([`BG3_CUTOFF`], `WOW_BG3_TAV_CUTOFF`).
++    cutoff: f32,
+     cache: MaterialCache,
+     material: Option<Handle<WowModelMaterial>>,
+-    scratch: (Vec<Vec3>, Vec<Vec3>, Vec<Vec3>),
+     logged: u64,
+     /// `tavtex.txt` (link/tools/tavtex.py): its stamp, and the textures loaded so far by file.
+     tex_stamp: Option<(SystemTime, u32)>,
+@@ -482,10 +599,18 @@ pub(crate) fn build(app: &mut App) {
+     let flip_y = std::env::var("WOW_BG3_TAV_NORMAL_Y").is_ok_and(|v| v == "flip");
+     let maps = std::env::var("WOW_BG3_TAV_MAPS").map_or(true, |v| v != "off");
+     let det_sign = mapping_det_sign();
++    let smooth = std::env::var("WOW_BG3_TAV_SMOOTH").map_or(true, |v| v != "off");
++    let trace = std::env::var("WOW_BG3_TAV_TRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
++    let cutoff = std::env::var("WOW_BG3_TAV_CUTOFF")
++        .ok()
++        .and_then(|v| v.trim().parse::<f32>().ok())
++        .filter(|v| (0.0..=1.0).contains(v))
++        .unwrap_or(BG3_CUTOFF);
+     info!(
+-        "wowbg3 tav: drawing BG3's character from {dir:?} (surface maps {}, highlight {spec}, normal green {}, mapping det {det_sign})",
++        "wowbg3 tav: drawing BG3's character from {dir:?} (surface maps {}, highlight {spec}, normal green {}, mapping det {det_sign}, poses {}, cut-off {cutoff})",
+         if maps { "on" } else { "off" },
+-        if flip_y { "flipped" } else { "as baked" }
++        if flip_y { "flipped" } else { "as baked" },
++        if smooth { "blended at WoW's frame rate" } else { "as they come" }
+     );
+     app.insert_resource(TavDraw {
+         dir,
+@@ -497,9 +622,14 @@ pub(crate) fn build(app: &mut App) {
+         parts: Vec::new(),
+         last_pose: 0,
+         last_pose_at: None,
++        track: PoseTrack::new(),
++        smooth,
++        trace,
++        skin_cost: (0, 0),
++        trace_root: (Vec3::ZERO, 0),
++        cutoff,
+         cache: MaterialCache::default(),
+         material: None,
+-        scratch: (Vec::new(), Vec::new(), Vec::new()),
+         logged: 0,
+         tex_stamp: None,
+         textures: HashMap::new(),
+@@ -512,7 +642,11 @@ pub(crate) fn build(app: &mut App) {
+         flip_y,
+         maps,
+     })
+-    .add_systems(Update, (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes)));
++    .init_resource::<TavFeet>()
++    .add_systems(
++        Update,
++        (load_meshes, load_textures.after(load_meshes), apply_pose.after(load_meshes).in_set(TavPose)),
++    );
+ }
+ 
+ /// The triangles in the other winding.
+@@ -537,6 +671,7 @@ fn load_meshes(
+         return;
+     }
+     let Some(light) = light else { return };
++    let started = Instant::now();
+     let Ok(raw) = std::fs::read(&path) else { return };
+     d.mesh_mtime = Some(mtime);
+     let Some(file) = decode_mesh(&raw) else {
+@@ -625,17 +760,19 @@ fn load_meshes(
+         parts.push(Part { key: m.key, entity, mesh: handle, dressed });
+     }
+     info!(
+-        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals; {kept} keep their look, {waiting} wait for maps",
++        "wowbg3 tav: plan {} with {} meshes ({} vertices) over {} visuals; {kept} keep their look, {waiting} wait for maps ({} ms)",
+         file.seq,
+         file.meshes.len(),
+         file.meshes.iter().map(|m| m.pos.len()).sum::<usize>(),
+-        file.meshes.iter().map(|m| m.part).max().map_or(0, |p| p + 1)
++        file.meshes.iter().map(|m| m.part).max().map_or(0, |p| p + 1),
++        started.elapsed().as_millis()
+     );
+     d.parts = parts;
+     d.tex_stamp = None; // new meshes: apply the textures again
+     d.root = Some(root);
+     d.file = Some(file);
+     d.last_pose = 0;
++    d.track = PoseTrack::new();
+     d.plan_at = Some(Instant::now());
+     d.fallback_done = false;
+ }
+@@ -680,22 +817,71 @@ pub(crate) fn normal_mip(prev: &[u8], cw: usize, ch: usize) -> (Vec<u8>, usize,
+     (next, nw, nh)
+ }
+ 
++/// The smallest alpha byte the GPU's alpha test at `cutoff` keeps (`alpha < cutoff` discards).
++fn alpha_key(cutoff: f32) -> u8 {
++    (cutoff * 255.0 - 1e-3).ceil().clamp(0.0, 255.0) as u8
++}
++
++/// The share of texels whose alpha passes the cut at `cutoff`.
++fn coverage(px: &[u8], cutoff: f32) -> f32 {
++    let n = px.len() / 4;
++    if n == 0 {
++        return 0.0;
++    }
++    let key = alpha_key(cutoff);
++    px.chunks_exact(4).filter(|t| t[3] >= key).count() as f32 / n as f32
++}
++
++/// A mip level's alpha scaled up so the cut-out keeps `target` coverage (Castaño's
++/// coverage-preserving mips): box-filtered alpha thins a cut-out at every level, so hair and lace
++/// would fade into holes at a distance. A level that keeps enough already is left alone.
++pub(crate) fn keep_coverage(level: &mut [u8], target: f32, cutoff: f32) {
++    let key = alpha_key(cutoff);
++    let scaled = |a: u8, k: f32| (f32::from(a) * k).round().clamp(0.0, 255.0) as u8;
++    let want = (target * (level.len() / 4) as f32).round() as usize;
++    let passing = |level: &[u8], k: f32| level.chunks_exact(4).filter(|t| scaled(t[3], k) >= key).count();
++    if passing(level, 1.0) >= want {
++        return;
++    }
++    let (mut lo, mut hi) = (1.0f32, 8.0f32);
++    for _ in 0..16 {
++        let mid = 0.5 * (lo + hi);
++        if passing(level, mid) < want {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    for t in level.chunks_exact_mut(4) {
++        t[3] = scaled(t[3], hi);
++    }
++}
++
+ /// A baked texture as a mipmapped, anisotropically filtered image (sharp up close, calm at a
+-/// distance): the albedo in sRGB, normal and surface maps as linear data.
+-fn tvt_image(w: u32, h: u32, px: &[u8], role: Role) -> Image {
++/// distance): the albedo in sRGB (a cut-out's mips keeping its coverage at `cutoff`), normal and
++/// surface maps as linear data.
++fn tvt_image(w: u32, h: u32, px: &[u8], role: Role, cutoff: f32) -> Image {
+     use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+     let mut data = px.to_vec();
+     let (mut cw, mut ch, mut levels) = (w as usize, h as usize, 1u32);
+     let mut prev = px.to_vec();
++    let cover = (role == Role::Cutout).then(|| coverage(px, cutoff));
+     while cw > 1 || ch > 1 {
+         let (next, nw, nh) = if role == Role::Normal { normal_mip(&prev, cw, ch) } else { box_mip(&prev, cw, ch) };
+-        data.extend_from_slice(&next);
++        match cover {
++            Some(c) => {
++                let mut kept = next.clone();
++                keep_coverage(&mut kept, c, cutoff);
++                data.extend_from_slice(&kept);
++            }
++            None => data.extend_from_slice(&next),
++        }
+         prev = next;
+         cw = nw;
+         ch = nh;
+         levels += 1;
+     }
+-    let format = if role == Role::Albedo {
++    let format = if matches!(role, Role::Albedo | Role::Cutout) {
+         bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb
+     } else {
+         bevy::render::render_resource::TextureFormat::Rgba8Unorm
+@@ -771,6 +957,7 @@ fn load_tvt(
+     dir: &Path,
+     file: &str,
+     role: Role,
++    cutoff: f32,
+     logged: &mut HashSet<String>,
+ ) -> Option<Handle<Image>> {
+     if let Some(h) = textures.get(&(file.to_string(), role)) {
+@@ -779,10 +966,10 @@ fn load_tvt(
+     let decoded = std::fs::read(dir.join(file)).ok().and_then(|raw| {
+         let (w, h, flags, px) = decode_tvt(&raw)?;
+         // Normal and surface maps are linear data (flag 4); an albedo is sRGB.
+-        if (role != Role::Albedo) != (flags & TVT_LINEAR != 0) && logged.insert(file.to_string()) {
++        if matches!(role, Role::Normal | Role::Data) != (flags & TVT_LINEAR != 0) && logged.insert(file.to_string()) {
+             warn!("wowbg3 tav: {file} flags {flags} do not match its use as {role:?}");
+         }
+-        Some(tvt_image(w, h, px, role))
++        Some(tvt_image(w, h, px, role, cutoff))
+     });
+     let Some(image) = decoded else {
+         if logged.insert(file.to_string()) {
+@@ -809,6 +996,7 @@ fn tav_material(
+     surface: Option<Handle<Image>>,
+     flip_y: bool,
+     spec: f32,
++    cutoff: f32,
+ ) -> Handle<WowModelMaterial> {
+     let plain = model_material(
+         cache,
+@@ -839,6 +1027,10 @@ fn tav_material(
+     benilla_world::model_render::lazy::realize(materials, plain.id());
+     let Some(mut m) = materials.get(&plain).cloned() else { return plain };
+     let has_surface = surface.is_some();
++    // BG3's cut, not WoW's 224/255 (`model_material`'s), which ate the strands of her hair.
++    if alpha_test {
++        m.base.alpha_mode = AlphaMode::Mask(cutoff);
++    }
+     m.base.normal_map_texture = normal;
+     m.base.flip_normal_map_y = flip_y;
+     m.base.occlusion_texture = surface.clone();
+@@ -892,7 +1084,7 @@ fn load_textures(
+     d.tex_stamp = Some((mtime, seq));
+     let (mut applied, mut hidden, mut mapped) = (0, 0, 0);
+     let mut logged = HashSet::new();
+-    let TavDraw { dir, cache, textures, looks, surface_mats, parts, spec, flip_y, maps, .. } = &mut *d;
++    let TavDraw { dir, cache, textures, looks, surface_mats, parts, spec, flip_y, maps, cutoff, .. } = &mut *d;
+     for line in lines {
+         let Some(t) = parse_tex_line(line) else { continue };
+         let Some(part) = parts.iter_mut().find(|p| p.key == t.key) else { continue };
+@@ -914,11 +1106,12 @@ fn load_textures(
+         let material = match surface_mats.get(&key) {
+             Some(h) => h.clone(),
+             None => {
+-                let Some(a) = load_tvt(textures, &mut images, dir.as_path(), &albedo, Role::Albedo, &mut logged) else { continue };
+-                let n = key.1.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Normal, &mut logged));
+-                let s = key.2.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Data, &mut logged));
++                let role = if alpha_test && *maps { Role::Cutout } else { Role::Albedo };
++                let Some(a) = load_tvt(textures, &mut images, dir.as_path(), &albedo, role, *cutoff, &mut logged) else { continue };
++                let n = key.1.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Normal, *cutoff, &mut logged));
++                let s = key.2.as_deref().and_then(|f| load_tvt(textures, &mut images, dir.as_path(), f, Role::Data, *cutoff, &mut logged));
+                 let h = if *maps {
+-                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec)
++                    tav_material(cache, &mut materials, &light.0, a, alpha_test, n, s, *flip_y, *spec, *cutoff)
+                 } else {
+                     model_material(
+                         cache,
+@@ -967,8 +1160,14 @@ fn apply_pose(
+     mut d: ResMut<TavDraw>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut roots: Query<(&mut Transform, &mut Visibility)>,
++    mut feet: ResMut<TavFeet>,
++    mut wow_frame: Local<u64>,
+ ) {
+-    let Some(root) = d.root else { return };
++    *wow_frame += 1;
++    let Some(root) = d.root else {
++        feet.0 = None;
++        return;
++    };
+     let raw = std::fs::read(d.dir.join("tavpose.bin")).ok();
+     let pose = raw.as_deref().and_then(decode_pose);
+     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64());
+@@ -978,6 +1177,7 @@ fn apply_pose(
+     if !fresh {
+         if *vis != Visibility::Hidden && d.last_pose_at.is_none_or(|t| t.elapsed().as_secs_f32() > 0.5) {
+             *vis = Visibility::Hidden;
++            feet.0 = None;
+         }
+         // The old figure stands in for a new plan's first pose, not for a stale stream.
+         let stale = pose.as_ref().is_none_or(|p| (now - p.time).abs() >= STALE_SECS);
+@@ -989,60 +1189,120 @@ fn apply_pose(
+         return;
+     }
+     let pose = pose.unwrap();
+-    if pose.frame == d.last_pose {
+-        return;
++    if pose.frame != d.last_pose {
++        d.last_pose = pose.frame;
++        d.last_pose_at = Some(Instant::now());
++        d.track.push(pose);
++    }
++    // The pair to draw and where between them (smoothing off: the newest record alone).
++    let (recs, key) = match (&d.track.prev, &d.track.last) {
++        (Some(a), Some(b)) if d.smooth => {
++            let t = blend_at(a.time, b.time, now, d.track.interval);
++            let key = (a.frame, b.frame, t);
++            (if d.track.drawn == Some(key) { None } else { Some(blend_pose(a, b, t)) }, key)
++        }
++        (_, Some(b)) => {
++            let key = (b.frame, b.frame, 1.0);
++            (if d.track.drawn == Some(key) { None } else { Some(b.recs.clone()) }, key)
++        }
++        _ => return,
++    };
++    if tf.translation.distance_squared(d.trace_root.0) > 1e-8 {
++        d.trace_root = (tf.translation, *wow_frame);
++    }
++    let tracing = d.trace > 0 && *wow_frame - d.trace_root.1 < 60;
++    if tracing {
++        d.trace -= 1;
++        info!(
++            "wowbg3 tav trace: wow frame {} bg3 {}..{} at {:.3} root {:?}{}",
++            *wow_frame,
++            key.0,
++            key.1,
++            key.2,
++            tf.translation,
++            if recs.is_none() { " (unchanged)" } else { "" }
++        );
+     }
+-    d.last_pose = pose.frame;
+-    d.last_pose_at = Some(Instant::now());
+-    let det = d.det_sign;
++    let Some(recs) = recs else { return };
++    d.track.drawn = Some(key);
++    let (det, interval) = (d.det_sign, d.track.interval);
+     let old_root = d.old_root.take();
+-    let TavDraw { file, parts, scratch, logged, .. } = &mut *d;
++    let TavDraw { file, parts, logged, trace, skin_cost, .. } = &mut *d;
+     let Some(file) = file.as_ref() else { return };
+     // Her root: the first mesh's object origin, mapped; the ground lock lowers her with the camera.
+-    let Some(anchor) = pose.recs.iter().find(|r| r.flags & 1 != 0) else { return };
++    let Some(anchor) = recs.iter().find(|r| r.flags & 1 != 0) else { return };
+     let origin = wow_to_bevy(bg3_to_wow(Vec3::new(anchor.world[4], anchor.world[5], anchor.world[6]), file.centre, file.wow))
+         - Vec3::Y * crate::wowbg3_lead::ground_lock();
+     tf.translation = origin;
+     tf.rotation = Quat::IDENTITY;
++    feet.0 = Some(origin);
+     if *vis != Visibility::Inherited {
+         *vis = Visibility::Inherited;
+     }
+     if let Some(old) = old_root {
+         commands.entity(old).despawn();
+     }
+-    let (pos, nrm, tan) = scratch;
+-    for (m, part) in file.meshes.iter().zip(parts.iter()) {
+-        debug_assert_eq!(m.key, part.key);
+-        let want = m.skin_from.unwrap_or(m.key);
+-        let Some(rec) = pose.recs.iter().find(|r| r.key == want && r.flags & 1 != 0) else { continue };
+-        if !m.weights.is_empty() && rec.palette.is_empty() {
+-            continue;
++    let skin_started = Instant::now();
++    // Skinned on every WoW frame now, so the meshes skin in parallel (the hair alone is a third
++    // of her vertices); the attributes go in on this thread.
++    let lift = Vec3::Y * crate::wowbg3_lead::ground_lock();
++    let (centre, wow) = (file.centre, file.wow);
++    let jobs: Vec<(usize, &TavMesh, &PoseRec)> = file
++        .meshes
++        .iter()
++        .enumerate()
++        .filter_map(|(i, m)| {
++            let want = m.skin_from.unwrap_or(m.key);
++            let rec = recs.iter().find(|r| r.key == want && r.flags & 1 != 0)?;
++            (m.weights.is_empty() || !rec.palette.is_empty()).then_some((i, m, rec))
++        })
++        .collect();
++    let skinned = bevy::tasks::ComputeTaskPool::get().scope(|scope| {
++        for (i, m, rec) in jobs {
++            scope.spawn(async move {
++                let (mut pos, mut nrm, mut tan) = (Vec::new(), Vec::new(), Vec::new());
++                pose_mesh(m, rec, &mut pos, &mut nrm, &mut tan);
++                let p: Vec<[f32; 3]> =
++                    pos.iter().map(|v| (wow_to_bevy(bg3_to_wow(*v, centre, wow)) - lift - origin).to_array()).collect();
++                let n: Vec<[f32; 3]> = nrm.iter().map(|v| bg3_dir_to_bevy(*v).normalize_or_zero().to_array()).collect();
++                // Tangents map like normals; the mirror flips their frame's handedness.
++                let t: Vec<[f32; 4]> = tan
++                    .iter()
++                    .zip(&m.tan)
++                    .map(|(v, b)| {
++                        let v = bg3_dir_to_bevy(*v).normalize_or_zero();
++                        [v.x, v.y, v.z, b[3] * det]
++                    })
++                    .collect();
++                (i, p, n, t)
++            });
+         }
+-        pose_mesh(m, rec, pos, nrm, tan);
+-        let lift = Vec3::Y * crate::wowbg3_lead::ground_lock();
+-        let p: Vec<[f32; 3]> = pos
+-            .iter()
+-            .map(|v| (wow_to_bevy(bg3_to_wow(*v, file.centre, file.wow)) - lift - origin).to_array())
+-            .collect();
+-        let n: Vec<[f32; 3]> = nrm.iter().map(|v| bg3_dir_to_bevy(*v).normalize_or_zero().to_array()).collect();
+-        // Tangents map like normals; the mirror flips their frame's handedness.
+-        let t: Vec<[f32; 4]> = tan
+-            .iter()
+-            .zip(&m.tan)
+-            .map(|(v, b)| {
+-                let v = bg3_dir_to_bevy(*v).normalize_or_zero();
+-                [v.x, v.y, v.z, b[3] * det]
+-            })
+-            .collect();
+-        if let Some(mesh) = meshes.get_mut(&part.mesh) {
++    });
++    for (i, p, n, t) in skinned {
++        debug_assert_eq!(file.meshes[i].key, parts[i].key);
++        if let Some(mesh) = parts.get(i).and_then(|part| meshes.get_mut(&part.mesh)) {
+             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, p);
+             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, n);
+             mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, t);
+         }
+     }
++    if tracing {
++        skin_cost.0 += skin_started.elapsed().as_micros();
++        skin_cost.1 += 1;
++        if *trace == 0 {
++            info!("wowbg3 tav trace: {} skins, {} us each on average", skin_cost.1, skin_cost.0 / u128::from(skin_cost.1.max(1)));
++        }
++    }
+     *logged += 1;
+-    if *logged % 600 == 1 {
+-        info!("wowbg3 tav: pose {} at {origin:?}", pose.frame);
++    if *logged % 1800 == 1 {
++        info!(
++            "wowbg3 tav: pose {}..{} at {:.2} (BG3 frame interval {:.1} ms, skinned in {} us) at {origin:?}",
++            key.0,
++            key.1,
++            key.2,
++            interval * 1e3,
++            skin_started.elapsed().as_micros()
++        );
+     }
+ }
+ 
+@@ -1225,4 +1485,72 @@ mod tests {
+         assert_eq!((p.seq, p.frame, p.recs.len(), p.recs[0].palette.len()), (7, 3, 1, 1));
+         assert!(decode_pose(&b[..b.len() - 4]).is_none());
+     }
++
++    fn pose_at(frame: u32, time: f64, x: f32, yaw: f32, bone_x: f32) -> PoseFile {
++        let q = Quat::from_rotation_y(yaw);
++        let mut world = [0.0; 10];
++        world[0..4].copy_from_slice(&q.to_array());
++        world[4..7].copy_from_slice(&[x, 0.0, 0.0]);
++        world[7..10].copy_from_slice(&[1.0; 3]);
++        let bone = [1.0, 0.0, 0.0, bone_x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
++        PoseFile { seq: 1, frame, time, recs: vec![PoseRec { key: 9, flags: 1, world, palette: vec![bone] }] }
++    }
++
++    #[test]
++    fn blends_poses_between_bg3_frames() {
++        let (a, b) = (pose_at(10, 100.0, 0.0, 0.0, 0.0), pose_at(11, 100.05, 1.0, 0.4, 2.0));
++        let mid = blend_pose(&a, &b, 0.5);
++        assert!((mid[0].world[4] - 0.5).abs() < 1e-6, "translation halfway");
++        assert!((mid[0].palette[0][3] - 1.0).abs() < 1e-6, "bone halfway");
++        let q = Quat::from_slice(&mid[0].world[0..4]);
++        assert!(q.angle_between(Quat::from_rotation_y(0.2)) < 1e-3, "rotation halfway");
++        // The shorter arc, whatever sign each record's quaternion carries.
++        let mut flipped = pose_at(11, 100.05, 1.0, 0.4, 2.0);
++        for v in &mut flipped.recs[0].world[0..4] {
++            *v = -*v;
++        }
++        let q = Quat::from_slice(&blend_pose(&a, &flipped, 0.5)[0].world[0..4]);
++        assert!(q.angle_between(Quat::from_rotation_y(0.2)) < 1e-3, "shorter arc");
++        // A record only the newer pose has is drawn as it is.
++        let mut extra = pose_at(11, 100.05, 1.0, 0.4, 2.0);
++        extra.recs[0].key = 10;
++        assert_eq!(blend_pose(&a, &extra, 0.5)[0].world[4], 1.0);
++    }
++
++    #[test]
++    fn draws_one_bg3_frame_back_and_extrapolates_little() {
++        // Records at 0 and 50 ms, a 50 ms interval: at 75 ms the blend is halfway.
++        assert!((blend_at(0.0, 0.05, 0.075, 0.05) - 0.5).abs() < 1e-5);
++        assert_eq!(blend_at(0.0, 0.05, 0.03, 0.05), 0.0, "never before the older record");
++        assert_eq!(blend_at(0.0, 0.05, 0.5, 0.05), 1.25, "a late BG3: a quarter frame further at most");
++        assert_eq!(blend_at(0.05, 0.05, 0.1, 0.05), 1.0, "no span: the newest record");
++        let mut track = PoseTrack::new();
++        for k in 0..40 {
++            track.push(pose_at(k, 100.0 + f64::from(k) / 21.0, 0.0, 0.0, 0.0));
++        }
++        assert!((track.interval - 1.0 / 21.0).abs() < 0.002, "learns BG3's frame interval");
++        track.push(pose_at(41, 99.0, 0.0, 0.0, 0.0));
++        assert!(track.prev.is_none(), "a clock going back blends nothing");
++    }
++
++    #[test]
++    fn cutout_mips_keep_their_coverage() {
++        // A 4x4 stripe pattern: half the texels opaque, half clear; box filtering gives 50% alpha
++        // everywhere, which a 0.5 cut keeps but a 0.88 cut would lose entirely.
++        let px: Vec<u8> = (0..16).flat_map(|i| [200, 150, 100, if i % 2 == 0 { 255 } else { 0 }]).collect();
++        assert_eq!(coverage(&px, 0.878), 0.5);
++        let (mut mip, _, _) = box_mip(&px, 4, 4);
++        assert_eq!(coverage(&mip, 0.878), 0.0, "thinned by the box filter");
++        keep_coverage(&mut mip, 0.5, 0.878);
++        assert!(coverage(&mip, 0.878) >= 0.5, "coverage restored");
++        let img = tvt_image(4, 4, &px, Role::Cutout, 0.878);
++        let data = img.data.as_ref().expect("pixels");
++        assert_eq!(img.texture_descriptor.mip_level_count, 3);
++        assert!(coverage(&data[64..80], 0.878) >= 0.5, "the stored mip too");
++        // An opaque cut-out stays opaque in every mip: coverage is only ever restored, never cut.
++        let solid: Vec<u8> = (0..16).flat_map(|_| [10, 20, 30, 255]).collect();
++        let img = tvt_image(4, 4, &solid, Role::Cutout, 0.5);
++        assert!(img.data.as_ref().unwrap().chunks_exact(4).all(|t| t[3] == 255));
++        assert_eq!((alpha_key(0.5), alpha_key(0.8784314)), (128, 224), "the GPU's own test");
++    }
+ }

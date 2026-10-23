@@ -1,0 +1,96 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index a33dcbb..8790e16 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -43,6 +43,7 @@
+ 
+ #include <atomic>
+ #include <cctype>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <deque>
+@@ -61,6 +62,7 @@ namespace
+     size_t const MAX_MOBS      = 8;                         // per encounter, and pending per player
+     float const CLAIM_RANGE    = 50.0f;                     // yards, begin and join
+     float const DAMAGE_RANGE   = 100.0f;                    // yards, hp
++    float const PLACE_RANGE    = 60.0f;                     // yards, pos (from the owner)
+     uint32 const PENDING_MS    = 15 * IN_MILLISECONDS;      // unclaimed aggro holds
+     uint32 const IDLE_MS       = 120 * IN_MILLISECONDS;     // encounter without any command
+     uint32 const MAX_FIGHT_MS  = 30 * MINUTE * IN_MILLISECONDS;
+@@ -789,6 +791,66 @@ namespace
+         out.Add(head + "ok " + std::to_string(c->GetHealth()) + " " + std::to_string(maxHealth));
+     }
+ 
++    // pos <enc> <guid> <x> <y> <z>: a held mob stands where BG3's fight put it
++    // (its model already does on the owner's client), facing the owner, so its
++    // corpse lies there and the owner can loot it ("corpse too
++    // far away"). Only a living member of the owner's running encounter, on the
++    // owner's map, within PLACE_RANGE of the owner. Applying the same line again
++    // changes nothing.
++    void Place(Player* p, std::string const& enc, std::string const& guidText,
++        std::string const& xText, std::string const& yText, std::string const& zText, Out& out)
++    {
++        ObjectGuid g;
++        if (!ParseGuid(guidText, g))
++            return out.Add("WOWBG3 pos " + enc + " " + guidText + " refused badguid");
++        std::string const head = "WOWBG3 pos " + enc + " " + Hex(g) + " ";
++        std::string const* texts[3] = { &xText, &yText, &zText };
++        float xyz[3] = { 0.0f, 0.0f, 0.0f };
++        for (int i = 0; i < 3; ++i)
++        {
++            char* end = nullptr;
++            xyz[i] = strtof(texts[i]->c_str(), &end);
++            if (texts[i]->empty() || !end || *end || !std::isfinite(xyz[i]))
++                return out.Add(head + "refused badpos");
++        }
++        float const x = xyz[0], y = xyz[1], z = xyz[2];
++        if (!MaNGOS::IsValidMapCoord(x, y, z))
++            return out.Add(head + "refused badpos");
++
++        ObjectGuid const pg = p->GetObjectGuid();
++        uint32 map = 0, instance = 0;
++        {
++            WriteLock lock(g_lock);
++            Fighter& f = g_fighters[pg];
++            if (f.IsClosed(enc))
++                return out.Add(head + "refused closed");
++            if (!f.active || f.active->id != enc)
++                return out.Add(head + "refused unknown");
++            Mob* m = f.active->Find(g);
++            if (!m)
++                return out.Add(head + "refused notmember");
++            f.active->last = WorldTimer::getMSTime();
++            if (m->killed)
++                return out.Add(head + "dead");
++            map = f.active->map;
++            instance = f.active->instance;
++        }
++
++        if (char const* why = CheckPlayer(p))
++            return out.Add(head + "refused " + why);
++        Creature* c = FindMob(map, instance, g, p);
++        if (!c || !c->IsAlive())
++            return out.Add(head + "gone");
++        if (p->GetMapId() != map || p->GetInstanceId() != instance ||
++            p->GetDistance(x, y, z, SizeFactor::None) > PLACE_RANGE)
++            return out.Add(head + "refused far");
++        if (c->GetDistance(x, y, z, SizeFactor::None) < 0.5f)
++            return out.Add(head + "ok same");
++        float const facing = std::atan2(p->GetPositionY() - y, p->GetPositionX() - x);
++        c->NearTeleportTo(x, y, z, facing < 0.0f ? facing + 2.0f * float(M_PI) : facing);
++        out.Add(head + "ok");
++    }
++
+     // hero <enc> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
+     // follows Tav's as a fraction (rounded, at least 1 while Tav lives), both
+     // ways. 0 is a normal WoW death: the
+@@ -975,6 +1037,8 @@ namespace
+             HeroHealth(p, a[2], a[3], a[4], a.size() == 6 ? a[5] : std::string(), out);
+         else if (verb == "keep" && a.size() == 3 && ValidId(a[2]))
+             Keep(p, a[2], out);
++        else if (verb == "pos" && a.size() == 7 && ValidId(a[2]))
++            Place(p, a[2], a[3], a[4], a[5], a[6], out);
+         else
+             out.Add("WOWBG3 refused usage " + (verb.empty() ? std::string("-") : verb));
+ 

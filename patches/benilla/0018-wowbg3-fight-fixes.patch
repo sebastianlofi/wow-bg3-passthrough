@@ -1,0 +1,717 @@
+diff --git a/crates/benilla-app/src/creature_anim/driver.rs b/crates/benilla-app/src/creature_anim/driver.rs
+--- a/crates/benilla-app/src/creature_anim/driver.rs
++++ b/crates/benilla-app/src/creature_anim/driver.rs
+@@ -1245,6 +1245,14 @@
+             } else {
+                 None
+             };
++            // WOW-BG3: a flinch the fight module wrote (patch 0018) says whether it played.
++            let wowbg3_flinch = crate::wowbg3_fight::took_flinch(entity);
++            if wowbg3_flinch {
++                match refusal {
++                    Some(why) => info!("wowbg3 anim: {entity} wound {id} refused ({why})"),
++                    None => info!("wowbg3 anim: {entity} wound {id} plays"),
++                }
++            }
+             if let Some(why) = refusal {
+                 if benilla_assets::trace::enabled() {
+                     benilla_assets::trace::line(
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -38,9 +38,24 @@
+ //! client-seen aggro. A fight the bridge starts by itself (BG3 combat with a stand-in) is played
+ //! like a pull: fight.txt's `encounter` line is new, and every fight mob in it is held.
+ //!
++//! Playtest fixes (patch 0018), world mode:
++//! - Live stand-ins (models walked 1.0 to 1.2 s behind BG3 and sometimes faced
++//!   away from Tav): `standins.bin` (`LinkLive.lua`, BG3's client, every tick of a fight) gives
++//!   each stand-in where BG3 draws it and its facing. A record under 250 ms old drives the model:
++//!   it chases at max(7, 1.2 x the stand-in's speed, 16 x the gap) yd/s, walks at the stand-in's
++//!   streamed speed and turns to BG3's facing (10 rad/s); without one, fight.txt's `actor` lines and
++//!   the motion's direction as before. A striking model faces its victim.
++//! - Early strikes (attacks played 1.3 to 1.5 s late, 0-damage hits as misses):
++//!   `strikes.bin` (`Mirrors.lua`, BG3's server) carries each attack of a stand-in on Tav the moment
++//!   BG3 lands it (hit or miss as BG3 decided) and each hit of Tav's on a stand-in; the swing or
++//!   flinch plays at once and the later fight.txt strike or HP drop for it is skipped.
++//! - Flinches (they never played in world mode, as a swing from the hidden own character
++//!   has no impact key): written as the swing's impact itself (`SwingImpact`), the path the client
++//!   takes for a swing whose attacker it cannot resolve.
++//!
+ //! Files in `$WOW_BG3_LINK_DIR`: `pull.json`, `join.json`, `input.json` and `server-events.txt` are
+-//! written here, `fight.txt` (plain lines, see `Fight::text` in the bridge) and `server-cmd.txt`
+-//! are read.
++//! written here, `fight.txt` (plain lines, see `Fight::text` in the bridge), `server-cmd.txt`,
++//! `standins.bin` and `strikes.bin` are read.
+ 
+ use std::collections::{HashMap, HashSet, VecDeque};
+ use std::path::{Path, PathBuf};
+@@ -51,7 +66,7 @@
+ use benilla_protocol::messages::ObjectType;
+ use bevy::prelude::*;
+ 
+-use crate::creature_anim::{PlaySeq, SwingMessage};
++use crate::creature_anim::{PlaySeq, SwingImpact, SwingMessage};
+ use crate::net::{ChatKind, ClientCommand, Guid, NetCommands, ObjectStore, Reputations, SelfPlayer};
+ use crate::player::{AutoMove, Player, UNIT_FLAG_IN_COMBAT};
+ use crate::target::{can_attack, ring_reaction, Factions};
+@@ -82,6 +97,30 @@
+ const HIT_MISS: u32 = 0x10;
+ const HELP: &str = "Your turn: right-click the ground to move, right-click a mob to attack it, \
+                     F9 Fire Bolt, F10 end turn, F11 leave the fight";
++/// Milliseconds: a `standins.bin` record this young drives its model (else fight.txt's lines).
++const LIVE_FRESH_MS: f64 = 250.0;
++/// Seconds the walk keeps playing after the streamed stand-in last moved.
++const LIVE_WALK_HOLD: f32 = 0.15;
++/// Yards per second per yard behind: how fast a model closes its gap to the streamed stand-in.
++const LIVE_CATCH_UP: f32 = 16.0;
++/// Seconds of the stand-in's own motion a model leads by (the record's age, at most this).
++const LIVE_LEAD: f32 = 0.15;
++/// Radians per second a model turns toward BG3's facing.
++const TURN_RATE: f32 = 10.0;
++/// Seconds a striking model faces its victim.
++const FACE_VICTIM: f32 = 1.0;
++/// Seconds between two early strikes played on one mob.
++const EARLY_GAP: f32 = 0.35;
++/// Seconds an early strike stands in for the fight.txt strike of the same turn.
++const EARLY_MATCH: f32 = 15.0;
++/// Seconds an early wound stands in for the fight.txt HP drop it caused.
++const WOUND_MATCH: f32 = 8.0;
++/// Seconds between `wowbg3 live:` lines per moving model.
++const LIVE_TRACE: f32 = 0.25;
++/// `strikes.bin` flags (`Mirrors.lua`).
++const STRIKE_HIT: u32 = 1;
++const STRIKE_WOUND: u32 = 2;
++const STRIKE_LETHAL: u32 = 4;
+ 
+ enum Event {
+     Swing(u64),
+@@ -210,6 +249,159 @@
+     /// the live position comes in steps (about 3 a second), so the model reaches each one early.
+     walk_left: f32,
+     walk_speed: f32,
++    /// Early strikes (`strikes.bin`) to play now: hit, damage, BG3's time of the strike (ms).
++    early: VecDeque<(bool, u32, f64)>,
++    /// When early strikes and early wounds were played (fight clock), until fight.txt's own
++    /// strike or HP drop for them arrives (that one is then skipped).
++    early_played: VecDeque<f32>,
++    early_wounds: VecDeque<f32>,
++    /// The model's yaw (WoW orientation, radians) as this system turns it.
++    yaw: Option<f32>,
++    /// Seconds left facing the victim of its last swing.
++    face_victim: f32,
++    /// Seconds to the next `wowbg3 live:` line.
++    live_trace: f32,
++}
++
++/// One stand-in in `standins.bin`: where BG3 draws it.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct StandInRec {
++    /// WoW yards.
++    pub(crate) pos: [f32; 3],
++    /// WoW orientation, radians.
++    pub(crate) orient: f32,
++    pub(crate) dead: bool,
++    pub(crate) moving: bool,
++}
++
++/// `standins.bin`: "SIN1", seq u32, n u32, BG3's clock f64 ms, n x (guid hi u32, guid lo u32,
++/// x, y, z, orientation f32, flags u32: 1 dead, 2 moving), seq again. Returns (seq, BG3 ms,
++/// records), None for a torn or foreign file.
++pub(crate) fn decode_standins(b: &[u8]) -> Option<(u32, f64, Vec<(u64, StandInRec)>)> {
++    if b.len() < 24 || &b[0..4] != b"SIN1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let (seq, n) = (u(4), u(8) as usize);
++    if n > 256 || b.len() != 24 + 28 * n || u(20 + 28 * n) != seq {
++        return None;
++    }
++    let t = f64::from_le_bytes(b[12..20].try_into().unwrap());
++    let mut out = Vec::with_capacity(n);
++    for i in 0..n {
++        let o = 20 + 28 * i;
++        let rec = StandInRec {
++            pos: [f(o + 8), f(o + 12), f(o + 16)],
++            orient: f(o + 20),
++            dead: u(o + 24) & 1 != 0,
++            moving: u(o + 24) & 2 != 0,
++        };
++        if rec.pos.iter().all(|v| v.is_finite()) && rec.orient.is_finite() {
++            out.push(((u64::from(u(o)) << 32) | u64::from(u(o + 4)), rec));
++        }
++    }
++    t.is_finite().then_some((seq, t, out))
++}
++
++/// One record of `strikes.bin`.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct EarlyStrike {
++    pub(crate) guid: u64,
++    pub(crate) id: u32,
++    pub(crate) flags: u32,
++    pub(crate) damage: u32,
++    /// BG3's clock at the strike (ms).
++    pub(crate) t: f64,
++}
++
++/// `strikes.bin`: "STK1", epoch u32, seq u32, n u32, n x (guid hi u32, guid lo u32, id u32,
++/// flags u32, damage u32, BG3 time f64 ms), seq again. Returns (epoch, strikes).
++pub(crate) fn decode_strikes(b: &[u8]) -> Option<(u32, Vec<EarlyStrike>)> {
++    if b.len() < 20 || &b[0..4] != b"STK1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let (epoch, seq, n) = (u(4), u(8), u(12) as usize);
++    if n > 64 || b.len() != 20 + 28 * n || u(16 + 28 * n) != seq {
++        return None;
++    }
++    let out = (0..n)
++        .map(|i| {
++            let o = 16 + 28 * i;
++            EarlyStrike {
++                guid: (u64::from(u(o)) << 32) | u64::from(u(o + 4)),
++                id: u(o + 8),
++                flags: u(o + 12),
++                damage: u(o + 16),
++                t: f64::from_le_bytes(b[o + 20..o + 28].try_into().unwrap()),
++            }
++        })
++        .collect();
++    Some((epoch, out))
++}
++
++/// A stand-in's latest live record and what the model derives from the stream.
++#[derive(Clone, Copy, Debug)]
++struct Live {
++    rec: StandInRec,
++    /// BG3's clock at the record (ms) and when this side first read it (CLOCK_MONOTONIC ms).
++    t: f64,
++    seen: f64,
++    /// The stand-in's velocity (Bevy yards per second) from consecutive records.
++    vel: Vec3,
++}
++
++/// A live record's age in ms: by BG3's clock when it is this host's CLOCK_MONOTONIC (`shared`),
++/// else since this side first read it.
++fn live_age(l: &Live, now: f64, shared: bool) -> f64 {
++    if shared { now - l.t } else { now - l.seen }
++}
++
++/// Entities a flinch was written for (the animation driver logs whether the wound played).
++static FLINCHES: LazyLock<Mutex<HashSet<Entity>>> = LazyLock::new(Default::default);
++
++/// The animation driver asks this when a wound reaches a unit: true (once) when this module wrote
++/// it, so the driver logs it.
++pub(crate) fn took_flinch(entity: Entity) -> bool {
++    FLINCHES.lock().is_ok_and(|mut s| s.remove(&entity))
++}
++
++/// A flinch on `victim`: the impact of a landed swing, written directly. A `SwingMessage` from the
++/// own character (hidden in world mode) never reached its clip's impact key, so nothing played.
++fn flinch(attacker: Entity, victim: Entity, damage: u32, seq: u64) -> SwingImpact {
++    if let Ok(mut s) = FLINCHES.lock() {
++        if s.len() > 64 {
++            s.clear();
++        }
++        s.insert(victim);
++    }
++    SwingImpact {
++        swing: SwingMessage {
++            attacker,
++            victim: Some(victim),
++            hit_info: HIT_NORMAL,
++            victim_state: 1,
++            damage,
++            displayed: false,
++            seq,
++        },
++        text_only: false,
++        natural: None,
++        pos: None,
++    }
++}
++
++/// WoW orientation (Bevy yaw) of a horizontal Bevy direction: a unit at yaw `o` faces
++/// (-sin o, 0, -cos o).
++fn yaw_of(d: Vec3) -> f32 {
++    (-d.x).atan2(-d.z)
++}
++
++/// `a - b` wrapped into (-pi, pi].
++fn angle_diff(a: f32, b: f32) -> f32 {
++    let d = (a - b).rem_euclid(std::f32::consts::TAU);
++    if d > std::f32::consts::PI { d - std::f32::consts::TAU } else { d }
+ }
+ 
+ /// World mode (fight mobs slid without walking): each held model's motion this
+@@ -259,6 +451,17 @@
+     encounter: Option<String>,
+     /// World mode (`WOW_BG3_LEAD`): the hero acts in BG3, so no WoW key help.
+     world: bool,
++    /// World mode: BG3's live stand-ins by guid (`standins.bin`) and the file's last seq.
++    live: HashMap<u64, Live>,
++    live_seq: Option<u32>,
++    /// Whether `standins.bin`'s clock reads as this host's CLOCK_MONOTONIC (records are aged by
++    /// it; otherwise by when they were first read). Decided on the first record.
++    live_clock: Option<bool>,
++    /// `strikes.bin`: (epoch, highest strike id taken); None until first read (older strikes are
++    /// not replayed).
++    early_seen: Option<(u32, u32)>,
++    /// Seconds since start (`fight_hold`), for matching early strikes with fight.txt.
++    clock: f32,
+ }
+ 
+ /// One parsed `fight.txt`.
+@@ -367,6 +570,11 @@
+         m5: std::env::var_os("WOW_BG3_M5").map(|_| None),
+         encounter: None,
+         world: std::env::var_os("WOW_BG3_LEAD").is_some(),
++        live: HashMap::new(),
++        live_seq: None,
++        live_clock: None,
++        early_seen: None,
++        clock: 0.0,
+     })
+     .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
+     .add_systems(
+@@ -447,6 +655,63 @@
+             .get(&guid)
+             .is_some_and(|&at| self.frame < at + SETTLE_FRAMES)
+     }
++    /// `standins.bin` (world mode, every frame): the newest record per stand-in, with its velocity.
++    fn read_live(&mut self, now: f64) {
++        let Ok(raw) = std::fs::read(self.dir.join("standins.bin")) else {
++            return;
++        };
++        let Some((seq, t, recs)) = decode_standins(&raw) else {
++            return;
++        };
++        if self.live_seq == Some(seq) {
++            return;
++        }
++        self.live_seq = Some(seq);
++        if self.live_clock.is_none() {
++            let shared = (-50.0..5000.0).contains(&(now - t));
++            info!(
++                "wowbg3 live: standins.bin {} (record {:.0} ms old by this host's CLOCK_MONOTONIC)",
++                if shared { "ages by BG3's clock" } else { "ages from arrival: BG3's clock differs" },
++                now - t
++            );
++            self.live_clock = Some(shared);
++        }
++        for (guid, rec) in recs {
++            let at = wow_to_bevy(rec.pos);
++            let vel = match self.live.get(&guid) {
++                Some(prev) if rec.moving && !rec.dead => {
++                    let dt = ((t - prev.t) / 1000.0) as f32;
++                    if (0.004..0.5).contains(&dt) {
++                        prev.vel.lerp((at - wow_to_bevy(prev.rec.pos)) / dt, 0.5)
++                    } else {
++                        prev.vel
++                    }
++                }
++                _ => Vec3::ZERO,
++            };
++            self.live.insert(guid, Live { rec, t, seen: now, vel });
++        }
++        self.live.retain(|_, l| now - l.seen < 10_000.0);
++    }
++    /// `strikes.bin` (world mode, every frame): the strikes not taken yet.
++    fn read_strikes(&mut self) -> Vec<EarlyStrike> {
++        let Ok(raw) = std::fs::read(self.dir.join("strikes.bin")) else {
++            return Vec::new();
++        };
++        let Some((epoch, list)) = decode_strikes(&raw) else {
++            return Vec::new();
++        };
++        let newest = list.iter().map(|s| s.id).max().unwrap_or(0);
++        let Some((was, seen)) = self.early_seen else {
++            // Whatever BG3 wrote before this session is old news.
++            self.early_seen = Some((epoch, newest));
++            return Vec::new();
++        };
++        // A new BG3 run starts its ids over.
++        let seen = if was == epoch { seen } else { 0 };
++        self.early_seen = Some((epoch, newest.max(seen)));
++        list.into_iter().filter(|s| s.id > seen).collect()
++    }
+ }
+ 
+ /// One mob or the hero as a pull/join UNIT (WoW yards).
+@@ -870,6 +1135,7 @@
+             h.id = id.clone();
+         }
+     }
++    let clock = f.clock;
+     for (id, hp, max_hp, pos) in &t.actors {
+         if let Some(h) = by_id.get(id).and_then(|g| f.held.get_mut(g)) {
+             h.goal = Some(wow_to_bevy(*pos));
+@@ -878,7 +1144,15 @@
+             // Same scale only: an actor's numbers switch from WoW's to BG3's once BG3 reports them.
+             if let Some((prev, prev_max)) = h.hp {
+                 if prev_max == *max_hp && *hp < prev && *hp > 0 {
+-                    h.wounds.push_back(prev - hp);
++                    // World mode: the hit already flinched when BG3 landed it (`strikes.bin`).
++                    while h.early_wounds.front().is_some_and(|&at| clock - at > WOUND_MATCH) {
++                        h.early_wounds.pop_front();
++                    }
++                    if h.early_wounds.pop_front().is_some() {
++                        info!("wowbg3 fight: {id} hurt for {} (flinched already, early)", prev - hp);
++                    } else {
++                        h.wounds.push_back(prev - hp);
++                    }
+                 }
+             }
+             h.hp = Some((*hp, *max_hp));
+@@ -901,7 +1175,18 @@
+         if is_strike {
+             let (_, actor, _, hit, damage) = &t.strikes[i];
+             if let Some(h) = by_id.get(actor).and_then(|g| f.held.get_mut(g)) {
+-                h.strikes.push_back((*hit, *damage));
++                // The turn's attacks already played when BG3 landed them (`strikes.bin`): the
++                // bridge's one strike per turn (resolved by HP at the turn's end) is not repeated.
++                h.early_played.retain(|&at| clock - at <= EARLY_MATCH);
++                if !h.early_played.is_empty() || !h.early.is_empty() {
++                    info!(
++                        "wowbg3 fight: {actor} strike {seq} ({}, {damage}) played early already",
++                        if *hit { "hit" } else { "miss" }
++                    );
++                    h.early_played.clear();
++                } else {
++                    h.strikes.push_back((*hit, *damage));
++                }
+             }
+             continue;
+         }
+@@ -1035,15 +1320,61 @@
+ 
+ /// Fight mobs' models follow BG3: along its paths, then where it put them; an attack of the
+ /// stand-in plays the WoW mob's own melee swing at you (`SwingMessage`, as a server swing would).
++/// World mode: BG3's live stand-ins (`standins.bin`) drive position, gait and facing, and BG3's
++/// strikes (`strikes.bin`) play the moment they land.
++#[allow(clippy::too_many_arguments)]
+ fn fight_hold(
+     time: Res<Time>,
+     mut f: ResMut<Fight>,
+-    me: Query<Entity, With<SelfPlayer>>,
++    me: Query<(Entity, &Transform), With<SelfPlayer>>,
+     mut units: Query<(Entity, &Guid, &mut Transform), Without<SelfPlayer>>,
+     mut swings: MessageWriter<SwingMessage>,
++    mut impacts: MessageWriter<SwingImpact>,
+     mut play_seq: ResMut<PlaySeq>,
+     mut trace_t: Local<f32>,
+ ) {
++    let dt = time.delta_secs();
++    let f = &mut *f;
++    f.clock += dt;
++    let clock = f.clock;
++    let (victim, victim_at) = me
++        .single()
++        .map_or((None, None), |(e, t)| (Some(e), Some(t.translation)));
++    let now = crate::wowbg3_pace::mono_seconds() * 1000.0;
++    // World mode: where BG3 draws each stand-in, and the attacks BG3 just landed.
++    let early = if f.world {
++        f.read_live(now);
++        f.read_strikes()
++    } else {
++        Vec::new()
++    };
++    for s in early {
++        if s.flags & STRIKE_WOUND != 0 {
++            // Tav hit a stand-in: its model flinches now (a kill is the server's death instead).
++            if s.flags & STRIKE_LETHAL != 0 || s.damage == 0 {
++                continue;
++            }
++            if let Some(h) = f.held.get_mut(&s.guid) {
++                h.wounds.push_back(s.damage);
++                h.early_wounds.push_back(clock);
++            } else if let (Some(me), Some((entity, _, _))) =
++                (victim, units.iter().find(|u| u.1 .0 == s.guid))
++            {
++                // Her opening hit, before the mob is in a fight.
++                info!(
++                    "wowbg3 fight: guid {:#x} (unit={entity}) flinches ({}, {:.0} ms after BG3's hit)",
++                    s.guid,
++                    s.damage,
++                    now - s.t
++                );
++                impacts.write(flinch(me, entity, s.damage, play_seq.next()));
++            }
++        } else if let Some(h) = f.held.get_mut(&s.guid) {
++            h.early.push_back((s.flags & STRIKE_HIT != 0, s.damage, s.t));
++        } else {
++            info!("wowbg3 fight: early strike from guid {:#x}, not a held mob", s.guid);
++        }
++    }
+     if f.held.is_empty() {
+         if let Ok(mut w) = WALKERS.lock() {
+             if !w.is_empty() {
+@@ -1053,8 +1384,6 @@
+         return;
+     }
+     let mut walkers: HashMap<Entity, Option<f32>> = HashMap::new();
+-    let dt = time.delta_secs();
+-    let victim = me.single().ok();
+     // Desktop test 2 (models lag or never move): every 2 s one line per held mob.
+     *trace_t += dt;
+     let trace = *trace_t >= 2.0;
+@@ -1062,6 +1391,7 @@
+         *trace_t = 0.0;
+     }
+     let mut seen: HashSet<u64> = HashSet::new();
++    let shared = f.live_clock == Some(true);
+     for (entity, g, mut tf) in &mut units {
+         let Some(h) = f.held.get_mut(&g.0) else {
+             continue;
+@@ -1079,25 +1409,32 @@
+                 );
+             }
+         }
+-        if trace {
+-            info!(
+-                "wowbg3 hold: {} guid {:#x} model {:.1?} goal {:?} track {} strikes {} behind {:.1} yd",
+-                h.id,
+-                g.0,
+-                tf.translation,
+-                h.goal.map(|v| [v.x as i32, v.y as i32, v.z as i32]),
+-                h.track.len(),
+-                h.strikes.len(),
+-                h.goal.map_or(0.0, |v| v.distance(tf.translation))
+-            );
++        // A fresh live record: BG3's stand-in now (its motion carried over the record's age).
++        let live = f
++            .live
++            .get(&g.0)
++            .map(|l| (*l, live_age(l, now, shared)))
++            .filter(|(_, age)| *age < LIVE_FRESH_MS);
++        let mut bg3_at = None;
++        if let Some((l, age)) = live {
++            let lead = (age as f32 / 1000.0).clamp(0.0, LIVE_LEAD);
++            let target = wow_to_bevy(l.rec.pos) + l.vel * lead;
++            h.goal = Some(target);
++            h.track.clear();
++            bg3_at = Some(target);
+         }
+         let at = h.at.unwrap_or(tf.translation);
+         let next = h.track.front().copied().or(h.goal);
+         let mut moved = at;
+         if let Some(next) = next {
+             let d = next - at;
+-            // Catch up within about half a second when far behind (a Dash, a late update).
+-            let step = MOB_SPEED.max(d.length() * 2.0) * dt;
++            // Live: keep up with the stand-in and close any gap fast. Otherwise catch up within
++            // about half a second when far behind (a Dash, a late update).
++            let speed = match live {
++                Some((l, _)) => MOB_SPEED.max(l.vel.length() * 1.2).max(d.length() * LIVE_CATCH_UP),
++                None => MOB_SPEED.max(d.length() * 2.0),
++            };
++            let step = speed * dt;
+             if d.length() <= step {
+                 moved = next;
+                 h.track.pop_front();
+@@ -1108,52 +1445,115 @@
+         h.at = Some(moved);
+         let walking = !h.track.is_empty() || h.goal.is_some_and(|g| g.distance(moved) > 0.05);
+         let speed = if dt > 0.0 { moved.distance(at) / dt } else { 0.0 };
+-        if walking && speed > 0.2 {
+-            h.walk_left = 0.45;
+-            h.walk_speed = speed;
+-        } else {
+-            h.walk_left = (h.walk_left - dt).max(0.0);
++        match live {
++            // The walk at the stand-in's own speed while BG3 moves it.
++            Some((l, _)) if !l.rec.dead && (l.rec.moving || speed > 0.2) => {
++                h.walk_left = LIVE_WALK_HOLD;
++                h.walk_speed = if l.vel.length() > 0.3 { l.vel.length() } else { speed };
++            }
++            Some(_) => h.walk_left = (h.walk_left - dt).max(0.0),
++            None if walking && speed > 0.2 => {
++                h.walk_left = 0.45;
++                h.walk_speed = speed;
++            }
++            None => h.walk_left = (h.walk_left - dt).max(0.0),
+         }
+         walkers.insert(entity, (h.walk_left > 0.0).then_some(h.walk_speed));
+         if let (Some(me), Some(damage)) = (victim, h.wounds.pop_front()) {
+             // Tav's hit, shown as a hit on the WoW model: its flinch, blood and sounds.
+             info!("wowbg3 fight: {} (unit={entity}) flinches ({damage})", h.id);
++            impacts.write(flinch(me, entity, damage, play_seq.next()));
++        }
++        let mut swing = None;
++        if h.since >= EARLY_GAP {
++            if let Some((hit, damage, t)) = h.early.pop_front() {
++                h.early_played.push_back(clock);
++                swing = Some((hit, damage, format!("early, {:.0} ms after BG3", now - t)));
++            }
++        }
++        if swing.is_none() && !walking && h.since >= STRIKE_GAP {
++            if let Some((hit, damage)) = h.strikes.pop_front() {
++                swing = Some((hit, damage, "fight.txt".to_string()));
++            }
++        }
++        if let Some((hit, damage, how)) = swing {
++            h.since = 0.0;
++            h.face_victim = FACE_VICTIM;
+             swings.write(SwingMessage {
+-                attacker: me,
+-                victim: Some(entity),
+-                hit_info: HIT_NORMAL,
+-                victim_state: 1,
++                attacker: entity,
++                victim,
++                hit_info: if hit { HIT_NORMAL } else { HIT_MISS },
++                victim_state: hit as u32,
+                 damage,
++                // BG3 shows its own numbers; WoW's floating text would repeat them.
+                 displayed: false,
+                 seq: play_seq.next(),
+             });
++            info!(
++                "wowbg3 fight: {} (unit={entity}, guid {:#x}) plays its WoW attack ({}, {damage}; {how})",
++                h.id,
++                g.0,
++                if hit { "hit" } else { "miss" }
++            );
+         }
+-        if !walking && h.since >= STRIKE_GAP {
+-            if let Some((hit, damage)) = h.strikes.pop_front() {
+-                h.since = 0.0;
+-                swings.write(SwingMessage {
+-                    attacker: entity,
+-                    victim,
+-                    hit_info: if hit { HIT_NORMAL } else { HIT_MISS },
+-                    victim_state: hit as u32,
+-                    damage,
+-                    // BG3 shows its own numbers; WoW's floating text would repeat them.
+-                    displayed: false,
+-                    seq: play_seq.next(),
+-                });
++        // Facing: its victim while it strikes, else BG3's own facing, else where it walks.
++        h.face_victim = (h.face_victim - dt).max(0.0);
++        let toward = |p: Vec3| {
++            let d = p - moved;
++            (Vec2::new(d.x, d.z).length() > 0.05).then(|| yaw_of(d))
++        };
++        let want = match (h.face_victim > 0.0, victim_at, live) {
++            (true, Some(v), _) => toward(v),
++            (_, _, Some((l, _))) => Some(l.rec.orient),
++            _ => {
++                let d = moved - at;
++                (Vec2::new(d.x, d.z).length() > 0.02).then(|| yaw_of(d))
++            }
++        };
++        let yaw = h.yaw.get_or_insert_with(|| tf.rotation.to_euler(EulerRot::YXZ).0);
++        if let Some(want) = want {
++            let step = TURN_RATE * dt;
++            *yaw = angle_diff(*yaw + angle_diff(want, *yaw).clamp(-step, step), 0.0);
++        }
++        tf.rotation = Quat::from_rotation_y(*yaw);
++        tf.translation = moved;
++        // Issue 15/18 checks: while BG3 moves it, the record's age, the model's gap to the
++        // stand-in (to its record and to where it is now), speeds and both facings.
++        h.live_trace -= dt;
++        if let (Some((l, age)), Some(bg3)) = (live, bg3_at) {
++            if (l.rec.moving || trace) && h.live_trace <= 0.0 {
++                h.live_trace = LIVE_TRACE;
+                 info!(
+-                    "wowbg3 fight: {} (unit={entity}, guid {:#x}) plays its WoW attack ({}, {damage})",
++                    "wowbg3 live: {} guid {:#x} age {age:.0} ms gap {:.2} yd (record {:.2}) speed {:.1}/{:.1} yd/s \
++                     yaw {:.0} vs BG3 {:.0} deg{}",
+                     h.id,
+                     g.0,
+-                    if hit { "hit" } else { "miss" }
++                    bg3.distance(moved),
++                    wow_to_bevy(l.rec.pos).distance(moved),
++                    speed,
++                    l.vel.length(),
++                    h.yaw.unwrap_or(0.0).to_degrees(),
++                    l.rec.orient.to_degrees(),
++                    if l.rec.moving { " moving" } else { "" }
+                 );
+             }
+         }
+-        let d = moved - tf.translation;
+-        if Vec2::new(d.x, d.z).length() > 0.05 {
+-            tf.look_to(Vec3::new(d.x, 0.0, d.z), Vec3::Y);
++        if trace {
++            info!(
++                "wowbg3 hold: {} guid {:#x} model {:.1?} goal {:?} track {} strikes {} behind {:.1} yd{}",
++                h.id,
++                g.0,
++                tf.translation,
++                h.goal.map(|v| [v.x as i32, v.y as i32, v.z as i32]),
++                h.track.len(),
++                h.strikes.len(),
++                h.goal.map_or(0.0, |v| v.distance(tf.translation)),
++                match live {
++                    Some((_, age)) => format!(" live {age:.0} ms"),
++                    None => " no live record".to_string(),
++                }
++            );
+         }
+-        tf.translation = moved;
+     }
+     if let Ok(mut w) = WALKERS.lock() {
+         *w = walkers;
+@@ -1263,6 +1663,59 @@
+     }
+ 
+     #[test]
++    fn decodes_live_standins() {
++        let mut b = b"SIN1".to_vec();
++        b.extend(7u32.to_le_bytes());
++        b.extend(1u32.to_le_bytes());
++        b.extend(1234.5f64.to_le_bytes());
++        b.extend(0xf1300000u32.to_le_bytes());
++        b.extend(0x00012b01u32.to_le_bytes());
++        for v in [-8793.0f32, -116.0, 83.5, 1.5] {
++            b.extend(v.to_le_bytes());
++        }
++        b.extend(2u32.to_le_bytes());
++        b.extend(7u32.to_le_bytes());
++        let (seq, t, recs) = decode_standins(&b).unwrap();
++        assert_eq!((seq, t), (7, 1234.5));
++        assert_eq!(recs[0].0, 0xf130000000012b01);
++        assert_eq!(recs[0].1.pos, [-8793.0, -116.0, 83.5]);
++        assert!(recs[0].1.moving && !recs[0].1.dead);
++        // A torn file (trailing seq from another write) is refused.
++        let n = b.len();
++        b[n - 4] = 8;
++        assert!(decode_standins(&b).is_none());
++    }
++
++    #[test]
++    fn decodes_early_strikes() {
++        let mut b = b"STK1".to_vec();
++        for v in [99u32, 3, 1] {
++            b.extend(v.to_le_bytes());
++        }
++        for v in [0xf1300000u32, 0x00012b01, 5, STRIKE_HIT, 0] {
++            b.extend(v.to_le_bytes());
++        }
++        b.extend(10.0f64.to_le_bytes());
++        b.extend(3u32.to_le_bytes());
++        let (epoch, list) = decode_strikes(&b).unwrap();
++        assert_eq!(epoch, 99);
++        assert_eq!(list[0].guid, 0xf130000000012b01);
++        assert_eq!((list[0].id, list[0].flags, list[0].damage), (5, STRIKE_HIT, 0));
++        assert!(decode_strikes(&b[..b.len() - 1]).is_none());
++    }
++
++    #[test]
++    fn yaw_matches_look_to() {
++        for o in [-2.5f32, -1.0, 0.0, 0.7, 3.0] {
++            let d = Vec3::new(-o.sin(), 0.0, -o.cos());
++            assert!(angle_diff(yaw_of(d), o).abs() < 1e-5);
++            let t = Transform::default().looking_to(d, Vec3::Y);
++            assert!(angle_diff(t.rotation.to_euler(EulerRot::YXZ).0, o).abs() < 1e-4);
++        }
++        assert!((angle_diff(3.0, -3.0) - (6.0 - std::f32::consts::TAU)).abs() < 1e-5);
++    }
++
++    #[test]
+     fn json_text_escapes_names() {
+         assert_eq!(json_text("Defias \"Thug\"\\\n"), "Defias \\\"Thug\\\"\\\\");
+     }

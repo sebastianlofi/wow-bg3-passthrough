@@ -1,0 +1,193 @@
+diff --git a/crates/benilla-app/src/game_plugins.rs b/crates/benilla-app/src/game_plugins.rs
+index 0a9b22e..bdda3e1 100644
+--- a/crates/benilla-app/src/game_plugins.rs
++++ b/crates/benilla-app/src/game_plugins.rs
+@@ -250,6 +250,8 @@ impl PluginGroup for GamePlugins {
+             .add(UiChatPlugin)
+             .add(UiLayoutPlugin)
+             .add(crate::screenshot::ScreenshotPlugin)
++            // WOW-BG3 fork: last, so it adds no tie-break change for upstream systems.
++            .add(crate::wowbg3::WowBg3Plugin)
+     }
+ }
+ 
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index d78b128..7b513bb 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -186,6 +186,8 @@ mod weapon_trail;
+ mod world_backdrop;
+ mod world_state;
+ mod world_state_ui;
++// WOW-BG3 fork: the link to the hidden BG3 (camera stream).
++mod wowbg3;
+ 
+ use bevy::prelude::*;
+ 
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+new file mode 100644
+index 0000000..b0bfb1a
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -0,0 +1,161 @@
++//! WOW-BG3 link (local fork, not upstream benilla): the visible game owns the camera, as in
++//! SkyCraft. Every frame the world camera's pose is written to `$WOW_BG3_LINK_DIR/camera.bin`,
++//! which the hidden BG3's `wowbg3` native plugin reads to drive its own camera
++//! (`bg3/plugin`, "following benilla's camera"). Off unless `$WOW_BG3_LINK_DIR` is set.
++//!
++//! Record (96 bytes, little endian, rewritten in place): `WBC1`, seq u32, eye[3] f32,
++//! forward[3] f32, up[3] f32 (WoW world, yards), vertical fov f32 (radians), aspect f32,
++//! pad u32, time f64 (seconds since start), seq again u32 (equal when whole), pad u32,
++//! then the player: position[3] f32 (WoW world), map u32 (u32::MAX unknown), flags u32
++//! (bit 0: the server has placed us), pad u32. Readers that know only the first 72 bytes
++//! (the camera) keep working.
++
++use std::fs::{File, OpenOptions};
++use std::path::PathBuf;
++use std::time::Instant;
++
++use benilla_assets::coords::bevy_to_wow;
++use benilla_world::view::WorldCamera;
++use benilla_world::world_map::CurrentMap;
++
++use crate::player::Player;
++use bevy::camera::Projection;
++use bevy::prelude::*;
++
++pub(crate) struct WowBg3Plugin;
++
++impl Plugin for WowBg3Plugin {
++    fn build(&self, app: &mut App) {
++        let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else {
++            return;
++        };
++        info!("wowbg3: streaming the world camera to {:?}", dir);
++        app.insert_resource(CameraStream {
++            path: PathBuf::from(dir).join("camera.bin"),
++            file: None,
++            seq: 0,
++            start: Instant::now(),
++            retry: 0,
++        })
++        .add_systems(
++            PostUpdate,
++            stream_camera.after(bevy::transform::TransformSystems::Propagate),
++        );
++    }
++}
++
++#[derive(Resource)]
++struct CameraStream {
++    path: PathBuf,
++    file: Option<File>,
++    seq: u32,
++    start: Instant,
++    retry: u32,
++}
++
++/// The record for one pose, in the layout above.
++pub(crate) fn camera_record(
++    seq: u32,
++    eye: [f32; 3],
++    forward: [f32; 3],
++    up: [f32; 3],
++    fovy: f32,
++    aspect: f32,
++    time: f64,
++    player: [f32; 3],
++    map: u32,
++    flags: u32,
++) -> [u8; 96] {
++    let mut r = [0u8; 96];
++    r[0..4].copy_from_slice(b"WBC1");
++    r[4..8].copy_from_slice(&seq.to_le_bytes());
++    for (i, v) in eye.iter().chain(forward.iter()).chain(up.iter()).enumerate() {
++        r[8 + i * 4..12 + i * 4].copy_from_slice(&v.to_le_bytes());
++    }
++    r[44..48].copy_from_slice(&fovy.to_le_bytes());
++    r[48..52].copy_from_slice(&aspect.to_le_bytes());
++    r[56..64].copy_from_slice(&time.to_le_bytes());
++    r[64..68].copy_from_slice(&seq.to_le_bytes());
++    for (i, v) in player.iter().enumerate() {
++        r[72 + i * 4..76 + i * 4].copy_from_slice(&v.to_le_bytes());
++    }
++    r[84..88].copy_from_slice(&map.to_le_bytes());
++    r[88..92].copy_from_slice(&flags.to_le_bytes());
++    r
++}
++
++fn stream_camera(
++    mut s: ResMut<CameraStream>,
++    cam: Query<(&GlobalTransform, &Projection), With<WorldCamera>>,
++    player: Option<Res<Player>>,
++    map: Option<Res<CurrentMap>>,
++) {
++    let Ok((g, proj)) = cam.single() else {
++        return;
++    };
++    if s.file.is_none() {
++        if s.retry > 0 {
++            s.retry -= 1;
++            return;
++        }
++        s.retry = 120;
++        let mut o = OpenOptions::new();
++        o.write(true).create(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
++            o.mode(0o600);
++        }
++        match o.open(&s.path) {
++            Ok(f) => s.file = Some(f),
++            Err(e) => {
++                warn!("wowbg3: cannot open {:?}: {e}", s.path);
++                return;
++            }
++        }
++    }
++    let (fovy, aspect) = match proj {
++        Projection::Perspective(p) => (p.fov, p.aspect_ratio),
++        _ => (0.0, 0.0),
++    };
++    s.seq = s.seq.wrapping_add(1).max(1);
++    let rec = camera_record(
++        s.seq,
++        bevy_to_wow(g.translation()),
++        bevy_to_wow(*g.forward()),
++        bevy_to_wow(*g.up()),
++        fovy,
++        aspect,
++        s.start.elapsed().as_secs_f64(),
++        player.as_ref().map_or([0.0; 3], |p| bevy_to_wow(p.pos)),
++        map.as_ref().map_or(u32::MAX, |m| m.0 as u32),
++        player.as_ref().map_or(0, |p| p.active as u32),
++    );
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::FileExt;
++        if let Some(f) = s.file.as_ref() {
++            if f.write_all_at(&rec, 0).is_err() {
++                s.file = None;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn record_layout() {
++        let r = camera_record(7, [1.0, 2.0, 3.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.75, 1.5, 2.0, [4.0, 5.0, 6.0], 0, 1);
++        assert_eq!(&r[0..4], b"WBC1");
++        assert_eq!(u32::from_le_bytes(r[4..8].try_into().unwrap()), 7);
++        assert_eq!(u32::from_le_bytes(r[64..68].try_into().unwrap()), 7);
++        assert_eq!(f32::from_le_bytes(r[16..20].try_into().unwrap()), 3.0);
++        assert_eq!(f32::from_le_bytes(r[44..48].try_into().unwrap()), 0.75);
++        assert_eq!(f64::from_le_bytes(r[56..64].try_into().unwrap()), 2.0);
++        assert_eq!(f32::from_le_bytes(r[80..84].try_into().unwrap()), 6.0);
++        assert_eq!(u32::from_le_bytes(r[88..92].try_into().unwrap()), 1);
++    }
++}

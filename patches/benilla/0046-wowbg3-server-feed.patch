@@ -1,0 +1,95 @@
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -239,8 +239,18 @@
+     true
+ }
+ 
++/// Patch 0046: lines of `server-feed.txt` kept.
++const FEED_KEEP: usize = 4096;
++
++/// Patch 0046: a line of the server's per-member creature feed (server patch 0010): `WOWBG3 cr`,
++/// `crgone`, `tick` and `near`.
++fn is_feed_line(line: &str) -> bool {
++    matches!(line.split_whitespace().nth(1), Some("cr" | "crgone" | "tick" | "near"))
++}
++
+ /// A chat line from the server: a `WOWBG3 ...` system line is taken here and kept out of the
+-/// chat frame (true).
++/// chat frame (true). Every such line, also `WOWBG3 release refused` and the creature feed (patch
++/// 0046), never reaches the chat.
+ pub(crate) fn server_line(chat_type: u8, text: &str) -> bool {
+     const CHAT_MSG_SYSTEM: u8 = 0x0A;
+     if chat_type != CHAT_MSG_SYSTEM || !text.starts_with("WOWBG3 ") {
+@@ -255,7 +265,8 @@
+                 }
+             }
+         }
+-        if s.server_lines.len() < 256 {
++        // Patch 0046: the per-member feed (server 0010) can send hundreds of lines a second.
++        if s.server_lines.len() < 8192 {
+             s.server_lines.push_back(text.to_string());
+         }
+     }
+@@ -553,6 +564,8 @@
+     in_world_at: Option<u64>,
+     /// The last `server-events.txt` lines (`N LINE`).
+     server_events: VecDeque<String>,
++    /// Patch 0046: the server's creature-feed lines (`server-feed.txt`), apart from the fight's.
++    server_feed: VecDeque<String>,
+     /// `WOW_BG3_M5`: the last server-cmd.txt line sent (None until the file was first read: older
+     /// lines are not replayed).
+     m5: Option<Option<u64>>,
+@@ -680,6 +693,7 @@
+         help_turn: 0,
+         in_world_at: None,
+         server_events: VecDeque::new(),
++        server_feed: VecDeque::new(),
+         m5: std::env::var_os("WOW_BG3_M5").map(|_| None),
+         encounter: None,
+         world: std::env::var_os("WOW_BG3_LEAD").is_some(),
+@@ -1138,16 +1152,37 @@
+         }
+     }
+     if !lines.is_empty() {
++        // Patch 0046 (server 0010's per-member creature feed): `cr`, `crgone`, `tick` and `near`
++        // lines go to `server-feed.txt` (same `N LINE` form, the last FEED_KEEP lines), so their
++        // traffic never pushes a fight's lines out of `server-events.txt`'s 128.
++        let (mut events, mut feed) = (false, false);
+         for line in lines {
+             let n = f.next_seq();
+-            f.server_events.push_back(format!("{n} {line}"));
+-            if f.server_events.len() > 128 {
+-                f.server_events.pop_front();
+-            }
+-        }
+-        let text = f.server_events.iter().map(|l| format!("{l}\n")).collect::<String>();
+-        if let Err(e) = write_atomic(&f.dir.join("server-events.txt"), &text) {
+-            warn!("wowbg3 fight: cannot write server events: {e}");
++            if is_feed_line(&line) {
++                f.server_feed.push_back(format!("{n} {line}"));
++                if f.server_feed.len() > FEED_KEEP {
++                    f.server_feed.pop_front();
++                }
++                feed = true;
++            } else {
++                f.server_events.push_back(format!("{n} {line}"));
++                if f.server_events.len() > 128 {
++                    f.server_events.pop_front();
++                }
++                events = true;
++            }
++        }
++        if events {
++            let text = f.server_events.iter().map(|l| format!("{l}\n")).collect::<String>();
++            if let Err(e) = write_atomic(&f.dir.join("server-events.txt"), &text) {
++                warn!("wowbg3 fight: cannot write server events: {e}");
++            }
++        }
++        if feed {
++            let text = f.server_feed.iter().map(|l| format!("{l}\n")).collect::<String>();
++            if let Err(e) = write_atomic(&f.dir.join("server-feed.txt"), &text) {
++                warn!("wowbg3 fight: cannot write the server feed: {e}");
++            }
+         }
+     }
+     if let Some(s) = &scan {

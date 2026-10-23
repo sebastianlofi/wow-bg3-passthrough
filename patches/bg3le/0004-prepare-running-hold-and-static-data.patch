@@ -1,0 +1,302 @@
+--- a/include/bg3le_plugin.h
++++ b/include/bg3le_plugin.h
+@@ -51,8 +51,12 @@
+ 
+ /* Asked on the client's game thread when the engine queues the client game
+  * state `to` while it is in `from` (state names as Ext.Utils.GetGameState()
+- * gives them, e.g. "PrepareRunning" -> "Running"), and again once a frame
+- * while that switch is held. Return nonzero to hold it: the switch, and any
++ * gives them, e.g. "SwapLevel" -> "StopLoading"), and again once a frame
++ * while that switch is held. Also asked as "PrepareRunning" -> "Running"
++ * once a frame while the client is ready to leave PrepareRunning (that switch
++ * is never queued; state_gate_can_hold says whether this build can hold it):
++ * holding it keeps the client in PrepareRunning, its loading screen up,
++ * while the server runs the level. Return nonzero to hold it: the switch, and any
+  * queued after it, wait in order until no gate holds the first one. The
+  * loading screen a switch would end stays up meanwhile. Keep it cheap. */
+ typedef int (*bg3le_state_gate)(void* user, const char* from, const char* to);
+@@ -97,6 +101,12 @@
+      * (server = 1), as Ext.Utils.GetGameState() names it, or NULL before
+      * there is one. Any thread. */
+     const char* (*game_state)(int server);
++
++    /* 1 if a state gate can hold the client's switch `from` -> `to` in this
++     * build, else 0 (any queued switch with add_state_gate; "PrepareRunning"
++     * -> "Running" only where bg3le hooks that state). Any thread. Newer than
++     * game_state: check host->size. */
++    int (*state_gate_can_hold)(const char* from, const char* to);
+ } bg3le_host;
+ 
+ /* Exported by every plugin. Return 0 on success. Anything else reports it as
+--- a/src/game_state.cpp
++++ b/src/game_state.cpp
+@@ -11,6 +11,11 @@
+ //   hold a switch: a held state, and every one queued after it, waits here
+ //   in order and is queued for real by the per-frame update once no gate
+ //   holds it (bg3le_plugin.h, add_state_gate).
++// - PrepareRunning -> Running is never queued: the client leaves PrepareRunning
++//   by itself once the state's vtable slot 6 (a "may leave" predicate) says
++//   yes. That slot is hooked on the first PrepareRunning queued, so a state
++//   gate can hold the client there while the server runs the level (WOW-BG3
++//   patch 0004).
+ 
+ #include "game_state.h"
+ 
+@@ -116,11 +121,54 @@
+     return g_client_app_update(app, time, c, d);
+ }
+ 
+-// Upstream's server tick is a pre-hook here.
++// esv::GameStateMachine {+0x08 current state, +0x10 its id, +0x18 queued
++// states (a ring of state objects), +0x20 capacity, +0x24 count, +0x28 head},
++// as esv::GameStateMachine::Update reads it; a state object's id is at +0x10
++// as on the client. Ids in kServerStates' order (below): Running 13, Save 14.
++constexpr std::size_t kServerCurrentId = 0x10;
++constexpr std::size_t kServerQueue = 0x18;
++constexpr std::size_t kServerQueueCount = 0x24;
++constexpr std::size_t kServerQueueHead = 0x28;
++constexpr std::uint32_t kServerRunning = 13;
++constexpr std::uint32_t kServerSave = 14;
++std::atomic<bool> g_prepare_holding{false};  // the client is held in PrepareRunning (patch 0004)
++
++// A save the server queued next while it runs (an autosave as a new level
++// starts, BG3's own on arriving in a level): it needs the client to save too,
++// and a client held in PrepareRunning cannot, so the server would wait in
++// Save until the hold ends and the level would not run under the held
++// loading screen (harness: a new game's arrival autosave).
++bool server_save_is_next(void* machine) {
++    std::uint32_t current = 0, count = 0, head = 0, next = 0;
++    void** ring = nullptr;
++    void* state = nullptr;
++    auto* m = static_cast<char*>(machine);
++    return safe_read(m + kServerCurrentId, &current, sizeof(current)) && current == kServerRunning
++        && safe_read(m + kServerQueueCount, &count, sizeof(count)) && count > 0
++        && safe_read(m + kServerQueue, &ring, sizeof(ring)) && ring != nullptr
++        && safe_read(m + kServerQueueHead, &head, sizeof(head))
++        && safe_read(&ring[head], &state, sizeof(state)) && state != nullptr
++        && safe_read(static_cast<char*>(state) + kStateId, &next, sizeof(next)) && next == kServerSave;
++}
++
++// Upstream's server tick is a pre-hook here. Patch 0004: while the client is
++// held in PrepareRunning, a Save queued next waits in the server's queue (the
++// update sees an empty queue and keeps running the current state, Running);
++// it is taken as the hold ends, when the client can save with it.
+ StateProc g_server_machine_update = nullptr;
+ std::uint64_t server_machine_update_hook(void* machine, void* time, void* c, void* d) {
+     note_engine_time(g_clocks[1], time, "server");
+-    return g_server_machine_update(machine, time, c, d);
++    if (machine == nullptr || !g_prepare_holding.load(std::memory_order_acquire) || !server_save_is_next(machine)) {
++        return g_server_machine_update(machine, time, c, d);
++    }
++    static std::atomic<bool> told{false};
++    if (!told.exchange(true)) logf("gamestate: the server's queued Save waits while the client is held in PrepareRunning");
++    auto* count = reinterpret_cast<std::uint32_t*>(static_cast<char*>(machine) + kServerQueueCount);
++    const std::uint32_t queued = *count;
++    *count = 0;
++    const std::uint64_t result = g_server_machine_update(machine, time, c, d);
++    *count += queued;  // anything queued during the update comes after
++    return result;
+ }
+ 
+ char const* state_name(std::uint32_t state) {
+@@ -180,6 +228,66 @@
+     return state_id(state, &id) ? state_name(id) : "Unknown";
+ }
+ 
++// PrepareRunning -> Running (WOW-BG3 patch 0004).
++// ecl::GameStatePrepareRunning is not left through a queued state: the client
++// switches to Running itself once the state's vtable slot 6 answers yes (it
++// reads the state's done flag at +0x14, set by the per-frame slot 5 when the
++// level's start is synced, and one more engine flag). Holding the queued
++// StopLoading or PrepareRunning instead (patch 0003) keeps BG3's server in
++// Sync, so nothing of the level can run under the held loading screen. Here
++// slot 6 is hooked when the first PrepareRunning is queued: while a plugin's
++// state gate holds "PrepareRunning" -> "Running", a yes is answered "not yet".
++// Slot 5 still runs every frame, so the client keeps talking to the server,
++// which goes Running and runs the level while BG3's loading screen stays up.
++// The slot's code is checked first (its first instruction, cmp byte
++// [rdi+0x14], 0); anything else is left alone and logged.
++constexpr std::size_t kPrepareReadySlot = 6;
++constexpr unsigned char kPrepareReadyCode[] = {0x80, 0x7f, 0x14, 0x00};
++using ReadyProc = std::uint64_t (*)(void*, void*, void*, void*);
++std::atomic<ReadyProc> g_prepare_ready{nullptr};
++std::atomic<bool> g_prepare_tried{false};
++
++std::uint64_t prepare_running_ready_hook(void* state, void* a, void* b, void* c) {
++    const std::uint64_t ready = g_prepare_ready.load(std::memory_order_acquire)(state, a, b, c);
++    if ((ready & 0xff) == 0) return ready;
++    if (plugins_state_held("PrepareRunning", "Running")) {
++        if (!g_prepare_holding.exchange(true)) {
++            char const* server = server_game_state();
++            logf("gamestate: a plugin holds the client in PrepareRunning (server %s)",
++                 server != nullptr ? server : "?");
++        }
++        return ready & ~std::uint64_t{0xff};
++    }
++    if (g_prepare_holding.exchange(false)) {
++        logf("gamestate: the client's PrepareRunning is released");
++    }
++    return ready;
++}
++
++void hook_prepare_running(void* state) {
++    if (g_prepare_tried.exchange(true)) return;
++    void** vtable = nullptr;
++    void* fn = nullptr;
++    unsigned char code[sizeof(kPrepareReadyCode)] = {};
++    if (!safe_read(state, &vtable, sizeof(vtable)) || vtable == nullptr
++        || !safe_read(&vtable[kPrepareReadySlot], &fn, sizeof(fn)) || fn == nullptr
++        || !safe_read(fn, code, sizeof(code))
++        || std::memcmp(code, kPrepareReadyCode, sizeof(code)) != 0) {
++        logf("gamestate: PrepareRunning's slot %zu is not the predicate it was; the client "
++             "cannot be held in PrepareRunning", kPrepareReadySlot);
++        return;
++    }
++    g_prepare_ready.store(reinterpret_cast<ReadyProc>(fn), std::memory_order_release);
++    void* original = nullptr;
++    if (!hook_pointer(&vtable[kPrepareReadySlot], reinterpret_cast<void*>(&prepare_running_ready_hook),
++                      &original)) {
++        logf("gamestate: PrepareRunning's slot %zu could not be written", kPrepareReadySlot);
++        return;
++    }
++    logf("gamestate: PrepareRunning's slot %zu hooked (vtable image+%#lx): it can be held",
++         kPrepareReadySlot, (unsigned long)(reinterpret_cast<std::uintptr_t>(vtable) - load_bias()));
++}
++
+ // Queues what is held once no gate holds the first of it. Before the
+ // machine's update, on the client's game thread.
+ void release_held_states() {
+@@ -261,6 +369,7 @@
+         void* vtable = *static_cast<void**>(state);
+         logf("gamestate: client queued %s (vtable image+%#lx)", state_name(to),
+              (unsigned long)(reinterpret_cast<std::uintptr_t>(vtable) - load_bias()));
++        if (std::strcmp(state_name(to), "PrepareRunning") == 0) hook_prepare_running(state);
+     }
+     std::lock_guard<std::mutex> held(g_held_lock);
+     char const* name = queued_state_name(state);
+@@ -303,6 +412,11 @@
+     return g_set_target_state != nullptr && g_machine_update != nullptr;
+ }
+ 
++bool game_state_prepare_holdable() {
++    if (g_set_target_state == nullptr) return false;
++    return !g_prepare_tried.load() || g_prepare_ready.load() != nullptr;
++}
++
+ char const* client_state_name() {
+     char const* state = client_game_state();
+     return state != nullptr ? state : "unknown";
+--- a/src/game_state.h
++++ b/src/game_state.h
+@@ -15,4 +15,9 @@
+ // the plugins' state gates (src/plugins.cpp).
+ bool game_state_gate_hooked();
+ 
++// Whether the client can be held in PrepareRunning (patch 0004): its slot is
++// hooked, or not yet tried (it is hooked when the first PrepareRunning is
++// queued), and SetTargetState is hooked.
++bool game_state_prepare_holdable();
++
+ }  // namespace bg3le
+--- a/src/plugins.cpp
++++ b/src/plugins.cpp
+@@ -229,6 +229,14 @@
+     return server ? server_game_state() : client_game_state();
+ }
+ 
++int host_state_gate_can_hold(const char* from, const char* to) {
++    if (from != nullptr && to != nullptr && std::strcmp(from, "PrepareRunning") == 0
++        && std::strcmp(to, "Running") == 0) {
++        return game_state_prepare_holdable() ? 1 : 0;
++    }
++    return game_state_gate_hooked() ? 1 : 0;
++}
++
+ // From bg3le's own object, so RTLD_NEXT is SDL's real function, past ours.
+ void* host_sdl_function(const char* name) {
+     if (void* next = ::dlsym(RTLD_NEXT, name)) return next;
+@@ -265,6 +273,7 @@
+     host_add_frame_handler,
+     host_add_state_gate,
+     host_game_state,
++    host_state_gate_can_hold,
+ };
+ 
+ bg3le_plugin* find_plugin(const char* name) {
+--- a/src/vendor/static_data.cpp
++++ b/src/vendor/static_data.cpp
+@@ -53,6 +53,11 @@
+ // Within an Array: buffer, capacity, size.
+ constexpr std::size_t kArrayBuffer = 0;
+ constexpr std::size_t kArraySize = 12;
++// HashKeys (a StaticArray: buffer, size) and NextIds (an Array), and the size
++// of Values (an UninitializedStaticArray: buffer, size).
++constexpr std::size_t kHashKeysOffset = 0;
++constexpr std::size_t kStaticArraySize = 8;
++constexpr std::size_t kNextIdsOffset = 16;
+ 
+ static_assert(sizeof(GuidResourceManager) == 64,
+               "the manager is expected to be one HashMap");
+@@ -104,6 +109,8 @@
+ // from the symbol table, and the values have to be objects whose first word
+ // points into the executable. A HashMap of the right shape holding arbitrary
+ // integers will not pass.
++bool hash_map_consistent(char const* base, std::uint32_t keyCount);  // below
++
+ bool looks_like_manager(void const* candidate) {
+     void* keyBuf = nullptr;
+     std::uint32_t keyCount = 0;
+@@ -136,7 +143,52 @@
+         if (!read_as((void const*)bank, &vtable)) return false;
+         if (!looks_like_vtable(vtable)) return false;
+     }
+-    return true;
++    return hash_map_consistent(base, keyCount);
++}
++
++// Whether the HashMap at `base` with `keyCount` keys is internally whole: the
++// shape every lookup (find_index, try_get) walks. Each bucket of HashKeys is -1
++// or a key index, each NextIds entry a key index or a chain end (negative), and
++// the chains from all buckets visit every key exactly once. A table that only
++// looks like the manager (same key set and vtables; seen in WOW-BG3: a
++// main-menu Load in a fresh BG3 took one at region offset 0x6a218, and the
++// first lookup asserted "index < size_" and killed the game) fails this, so the
++// search goes on to the real one. The hash function is not needed for it.
++bool hash_map_consistent(char const* base, std::uint32_t keyCount) {
++    void* hashBuf = nullptr;
++    std::uint32_t buckets = 0;
++    void* nextBuf = nullptr;
++    std::uint32_t nextCount = 0;
++    std::uint32_t valueCount = 0;
++    if (!read_as(base + kHashKeysOffset + kArrayBuffer, &hashBuf)
++        || !read_as(base + kHashKeysOffset + kStaticArraySize, &buckets)
++        || !read_as(base + kNextIdsOffset + kArrayBuffer, &nextBuf)
++        || !read_as(base + kNextIdsOffset + kArraySize, &nextCount)
++        || !read_as(base + kValuesOffset + kStaticArraySize, &valueCount)) {
++        return false;
++    }
++    if (hashBuf == nullptr || nextBuf == nullptr || buckets == 0 || buckets > (1u << 16)) return false;
++    if (nextCount != keyCount || valueCount < keyCount) return false;
++
++    std::vector<std::int32_t> hash(buckets);
++    std::vector<std::int32_t> next(keyCount);
++    if (!safe_read(hashBuf, hash.data(), buckets * sizeof(std::int32_t))
++        || !safe_read(nextBuf, next.data(), keyCount * sizeof(std::int32_t))) {
++        return false;
++    }
++    std::vector<bool> seen(keyCount, false);
++    std::uint32_t visited = 0;
++    for (std::uint32_t b = 0; b < buckets; ++b) {
++        std::int32_t i = hash[b];
++        if (i < -1 || i >= (std::int32_t)keyCount) return false;
++        while (i >= 0) {
++            if (i >= (std::int32_t)keyCount || seen[(std::size_t)i]) return false;
++            seen[(std::size_t)i] = true;
++            if (++visited > keyCount) return false;
++            i = next[(std::size_t)i];
++        }
++    }
++    return visited == keyCount;
+ }
+ 
+ void* g_manager = nullptr;

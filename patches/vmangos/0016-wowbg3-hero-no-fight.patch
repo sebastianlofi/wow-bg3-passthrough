@@ -1,0 +1,99 @@
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -1043,12 +1043,25 @@
+         out.Add(head + "ok");
+     }
+ 
+-    // hero <enc> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
++    // hero <enc|-> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
+     // follows Tav's as a fraction (rounded, at least 1 while Tav lives), both
+     // ways. 0 is a normal WoW death: the
+     // killing blow comes from a living mob of the encounter (the killer if
+     // given), so it is a PvE death with the usual durability loss and nobody
+     // gets credit. Applying the same line again changes nothing.
++    //
++    // `-` for the encounter (0016): Tav's health outside a fight. Tav can lose
++    // health and die with no BG3 fight running (a fall, a grease fire, a
++    // surface), and every verb here wanted the owner's running encounter, so
++    // that damage and that death had no way over and the two sides disagreed
++    // about who was dead. `-` is the no-encounter marker the reply lines
++    // already use (ValidId refuses it as an id), and it is taken only while the
++    // owner has no running encounter: with a fight on it is refused `busy
++    // <id>`, so nothing about a running encounter changes. No mob can have
++    // struck the blow, so a `-` death is the environmental-style one this verb
++    // already uses when every mob of the encounter is dead: the usual 10%
++    // durability loss, no PvP corpse, no reward for anyone. A killer guid is
++    // refused with it.
+     void HeroHealth(Player* p, std::string const& enc, std::string const& hpText,
+         std::string const& maxText, std::string const& killerText, Out& out)
+     {
+@@ -1065,26 +1078,37 @@
+             return out.Add(head + "refused badguid");
+ 
+         ObjectGuid const pg = p->GetObjectGuid();
++        bool const loose = enc == "-";                      // outside a fight (see above)
+         std::vector<ObjectGuid> alive;                      // candidates for the killing blow
+         {
+             WriteLock lock(g_lock);
+             Fighter& f = g_fighters[pg];
+-            if (f.IsClosed(enc))
+-                return out.Add(head + "refused closed");
+-            if (!f.active || f.active->id != enc)
+-                return out.Add(head + "refused unknown");
+-            f.active->last = WorldTimer::getMSTime();
+-            if (!killerGuid.IsEmpty())
++            if (loose)
+             {
+-                Mob* m = f.active->Find(killerGuid);
+-                if (!m)
++                if (f.active)
++                    return out.Add(head + "refused busy " + f.active->id);
++                if (!killerGuid.IsEmpty())
+                     return out.Add(head + "refused notmember");
+-                if (!m->killed)
+-                    alive.push_back(killerGuid);
+             }
+-            for (Mob const& m : f.active->mobs)
+-                if (!m.killed && m.guid != killerGuid)
+-                    alive.push_back(m.guid);
++            else
++            {
++                if (f.IsClosed(enc))
++                    return out.Add(head + "refused closed");
++                if (!f.active || f.active->id != enc)
++                    return out.Add(head + "refused unknown");
++                f.active->last = WorldTimer::getMSTime();
++                if (!killerGuid.IsEmpty())
++                {
++                    Mob* m = f.active->Find(killerGuid);
++                    if (!m)
++                        return out.Add(head + "refused notmember");
++                    if (!m->killed)
++                        alive.push_back(killerGuid);
++                }
++                for (Mob const& m : f.active->mobs)
++                    if (!m.killed && m.guid != killerGuid)
++                        alive.push_back(m.guid);
++            }
+         }
+ 
+         uint32 const maxHealth = p->GetMaxHealth();
+@@ -1123,7 +1147,8 @@
+             killer->DealDamage(p, health, nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, true);
+         else
+         {
+-            // Every mob is already dead: die like an environmental death.
++            // Every mob is already dead, or there is no fight (`hero -`): die
++            // like an environmental death.
+             p->DealDamage(p, health, nullptr, SELF_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+             if (!p->IsAlive())
+                 p->DurabilityLossAll(0.10f, false);
+@@ -1550,7 +1575,7 @@
+             Health(p, a[2], a[3], a[4], a[5], out);
+         else if (verb == "end" && a.size() == 4 && ValidId(a[2]))
+             End(p, a[2], a[3], out);
+-        else if (verb == "hero" && (a.size() == 5 || a.size() == 6) && ValidId(a[2]))
++        else if (verb == "hero" && (a.size() == 5 || a.size() == 6) && (ValidId(a[2]) || a[2] == "-"))
+             HeroHealth(p, a[2], a[3], a[4], a.size() == 6 ? a[5] : std::string(), out);
+         else if (verb == "keep" && a.size() == 3 && ValidId(a[2]))
+             Keep(p, a[2], out);

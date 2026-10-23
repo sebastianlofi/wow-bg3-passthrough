@@ -1,0 +1,126 @@
+WOW-BG3 benilla patch 0067: the NPC under the pointer for BG3, and robbed NPCs searching.
+
+- wowbg3_lead.rs: wowhover.bin grows to 48 bytes: the guid of the unit under the pointer at 36 (0 for
+  none) and the seq a fifth time at 44, so WowCursor.lua knows which NPC WoW picks and a click on a
+  friendly NPC does the same whichever of WoW's pick and BG3's picks it.
+- wowbg3_fight.rs: mirrored.txt's "s GUID" lines (the bridge: a robbed NPC searching for the thief,
+  Mirrors.lua) hold that mob's model like a fight mob's: it walks where BG3 walks its stand-in
+  (standins.bin) until the line goes.
+
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -589,6 +589,8 @@
+     right_clicks: Option<u32>,
+     release: Option<(MouseButton, u8)>,
+     hover_flags: u32,
++    /// Patch 0067: the guid of the unit last reported under the pointer (0 for none).
++    hover_guid: u64,
+     hover_seq: u32,
+ }
+ 
+@@ -680,8 +682,12 @@
+     // 0 none), for WoW's quest cursor in BG3 (`WowCursor.lua`).
+     let status = hovered.guid.filter(|_| hovered.target.is_some()).and_then(|g| quest.status(g)).unwrap_or(0);
+     let key = flags | (kind << 8) | (u32::from(world_cursor.unable) << 16) | (status.min(255) << 24);
+-    if key != link.hover_flags || link.hover_seq == 0 {
++    // WOW-BG3 (patch 0067): the unit under the pointer, so BG3 knows which NPC WoW picks (its click on a
++    // friendly NPC is the same whichever of the two picks hits, WowCursor.lua).
++    let unit_guid = hovered.guid.filter(|_| hovered.target.is_some()).unwrap_or(0);
++    if key != link.hover_flags || unit_guid != link.hover_guid || link.hover_seq == 0 {
+         link.hover_flags = key;
++        link.hover_guid = unit_guid;
+         link.hover_seq = link.hover_seq.wrapping_add(1).max(1);
+         // What WoW has under BG3's pointer, each time it changes: whether a click there is WoW's
+         // (flag 2: a corpse to loot, an object, an NPC WoW claims), BG3's (flag 4: a mirrored mob,
+@@ -698,8 +704,9 @@
+             hovered.corpse_guid,
+             object.guid,
+         );
+-        // 36 bytes since patch 0047: the 28 of 0019, the status at 28 and the seq again at 32.
+-        let mut rec = [0u8; 36];
++        // 36 bytes since patch 0047: the 28 of 0019, the status at 28 and the seq again at 32; 48 since
++        // patch 0067: the unit's guid at 36 (0 for none) and the seq a fifth time at 44.
++        let mut rec = [0u8; 48];
+         rec[0..4].copy_from_slice(b"WBH1");
+         rec[4..8].copy_from_slice(&link.hover_seq.to_le_bytes());
+         rec[8..12].copy_from_slice(&flags.to_le_bytes());
+@@ -709,6 +716,8 @@
+         rec[24..28].copy_from_slice(&link.hover_seq.to_le_bytes());
+         rec[28..32].copy_from_slice(&status.to_le_bytes());
+         rec[32..36].copy_from_slice(&link.hover_seq.to_le_bytes());
++        rec[36..44].copy_from_slice(&unit_guid.to_le_bytes());
++        rec[44..48].copy_from_slice(&link.hover_seq.to_le_bytes());
+         let tmp = link.hover.with_extension("tmp");
+         if std::fs::write(&tmp, rec).is_ok() {
+             let _ = std::fs::rename(&tmp, &link.hover);
+@@ -771,6 +780,7 @@
+         right_clicks: None,
+         release: None,
+         hover_flags: 0,
++        hover_guid: 0,
+         hover_seq: 0,
+     })
+     .add_systems(PreUpdate, forward_pointer.before(bevy::input::InputSystems));
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -586,6 +586,8 @@
+     encounter: Option<String>,
+     /// World mode (`WOW_BG3_LEAD`): the hero acts in BG3, so no WoW key help.
+     world: bool,
++    /// Patch 0067: robbed NPCs searching for the thief (`mirrored.txt` `s`), held while listed.
++    searching: HashSet<u64>,
+     /// World mode: BG3's live stand-ins by guid (`standins.bin`) and the file's last seq.
+     live: HashMap<u64, Live>,
+     live_seq: Option<u32>,
+@@ -684,6 +686,7 @@
+         .map(|v| Auto { adds: v.trim() == "2", ..Auto::default() });
+     let dir_live = dir.join("wowmobs.bin");
+     app.insert_resource(Fight {
++        searching: HashSet::new(),
+         dir,
+         seq: 0,
+         text_seq: None,
+@@ -1029,10 +1032,13 @@
+     if f.frame % 30 == 2 {
+         let text = std::fs::read_to_string(f.dir.join("mirrored.txt")).unwrap_or_default();
+         let (mut m, mut h, mut c) = (HashSet::new(), HashSet::new(), HashSet::new());
++        let mut searching = HashSet::new();
+         for line in text.lines() {
+             match line.split_once(' ') {
+                 Some(("m", g)) => m.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 Some(("h", g)) => h.extend(u64::from_str_radix(g.trim(), 16).ok()),
++                // Patch 0067: a robbed NPC searching for the thief (Mirrors.lua lets BG3 walk its stand-in).
++                Some(("s", g)) => searching.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 // Patch 0060: a mirrored mob's corpse (BG3's loot window).
+                 Some(("c", g)) => c.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 _ => {}
+@@ -1043,6 +1049,29 @@
+             s.frozen = h;
+             s.corpses = c;
+         }
++        // Patch 0067: while it searches, its model is held like a fight mob's and walks where BG3 walks
++        // its stand-in (`standins.bin`, MirrorsClient.lua outside a fight); once it stops searching it is
++        // WoW's again (unless a fight holds it by then).
++        for g in &searching {
++            if !f.held.contains_key(g) {
++                if let Some((_, _, tf)) = unit_of(*g) {
++                    let at = tf.translation;
++                    f.hold(*g, at);
++                    info!("wowbg3 search: guid {g:#x} searches: its model follows BG3's stand-in");
++                }
++            }
++        }
++        let done: Vec<u64> = f.searching.difference(&searching).copied().collect();
++        for g in done {
++            if !(f.active && f.asked.contains(&g)) {
++                f.held.remove(&g);
++                if let Ok(mut s) = SHARED.lock() {
++                    s.held.remove(&g);
++                }
++                info!("wowbg3 search: guid {g:#x} stopped searching: WoW's again");
++            }
++        }
++        f.searching = searching;
+     }
+     let frozen: HashSet<u64> = SHARED.lock().map(|s| s.frozen.clone()).unwrap_or_default();
+     // The mobs near you for the bridge's mirrors (`mobs.txt`).

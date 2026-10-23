@@ -1,0 +1,55 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 5959905..76da3f4 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -61,7 +61,10 @@ namespace WowBg3
+ {
+ namespace
+ {
+-    uint32 const FREEZE_SPELL  = 9454;                      // GM "Freeze": stun aura without duration
++    // 0008: "Self Stun (DND)", a hidden stun aura without duration and without a spell visual. Was the
++    // GM "Freeze" (9454), whose visual 87 made the client play "Sleep Impact" on every held mob when
++    // the aura landed, applied or cast (0007 only dropped the cast's "Magic Cast").
++    uint32 const FREEZE_SPELL  = 29826;
+     size_t const MAX_MOBS      = 50;                        // per encounter, and pending per player
+     float const CLAIM_RANGE    = 50.0f;                     // yards, begin and join
+     float const DAMAGE_RANGE   = 100.0f;                    // yards, hp
+@@ -373,19 +376,18 @@ namespace
+         return m ? m->GetCreature(guid) : nullptr;
+     }
+ 
+-    // Stun with the GM freeze aura. False if the mob cannot be stunned.
+-    // 0007: the aura is applied, not cast. A cast sends the spell's start and go packets, and the
+-    // client plays spell visual 87's cast and impact kits for them ("Magic Cast", "Sleep Impact"):
+-    // a sleep sound on every held mob at each fight start. The cast's own immunity rule is kept
+-    // (a self cast: IsImmuneToSpell, then the aura effect's immunity, both as cast on self).
++    // Stun with the hold aura (FREEZE_SPELL). False if the mob cannot be stunned.
++    // 0007: the aura is applied, not cast (a cast's start and go packets made the client play the
++    // spell's cast and impact kits). 0008: the immunity rule of the old GM freeze cast: 9454 had
++    // SPELL_ATTR_NO_IMMUNITIES, so only the stun effect's own immunity (a stun-immune mob) counted;
++    // the new aura is held to the same rule rather than its own spell-level immunities.
+     bool Freeze(Creature* c)
+     {
+         if (!c->HasAura(FREEZE_SPELL))
+         {
+             c->InterruptNonMeleeSpells(false);
+             SpellEntry const* freeze = sSpellMgr.GetSpellEntry(FREEZE_SPELL);
+-            if (freeze && !c->IsImmuneToSpell(freeze, true) &&
+-                !c->IsImmuneToSpellEffect(freeze, EFFECT_INDEX_0, true))
++            if (freeze && !c->IsImmuneToSpellEffect(freeze, EFFECT_INDEX_0, true))
+                 c->AddAura(FREEZE_SPELL, ADD_AURA_NO_OPTION, c);
+         }
+         // Stunned mobs keep their leash anyway; this also covers the moment after release.
+diff --git a/src/game/WowBg3Fights.h b/src/game/WowBg3Fights.h
+index 9ae259f..7729142 100644
+--- a/src/game/WowBg3Fights.h
++++ b/src/game/WowBg3Fights.h
+@@ -16,7 +16,7 @@
+ 
+ // WOW-BG3 (local patch, not upstream VMaNGOS): hand a WoW fight to a hidden
+ // Baldur's Gate 3. While BG3 runs the fight turn by turn, the mobs in it are
+-// held here: stunned with the GM freeze aura, no AI (attacks, casts, scripts),
++// held here: stunned with a hidden stun aura (0008), no AI (attacks, casts, scripts),
+ // no leash or evade, no regeneration, aura timers stopped, and no damage or
+ // healing except what the fight's owner applies through `.wowbg3 hp`. That
+ // damage comes from the player, so a kill gives normal XP, loot and quest

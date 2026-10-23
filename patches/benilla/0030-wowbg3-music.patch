@@ -1,0 +1,268 @@
+WOW-BG3 benilla patch 0030: WoW's music in world mode.
+Outside BG3's fights WoW plays its own zone music and ambience; while BG3 runs a fight for BG3's
+character (tav.bin flags bit 1, BG3's own combat state) BG3's combat music plays and WoW's zone
+track fades out (the reference's 4.0 s music fade), starting again 8 s after the fight. In world
+mode WoW's sound follows BG3's own mute (tav.bin flags bit 2: BG3 mutes when its window loses
+focus) instead of benilla's headless window's focus. A POLLERR from ALSA (PipeWire's plugin) no
+longer leaves cpal's output loop spinning with no sound: the stream is rebuilt.
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -174,6 +174,34 @@
+ static TAV_COMBAT: AtomicBool = AtomicBool::new(false);
+ /// When the last new `tav.bin` record came ([`clock_ms`]; 0: never).
+ static TAV_SEEN_MS: AtomicU64 = AtomicU64::new(0);
++/// Patch 0030: BG3's own sound is muted (`tav.bin` flags bit 2): BG3's master volume RTPC is 0, as
++/// BG3 sets it when its window loses focus (its MuteSoundWhenNotFocused option) or its master
++/// volume is 0.
++static TAV_MUTED: AtomicBool = AtomicBool::new(false);
++
++/// Patch 0030: how old the last `tav.bin` record may be for its combat bit to count.
++const COMBAT_FRESH_MS: u64 = 5000;
++
++/// Patch 0030: BG3 runs a fight for BG3's character (`tav.bin` flags bit 1, BG3's
++/// own `TurnBased.IsInCombat`, read by `read_tav`). BG3's combat music plays then, so WoW's zone
++/// music yields to it (`sound::SoundConfig::music_yield`). False with no record for 5 s (world
++/// mode not running, or stopped).
++pub(crate) fn bg3_combat() -> bool {
++    let seen = TAV_SEEN_MS.load(Ordering::Relaxed);
++    seen != 0
++        && clock_ms().saturating_sub(seen) <= COMBAT_FRESH_MS
++        && TAV_COMBAT.load(Ordering::Relaxed)
++}
++
++/// Patch 0030: BG3's own sound is muted (`tav.bin` flags bit 2). In world mode the
++/// window played in is BG3's, so WoW's sound goes quiet with BG3's, as the reference mutes when
++/// its own window is inactive. False with no record for 5 s.
++pub(crate) fn bg3_muted() -> bool {
++    let seen = TAV_SEEN_MS.load(Ordering::Relaxed);
++    seen != 0
++        && clock_ms().saturating_sub(seen) <= COMBAT_FRESH_MS
++        && TAV_MUTED.load(Ordering::Relaxed)
++}
+ 
+ fn clock_ms() -> u64 {
+     static START: OnceLock<Instant> = OnceLock::new();
+@@ -384,7 +412,10 @@
+     // Patch 0019: a fresh record (an errand has someone to ask) and her BG3 combat (flags bit 1).
+     TAV_SEEN_MS.store(clock_ms(), Ordering::Relaxed);
+     if let Some(f) = raw.get(36..40) {
+-        TAV_COMBAT.store(u32::from_le_bytes(f.try_into().unwrap()) & 1 != 0, Ordering::Relaxed);
++        let flags = u32::from_le_bytes(f.try_into().unwrap());
++        TAV_COMBAT.store(flags & 1 != 0, Ordering::Relaxed);
++        // Patch 0030: BG3's own sound muted (flags bit 2).
++        TAV_MUTED.store(flags & 2 != 0, Ordering::Relaxed);
+     }
+     let at = wow_to_bevy(wow);
+     // Tav walking is the player at the keyboard too (WoW's idle clock).
+diff --git a/crates/benilla-app/src/sound/mod.rs b/crates/benilla-app/src/sound/mod.rs
+--- a/crates/benilla-app/src/sound/mod.rs
++++ b/crates/benilla-app/src/sound/mod.rs
+@@ -115,6 +115,12 @@
+     /// it would save music off for a player who quits mid-cinematic. So the reference's restore
+     /// latch (`[0xb4e278]`), needed there because its flag is the CVar itself, is not carried.
+     pub music_suppressed: bool,
++    /// Not a CVar (WOW-BG3 world mode, patch 0030): set while BG3 runs a fight for
++    /// BG3's character ([`feed_music_yield`]), when BG3's own combat music plays. The zone track
++    /// fades out over the reference's 4.0 s music fade and no track starts until the fight is
++    /// over; then the zone pump starts the zone's track again ([`zone`]'s `apply_music_yield`).
++    /// Ambience is untouched: WoW's world goes on around the fight.
++    pub music_yield: bool,
+     /// Deviation: `SoundOutputLimiter`, not a 1.12 CVar, default on, so overlapping full-scale
+     /// kits are limited rather than clipped. The reference has no headroom mechanism and clips at
+     /// full scale, as kira's hard clamp would (see [`limiter`]).
+@@ -166,6 +172,7 @@
+             reverb: false,
+             world_hold: false,
+             music_suppressed: false,
++            music_yield: false,
+             limiter: true,
+             // The reference's registered defaults: "1", "1", "0".
+             listener_at_character: true,
+@@ -196,7 +203,15 @@
+     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+     mut last: Local<Option<bool>>,
+ ) {
+-    let open = config.background_sound || windows.single().map_or(true, |w| w.focused);
++    // WOW-BG3 world mode (patch 0030): the window played in is BG3's; benilla draws into a headless
++    // one whose focus says nothing. WoW's sound goes quiet with BG3's own instead (BG3 mutes itself
++    // when its window loses focus; `wowbg3_lead::bg3_muted`).
++    let open = config.background_sound
++        || if crate::wowbg3_lead::hide_self() {
++            !crate::wowbg3_lead::bg3_muted()
++        } else {
++            windows.single().map_or(true, |w| w.focused)
++        };
+     if *last == Some(open) {
+         return;
+     }
+@@ -223,6 +238,15 @@
+     }
+ }
+ 
++/// Copy BG3's fight into [`SoundConfig::music_yield`] (world mode only). In `WorldStage::Stream`
++/// like the cinematic's flag, so [`zone::zone_audio`] in `Present` sees it the same frame.
++fn feed_music_yield(mut config: ResMut<SoundConfig>) {
++    let fight = crate::wowbg3_lead::hide_self() && crate::wowbg3_lead::bg3_combat();
++    if config.music_yield != fight {
++        config.music_yield = fight;
++    }
++}
++
+ /// The backend output; `mixer` is `None` with no device or under `$WOW_NOSOUND`. Non-Send: the
+ /// device stream is not `Send` on every platform, so audio systems run on the main thread.
+ pub(crate) struct SoundOutput {
+@@ -395,7 +419,8 @@
+         .add_systems(PreUpdate, feed_world_hold)
+         .add_systems(
+             Update,
+-            feed_music_suppression.in_set(benilla_world::schedule::WorldStage::Stream),
++            (feed_music_suppression, feed_music_yield)
++                .in_set(benilla_world::schedule::WorldStage::Stream),
+         )
+         .add_systems(
+             Update,
+diff --git a/crates/benilla-app/src/sound/zone.rs b/crates/benilla-app/src/sound/zone.rs
+--- a/crates/benilla-app/src/sound/zone.rs
++++ b/crates/benilla-app/src/sound/zone.rs
+@@ -55,6 +55,11 @@
+ /// `0x4603b0(0)`.
+ const CINEMATIC_MUSIC_RESUME_SECS: f64 = 3.0;
+ 
++/// WOW-BG3 (patch 0030): how long after BG3's fight the zone track comes back. BG3 ends its fight
++/// music first (`Music_Fight_End`, then its win stinger, about 8 s in the harness); the cinematic's
++/// 3.0 s would start WoW's track over that.
++const FIGHT_MUSIC_RESUME_SECS: f64 = 8.0;
++
+ fn phase(clock: &GameClock) -> usize {
+     if (330..1260).contains(&clock.minute) {
+         0
+@@ -160,6 +165,8 @@
+     unplayable: std::collections::HashSet<String>,
+     /// Last frame's [`SoundConfig::music_suppressed`], for its edges.
+     music_suppressed: bool,
++    /// Last frame's [`SoundConfig::music_yield`] (WOW-BG3, patch 0030), for its edges.
++    music_yielding: bool,
+     /// The looping ambience kit last asked for (0 = none): the bed playing, or the one opening.
+     ambience_kit: u32,
+     /// The bed playing and its base volume.
+@@ -195,6 +202,7 @@
+             next_track_at: None,
+             unplayable: std::collections::HashSet::new(),
+             music_suppressed: false,
++            music_yielding: false,
+             ambience_kit: 0,
+             ambience: None,
+             ambience_kit_vol: 1.0,
+@@ -294,6 +302,8 @@
+     // The cinematic's music stop: a cut, then a resume at +3.000 s; ambience is untouched.
+     // Ahead of the cover's hold arm, which returns, so the edge is not deferred to the reveal.
+     apply_music_suppression(zone, config.music_suppressed, now);
++    // WOW-BG3 (patch 0030): BG3's fight music takes over while BG3 runs a fight.
++    apply_music_yield(zone, config.music_yield, now);
+ 
+     // The loading cover kills the world soundscape, as the reference's loading screen sits over
+     // a torn-down world; resetting `area`/`interior` makes the reveal a fresh zone entry.
+@@ -457,6 +467,44 @@
+     }
+ }
+ 
++/// WOW-BG3 (patch 0030): the two edges of [`SoundConfig::music_yield`]. Down (BG3's
++/// fight began, its combat music plays): the zone track fades out over the reference's own 4.0 s
++/// music fade, the one a zone change makes (`0x4602e0`), a Lua track pauses on the same fade, and
++/// the pump waits ([`start_music_stream`] refuses). Up (the fight is over): a Lua track resumes,
++/// else the pump starts the zone's track [`FIGHT_MUSIC_RESUME_SECS`] later, as after a cinematic,
++/// with the kit for the phase then.
++fn apply_music_yield(zone: &mut ZoneAudio, yielding: bool, now: f64) {
++    if yielding == zone.music_yielding {
++        return;
++    }
++    zone.music_yielding = yielding;
++    if yielding {
++        if let Some(h) = zone.lua_music.as_mut() {
++            h.pause(mixer::fade(MUSIC_FADE_OUT_MS));
++            info!("Lua music: paused for BG3's fight");
++        }
++        if let Some(mut h) = zone.music.take() {
++            h.stop(mixer::fade(MUSIC_FADE_OUT_MS));
++            info!("zone music: fades out, BG3's fight music plays");
++        }
++        // The next track starts at position 0, behind this one's baseline.
++        zone.music_watch.reset();
++        zone.next_track_at = None;
++        return;
++    }
++    if zone.lua_slot_live() {
++        if let Some(h) = zone.lua_music.as_mut() {
++            h.resume(mixer::declick());
++            info!("Lua music: resumed after BG3's fight");
++        }
++        return;
++    }
++    if zone.zone_music != 0 {
++        zone.next_track_at = Some(now + FIGHT_MUSIC_RESUME_SECS);
++        info!("zone music: BG3's fight is over, back in {FIGHT_MUSIC_RESUME_SECS:.1}s");
++    }
++}
++
+ fn zone_music_row(cat: &AreaSoundCatalog, _id: u32) -> Option<&benilla_formats::ZoneMusicEntry> {
+     cat.zone_music(_id)
+ }
+@@ -563,7 +611,8 @@
+     // Nothing opens the slot during a cinematic, whoever asks: the reference's pump dies at its
+     // first instruction (`0x460040`, `[0xb06cc8]`). Refusing here also keeps an intro from being
+     // stamped as played.
+-    if config.music_suppressed {
++    // WOW-BG3 (patch 0030): nor while BG3 runs a fight, whose own combat music plays.
++    if config.music_suppressed || config.music_yield {
+         return false;
+     }
+     // Nor while a Lua track holds the override slot: the reference gates on the slot itself in
+@@ -689,9 +738,9 @@
+     match mixer_ref.play_stream(data.volume(mixer::amp_to_db(start_amp))) {
+         Ok(mut h) => {
+             info!("Lua music: {path}");
+-            if config.music_suppressed {
++            if config.music_suppressed || config.music_yield {
+                 h.pause(mixer::fade(0));
+-                info!("Lua music: held — a cinematic has music disabled");
++                info!("Lua music: held — a cinematic or BG3's fight (WOW-BG3) has music off");
+             }
+             // Only the loop's reopen finds a stream here; the verb already faded the old one.
+             if let Some(mut outgoing) = zone.lua_music.replace(h) {
+@@ -1076,6 +1125,7 @@
+     zone.was_underwater = false;
+     // Else the next entry sees a falling edge left from this session's cinematic.
+     zone.music_suppressed = false;
++    zone.music_yielding = false;
+     if had {
+         info!("sound: world soundscape stopped ({reason})");
+     }
+diff --git a/crates/benilla-app/src/sound/output/cpal.rs b/crates/benilla-app/src/sound/output/cpal.rs
+--- a/crates/benilla-app/src/sound/output/cpal.rs
++++ b/crates/benilla-app/src/sound/output/cpal.rs
+@@ -166,11 +166,24 @@
+         // Only `DeviceNotAvailable` and `StreamInvalidated` are fatal, as kira draws it; an ALSA
+         // xrun (`BufferUnderrun`) or `BackendSpecific` must not tear the stream down.
+         let reported = std::sync::atomic::AtomicBool::new(false);
++        let wedged = std::sync::atomic::AtomicBool::new(false);
+         let on_error = move |e: cpal::StreamError| {
+             match e {
+                 cpal::StreamError::DeviceNotAvailable | cpal::StreamError::StreamInvalidated => {
+                     errors.device_died.store(true, Ordering::Release);
+                 }
++                // WOW-BG3 (patch 0030): after a POLLERR cpal's ALSA loop polls a PCM left in an
++                // error state for good: no callback ever again, and the loop spins a whole core
++                // (cpal 0.17.1 prepares the PCM only after an xrun it sees through `avail`). Seen
++                // with PipeWire's ALSA plugin seconds into world mode, as BG3's own stream joined
++                // the graph. Rebuilt like a lost device; the loop
++                // reports it on every pass until the stream drops, so once.
++                cpal::StreamError::BackendSpecific { ref err } if err.description.contains("POLLERR") => {
++                    if wedged.swap(true, Ordering::Relaxed) {
++                        return;
++                    }
++                    errors.device_died.store(true, Ordering::Release);
++                }
+                 // Logged once per stream: this is the audio thread, and a starved device is
+                 // already counted as an underrun.
+                 _ => {

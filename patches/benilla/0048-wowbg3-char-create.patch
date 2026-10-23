@@ -1,0 +1,337 @@
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_create.rs
+@@ -0,0 +1,313 @@
++//! WOW-BG3 (local fork, patch 0048): character creation in the player
++//! build.
++//!
++//! `WOW_BG3_CREATE=NAME,RACE,CLASS,GENDER` (`ChrRaces.dbc` and `ChrClasses.dbc` ids, gender 0 male,
++//! 1 female): at character select, a NAME already on the account is logged in at once; otherwise
++//! the real `CMSG_CHAR_CREATE` goes out (appearance dials 0, the server's start gear), and once the
++//! server answers success the new character is logged in, in the same run. The capture probe
++//! (`WOW_PROBE_CHARCREATE`) only exists in the dev build; this is the path the shipped player build
++//! takes (`link/tools/lifecycle.py` through the launchers' `lc create`).
++//!
++//! Every step rewrites `$WOW_BG3_LINK_DIR/charcreate.json`:
++//! `{Name, Result, Code, Reason, Made, InWorld, Pid, Time}`. Result: `waiting` (no character list
++//! yet), `creating` (request sent), `made` (created, logging in), `exists` (on the account, logging
++//! in), `refused` (the server's `SMSG_CHAR_CREATE` code: 0x31 name in use, 0x4B reserved, 0x34 the
++//! realm's character limit...), `login-refused` (`SMSG_CHARACTER_LOGIN_FAILED`), `timeout` (no
++//! character list in [`ROSTER`] s, or no answer to the request in [`ANSWER`] s), `invalid` (a bad
++//! spec). `InWorld` turns true once the character is in the world. After a refusal or a timeout
++//! benilla stays at character select; the launcher stops it.
++//! With `WOW_CHAR` set as well, char select's own fast path wins and this stays inert.
++
++use std::path::{Path, PathBuf};
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
++
++use benilla_protocol::{messages, CharAction, CharCreateReq};
++use bevy::prelude::*;
++
++use crate::char_select::{send_pick, Roster};
++use crate::net::{
++    CharActionResultMessage, CharListMessage, CharPick, CharRequest, CharacterLoginFailedMessage,
++    EnteredWorldMessage,
++};
++
++/// Seconds to wait for the server's answer to the create request.
++const ANSWER: f32 = 30.0;
++/// Seconds to wait for the first character list (logon, realm, world session).
++const ROSTER: f32 = 90.0;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Step {
++    /// Waiting for the first character list.
++    Roster,
++    /// `Create` sent, waiting for its result.
++    Creating,
++    /// Created but not on the list in hand: the list asked for again.
++    Refetch,
++    /// `Enter` sent, waiting for the world.
++    Entering,
++    /// Nothing left to do.
++    Done,
++}
++
++#[derive(Resource)]
++struct Create {
++    req: CharCreateReq,
++    out: PathBuf,
++    step: Step,
++    since: Instant,
++    result: &'static str,
++    made: bool,
++    in_world: bool,
++    roster: Vec<benilla_protocol::Character>,
++}
++
++impl Create {
++    fn find(&self) -> Option<u64> {
++        self.roster
++            .iter()
++            .find(|ch| ch.name.eq_ignore_ascii_case(&self.req.name))
++            .map(|ch| ch.guid)
++    }
++
++    fn write(&mut self, result: &'static str, code: Option<u8>, reason: &str) {
++        self.result = result;
++        report(&self.out, &self.req.name, result, code, (self.made, self.in_world), reason);
++    }
++}
++
++pub(crate) fn build(app: &mut App, link: PathBuf) {
++    let Ok(spec) = std::env::var("WOW_BG3_CREATE") else {
++        return;
++    };
++    let out = link.join("charcreate.json");
++    if std::env::var_os("WOW_CHAR").is_some() {
++        warn!("wowbg3 create: WOW_CHAR is set too; it wins and WOW_BG3_CREATE={spec:?} is ignored");
++        return;
++    }
++    let Some(req) = parse(&spec) else {
++        error!("wowbg3 create: WOW_BG3_CREATE={spec:?} is not NAME,RACE,CLASS,GENDER (NAME 2 to 12 letters)");
++        report(&out, "", "invalid", None, (false, false), "WOW_BG3_CREATE is not NAME,RACE,CLASS,GENDER");
++        return;
++    };
++    info!(
++        "wowbg3 create: at character select, {} logs in (made first if missing: race {} class {} gender {}); result in {:?}",
++        req.name, req.race, req.class, req.gender, out
++    );
++    let mut c = Create {
++        req,
++        out,
++        step: Step::Roster,
++        since: Instant::now(),
++        result: "waiting",
++        made: false,
++        in_world: false,
++        roster: Vec::new(),
++    };
++    c.write("waiting", None, "no character list yet");
++    app.insert_resource(c).add_systems(Update, drive);
++}
++
++/// `NAME,RACE,CLASS,GENDER`: NAME 2 to 12 ASCII letters (as WoW's name rules), the rest numbers,
++/// gender 0 or 1. The server judges the rest (race and class pair, reserved names).
++fn parse(spec: &str) -> Option<CharCreateReq> {
++    let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
++    let [name, race, class, gender] = parts.as_slice() else {
++        return None;
++    };
++    let ok = (2..=12).contains(&name.len()) && name.chars().all(|ch| ch.is_ascii_alphabetic());
++    if !ok {
++        return None;
++    }
++    let gender: u8 = gender.parse().ok().filter(|g| *g <= 1)?;
++    Some(CharCreateReq {
++        name: (*name).to_string(),
++        race: race.parse().ok()?,
++        class: class.parse().ok()?,
++        gender,
++        skin: 0,
++        face: 0,
++        hair_style: 0,
++        hair_color: 0,
++        facial_hair: 0,
++    })
++}
++
++fn drive(
++    mut c: ResMut<Create>,
++    mut roster: ResMut<Roster>,
++    pick: Res<CharPick>,
++    mut lists: MessageReader<CharListMessage>,
++    mut results: MessageReader<CharActionResultMessage>,
++    mut login_failed: MessageReader<CharacterLoginFailedMessage>,
++    mut entered: MessageReader<EnteredWorldMessage>,
++) {
++    // Every reader drained each frame, so a later step never sees an old message.
++    let mut fresh = false;
++    for m in lists.read() {
++        c.roster = m.characters.clone();
++        fresh = true;
++    }
++    let created = results
++        .read()
++        .filter(|r| r.action == CharAction::Create)
++        .last()
++        .map(|r| r.code);
++    let refused = login_failed.read().last().map(|m| m.result);
++    let in_world = entered.read().count() > 0;
++    let waited = c.since.elapsed().as_secs_f32();
++    match c.step {
++        Step::Roster => {
++            if fresh {
++                if let Some(guid) = c.find() {
++                    info!("wowbg3 create: {} is on the account; logging in", c.req.name);
++                    c.write("exists", None, "on the account; logging in");
++                    send_pick(&mut roster, &pick, guid);
++                    c.step = Step::Entering;
++                } else {
++                    info!(
++                        "wowbg3 create: creating {} (race {} class {} gender {})",
++                        c.req.name, c.req.race, c.req.class, c.req.gender
++                    );
++                    let _ = pick.0.send(CharRequest::Create(c.req.clone()));
++                    c.since = Instant::now();
++                    c.step = Step::Creating;
++                    c.write("creating", None, "create request sent");
++                }
++            } else if waited > ROSTER {
++                error!("wowbg3 create: no character list in {ROSTER} s (logon or realm failed?)");
++                c.write("timeout", None, "no character list (logon or realm failed)");
++                c.step = Step::Done;
++            }
++        }
++        Step::Creating => match created {
++            Some(messages::CHAR_CREATE_SUCCESS) => {
++                c.made = true;
++                if let Some(guid) = c.find() {
++                    info!("wowbg3 create: {} made; logging in", c.req.name);
++                    c.write("made", Some(messages::CHAR_CREATE_SUCCESS), "made; logging in");
++                    send_pick(&mut roster, &pick, guid);
++                    c.step = Step::Entering;
++                } else {
++                    let _ = pick.0.send(CharRequest::Enumerate);
++                    c.since = Instant::now();
++                    c.step = Step::Refetch;
++                }
++            }
++            Some(code) => {
++                let key = code_key(code);
++                error!("wowbg3 create: the server refused {}: {code:#04x} {key}", c.req.name);
++                c.write("refused", Some(code), key);
++                c.step = Step::Done;
++            }
++            None if waited > ANSWER => {
++                error!("wowbg3 create: no answer to creating {} in {ANSWER} s", c.req.name);
++                c.write("timeout", None, "no answer to the create request");
++                c.step = Step::Done;
++            }
++            None => {}
++        },
++        Step::Refetch => {
++            if fresh {
++                if let Some(guid) = c.find() {
++                    info!("wowbg3 create: {} made; logging in", c.req.name);
++                    c.write("made", Some(messages::CHAR_CREATE_SUCCESS), "made; logging in");
++                    send_pick(&mut roster, &pick, guid);
++                    c.step = Step::Entering;
++                } else {
++                    error!("wowbg3 create: {} made but not on the character list", c.req.name);
++                    c.write("timeout", None, "made but not on the character list");
++                    c.step = Step::Done;
++                }
++            } else if waited > ANSWER {
++                error!("wowbg3 create: no character list after making {}", c.req.name);
++                c.write("timeout", None, "no character list after the create");
++                c.step = Step::Done;
++            }
++        }
++        Step::Entering => {
++            if let Some(code) = refused {
++                error!("wowbg3 create: the server refused the login of {}: {code}", c.req.name);
++                c.write("login-refused", Some(code), "SMSG_CHARACTER_LOGIN_FAILED");
++                c.step = Step::Done;
++            } else if in_world {
++                info!("wowbg3 create: {} is in the world", c.req.name);
++                c.in_world = true;
++                let result = c.result;
++                c.write(result, None, "in the world");
++                c.step = Step::Done;
++            }
++        }
++        Step::Done => {}
++    }
++}
++
++fn report(out: &Path, name: &str, result: &str, code: Option<u8>, (made, in_world): (bool, bool), reason: &str) {
++    let time = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_or(0.0, |d| d.as_secs_f64());
++    let code = code.map_or_else(|| "null".to_string(), |c| c.to_string());
++    let body = format!(
++        "{{\"Name\": \"{name}\", \"Result\": \"{result}\", \"Code\": {code}, \"Reason\": \"{reason}\", \
++         \"Made\": {made}, \"InWorld\": {in_world}, \"Pid\": {}, \"Time\": {time:.3}}}\n",
++        std::process::id()
++    );
++    let tmp = out.with_extension("json.tmp");
++    if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, out)) {
++        warn!("wowbg3 create: could not write {out:?}: {e}");
++    }
++}
++
++/// `SMSG_CHAR_CREATE` result codes (vmangos `ResponseCodes`), as the glue strings name them.
++fn code_key(code: u8) -> &'static str {
++    match code {
++        0x2E => "CHAR_CREATE_SUCCESS",
++        0x2F => "CHAR_CREATE_ERROR",
++        0x30 => "CHAR_CREATE_FAILED",
++        0x31 => "CHAR_CREATE_NAME_IN_USE",
++        0x32 => "CHAR_CREATE_DISABLED",
++        0x33 => "CHAR_CREATE_PVP_TEAMS_VIOLATION",
++        0x34 => "CHAR_CREATE_SERVER_LIMIT",
++        0x35 => "CHAR_CREATE_ACCOUNT_LIMIT",
++        0x36 => "CHAR_CREATE_SERVER_QUEUE",
++        0x37 => "CHAR_CREATE_ONLY_EXISTING",
++        0x45 => "CHAR_NAME_NO_NAME",
++        0x46 => "CHAR_NAME_TOO_SHORT",
++        0x47 => "CHAR_NAME_TOO_LONG",
++        0x48 => "CHAR_NAME_INVALID_CHARACTER",
++        0x49 => "CHAR_NAME_MIXED_LANGUAGES",
++        0x4A => "CHAR_NAME_PROFANE",
++        0x4B => "CHAR_NAME_RESERVED",
++        0x4C => "CHAR_NAME_INVALID_APOSTROPHE",
++        0x4D => "CHAR_NAME_MULTIPLE_APOSTROPHES",
++        0x4E => "CHAR_NAME_THREE_CONSECUTIVE",
++        0x4F => "CHAR_NAME_INVALID_SPACE",
++        _ => "CHAR_CREATE_INVALID_NAME",
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn spec_parses_and_rejects() {
++        let r = parse("Galea,1,8,0").expect("spec");
++        assert_eq!((r.name.as_str(), r.race, r.class, r.gender), ("Galea", 1, 8, 0));
++        assert!(parse("Ga1ea,1,8,0").is_none());
++        assert!(parse("G,1,8,0").is_none());
++        assert!(parse("Galea,1,8,2").is_none());
++        assert!(parse("Galea,1,8").is_none());
++        assert!(parse("Abcdefghijklm,1,8,0").is_none());
++    }
++
++    #[test]
++    fn report_is_json() {
++        let dir = std::env::temp_dir().join(format!("wowbg3-create-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let out = dir.join("charcreate.json");
++        report(&out, "Galeb", "refused", Some(0x31), (false, false), code_key(0x31));
++        let text = std::fs::read_to_string(&out).unwrap();
++        assert!(text.starts_with("{\"Name\": \"Galeb\", \"Result\": \"refused\", \"Code\": 49, "));
++        assert!(text.contains("\"Reason\": \"CHAR_CREATE_NAME_IN_USE\", \"Made\": false, \"InWorld\": false, "));
++    }
++}
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -30,6 +30,8 @@
+             return;
+         };
+         info!("wowbg3: streaming the world camera to {:?}", dir);
++        // Patch 0048: WOW_BG3_CREATE makes a missing character and logs it in.
++        crate::wowbg3_create::build(app, PathBuf::from(&dir));
+         // Fights: Young Wolf pulls become BG3 fights (`wowbg3_fight`).
+         crate::wowbg3_fight::build(app, PathBuf::from(&dir));
+         // World mode: BG3 leads the camera, WoW frames go to BG3's compositor.
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -188,6 +188,7 @@
+ mod world_state_ui;
+ // WOW-BG3 fork: the link to the hidden BG3 (camera stream).
+ mod wowbg3;
++mod wowbg3_create;
+ mod wowbg3_cursors;
+ mod wowbg3_fight;
+ mod wowbg3_frames;

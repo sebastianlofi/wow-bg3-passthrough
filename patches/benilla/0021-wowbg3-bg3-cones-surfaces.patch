@@ -1,0 +1,510 @@
+diff --git a/crates/benilla-app/src/wowbg3_fx.rs b/crates/benilla-app/src/wowbg3_fx.rs
+--- a/crates/benilla-app/src/wowbg3_fx.rs
++++ b/crates/benilla-app/src/wowbg3_fx.rs
+@@ -42,9 +42,6 @@
+ // Patch 0012: BG3's route line on WoW's ground (sent as segments, not replayed).
+ #[path = "wowbg3_route.rs"]
+ mod route;
+-// Patch 0020: enemy vision cones on WoW's ground (`Cones.lua`'s list, drawn here).
+-#[path = "wowbg3_cones.rs"]
+-mod cones;
+ 
+ /// A frame whose BG3 wall time is older than this draws nothing.
+ const STALE_SECS: f64 = 0.5;
+@@ -59,6 +56,13 @@
+ /// Texture keys up to this are BG3's per-frame targets, not files (format doc, "Special keys";
+ /// 6, BG3's G-buffer normal, since patch 0012).
+ const SPECIAL_KEYS: u64 = 6;
++/// Patch 0021: a texture key with these top bits names a texture sent inline in the frame (BG3's
++/// sight overlay textures, which BG3 rewrites as enemies turn and walk): bits 32..61 its texel
++/// bytes, bits 0..31 the blob offset of its FXT1 header (texels right after it). The parse renames
++/// each to [`INLINE_KEY`] | its content's hash, so unchanged ones are not uploaded again.
++pub(crate) const SIGHT_INLINE: u64 = 0xc000_0000_0000_0000;
++/// Patch 0021: keys of inline textures after the parse (the replay drops old ones, a few hundred kept).
++pub(crate) const INLINE_KEY: u64 = 0x8000_0000_0000_0000;
+ /// Decoded frames kept to pair with the camera record ([`pick_frame`]).
+ const HISTORY: usize = 8;
+ 
+@@ -355,6 +359,8 @@
+     /// 224 bytes) and set 0 binding 1 (the scene block, its camera axes at +48).
+     pub(crate) cam_b2: Vec<u32>,
+     pub(crate) cam_b1: Vec<u32>,
++    /// Patch 0021: the frame's inline textures (FXT1 bytes) by their renamed keys.
++    pub(crate) inline: Vec<(u64, Arc<Vec<u8>>)>,
+ }
+ 
+ /// BG3's post-processing after the effects (format doc, "Post block").
+@@ -582,7 +588,47 @@
+         });
+     }
+     let post = if post_offset == 0 { None } else { Some(parse_post(b, post_offset)?) };
+-    Some(FxFrame { frame, wall, eye, width, height, draws, blob, post, view: None, cam_b2: Vec::new(), cam_b1: Vec::new() })
++    let mut f = FxFrame { frame, wall, eye, width, height, draws, blob, post, view: None, cam_b2: Vec::new(), cam_b1: Vec::new(), inline: Vec::new() };
++    inline_textures(&mut f);
++    Some(f)
++}
++
++/// Patch 0021: the inline textures' FXT1 copies out of the blob, each draw's key renamed to its
++/// content's ([`SIGHT_INLINE`]); a key that does not fit the blob becomes 3 (neutral).
++fn inline_textures(f: &mut FxFrame) {
++    let mut named: HashMap<u64, u64> = HashMap::new();
++    for d in &mut f.draws {
++        for s in &mut d.sets {
++            for slot in &mut s.slots {
++                let k = match &mut slot.res {
++                    SlotRes::Image(k) | SlotRes::Combined(k, _) => k,
++                    _ => continue,
++                };
++                if *k & SIGHT_INLINE != SIGHT_INLINE {
++                    continue;
++                }
++                let raw = *k;
++                *k = *named.entry(raw).or_insert_with(|| {
++                    let at = (raw & 0xffff_ffff) as usize;
++                    let size = ((raw >> 32) & 0x3fff_ffff) as usize;
++                    let Some(b) = f.blob.get(at..at.saturating_add(TexFile::DATA).saturating_add(size)) else { return 3 };
++                    if b.len() != TexFile::DATA + size || &b[..4] != b"FXT1" {
++                        return 3;
++                    }
++                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
++                    for &x in b {
++                        h ^= u64::from(x);
++                        h = h.wrapping_mul(0x0100_0000_01b3);
++                    }
++                    let key = INLINE_KEY | (h & !SIGHT_INLINE);
++                    if !f.inline.iter().any(|(c, _)| *c == key) {
++                        f.inline.push((key, Arc::new(b.to_vec())));
++                    }
++                    key
++                });
++            }
++        }
++    }
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+@@ -1269,6 +1315,18 @@
+                         set.samplers.insert(k, v);
+                     }
+                 }
++                // Patch 0021: inline textures come with the frame.
++                if let Some(k) = tex.filter(|k| *k & INLINE_KEY != 0 && !set.textures.contains_key(k)) {
++                    match frame.inline.iter().find(|(c, _)| *c == k).and_then(|(_, b)| parse_tex(b.to_vec())) {
++                        Some(t) => {
++                            set.textures.insert(k, Arc::new(t));
++                        }
++                        None => {
++                            set.unusable.insert(k);
++                        }
++                    }
++                    continue;
++                }
+                 if let Some(k) = tex.filter(|k| *k > SPECIAL_KEYS && !set.textures.contains_key(k)) {
+                     let ready = matches!(textures.get(&k), Some(Slot::Ready(_)));
+                     if !ready && budget == 0 {
+@@ -1351,7 +1409,6 @@
+     );
+     let link_dir = std::env::var_os("WOW_BG3_LINK_DIR").map(PathBuf::from);
+     route::build(app, tav_dir.clone(), link_dir.clone());
+-    cones::build(app, link_dir.clone());
+     app.insert_resource(FxLoader {
+         tav_dir,
+         fx_dir,
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -64,6 +64,8 @@
+ /// Patch 0020: Tav's capsule for the decal mask, yards round her root: radius, then the height
+ /// range above her feet (her feet's own ground stays a decal receiver).
+ const TAV_MASK: [f32; 3] = [0.7, 0.25, 2.6];
++/// Patch 0021: inline (sight overlay) textures kept uploaded.
++const INLINE_KEEP: usize = 256;
+ 
+ pub(crate) fn build(app: &mut App) {
+     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<crate::wowbg3_tav::TavFeet>::default());
+@@ -484,6 +486,8 @@
+     pipes: HashMap<PipeKey, Option<Arc<Pipe>>>,
+     samplers: HashMap<u64, Option<wgpu::Sampler>>,
+     textures: HashMap<u64, Option<GpuTex>>,
++    /// Patch 0021: inline texture keys in upload order (the oldest go past [`INLINE_KEEP`]).
++    inline_order: std::collections::VecDeque<u64>,
+     targets: Option<Targets>,
+     composites: HashMap<wgpu::TextureFormat, Option<wgpu::RenderPipeline>>,
+     /// The set `ready` was built from (rebuilt only when the main world sends a new one).
+@@ -1154,6 +1158,16 @@
+         }
+         let ok = made.is_ok();
+         self.textures.insert(key, made.ok());
++        // Patch 0021: BG3's sight textures change as enemies move; old copies are dropped (a bind
++        // group still using one keeps it alive).
++        if key & crate::wowbg3_fx::INLINE_KEY != 0 {
++            self.inline_order.push_back(key);
++            while self.inline_order.len() > INLINE_KEEP {
++                if let Some(old) = self.inline_order.pop_front() {
++                    self.textures.remove(&old);
++                }
++            }
++        }
+         ok
+     }
+ 
+diff --git a/crates/benilla-app/src/wowbg3_cones.rs b/crates/benilla-app/src/wowbg3_cones.rs
+deleted file mode 100644
+--- a/crates/benilla-app/src/wowbg3_cones.rs
++++ /dev/null
+@@ -1,355 +0,0 @@
+-//! WOW-BG3 (local fork, patch 0020): enemy vision cones on WoW's ground. From
+-//! playtesting: the cones must show, while sneaking and with Shift. BG3 drew none over
+-//! the void (harness: a sneaking Tav, a hostile wolf stand-in in view, Shift held: no cone
+-//! in BG3's own frame and no draw for one), and one drawn by BG3 would lie on BG3's floor, not on
+-//! WoW's hills. `Cones.lua` (BG3's client) lists the hostile mobs whose stand-in would show one in
+-//! `cones.bin` in the link folder: "CON1", seq u32, flags u32 (1 Tav sneaking, 2 Shift held), n u32,
+-//! n x (guid hi u32, guid lo u32, sight range f32 metres, field of view f32 degrees, flags u32),
+-//! seq again. Each cone is a fan at the WoW mob, along its facing (its stand-in looks the same way,
+-//! `Mirrors.lua`), as long as BG3's sight range and as wide as its field of view, projected onto
+-//! WoW's receiving surfaces in tiles (the route line's ground-decal projector) so it lies on hills,
+-//! in BG3's red, unlit and unfogged. A file older than [`STALE_SECS`] (BG3 or world mode gone)
+-//! shows nothing. Child of `wowbg3_fx`.
+-
+-use std::collections::HashMap;
+-use std::path::PathBuf;
+-
+-use benilla_world::decal::{DecalFrame, WorldDecal};
+-use benilla_world::particles::buffer::{begin_effect_frame, EffectVertex, WorldEffectDraw};
+-use benilla_world::view::WorldCamera;
+-use benilla_world::world_point::WorldPoint;
+-use bevy::asset::RenderAssetUsages;
+-use bevy::prelude::*;
+-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+-
+-use crate::net::{Guid, SelfPlayer};
+-
+-/// Metres per yard (BG3 to WoW).
+-const YD: f32 = 0.9144;
+-/// A cone file this old (seconds) shows nothing: `Cones.lua` rewrites it at least once a second.
+-const STALE_SECS: f32 = 2.5;
+-/// Projection tile edge (yards): each tile is projected around WoW's ground at its middle.
+-const TILE: f32 = 4.0;
+-/// How far (yards) WoW's terrain may lie from the mob's height and still be the tile's ground.
+-const SNAP: f32 = 6.0;
+-/// Vertical reach (yards) of a tile's projection around its ground.
+-const REACH: f32 = 3.0;
+-/// BG3's red (cones of enemies that would attack), gamma RGB.
+-const RED: [f32; 3] = [0.86, 0.12, 0.08];
+-/// Texture size of a cone's shape (along x across).
+-const TEX: u32 = 128;
+-
+-/// One cone from `cones.bin`.
+-#[derive(Clone, Copy, Debug, PartialEq)]
+-pub(crate) struct Cone {
+-    pub(crate) guid: u64,
+-    /// Sight range (metres) and field of view (degrees), BG3's.
+-    pub(crate) range: f32,
+-    pub(crate) fov: f32,
+-}
+-
+-/// Decodes `cones.bin`: (seq, flags, cones), `None` when torn or foreign.
+-pub(crate) fn decode_cones(b: &[u8]) -> Option<(u32, u32, Vec<Cone>)> {
+-    const REC: usize = 20;
+-    if b.len() < 20 || &b[0..4] != b"CON1" {
+-        return None;
+-    }
+-    let u = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+-    let f = |o: usize| b.get(o..o + 4).map(|s| f32::from_le_bytes(s.try_into().unwrap()));
+-    let (seq, flags, n) = (u(4)?, u(8)?, u(12)? as usize);
+-    if n > 256 || b.len() != 16 + REC * n + 4 || u(16 + REC * n)? != seq {
+-        return None;
+-    }
+-    let mut cones = Vec::with_capacity(n);
+-    for i in 0..n {
+-        let o = 16 + REC * i;
+-        let (range, fov) = (f(o + 8)?, f(o + 12)?);
+-        if !(range.is_finite() && range > 0.0 && range < 200.0 && fov.is_finite() && fov > 0.0) {
+-            continue;
+-        }
+-        cones.push(Cone { guid: (u64::from(u(o)?) << 32) | u64::from(u(o + 4)?), range, fov: fov.min(180.0) });
+-    }
+-    Some((seq, flags, cones))
+-}
+-
+-/// The fan's half-width across its frame (yards) for range `r` (yards) and field of view `fov`
+-/// (degrees, at most 180).
+-pub(crate) fn half_width(r: f32, fov: f32) -> f32 {
+-    r * (fov.to_radians() * 0.5).sin().max(0.05)
+-}
+-
+-/// The fan's weight at (x along the facing, z across) for range `r` and field of view `fov`:
+-/// a translucent fill, brighter toward the mob, and a stronger rim at the arc and the sides.
+-pub(crate) fn fan_alpha(x: f32, z: f32, r: f32, fov: f32) -> f32 {
+-    let d = (x * x + z * z).sqrt() / r;
+-    let half = fov.to_radians() * 0.5;
+-    let ang = z.abs().atan2(x);
+-    if d > 1.0 || ang > half {
+-        return 0.0;
+-    }
+-    let rim_arc = (1.0 - d) * r; // yards from the arc
+-    let rim_side = (half - ang) * d * r; // about yards from the nearer side
+-    let rim = rim_arc.min(rim_side);
+-    let fill = 0.16 + 0.14 * (1.0 - d);
+-    if rim < 0.35 { 0.62 } else { fill }
+-}
+-
+-/// A cone's shape for one field of view: u along the facing (0 the mob, 1 the range), v across
+-/// (0..1 over twice the half-width), white with the fan's weight in alpha.
+-fn fan_texture(fov: f32) -> Image {
+-    // Drawn for a range of 16 m (the rim's width in yards scales with it; close enough for 11 to 20 m).
+-    let r = 16.0 / YD;
+-    let hw = half_width(r, fov);
+-    let mut px = Vec::with_capacity((TEX * TEX * 4) as usize);
+-    for vy in 0..TEX {
+-        let z = ((vy as f32 + 0.5) / TEX as f32 * 2.0 - 1.0) * hw;
+-        for ux in 0..TEX {
+-            let x = (ux as f32 + 0.5) / TEX as f32 * r;
+-            let a = fan_alpha(x, z, r, fov);
+-            px.extend_from_slice(&[255, 255, 255, (a * 255.0).round() as u8]);
+-        }
+-    }
+-    Image::new(
+-        Extent3d { width: TEX, height: TEX, depth_or_array_layers: 1 },
+-        TextureDimension::D2,
+-        px,
+-        TextureFormat::Rgba8Unorm,
+-        RenderAssetUsages::RENDER_WORLD,
+-    )
+-}
+-
+-/// A projected cone.
+-struct Drawn {
+-    /// Where it was projected from: the mob's position, facing (radians) and the receiving surfaces.
+-    at: Vec3,
+-    yaw: f32,
+-    surfaces: usize,
+-    strip: Vec<EffectVertex>,
+-    tex: Handle<Image>,
+-}
+-
+-#[derive(Resource)]
+-struct Cones {
+-    path: PathBuf,
+-    frame: u64,
+-    stamp: Option<std::time::SystemTime>,
+-    last_seq: u32,
+-    flags: u32,
+-    list: Vec<Cone>,
+-    drawn: HashMap<u64, Drawn>,
+-    textures: HashMap<u32, Handle<Image>>,
+-    owner: Entity,
+-    logged: u32,
+-}
+-
+-pub(super) fn build(app: &mut App, link_dir: Option<PathBuf>) {
+-    let Some(dir) = link_dir else { return };
+-    let path = dir.join("cones.bin");
+-    app.add_systems(Startup, move |mut commands: Commands| {
+-        let owner = commands.spawn(Name::new("wowbg3 vision cones")).id();
+-        commands.insert_resource(Cones {
+-            path: path.clone(),
+-            frame: 0,
+-            stamp: None,
+-            last_seq: 0,
+-            flags: 0,
+-            list: Vec::new(),
+-            drawn: HashMap::new(),
+-            textures: HashMap::new(),
+-            owner,
+-            logged: 0,
+-        });
+-    })
+-    .add_systems(Update, (read_cones, project_cones.after(read_cones)))
+-    .add_systems(PostUpdate, push_cones.after(begin_effect_frame));
+-}
+-
+-fn read_cones(c: Option<ResMut<Cones>>) {
+-    let Some(mut c) = c else { return };
+-    c.frame += 1;
+-    if c.frame % 3 != 0 {
+-        return;
+-    }
+-    let md = std::fs::metadata(&c.path).ok();
+-    let modified = md.as_ref().and_then(|m| m.modified().ok());
+-    let fresh = modified.is_some_and(|m| m.elapsed().is_ok_and(|e| e.as_secs_f32() < STALE_SECS));
+-    if !fresh {
+-        if !c.list.is_empty() || c.flags != 0 {
+-            c.list.clear();
+-            c.flags = 0;
+-            c.drawn.clear();
+-        }
+-        return;
+-    }
+-    if modified == c.stamp {
+-        return;
+-    }
+-    let Ok(raw) = std::fs::read(&c.path) else { return };
+-    let Some((seq, flags, list)) = decode_cones(&raw) else { return };
+-    c.stamp = modified;
+-    if seq == c.last_seq {
+-        return;
+-    }
+-    c.last_seq = seq;
+-    if list != c.list || flags != c.flags {
+-        if c.logged < 20 && list.len() != c.list.len() {
+-            c.logged += 1;
+-            info!(
+-                "wowbg3 cones: {} cones (Tav sneaking {}, Shift {}){}",
+-                list.len(),
+-                flags & 1 != 0,
+-                flags & 2 != 0,
+-                list.first().map_or(String::new(), |k| format!(", first {:016x} {:.1} m {:.0} degrees", k.guid, k.range, k.fov))
+-            );
+-        }
+-        c.drawn.retain(|g, _| list.iter().any(|k| k.guid == *g));
+-        c.list = list;
+-        c.flags = flags;
+-    }
+-}
+-
+-/// Projects each listed cone at its WoW mob when the mob moved or turned (or a tile arrived).
+-fn project_cones(
+-    c: Option<ResMut<Cones>>,
+-    units: Query<(&Guid, &Transform), Without<SelfPlayer>>,
+-    decals: WorldDecal,
+-    world: WorldPoint,
+-    mut images: ResMut<Assets<Image>>,
+-) {
+-    let Some(mut c) = c else { return };
+-    if c.list.is_empty() {
+-        if !c.drawn.is_empty() {
+-            c.drawn.clear();
+-        }
+-        return;
+-    }
+-    let surfaces = decals.receiver_count();
+-    let Cones { list, drawn, textures, .. } = &mut *c;
+-    for k in list.iter() {
+-        let Some((_, tf)) = units.iter().find(|(g, _)| g.0 == k.guid) else {
+-            drawn.remove(&k.guid);
+-            continue;
+-        };
+-        let at = tf.translation;
+-        // WoW orientation: a unit at yaw o faces (-sin o, 0, -cos o) in Bevy.
+-        let yaw = tf.rotation.to_euler(EulerRot::YXZ).0;
+-        if let Some(d) = drawn.get(&k.guid) {
+-            let turned = ((d.yaw - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs();
+-            if d.surfaces == surfaces && d.at.distance_squared(at) < 0.15 * 0.15 && turned < 0.03 {
+-                continue;
+-            }
+-        }
+-        let fov_key = k.fov.round().clamp(1.0, 180.0) as u32;
+-        let tex = textures.entry(fov_key).or_insert_with(|| images.add(fan_texture(fov_key as f32))).clone();
+-        let r = k.range / YD;
+-        let hw = half_width(r, fov_key as f32);
+-        let dir = Vec2::new(-yaw.sin(), -yaw.cos());
+-        let perp = Vec2::new(-dir.y, dir.x);
+-        let mut strip = Vec::new();
+-        let (nx, nz) = ((r / TILE).ceil().max(1.0) as usize, (2.0 * hw / TILE).ceil().max(1.0) as usize);
+-        let (tx, tz) = (r / nx as f32, 2.0 * hw / nz as f32);
+-        for i in 0..nx {
+-            for j in 0..nz {
+-                let (xc, zc) = (tx * (i as f32 + 0.5), -hw + tz * (j as f32 + 0.5));
+-                // Tiles wholly outside the fan (corners near the mob on a wide one) are skipped.
+-                let near = Vec2::new((xc - tx * 0.5).max(0.0), (zc.abs() - tz * 0.5).max(0.0));
+-                if near.length() > r || near.y.atan2(xc + tx * 0.5) > (fov_key as f32).to_radians() * 0.5 + 0.05 {
+-                    continue;
+-                }
+-                let flat = Vec2::new(at.x, at.z) + dir * xc + perp * zc;
+-                let guess = Vec3::new(flat.x, at.y, flat.y);
+-                let ground = world.terrain_height_under(guess).filter(|g| (g - at.y).abs() < SNAP).unwrap_or(at.y);
+-                let frame = DecalFrame {
+-                    center: Vec3::new(flat.x, ground, flat.y),
+-                    sin: -dir.y,
+-                    cos: dir.x,
+-                    min_x: -tx * 0.5,
+-                    max_x: tx * 0.5,
+-                    min_z: -tz * 0.5,
+-                    max_z: tz * 0.5,
+-                    min_y: -REACH,
+-                    max_y: REACH,
+-                };
+-                let from = strip.len();
+-                decals.project(&mut strip, &frame, |_| 1.0, |u, v| [(xc + u) / r, (zc + v + hw) / (2.0 * hw)]);
+-                for v in &mut strip[from..] {
+-                    v.color[0] = RED[0];
+-                    v.color[1] = RED[1];
+-                    v.color[2] = RED[2];
+-                }
+-            }
+-        }
+-        drawn.insert(k.guid, Drawn { at, yaw, surfaces, strip, tex });
+-    }
+-}
+-
+-/// Draws the projected cones every frame: alpha blended, unlit, unfogged, at the selection ring's
+-/// rung (over the ground, under everything else), like BG3's route line.
+-fn push_cones(c: Option<Res<Cones>>, cam: Query<Entity, With<WorldCamera>>, mut draw: WorldEffectDraw) {
+-    let Some(c) = c else { return };
+-    if c.drawn.is_empty() {
+-        return;
+-    }
+-    let Ok(cam) = cam.single() else { return };
+-    for d in c.drawn.values() {
+-        if d.strip.is_empty() {
+-            continue;
+-        }
+-        let mut batch = draw
+-            .batch(cam, d.tex.id())
+-            .alpha()
+-            .anchored(d.at)
+-            .rung(benilla_world::sky_order::Rung::RING, benilla_world::sky_order::Rung::DECAL_RASTER)
+-            .owner(c.owner);
+-        batch.vertices(&d.strip);
+-        batch.tris();
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    fn record(seq: u32, flags: u32, cones: &[(u64, f32, f32)]) -> Vec<u8> {
+-        let mut b = b"CON1".to_vec();
+-        for v in [seq, flags, cones.len() as u32] {
+-            b.extend_from_slice(&v.to_le_bytes());
+-        }
+-        for (g, r, f) in cones {
+-            b.extend_from_slice(&((g >> 32) as u32).to_le_bytes());
+-            b.extend_from_slice(&(*g as u32).to_le_bytes());
+-            b.extend_from_slice(&r.to_le_bytes());
+-            b.extend_from_slice(&f.to_le_bytes());
+-            b.extend_from_slice(&0u32.to_le_bytes());
+-        }
+-        b.extend_from_slice(&seq.to_le_bytes());
+-        b
+-    }
+-
+-    #[test]
+-    fn decodes_cones() {
+-        let b = record(5, 1, &[(0xf130_0001_2b01_3858, 16.0, 90.0)]);
+-        let (seq, flags, list) = decode_cones(&b).expect("decodes");
+-        assert_eq!((seq, flags, list.len()), (5, 1, 1));
+-        assert_eq!(list[0], Cone { guid: 0xf130_0001_2b01_3858, range: 16.0, fov: 90.0 });
+-        let mut torn = b.clone();
+-        let n = torn.len();
+-        torn[n - 1] ^= 1;
+-        assert!(decode_cones(&torn).is_none());
+-        assert!(decode_cones(&b[..b.len() - 2]).is_none());
+-        assert_eq!(decode_cones(&record(6, 0, &[])).unwrap().2.len(), 0);
+-    }
+-
+-    #[test]
+-    fn fans_out_along_the_facing() {
+-        let (r, fov) = (17.5, 90.0);
+-        // Inside, filled; behind the mob, past the range or outside the field of view: nothing.
+-        assert!(fan_alpha(8.0, 0.0, r, fov) > 0.1);
+-        assert_eq!(fan_alpha(-1.0, 0.0, r, fov), 0.0);
+-        assert_eq!(fan_alpha(18.0, 0.0, r, fov), 0.0);
+-        assert_eq!(fan_alpha(5.0, 6.0, r, fov), 0.0);
+-        // The rim is stronger than the fill.
+-        assert!(fan_alpha(17.4, 0.0, r, fov) > fan_alpha(8.0, 0.0, r, fov));
+-        assert!((half_width(r, 90.0) - r * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
+-    }
+-}

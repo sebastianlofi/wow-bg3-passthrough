@@ -1,0 +1,424 @@
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -634,6 +634,7 @@
+     mut buttons: MessageWriter<bevy::input::mouse::MouseButtonInput>,
+     (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
+     world_cursor: Res<crate::target::WorldCursor>,
++    quest: Res<crate::ui_quest::QuestGiver>,
+ ) {
+     use bevy::input::mouse::MouseButtonInput;
+     use bevy::input::ButtonState;
+@@ -661,11 +662,15 @@
+         | (u32::from(mirrored) << 2);
+     // Patch 0009: WoW's cursor kind and its grayed state follow (BG3 shows its closest cursor).
+     let kind = crate::wowbg3_fight::cursor_code(world_cursor.kind);
+-    let key = flags | (kind << 8) | (u32::from(world_cursor.unable) << 16);
++    // Patch 0047: the hovered unit's quest-giver status (WoW's DIALOG_STATUS,
++    // 0 none), for WoW's quest cursor in BG3 (`WowCursor.lua`).
++    let status = hovered.guid.filter(|_| hovered.target.is_some()).and_then(|g| quest.status(g)).unwrap_or(0);
++    let key = flags | (kind << 8) | (u32::from(world_cursor.unable) << 16) | (status.min(255) << 24);
+     if key != link.hover_flags || link.hover_seq == 0 {
+         link.hover_flags = key;
+         link.hover_seq = link.hover_seq.wrapping_add(1).max(1);
+-        let mut rec = [0u8; 28];
++        // 36 bytes since patch 0047: the 28 of 0019, the status at 28 and the seq again at 32.
++        let mut rec = [0u8; 36];
+         rec[0..4].copy_from_slice(b"WBH1");
+         rec[4..8].copy_from_slice(&link.hover_seq.to_le_bytes());
+         rec[8..12].copy_from_slice(&flags.to_le_bytes());
+@@ -673,6 +678,8 @@
+         rec[16..20].copy_from_slice(&kind.to_le_bytes());
+         rec[20..24].copy_from_slice(&u32::from(world_cursor.unable).to_le_bytes());
+         rec[24..28].copy_from_slice(&link.hover_seq.to_le_bytes());
++        rec[28..32].copy_from_slice(&status.to_le_bytes());
++        rec[32..36].copy_from_slice(&link.hover_seq.to_le_bytes());
+         let tmp = link.hover.with_extension("tmp");
+         if std::fs::write(&tmp, rec).is_ok() {
+             let _ = std::fs::rename(&tmp, &link.hover);
+--- a/crates/benilla-app/src/target/mod.rs
++++ b/crates/benilla-app/src/target/mod.rs
+@@ -284,6 +284,10 @@
+ impl Plugin for TargetPlugin {
+     fn build(&self, app: &mut App) {
+         app.add_observer(on_cvar);
++        // WOW-BG3 (patch 0047): BG3's Talk on a WoW unit, in world mode only.
++        if let Some(link) = click::Bg3Use::from_env() {
++            app.insert_resource(link);
++        }
+         app.init_resource::<Selection>()
+             .init_resource::<ClickConfig>()
+             .init_resource::<AssistAttack>()
+@@ -346,6 +350,8 @@
+                         click::act_on_arrival,
+                         click::act_on_right_click,
+                         click::act_on_interact,
++                        // WOW-BG3 (patch 0047): BG3's Talk on a WoW unit (`wowuse.bin`).
++                        click::act_on_bg3_use,
+                     )
+                         .chain(),
+                     // The loot close's guid-scoped deselect.
+--- a/crates/benilla-app/src/target/click.rs
++++ b/crates/benilla-app/src/target/click.rs
+@@ -1006,6 +1006,72 @@
+             cursor_mode::classify(&set.p0(), &pick.hovered, &pick.object);
+         interact(&mut set.p1(), &pick, Select::OnAttack(&mut selection));
+     }
++}
++
++/// WOW-BG3 (local fork, patch 0047): BG3's own "Talk" on a WoW NPC (its context
++/// menu, or a left click on the stand-in) reaches WoW. `link/wowuse.bin` (BG3 -> WoW, 24 bytes,
++/// little endian): `WUS1`, seq u32, guid lo u32, guid hi u32, verb u32 (1 talk), seq again. A new seq
++/// runs the right-click dispatcher's talk on that unit, as a right click would: in reach the NPC's
++/// service (gossip, quests, vendor...), out of reach the walk, which world mode turns into BG3's
++/// errand. The record found at the first read is history. Logs `wowbg3 use: talk GUID`.
++#[derive(Resource)]
++pub(crate) struct Bg3Use {
++    path: std::path::PathBuf,
++    last: Option<u32>,
++    frame: u32,
++}
++
++impl Bg3Use {
++    /// In world mode (`WOW_BG3_LEAD` and the link folder) only.
++    pub(crate) fn from_env() -> Option<Self> {
++        std::env::var_os("WOW_BG3_LEAD")?;
++        let dir = std::env::var_os("WOW_BG3_LINK_DIR")?;
++        Some(Self { path: std::path::PathBuf::from(dir).join("wowuse.bin"), last: None, frame: 0 })
++    }
++}
++
++/// Decodes `wowuse.bin`: (seq, guid, verb); `None` when torn or foreign.
++pub(crate) fn decode_use(b: &[u8]) -> Option<(u32, u64, u32)> {
++    if b.len() < 24 || b.get(0..4)? != b"WUS1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    let seq = u(4);
++    (seq != 0 && seq == u(20)).then(|| (seq, u64::from(u(8)) | (u64::from(u(12)) << 32), u(16)))
++}
++
++pub(super) fn act_on_bg3_use(
++    mut dispatch: Dispatch,
++    index: Res<crate::net::GuidIndex>,
++    link: Option<ResMut<Bg3Use>>,
++) {
++    let Some(mut link) = link else { return };
++    link.frame = link.frame.wrapping_add(1);
++    if link.frame % 3 != 0 {
++        return;
++    }
++    let Some((seq, guid, verb)) = std::fs::read(&link.path).ok().and_then(|b| decode_use(&b)) else {
++        return;
++    };
++    let first = link.last.is_none();
++    if link.last == Some(seq) {
++        return;
++    }
++    link.last = Some(seq);
++    if first {
++        return;
++    }
++    if verb != 1 {
++        warn!("wowbg3 use: verb {verb} on {guid:#x} not known (1 is talk)");
++        return;
++    }
++    let Some(&entity) = index.0.get(&guid) else {
++        info!("wowbg3 use: talk {guid:#x}: not in WoW's world here");
++        return;
++    };
++    let d2 = dispatch.dist_sq(entity).unwrap_or(f32::INFINITY);
++    info!("wowbg3 use: talk {guid:#x} ({:.1} yd)", d2.sqrt());
++    dispatch.talk(entity, guid, d2 <= SERVICE_RANGE_SQ, true);
+ }
+ 
+ /// The verb an approach owed, once it arrived (`0x60fa20`, run at the stop): the dispatcher alone,
+--- a/crates/benilla-app/src/ui_merchant/mod.rs
++++ b/crates/benilla-app/src/ui_merchant/mod.rs
+@@ -115,6 +115,10 @@
+                     // feed follows `UnitFeed`: `MERCHANT_SHOW`'s paint reads the item and
+                     // player-requirement stores for `GetMerchantItemInfo`'s `isUsable`.
+                     close_npc_session_out_of_range::<MerchantOpen>.before(feed_merchant),
++                    // WOW-BG3 (patch 0047): in world mode BG3's trade screen takes the vendor.
++                    hand_vendor_to_bg3
++                        .after(close_npc_session_out_of_range::<MerchantOpen>)
++                        .before(feed_merchant),
+                     feed_merchant.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
+                     // Before `feed_char`: the `UNIT_INVENTORY_CHANGED` a repair fires refreshes the
+                     // Repair All button from this total (`PaperDollFrame.lua:717-724`).
+@@ -125,6 +129,42 @@
+                 ),
+             );
+     }
++}
++
++/// WOW-BG3 (local fork, patch 0047): in world mode a WoW vendor opens BG3's
++/// trade screen instead of WoW's merchant window. When WoW's merchant opens on a creature (the
++/// `SMSG_LIST_INVENTORY` that would raise `MERCHANT_SHOW`), `link/wowtrade.bin` (WoW -> BG3, 20
++/// bytes, little endian: `WTR1`, seq u32, vendor guid lo u32, hi u32, seq again) names the vendor
++/// (`Interact.lua` opens BG3's trade with its stand-in) and WoW's window is closed before it shows
++/// (the vendor's list is cleared; a merchant has no close packet). Logs `wowbg3 trade: ...`.
++fn hand_vendor_to_bg3(
++    mut open: ResMut<MerchantOpen>,
++    mut state: Local<Option<(std::path::PathBuf, u32)>>,
++    mut armed: Local<Option<bool>>,
++) {
++    if armed.is_none() {
++        let on = std::env::var_os("WOW_BG3_LEAD").is_some();
++        *state = std::env::var_os("WOW_BG3_LINK_DIR").filter(|_| on).map(|d| (std::path::PathBuf::from(d).join("wowtrade.bin"), 0));
++        *armed = Some(state.is_some());
++    }
++    let (Some((path, seq)), Some(vendor)) = (state.as_mut(), open.vendor) else { return };
++    // A creature only (high guid 0xF130...); a player's or an item's list stays WoW's.
++    if vendor >> 48 != 0xF130 {
++        return;
++    }
++    *seq = seq.wrapping_add(1).max(1);
++    let mut rec = [0u8; 20];
++    rec[0..4].copy_from_slice(b"WTR1");
++    rec[4..8].copy_from_slice(&seq.to_le_bytes());
++    rec[8..12].copy_from_slice(&(vendor as u32).to_le_bytes());
++    rec[12..16].copy_from_slice(&((vendor >> 32) as u32).to_le_bytes());
++    rec[16..20].copy_from_slice(&seq.to_le_bytes());
++    let tmp = path.with_extension("tmp");
++    match std::fs::write(&tmp, rec).and_then(|()| std::fs::rename(&tmp, &*path)) {
++        Ok(()) => info!("wowbg3 trade: vendor {vendor:#x} to BG3's trade screen ({} items); WoW's window closed", open.items.len()),
++        Err(e) => warn!("wowbg3 trade: cannot write {path:?}: {e}"),
++    }
++    open.clear();
+ }
+ 
+ /// The one `BuyResult` code the reference shows nothing for: `0x5dcde7`'s jump table sends 6 to
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_cursors.rs
+@@ -0,0 +1,210 @@
++//! WOW-BG3 (local fork, patch 0047): WoW's quest cursors for BG3, written once
++//! from the player's own WoW files so the release needs no Python (`link/tools/wowcursor.py` is the
++//! harness twin; same layout and scaling). In world mode, at start, when any is missing:
++//! `<SE>/wow-bg3/cursors/quest-available.cur`, `quest-available-pressed.cur`, `quest-turnin.cur`,
++//! `quest-turnin-pressed.cur`: one-image Windows .cur files as BG3's own (32 x 32, 32-bit BGRA
++//! bottom-up with an empty AND mask, hotspot 0,0), the icon (`Interface\GossipFrame\
++//! AvailableQuestIcon.blp`, `ActiveQuestIcon.blp`) cropped to its drawn box (alpha) and scaled (Lanczos-3, as
++//! Pillow's LANCZOS, on premultiplied alpha) to 30 px on its long side at 1,1, or 26 px at 3,3
++//! pressed. `WowCursor.lua` points two unused BG3 cursor types at them. Off-thread; logs
++//! `wowbg3 cursors:`.
++
++use std::path::{Path, PathBuf};
++
++use bevy::prelude::*;
++
++use benilla_assets::{AssetSet, LockRecover, WorldAssets};
++
++const SIZE: usize = 32;
++const ICONS: [(&str, &str); 2] = [
++    ("quest-available", "Interface\\GossipFrame\\AvailableQuestIcon.blp"),
++    ("quest-turnin", "Interface\\GossipFrame\\ActiveQuestIcon.blp"),
++];
++
++pub(crate) fn build(app: &mut App, link: PathBuf) {
++    if std::env::var_os("WOW_BG3_LEAD").is_none() {
++        return;
++    }
++    let Some(dir) = link.parent().map(|p| p.join("cursors")) else { return };
++    app.insert_resource(CursorDir(dir)).add_systems(Startup, write_cursors.after(AssetSet::Open));
++}
++
++#[derive(Resource)]
++struct CursorDir(PathBuf);
++
++fn write_cursors(dir: Res<CursorDir>, assets: Option<Res<WorldAssets>>) {
++    let dir = dir.0.clone();
++    let names = ["quest-available", "quest-available-pressed", "quest-turnin", "quest-turnin-pressed"];
++    if names.iter().all(|n| dir.join(format!("{n}.cur")).exists()) {
++        return;
++    }
++    let Some(assets) = assets else { return };
++    let chain = assets.chain.clone();
++    let _ = std::thread::Builder::new().name("wowbg3-cursors".into()).spawn(move || {
++        for (stem, path) in ICONS {
++            let icon = chain
++                .lock_recover()
++                .read_file(path)
++                .map_err(|e| format!("{e:#}"))
++                .and_then(|b| benilla_formats::blp_to_rgba(&b).map_err(|e| format!("{e:#}")));
++            let (w, h, rgba) = match icon {
++                Ok(v) => v,
++                Err(e) => {
++                    warn!("wowbg3 cursors: {path}: {e}");
++                    continue;
++                }
++            };
++            for pressed in [false, true] {
++                let img = cursor_image(&rgba, w as usize, h as usize, pressed);
++                let name = format!("{stem}{}.cur", if pressed { "-pressed" } else { "" });
++                match write(&dir, &name, &cur_bytes(&img)) {
++                    Ok(p) => info!("wowbg3 cursors: wrote {p:?}"),
++                    Err(e) => warn!("wowbg3 cursors: {name}: {e}"),
++                }
++            }
++        }
++    });
++}
++
++fn write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
++    std::fs::create_dir_all(dir)?;
++    let p = dir.join(name);
++    let tmp = p.with_extension("tmp");
++    std::fs::write(&tmp, bytes)?;
++    std::fs::rename(&tmp, &p)?;
++    Ok(p)
++}
++
++/// A one-image .cur: header, entry, BITMAPINFOHEADER (height doubled), BGRA rows bottom-up, mask.
++fn cur_bytes(rgba: &[u8]) -> Vec<u8> {
++    let (w, h) = (SIZE as u32, SIZE as u32);
++    let mut px = Vec::with_capacity(SIZE * SIZE * 4);
++    for y in (0..SIZE).rev() {
++        for x in 0..SIZE {
++            let s = (y * SIZE + x) * 4;
++            px.extend_from_slice(&[rgba[s + 2], rgba[s + 1], rgba[s], rgba[s + 3]]);
++        }
++    }
++    let mask = vec![0u8; SIZE * SIZE / 8];
++    let mut bmp = Vec::new();
++    for v in [40u32] {
++        bmp.extend_from_slice(&v.to_le_bytes());
++    }
++    bmp.extend_from_slice(&(w as i32).to_le_bytes());
++    bmp.extend_from_slice(&((h * 2) as i32).to_le_bytes());
++    bmp.extend_from_slice(&1u16.to_le_bytes());
++    bmp.extend_from_slice(&32u16.to_le_bytes());
++    bmp.extend_from_slice(&0u32.to_le_bytes());
++    bmp.extend_from_slice(&((px.len() + mask.len()) as u32).to_le_bytes());
++    for _ in 0..4 {
++        bmp.extend_from_slice(&0u32.to_le_bytes());
++    }
++    bmp.extend_from_slice(&px);
++    bmp.extend_from_slice(&mask);
++    let mut out = Vec::new();
++    out.extend_from_slice(&0u16.to_le_bytes());
++    out.extend_from_slice(&2u16.to_le_bytes());
++    out.extend_from_slice(&1u16.to_le_bytes());
++    out.extend_from_slice(&[w as u8, h as u8, 0, 0]);
++    out.extend_from_slice(&0u16.to_le_bytes()); // hotspot x
++    out.extend_from_slice(&0u16.to_le_bytes()); // hotspot y
++    out.extend_from_slice(&(bmp.len() as u32).to_le_bytes());
++    out.extend_from_slice(&22u32.to_le_bytes());
++    out.extend_from_slice(&bmp);
++    out
++}
++
++/// The icon cropped to its drawn box (alpha non-zero, as Pillow's RGBA getbbox), scaled to 30 px
++/// (26 pressed) on its long side, placed at 1,1 (3,3 pressed) in a transparent 32 x 32.
++fn cursor_image(rgba: &[u8], w: usize, h: usize, pressed: bool) -> Vec<u8> {
++    let mut out = vec![0u8; SIZE * SIZE * 4];
++    let lit = |x: usize, y: usize| rgba[(y * w + x) * 4 + 3] != 0;
++    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
++    for y in 0..h {
++        for x in 0..w {
++            if lit(x, y) {
++                x0 = x0.min(x);
++                y0 = y0.min(y);
++                x1 = x1.max(x + 1);
++                y1 = y1.max(y + 1);
++            }
++        }
++    }
++    if x1 <= x0 || y1 <= y0 {
++        (x0, y0, x1, y1) = (0, 0, w, h);
++    }
++    let (gw, gh) = (x1 - x0, y1 - y0);
++    let target = if pressed { 26.0 } else { 30.0 };
++    let scale = target / gw.max(gh) as f64;
++    let (nw, nh) = (((gw as f64 * scale).round() as usize).max(1), ((gh as f64 * scale).round() as usize).max(1));
++    // Premultiplied f64 source.
++    let mut src = vec![[0f64; 4]; gw * gh];
++    for y in 0..gh {
++        for x in 0..gw {
++            let s = ((y + y0) * w + x + x0) * 4;
++            let a = f64::from(rgba[s + 3]) / 255.0;
++            src[y * gw + x] = [f64::from(rgba[s]) * a, f64::from(rgba[s + 1]) * a, f64::from(rgba[s + 2]) * a, f64::from(rgba[s + 3])];
++        }
++    }
++    let horiz = resample(&src, gw, gh, nw, true);
++    let full = resample(&horiz, nw, gh, nh, false);
++    let off = if pressed { 3 } else { 1 };
++    for y in 0..nh.min(SIZE - off) {
++        for x in 0..nw.min(SIZE - off) {
++            let [r, g, b, a] = full[y * nw + x];
++            let a8 = a.round().clamp(0.0, 255.0);
++            let un = |c: f64| if a8 > 0.0 { (c * 255.0 / a8).round().clamp(0.0, 255.0) } else { 0.0 };
++            let d = ((y + off) * SIZE + x + off) * 4;
++            out[d] = un(r) as u8;
++            out[d + 1] = un(g) as u8;
++            out[d + 2] = un(b) as u8;
++            out[d + 3] = a8 as u8;
++        }
++    }
++    out
++}
++
++fn lanczos3(x: f64) -> f64 {
++    if x == 0.0 {
++        return 1.0;
++    }
++    if x.abs() >= 3.0 {
++        return 0.0;
++    }
++    let px = std::f64::consts::PI * x;
++    3.0 * px.sin() * (px / 3.0).sin() / (px * px)
++}
++
++/// One axis of a Lanczos-3 resize (Pillow's convolution: support widened when shrinking).
++fn resample(src: &[[f64; 4]], w: usize, h: usize, n: usize, horizontal: bool) -> Vec<[f64; 4]> {
++    let len = if horizontal { w } else { h };
++    let scale = len as f64 / n as f64;
++    let support = 3.0 * scale.max(1.0);
++    let (ow, oh) = if horizontal { (n, h) } else { (w, n) };
++    let mut out = vec![[0f64; 4]; ow * oh];
++    for i in 0..n {
++        let centre = (i as f64 + 0.5) * scale;
++        let lo = ((centre - support).floor().max(0.0)) as usize;
++        let hi = ((centre + support).ceil() as usize).min(len);
++        let mut weights: Vec<(usize, f64)> = (lo..hi).map(|j| (j, lanczos3((j as f64 + 0.5 - centre) / scale.max(1.0)))).collect();
++        let sum: f64 = weights.iter().map(|w| w.1).sum();
++        if sum != 0.0 {
++            for w in &mut weights {
++                w.1 /= sum;
++            }
++        }
++        let lines = if horizontal { h } else { w };
++        for l in 0..lines {
++            let mut acc = [0f64; 4];
++            for &(j, wt) in &weights {
++                let s = if horizontal { src[l * w + j] } else { src[j * w + l] };
++                for c in 0..4 {
++                    acc[c] += s[c] * wt;
++                }
++            }
++            let d = if horizontal { l * ow + i } else { i * ow + l };
++            out[d] = acc;
++        }
++    }
++    out
++}
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -188,6 +188,7 @@
+ mod world_state_ui;
+ // WOW-BG3 fork: the link to the hidden BG3 (camera stream).
+ mod wowbg3;
++mod wowbg3_cursors;
+ mod wowbg3_fight;
+ mod wowbg3_frames;
+ mod wowbg3_fx;
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -43,6 +43,8 @@
+         crate::wowbg3_tav::build(app);
+         // BG3's own effects replayed inside WoW with BG3's shaders (patch 0005).
+         crate::wowbg3_fx::build(app);
++        // Patch 0047: WoW's quest cursors for BG3, from the player's files.
++        crate::wowbg3_cursors::build(app, PathBuf::from(&dir));
+         // Patch 0041: a server teleport in world mode moves BG3's character.
+         crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {

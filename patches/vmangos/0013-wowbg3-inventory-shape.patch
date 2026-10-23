@@ -1,0 +1,508 @@
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index 062ab7d..ae2a788 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -36,6 +36,7 @@
+ #include "SharedDefines.h"
+ #include "World.h"
+ #include "WorldSession.h"
++#include "ObjectGuid.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -385,15 +386,15 @@ namespace
+     // give MEMBER ITEMGUID TOMEMBER [COUNT]: an item from one party member's bags or body to
+     // another's bags (BG3's one party inventory; dragging onto another member). Whole stack, or COUNT
+     // of a stack (a new stack for the receiver). Both are saved at once, as a trade does.
+-    void Give(Player* owner, Player* m, std::string const& member, std::vector<std::string> const& a, Out& out)
++    void Give(Player* owner, Player* m, std::string const& member, std::vector<std::string> const& a, Out& out, Player* given = nullptr)
+     {
+         std::string const head = "WOWBG3 give " + member + " ";
+         ObjectGuid g;
+         uint32 count = 0;
+         if (!ParseGuid(a[3], g) || (a.size() == 6 && (!ParseUInt(a[5], count, 10000) || count == 0)))
+             return out.Add(head + "refused usage");
+-        char const* why = nullptr;
+-        Player* to = FindMember(owner, a[4], why);
++        char const* why = "offline";
++        Player* to = given ? given : FindMember(owner, a[4], why);
+         if (!to)
+             return out.Add(head + "refused " + std::string(why) + " " + a[4]);
+         if (to == m)
+@@ -598,10 +599,432 @@ namespace
+         for (std::string const& l : lines)
+             out.Add(l);
+     }
++
++    // ---- the inventory bridge's console shape (link/tools/inventory_bridge.py, class Server) ----
++    // `inv list|equip|unequip|move|add|del|money|give CHAR ...`, `loot list|take CHAR NPC ...`,
++    // `vendor list|buy|sell CHAR NPC ...`; replies `WOWBG3 inv|loot|vendor CHAR ... ok|refused WHY`.
++
++    std::string Code(InventoryResult r)
++    {
++        return "inv_" + std::to_string(uint32(r));
++    }
++
++    // The item's place after an action, or nothing.
++    std::string Place(Player* m, ObjectGuid g)
++    {
++        for (Held const& h : Carried(m))
++            if (h.item->GetObjectGuid() == g)
++                return std::to_string(uint32(h.bag)) + " " + std::to_string(uint32(h.slot));
++        return "";
++    }
++
++    void ShapeInv(Player* m, std::string const& name, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const sub = a[2];
++        std::string const head = "WOWBG3 inv " + name + " " + sub + " ";
++        if (sub == "list")
++        {
++            std::vector<Held> list = Carried(m);
++            out.Add("WOWBG3 inv " + name + " begin " + std::to_string(m->GetMoney()) + " " + std::to_string(list.size()));
++            for (Held const& h : list)
++            {
++                char buf[200];
++                snprintf(buf, sizeof(buf), "WOWBG3 inv %s item %u %u %s %u %u %u %u %d", name.c_str(), uint32(h.bag),
++                    uint32(h.slot), Hex(h.item->GetObjectGuid()).c_str(), h.item->GetEntry(), h.item->GetCount(),
++                    h.item->GetUInt32Value(ITEM_FIELD_DURABILITY), h.item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY),
++                    h.item->GetItemRandomPropertyId());
++                out.Add(buf);
++            }
++            return out.Add("WOWBG3 inv " + name + " end " + std::to_string(list.size()));
++        }
++        if (sub == "add")
++        {
++            uint32 entry = 0, count = 1;
++            if (a.size() < 5 || !ParseUInt(a[4], entry) || (a.size() > 5 && (!ParseUInt(a[5], count, 10000) || count == 0)))
++                return out.Add(head + "refused usage");
++            if (!sObjectMgr.GetItemPrototype(entry))
++                return out.Add(head + std::to_string(entry) + " refused unknown");
++            ItemPosCountVec dest;
++            uint32 noSpace = 0;
++            InventoryResult r = m->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count, &noSpace);
++            if (r != EQUIP_ERR_OK && (dest.empty() || count == noSpace))
++                return out.Add(head + std::to_string(entry) + " refused " + Code(r));
++            Item* it = m->StoreNewItem(dest, entry, true, Item::GenerateItemRandomPropertyId(entry));
++            if (!it)
++                return out.Add(head + std::to_string(entry) + " refused failed");
++            m->SendNewItem(it, count - noSpace, true, false);
++            return out.Add(head + std::to_string(entry) + " ok " + Hex(it->GetObjectGuid()) + " " + std::to_string(count - noSpace));
++        }
++        if (sub == "money")
++        {
++            int32 delta = 0;
++            if (a.size() != 5 || !ParseInt(a[4], delta))
++                return out.Add(head + "refused usage");
++            if (delta < 0 && uint32(-int64(delta)) > m->GetMoney())
++                return out.Add(head + "refused notenough");
++            if (delta > 0 && uint64(m->GetMoney()) + uint64(delta) > MAX_MONEY_AMOUNT)
++                return out.Add(head + "refused toomuch");
++            m->ModifyMoney(delta);
++            return out.Add(head + "ok " + std::to_string(m->GetMoney()));
++        }
++        // The rest name an item the character carries.
++        ObjectGuid g;
++        if (a.size() < 5 || !ParseGuid(a[4], g))
++            return out.Add(head + "refused usage");
++        std::string const ihead = head + a[4] + " ";
++        Item* it = FindCarried(m, g);
++        if (!it)
++            return out.Add(ihead + "refused noitem");
++        if (sub == "del")
++        {
++            uint32 count = 0;
++            if (a.size() > 5 && (!ParseUInt(a[5], count, 10000) || count == 0))
++                return out.Add(ihead + "refused usage");
++            uint32 left = 0;
++            if (count == 0 || count >= it->GetCount())
++            {
++                if (it->IsEquipped())
++                {
++                    InventoryResult r = m->CanUnequipItem(it->GetPos(), false);
++                    if (r != EQUIP_ERR_OK)
++                        return out.Add(ihead + "refused " + Code(r));
++                }
++                if (it->IsBag() && !static_cast<Bag*>(it)->IsEmpty())
++                    return out.Add(ihead + "refused notempty");
++                m->DestroyItem(it->GetBagSlot(), it->GetSlot(), true);
++            }
++            else
++            {
++                left = it->GetCount() - count;
++                m->DestroyItemCount(it, count, true);
++            }
++            return out.Add(ihead + "ok " + std::to_string(left));
++        }
++        if (sub == "equip" || sub == "move")
++        {
++            uint32 bag = INVENTORY_SLOT_BAG_0, slot = NULL_SLOT;
++            if (sub == "move" && (a.size() < 7 || !ParseUInt(a[5], bag, 255) || !ParseUInt(a[6], slot, 255)))
++                return out.Add(ihead + "refused usage");
++            uint16 src = it->GetPos();
++            uint16 dst = 0;
++            if (sub == "equip" || (bag == INVENTORY_SLOT_BAG_0 && slot < EQUIPMENT_SLOT_END))
++            {
++                InventoryResult r = m->CanEquipItem(sub == "equip" ? uint8(NULL_SLOT) : uint8(slot), dst, it, !it->IsBag());
++                if (r != EQUIP_ERR_OK)
++                    return out.Add(ihead + "refused " + Code(r));
++            }
++            else
++                dst = uint16(bag << 8 | slot);
++            if (dst == src)
++                return out.Add(ihead + "ok " + Place(m, g));
++            uint32 count = 0;
++            if (sub == "move" && a.size() > 7 && (!ParseUInt(a[7], count, 255) || count == 0))
++                return out.Add(ihead + "refused usage");
++            if (count && count < it->GetCount())
++            {
++                WorldPackets::Item::SplitItem p;
++                p.srcbag = uint8(src >> 8);
++                p.srcslot = uint8(src & 255);
++                p.dstbag = uint8(dst >> 8);
++                p.dstslot = uint8(dst & 255);
++                p.count = uint8(count);
++                m->GetSession()->HandleSplitItemOpcode(p);
++                Item* moved = m->GetItemByPos(uint8(dst >> 8), uint8(dst & 255));
++                if (!moved || moved == it)
++                    return out.Add(ihead + "refused failed");
++                return out.Add(ihead + "ok " + Place(m, moved->GetObjectGuid()));
++            }
++            m->SwapItem(src, dst);
++            std::string const now = Place(m, g);
++            if (now.empty() || it->GetPos() == src)
++                return out.Add(ihead + "refused failed");
++            return out.Add(ihead + "ok " + now);
++        }
++        if (sub == "unequip")
++        {
++            if (!it->IsEquipped())
++                return out.Add(ihead + "refused notequipped");
++            InventoryResult r = m->CanUnequipItem(it->GetPos(), false);
++            if (r != EQUIP_ERR_OK)
++                return out.Add(ihead + "refused " + Code(r));
++            ItemPosCountVec dest;
++            uint8 bagSlot = 0;
++            r = m->CanStoreItem(NULL_BAG, NULL_SLOT, dest, it, bagSlot, false);
++            if (r != EQUIP_ERR_OK)
++                return out.Add(ihead + "refused " + Code(r));
++            m->RemoveItem(it->GetBagSlot(), it->GetSlot(), true);
++            m->StoreItem(dest, it, true);
++            return out.Add(ihead + "ok " + Place(m, g));
++        }
++        out.Add(head + "refused usage");
++    }
++
++    // give CHAR GUID TOCHAR [COUNT] (console: TOCHAR any online character; chat: a party member)
++    void ShapeGive(Player* owner, Player* m, std::string const& name, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const head = "WOWBG3 inv " + name + " give " + (a.size() > 4 ? a[4] : std::string("-")) + " ";
++        if (a.size() < 6 || a.size() > 7)
++            return out.Add(head + "refused usage");
++        Player* to = nullptr;
++        if (owner)
++        {
++            char const* why = nullptr;
++            to = FindMember(owner, a[5], why);
++        }
++        else
++        {
++            std::string n = a[5];
++            normalizePlayerName(n);
++            to = ObjectAccessor::FindPlayerByName(n.c_str());
++        }
++        if (!to || !to->IsInWorld())
++            return out.Add(head + "refused offline");
++        std::vector<std::string> v = { a[0], "give", name, a[4], a[5] };
++        if (a.size() == 7)
++            v.push_back(a[6]);
++        std::vector<std::string> lines;
++        Out tmp{ lines };
++        Give(owner ? owner : m, m, name, v, tmp, to);
++        if (lines.empty() || lines[0].find(" ok ") == std::string::npos)
++            return out.Add(head + "refused " + (lines.empty() ? std::string("failed") : lines[0].substr(lines[0].find("refused ") == std::string::npos ? 0 : lines[0].find("refused ") + 8)));
++        // The receiver's new or grown stack: its last `item` line.
++        std::string guid = "-";
++        for (std::string const& l : lines)
++            if (l.compare(0, 12 + a[5].size(), "WOWBG3 item " + a[5]) == 0)
++            {
++                std::vector<std::string> w;
++                std::string cur;
++                for (char ch : l) { if (ch == ' ') { w.push_back(cur); cur.clear(); } else cur += ch; }
++                w.push_back(cur);
++                if (w.size() > 5)
++                    guid = w[5];
++            }
++        out.Add(head + "ok " + a[5] + " " + guid);
++    }
++
++    void ShapeLoot(Player* m, std::string const& name, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const sub = a[2];
++        std::string const head = "WOWBG3 loot " + name + " " + (a.size() > 4 ? a[4] : std::string("-")) + " ";
++        ObjectGuid g;
++        if (a.size() < 5 || !ParseGuid(a[4], g) || !g.IsAnyTypeCreature())
++            return out.Add(head + "refused usage");
++        Creature* c = m->GetMap()->GetAnyTypeCreature(g);
++        if (!c)
++            return out.Add(head + "refused missing");
++        if (c->IsAlive())
++            return out.Add(head + "refused notlootable");
++        if (!m->IsWithinDistInMap(c, INTERACTION_DISTANCE))
++            return out.Add(head + "refused far");
++        WorldSession* s = m->GetSession();
++        if (m->GetLootGuid() != g)
++        {
++            WorldPackets::Loot::LootUnit lu;
++            lu.guid = g;
++            s->HandleLootOpcode(lu);
++            if (m->GetLootGuid() != g)
++                return out.Add(head + "refused notyours");
++        }
++        Loot& loot = c->loot;
++        uint32 const low = m->GetGUIDLow();
++        if (sub == "list")
++        {
++            std::vector<std::string> items;
++            uint32 const max = loot.GetMaxSlotInLootFor(low);
++            for (uint32 i = 0; i < max; ++i)
++            {
++                QuestItem* q = nullptr; QuestItem* ffa = nullptr; QuestItem* cond = nullptr;
++                LootItem* li = loot.LootItemInSlot(i, low, &q, &ffa, &cond);
++                if (!li || li->is_looted || (q && q->is_looted) || (ffa && ffa->is_looted) || (cond && cond->is_looted))
++                    continue;
++                if (!li->AllowedForPlayer(m, c))
++                    continue;
++                items.push_back(head + "item " + std::to_string(i) + " " + std::to_string(li->itemid) + " " + std::to_string(uint32(li->count)));
++            }
++            out.Add(head + "begin " + std::to_string(loot.gold) + " " + std::to_string(items.size()));
++            for (std::string const& l : items)
++                out.Add(l);
++            return out.Add(head + "end " + std::to_string(items.size()));
++        }
++        // take IDX|money|all
++        if (a.size() != 6)
++            return out.Add(head + "refused usage");
++        std::string const what = a[5];
++        auto const before = Snapshot(m);
++        uint32 const money = m->GetMoney();
++        if (what == "money" || what == "all")
++        {
++            NullClientPacket none(CMSG_LOOT_MONEY);
++            s->HandleLootMoneyOpcode(none);
++        }
++        uint32 idx = 0;
++        if (what == "all")
++        {
++            uint32 const max = loot.GetMaxSlotInLootFor(low);
++            for (uint32 i = 0; i < max && i < 64; ++i)
++            {
++                WorldPackets::Loot::AutoStoreLootItem p;
++                p.lootSlot = uint8(i);
++                s->HandleAutostoreLootItemOpcode(p);
++            }
++        }
++        else if (what != "money")
++        {
++            if (!ParseUInt(what, idx, 255))
++                return out.Add(head + "refused usage");
++            WorldPackets::Loot::AutoStoreLootItem p;
++            p.lootSlot = uint8(idx);
++            s->HandleAutostoreLootItemOpcode(p);
++        }
++        // New or grown stacks.
++        std::string guid;
++        for (Held const& h : Carried(m))
++        {
++            auto o = before.find(h.item->GetObjectGuid().GetRawValue());
++            if (o == before.end() || o->second.count != h.item->GetCount())
++                guid = Hex(h.item->GetObjectGuid());
++        }
++        bool const done = loot.isLooted();
++        if (done)
++        {
++            WorldPackets::Loot::LootRelease rel;
++            rel.guid = g;
++            s->HandleLootReleaseOpcode(rel);
++        }
++        if (what == "money")
++            return out.Add(head + "take money " + (m->GetMoney() != money ? "ok " : "refused nothing ") + std::to_string(m->GetMoney() - money));
++        if (guid.empty() && m->GetMoney() == money)
++            return out.Add(head + "take " + what + " refused full");
++        out.Add(head + "take " + what + " ok " + (guid.empty() ? std::string("-") : guid) + " " + std::to_string(m->GetMoney()));
++    }
++
++    void ShapeVendor(Player* m, std::string const& name, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const sub = a[2];
++        std::string const head = "WOWBG3 vendor " + name + " " + (a.size() > 4 ? a[4] : std::string("-")) + " ";
++        char const* why = nullptr;
++        Creature* v = a.size() > 4 ? Vendor(m, a[4], why) : nullptr;
++        if (!v)
++            return out.Add(head + "refused " + (why ? why : "usage"));
++        if (sub == "list")
++        {
++            std::vector<std::string> wares;
++            uint32 idx = 0;
++            for (VendorItemData const* data : { v->GetVendorItems(), v->GetVendorTemplateItems() })
++            {
++                if (!data)
++                    continue;
++                for (VendorItem const* vi : data->m_items)
++                {
++                    ItemPrototype const* p = sObjectMgr.GetItemPrototype(vi->item);
++                    if (!p)
++                        continue;
++                    uint32 const price = uint32(std::floor(p->BuyPrice * m->GetReputationPriceDiscount(v)));
++                    int32 const stock = vi->maxcount ? int32(v->GetVendorItemCurrentCount(vi)) : -1;
++                    wares.push_back(head + "item " + std::to_string(idx++) + " " + std::to_string(vi->item) + " " +
++                        std::to_string(price) + " " + std::to_string(stock) + " " + std::to_string(p->BuyCount ? p->BuyCount : 1));
++                }
++            }
++            out.Add(head + "begin " + std::to_string(wares.size()));
++            for (std::string const& w : wares)
++                out.Add(w);
++            return out.Add(head + "end " + std::to_string(wares.size()));
++        }
++        if (sub == "buy")
++        {
++            uint32 entry = 0, lots = 1;
++            if (a.size() < 6 || !ParseUInt(a[5], entry) || (a.size() > 6 && (!ParseUInt(a[6], lots, 255) || lots == 0)))
++                return out.Add(head + "buy refused usage");
++            auto const before = Snapshot(m);
++            uint32 const money = m->GetMoney();
++            m->BuyItemFromVendor(v->GetObjectGuid(), entry, uint8(lots), NULL_BAG, NULL_SLOT);
++            if (m->GetMoney() == money)
++                return out.Add(head + "buy " + std::to_string(entry) + " refused failed");
++            std::string guid = "-";
++            for (Held const& h : Carried(m))
++            {
++                auto o = before.find(h.item->GetObjectGuid().GetRawValue());
++                if (h.item->GetEntry() == entry && (o == before.end() || o->second.count != h.item->GetCount()))
++                    guid = Hex(h.item->GetObjectGuid());
++            }
++            return out.Add(head + "buy " + std::to_string(entry) + " ok " + guid + " " + std::to_string(m->GetMoney()));
++        }
++        if (sub == "sell")
++        {
++            ObjectGuid g;
++            uint32 count = 0;
++            if (a.size() < 6 || !ParseGuid(a[5], g) || (a.size() > 6 && !ParseUInt(a[6], count, 255)))
++                return out.Add(head + "sell refused usage");
++            if (!FindCarried(m, g))
++                return out.Add(head + "sell " + a[5] + " refused noitem");
++            uint32 const money = m->GetMoney();
++            WorldPackets::Item::SellItem p;
++            p.vendorGuid = v->GetObjectGuid();
++            p.itemGuid = g;
++            p.count = uint8(count);
++            m->GetSession()->HandleSellItemOpcode(p);
++            if (m->GetMoney() == money)
++                return out.Add(head + "sell " + a[5] + " refused failed");
++            return out.Add(head + "sell " + a[5] + " ok " + std::to_string(m->GetMoney()));
++        }
++        out.Add(head + "refused usage");
++    }
++}
++
++bool ExecuteItemsShape(Player* owner, std::vector<std::string> const& a, std::vector<std::string>& lines)
++{
++    // owner: the hero whose party CHAR must belong to (chat), or nullptr (console: any online CHAR).
++    Out out{ lines };
++    std::string const verb = a.size() > 1 ? a[1] : "";
++    std::string const sub = a.size() > 2 ? a[2] : "";
++    bool const inv = verb == "inv" && (sub == "list" || sub == "equip" || sub == "unequip" || sub == "move" ||
++        sub == "add" || sub == "del" || sub == "money" || sub == "give");
++    bool const loot = verb == "loot" && (sub == "list" || sub == "take");
++    bool const vendor = verb == "vendor" && (sub == "list" || sub == "buy" || sub == "sell");
++    if (!inv && !loot && !vendor)
++        return false;
++    if (a.size() < 4 || a.size() > 8)
++    {
++        out.Add("WOWBG3 " + verb + " - " + sub + " refused usage");
++        return true;
++    }
++    std::string name = a[3];
++    Player* m = nullptr;
++    if (owner)
++    {
++        char const* why = nullptr;
++        m = FindMember(owner, name, why);
++    }
++    else
++    {
++        normalizePlayerName(name);
++        m = ObjectAccessor::FindPlayerByName(name.c_str());
++    }
++    if (!m || !m->IsInWorld())
++    {
++        out.Add("WOWBG3 " + verb + " " + a[3] + " refused offline");
++        return true;
++    }
++    // From here the CHAR token is out of the way: a[2] is the sub verb, a[4]... its arguments.
++    std::vector<std::string> b = a;
++    b.erase(b.begin() + 3);
++    // b: [.wowbg3, verb, sub, args...]; the Shape functions read a[4]... so put a placeholder back.
++    b.insert(b.begin() + 3, name);
++    if (inv && sub == "give")
++        ShapeGive(owner, m, name, b, out);
++    else if (inv)
++        ShapeInv(m, name, b, out);
++    else if (loot)
++        ShapeLoot(m, name, b, out);
++    else
++        ShapeVendor(m, name, b, out);
++    return true;
+ }
+ 
+ bool ExecuteItems(Player* owner, std::vector<std::string> const& a, std::vector<std::string>& lines)
+ {
++    if (ExecuteItemsShape(owner, a, lines))
++        return true;
+     Out out{ lines };
+     std::string const verb = a.size() > 1 ? a[1] : "";
+     if (verb == "itemdata" && a.size() == 3)
+diff --git a/src/game/WowBg3Items.h b/src/game/WowBg3Items.h
+index 1e970a6..35c9922 100644
+--- a/src/game/WowBg3Items.h
++++ b/src/game/WowBg3Items.h
+@@ -31,6 +31,10 @@ namespace WowBg3
+ {
+     // Verbs this module knows (world thread, no map updates). False: not ours.
+     bool ExecuteItems(Player* owner, std::vector<std::string> const& a, std::vector<std::string>& out);
++
++    // 0013, the inventory bridge's shape (`inv|loot|vendor SUB CHAR ...`): owner nullptr = the console
++    // (CHAR any online character). False: not that shape.
++    bool ExecuteItemsShape(Player* owner, std::vector<std::string> const& a, std::vector<std::string>& out);
+ }
+ 
+ #endif
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+index 84f2221..769a301 100644
+--- a/src/game/WowBg3Party.cpp
++++ b/src/game/WowBg3Party.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "WowBg3Party.h"
+ #include "WowBg3Fights.h"
++#include "WowBg3Items.h"
+ #include "AccountMgr.h"
+ #include "Camera.h"
+ #include "Chat.h"
+@@ -1537,7 +1538,15 @@ bool HandleConsole(ChatHandler* handler, char const* args)
+     std::string line = ".wowbg3";
+     for (size_t i = 1; i < a.size(); ++i)
+         line += " " + a[i];
+-    if (name == "-")
++    if (name == "inv" || name == "loot" || name == "vendor")
++    {
++        // 0013: the inventory bridge's shape, CHAR is any online character (bots have no client).
++        std::vector<std::string> v = a;
++        v.insert(v.begin(), ".wowbg3");
++        if (!ExecuteItemsShape(nullptr, v, lines))
++            lines.push_back("WOWBG3 " + name + " - refused usage");
++    }
++    else if (name == "-")
+     {
+         std::vector<std::string> v = a;
+         v[0] = ".wowbg3";

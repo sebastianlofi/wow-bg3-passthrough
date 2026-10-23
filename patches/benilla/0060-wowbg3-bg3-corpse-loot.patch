@@ -1,0 +1,86 @@
+WOW-BG3 benilla patch 0060: a mirrored mob's corpse is BG3's to click (BG3's own loot window).
+
+- The bridge lists, besides the live stand-ins (`m GUID`), every dead mob whose stand-in's corpse is still
+  there (`mirrored.txt` `c GUID`). wowbg3_fight.rs reads them; wowbg3_lead.rs then flags such a corpse as
+  BG3's (flag 4) instead of WoW's (flag 2): BG3 loots it through the stand-in's corpse, which
+  Inventory.lua fills with the WoW loot, and WoW's own loot window never opens for it (the
+  0.1.0 playtest: both happened, and WoW's window was the one the player saw). Corpses with no stand-in stay WoW's.
+  A dead creature is still a unit under WoW's pointer (only players leave corpse objects), so the hovered
+  unit's guid is tested against the corpse lines as well as the corpse object's (a test run: the
+  dead boar read flags 2, unit, loot cursor, with its `c` line in place).
+
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -175,6 +175,9 @@
+     mirrored: HashSet<u64>,
+     /// Mobs held by a turn-based freeze (`mirrored.txt` `h`).
+     frozen: HashSet<u64>,
++    /// WOW-BG3 (patch 0060): dead mobs whose BG3 stand-in's corpse is still there (`mirrored.txt`
++    /// `c`): BG3 takes clicks on those corpses (its own loot window, filled with the WoW loot).
++    corpses: HashSet<u64>,
+ }
+ 
+ /// WoW's cursor kind as `wowhover.bin` carries it (BG3's `WowCursor.lua` reads the same order).
+@@ -204,6 +207,12 @@
+ /// The pointer link (`wowbg3_lead.rs`) asks this for the unit under BG3's cursor: a mirrored mob
+ /// is BG3's to click (its stand-in), not WoW's. Patch 0027: a mirrored friendly NPC (one WoW does
+ /// not let you attack) stays WoW's; BG3 keeps such a click only for an attack (`WorldMode.lua`).
++/// WOW-BG3 (patch 0060): the corpse under BG3's cursor belongs to a mirrored mob, so BG3 loots it
++/// through its stand-in's corpse (BG3's loot window) and WoW never hears of the click.
++pub(crate) fn bg3_corpse(guid: Option<u64>) -> bool {
++    guid.is_some_and(|g| SHARED.lock().is_ok_and(|s| s.corpses.contains(&g)))
++}
++
+ pub(crate) fn claims_hover(guid: Option<u64>) -> bool {
+     guid.is_none_or(|g| {
+         !SHARED
+@@ -1019,17 +1028,20 @@
+     // The bridge's mirror list (`mirrored.txt`): stand-ins and turn-based freezes.
+     if f.frame % 30 == 2 {
+         let text = std::fs::read_to_string(f.dir.join("mirrored.txt")).unwrap_or_default();
+-        let (mut m, mut h) = (HashSet::new(), HashSet::new());
++        let (mut m, mut h, mut c) = (HashSet::new(), HashSet::new(), HashSet::new());
+         for line in text.lines() {
+             match line.split_once(' ') {
+                 Some(("m", g)) => m.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 Some(("h", g)) => h.extend(u64::from_str_radix(g.trim(), 16).ok()),
++                // Patch 0060: a mirrored mob's corpse (BG3's loot window).
++                Some(("c", g)) => c.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 _ => {}
+             }
+         }
+         if let Ok(mut s) = SHARED.lock() {
+             s.mirrored = m;
+             s.frozen = h;
++            s.corpses = c;
+         }
+     }
+     let frozen: HashSet<u64> = SHARED.lock().map(|s| s.frozen.clone()).unwrap_or_default();
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -650,13 +650,20 @@
+     }
+     // Tell BG3 what WoW has under the pointer (changes only). A mob with a BG3 stand-in is BG3's
+     // to click (patch 0009, `mirrored.txt`).
+-    let unit = hovered.corpse.is_some()
+-        || (hovered.target.is_some() && crate::wowbg3_fight::claims_hover(hovered.guid));
++    // Patch 0060: a mirrored mob's corpse is BG3's too: BG3 opens its own loot window on the
++    // stand-in's corpse (filled with the WoW loot), and WoW's loot window never opens for it. A dead
++    // creature is still a unit under the pointer (only players leave corpse objects), so its guid is
++    // tested too.
++    let bg3_corpse = crate::wowbg3_fight::bg3_corpse(hovered.corpse_guid)
++        || (hovered.target.is_some() && crate::wowbg3_fight::bg3_corpse(hovered.guid));
++    let unit = (hovered.corpse.is_some() && !bg3_corpse)
++        || (hovered.target.is_some() && !bg3_corpse && crate::wowbg3_fight::claims_hover(hovered.guid));
+     // Patch 0019: flag 4, a mirrored mob is under the pointer (its stand-in takes the
+     // click; BG3 shows WoW's cursor for it).
+-    let mirrored = hovered.corpse.is_none()
+-        && hovered.target.is_some()
+-        && !crate::wowbg3_fight::claims_hover(hovered.guid);
++    let mirrored = bg3_corpse
++        || (hovered.corpse.is_none()
++            && hovered.target.is_some()
++            && !crate::wowbg3_fight::claims_hover(hovered.guid));
+     let flags = u32::from(over_ui.0)
+         | (u32::from(unit || object.target.is_some()) << 1)
+         | (u32::from(mirrored) << 2);

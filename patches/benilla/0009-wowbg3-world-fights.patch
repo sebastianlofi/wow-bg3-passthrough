@@ -1,0 +1,1340 @@
+WOW-BG3 benilla patch 0009: world fights (on top of 0001-0008).
+
+- wowbg3_fight.rs: any attackable creature is a BG3 fight (a swing at it, or a hostile mob's aggro),
+  packs and adds join one encounter, fight mobs play BG3's paths and their own WoW attack animation
+  when their stand-in attacks, the server channel (server-cmd.txt out as SAY chat with
+  WOW_BG3_M5=1, WOWBG3 system lines into server-events.txt).
+- Mirrored mobs (world mode): mobs.txt (hero and every attackable creature within 40 yd, every 12
+  frames) for the bridge's BG3 stand-ins; mirrored.txt back (m GUID: BG3 takes clicks on it; h GUID:
+  held by a turn-based freeze, never pulled by client-seen aggro); a fight the bridge starts by itself
+  (fight.txt `encounter` line) is played like a pull, and mobs the bridge adds are held too. In
+  world mode the channel arms with `.wowbg3 arm sight` (server patch 0002: BG3's stand-ins decide
+  who notices Tav), outside it with `.wowbg3 arm nosight` (server p3).
+- wowbg3_lead.rs (forward_pointer): a hovered mob with a BG3 stand-in is not claimed for WoW
+  (wowhover.bin flag 2 off, no WoW right click), so BG3's own action on the stand-in runs.
+  wowhover.bin grows to 28 bytes: WoW's cursor kind (`cursor_code`) and its grayed state, then the
+  seq again; BG3's WowCursor.lua shows the closest BG3 cursor.
+
+diff --git a/crates/benilla-app/src/creature_anim/net.rs b/crates/benilla-app/src/creature_anim/net.rs
+index 93076de..b7df94f 100644
+--- a/crates/benilla-app/src/creature_anim/net.rs
++++ b/crates/benilla-app/src/creature_anim/net.rs
+@@ -126,6 +126,10 @@ fn on_attacker_state(
+     mut play_seq: ResMut<PlaySeq>,
+ ) {
+     if let SessionEvent::AttackerState(s) = ev {
++        // WOW-BG3 (local fork): a mob in a BG3 fight swings only when its BG3 stand-in attacks.
++        if crate::wowbg3_fight::mutes_swing(s.attacker) {
++            return;
++        }
+         attacker_state(
+             s,
+             &index,
+diff --git a/crates/benilla-app/src/ui_chat/net.rs b/crates/benilla-app/src/ui_chat/net.rs
+index 04ed774..d99690d 100644
+--- a/crates/benilla-app/src/ui_chat/net.rs
++++ b/crates/benilla-app/src/ui_chat/net.rs
+@@ -38,6 +38,10 @@ fn on_chat(
+     mut server_said: MessageWriter<ServerSaidMessage>,
+ ) {
+     if let SessionEvent::Chat(m) = ev {
++        // WOW-BG3 (local fork): the server's WOWBG3 lines go to the fight bridge, not the chat.
++        if crate::wowbg3_fight::server_line(m.chat_type, &m.text) {
++            return;
++        }
+         chat(m, &mut chat_log, &social, &commands, &mut server_said);
+     }
+ }
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+index 6b1efc7..a73b2dd 100644
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -1,39 +1,84 @@
+-//! WOW-BG3 fights (local fork, not upstream benilla).
+-//! Attacking a Young Wolf (creature 299) no longer starts a WoW fight: the swing stays off the
+-//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `link/src/bridge.rs`),
+-//! which sets up the fight in the hidden BG3. While it runs, BG3 decides everything:
+-//! - on your turn, a right-click on the ground asks BG3 to move there (BG3 paths it on WoW
+-//!   ground; the character then walks to where BG3 put it), a right-click on the wolf asks for
+-//!   a melee attack, F9 casts Fire Bolt at it, F10 ends the turn and F11 leaves the fight;
+-//! - the wolf's model plays BG3's moves (its server position is ignored until the fight ends),
+-//!   and BG3's turns, hits and hit points appear in the chat frame as system lines.
+-//! There is no server freeze yet: the real wolf may wander or aggro meanwhile.
++//! WOW-BG3 fights (local fork, not upstream benilla). Young Wolf pulls first, then world fights
++//! (any hostile mob becomes a BG3 fight, whether you attack it or it aggroes
++//! you; neutral mobs only when attacked; every mob in combat with you joins one encounter, and adds
++//! join it while it runs):
++//! - A swing at any attackable creature stays off the wire and pulls it, with every other mob in
++//!   combat with you, into a BG3 fight (`pull.json` for the bridge, `link/src/bridge.rs`). A hostile
++//!   mob that aggroes you (its target is you and it is in combat) pulls the same way.
++//! - While the fight runs, mobs that enter combat with you, or that you attack, join it
++//!   (`join.json`, every mob asked for so far; the bridge skips the ones already in).
++//! - On your turn a right-click on the ground asks BG3 to move there, a right-click on a fight mob
++//!   asks for a melee attack on it, F9 casts Fire Bolt at your target (or the nearest), F10 ends the
++//!   turn and F11 leaves the fight.
++//! - Every fight mob's model plays BG3: it stays where BG3 put it and walks BG3's paths, and when
++//!   its stand-in attacks it plays its own WoW attack animation and sounds (a `SwingMessage`, hit or
++//!   miss as BG3 decided); the server's own swings of fight mobs are not animated.
++//! - BG3's turns, hits and hit points appear in the chat frame as system lines.
++//!
++//! There is no server freeze yet: the real mobs keep their WoW AI meanwhile and a BG3 kill
++//! gives no WoW credit. With `WOW_BG3_M5=1` the bridge's server requests (`server-cmd.txt`, see
++//! `link/src/handoff.rs` and `AI Context/m5-server-handoff.md`) go out once each as SAY chat.
+ //!
+ //! `WOW_BG3_AUTOFIGHT=1` (harness tests only): ten seconds in the world, the nearest Young Wolf
+ //! within reach is pulled as if attacked, and each of your turns plays itself (first turn: a
+-//! two-yard move toward the wolf; every turn: Fire Bolt, then end turn; after four turns: leave).
++//! two-yard move toward it; every turn: Fire Bolt, then end turn; after six turns: leave).
++//! `WOW_BG3_AUTOFIGHT=2` also attacks the next nearest attackable mob on your first turn, so it
++//! joins the running fight.
++//!
++//! The server's `WOWBG3 ...` system lines never reach the chat frame: they go to
++//! `server-events.txt` (`N LINE`) for the bridge, and an aggro hold (`WOWBG3 mob - GUID ... aggro`,
++//! or an add joining the running encounter) pulls or joins that mob like a client-seen aggro.
++//!
++//! Mirrored mobs (world mode): every 12 frames `mobs.txt` lists the hero and every
++//! living attackable creature within 40 yards (position, facing, HP, hostile or neutral, combat
++//! flags) for the bridge, which keeps a BG3 stand-in at each (`link/src/mirror.rs`, `Mirrors.lua`).
++//! `mirrored.txt` (bridge) names the mobs that have one (`m GUID`): BG3 takes clicks on those (its
++//! own attack, spell, throw or targeting on the stand-in), so the pointer link does not claim them
++//! for WoW (`claims_hover`). Mobs held by a turn-based freeze (`h GUID`) never pull by their
++//! client-seen aggro. A fight the bridge starts by itself (BG3 combat with a stand-in) is played
++//! like a pull: fight.txt's `encounter` line is new, and every fight mob in it is held.
+ //!
+-//! Files in `$WOW_BG3_LINK_DIR`: `pull.json` and `input.json` are written here, `fight.txt`
+-//! (plain lines, see `Fight::text` in the bridge) is read every few frames.
++//! Files in `$WOW_BG3_LINK_DIR`: `pull.json`, `join.json`, `input.json` and `server-events.txt` are
++//! written here, `fight.txt` (plain lines, see `Fight::text` in the bridge) and `server-cmd.txt`
++//! are read.
+ 
+-use std::collections::{HashSet, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::path::{Path, PathBuf};
+ use std::sync::{LazyLock, Mutex};
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
++use benilla_protocol::messages::ObjectType;
+ use bevy::prelude::*;
+ 
+-use crate::net::{Guid, ObjectStore, SelfPlayer};
+-use crate::player::{AutoMove, Player};
++use crate::creature_anim::{PlaySeq, SwingMessage};
++use crate::net::{ChatKind, ClientCommand, Guid, NetCommands, ObjectStore, Reputations, SelfPlayer};
++use crate::player::{AutoMove, Player, UNIT_FLAG_IN_COMBAT};
++use crate::target::{can_attack, ring_reaction, Factions};
+ use crate::ui_chat::{ChatEvent, ChatEventKind, ChatLog};
+ 
+ const YOUNG_WOLF: u32 = 299;
+-/// Yards: the stand-in must land inside the 40 m arena cut around the hero.
++/// Yards: a mob you attack must stand this close (its stand-in spawns within 20 m of Tav).
+ const PULL_RANGE: f32 = 18.0;
+-/// Yards per second for the wolf model along BG3's path.
+-const WOLF_SPEED: f32 = 7.0;
+-const HELP: &str = "Your turn: right-click the ground to move, right-click the wolf to attack, \
++/// Yards: mobs in combat with you this close go into the pull or join the fight.
++const PACK_RANGE: f32 = 30.0;
++/// Yards: mobs listed in `mobs.txt` for the bridge's mirrors.
++const MIRROR_RANGE: f32 = 40.0;
++/// Yards per second for a mob model along BG3's path.
++const MOB_SPEED: f32 = 7.0;
++/// Seconds between two attacks played on one mob.
++const STRIKE_GAP: f32 = 0.9;
++/// Frames a mob from an ended fight is not pulled again by its aggro (without the server's hold the server keeps it
++/// in combat with you).
++const SETTLE_FRAMES: u64 = 3600;
++/// `UNIT_FIELD_FLAGS` bit 3: players and their pets.
++const PLAYER_CONTROLLED: u32 = 1 << 3;
++/// `UnitReaction` rank: below this a mob is hostile (it aggroes by itself).
++const NEUTRAL: u8 = 3;
++/// Swing packet bits as vmangos sends them: a landed hit (`HITINFO_NORMALSWING2`) or a miss.
++const HIT_NORMAL: u32 = 0x2;
++const HIT_MISS: u32 = 0x10;
++const HELP: &str = "Your turn: right-click the ground to move, right-click a mob to attack it, \
+                     F9 Fire Bolt, F10 end turn, F11 leave the fight";
+ 
+ enum Event {
+@@ -45,19 +90,60 @@ enum Event {
+ struct Shared {
+     enabled: bool,
+     active: bool,
+-    wolves: HashSet<u64>,
++    /// Creatures you may attack (alive, not player-controlled): a swing at one is a BG3 fight.
++    attackable: HashSet<u64>,
++    /// Fight mobs: the server's swings of these are not animated.
++    held: HashSet<u64>,
+     events: VecDeque<Event>,
++    /// `WOWBG3 ...` server lines not yet written to `server-events.txt`.
++    server_lines: VecDeque<String>,
++    /// Mobs the server holds after their aggro, not yet pulled or joined.
++    server_aggro: VecDeque<u64>,
++    /// Mobs with a BG3 stand-in (`mirrored.txt` `m`): BG3 takes clicks on them.
++    mirrored: HashSet<u64>,
++    /// Mobs held by a turn-based freeze (`mirrored.txt` `h`).
++    frozen: HashSet<u64>,
++}
++
++/// WoW's cursor kind as `wowhover.bin` carries it (BG3's `WowCursor.lua` reads the same order).
++pub(crate) fn cursor_code(kind: crate::target::CursorKind) -> u32 {
++    use crate::target::CursorKind as K;
++    match kind {
++        K::Point => 0,
++        K::Attack => 1,
++        K::Speak => 2,
++        K::Pickup => 3,
++        K::LootAll => 4,
++        K::Interact => 5,
++        K::Buy => 6,
++        K::Inspect => 7,
++        K::Trainer => 8,
++        K::Taxi => 9,
++        K::Skin => 10,
++        K::Repair => 11,
++        K::Mail => 12,
++        K::Mine => 13,
++        K::GatherHerbs => 14,
++        K::PickLock => 15,
++        K::Cast => 16,
++    }
++}
++
++/// The pointer link (`wowbg3_lead.rs`) asks this for the unit under BG3's cursor: a mirrored mob
++/// is BG3's to click (its stand-in), not WoW's.
++pub(crate) fn claims_hover(guid: Option<u64>) -> bool {
++    guid.is_none_or(|g| !SHARED.lock().is_ok_and(|s| s.mirrored.contains(&g)))
+ }
+ 
+ static SHARED: LazyLock<Mutex<Shared>> = LazyLock::new(|| Mutex::new(Shared::default()));
+ 
+-/// The network thread asks this for every `CMSG_ATTACKSWING`; true keeps it off the wire
+-/// (a swing at a Young Wolf starts or continues a BG3 fight instead).
++/// The network thread asks this for every `CMSG_ATTACKSWING`; true keeps it off the wire (a swing
++/// at an attackable creature starts, joins or acts in a BG3 fight instead).
+ pub(crate) fn intercept_swing(guid: u64) -> bool {
+     let Ok(mut s) = SHARED.lock() else {
+         return false;
+     };
+-    if !s.enabled || !s.wolves.contains(&guid) {
++    if !s.enabled || !s.attackable.contains(&guid) {
+         return false;
+     }
+     s.events.push_back(Event::Swing(guid));
+@@ -76,6 +162,47 @@ pub(crate) fn intercept_ground_click(at: Vec3) -> bool {
+     true
+ }
+ 
++/// A chat line from the server: a `WOWBG3 ...` system line is taken here and kept out of the
++/// chat frame (true).
++pub(crate) fn server_line(chat_type: u8, text: &str) -> bool {
++    const CHAT_MSG_SYSTEM: u8 = 0x0A;
++    if chat_type != CHAT_MSG_SYSTEM || !text.starts_with("WOWBG3 ") {
++        return false;
++    }
++    if let Ok(mut s) = SHARED.lock() {
++        let w: Vec<&str> = text.split_whitespace().collect();
++        if w.get(1) == Some(&"mob") && w.last() == Some(&"aggro") {
++            if let Some(g) = w.get(3).and_then(|g| u64::from_str_radix(g, 16).ok()) {
++                if s.server_aggro.len() < 64 {
++                    s.server_aggro.push_back(g);
++                }
++            }
++        }
++        if s.server_lines.len() < 256 {
++            s.server_lines.push_back(text.to_string());
++        }
++    }
++    true
++}
++
++/// `SMSG_ATTACKERSTATEUPDATE` from a mob in a BG3 fight: BG3 decides its attacks, so the server's
++/// real-time swing (no server freeze without the server patch) is not played.
++pub(crate) fn mutes_swing(attacker: u64) -> bool {
++    SHARED.lock().is_ok_and(|s| s.held.contains(&attacker))
++}
++
++/// A fight mob's model: where BG3 has it and what it still has to play.
++#[derive(Default)]
++struct Held {
++    id: String,
++    at: Option<Vec3>,
++    goal: Option<Vec3>,
++    track: VecDeque<Vec3>,
++    /// (hit, damage) per BG3 attack, played once the model stands at the end of its path.
++    strikes: VecDeque<(bool, u32)>,
++    since: f32,
++}
++
+ #[derive(Resource)]
+ struct Fight {
+     dir: PathBuf,
+@@ -85,18 +212,34 @@ struct Fight {
+     your_turn: bool,
+     printed: u64,
+     anim_seen: u64,
+-    wolf: Option<u64>,
+-    wolf_track: VecDeque<Vec3>,
+-    wolf_at: Option<Vec3>,
++    /// A pull is out until the bridge says the fight is over.
++    active: bool,
++    held: HashMap<u64, Held>,
++    /// Every mob sent in the pull or a join (guid -> entry for join.json).
++    asked: HashSet<u64>,
++    /// Mobs asked to join after the pull, rewritten into join.json.
++    joins: Vec<String>,
++    /// Mobs of ended fights and when they ended (not pulled again by aggro for a while).
++    settled: HashMap<u64, u64>,
+     walk_to: Option<Vec3>,
+     frame: u64,
+     started: bool,
+     pulled_at: u64,
+-    /// `WOW_BG3_AUTOFIGHT` progress.
++    /// `WOW_BG3_AUTOFIGHT` progress (1: one wolf, 2: plus an attacked add).
+     auto: Option<Auto>,
+     turn: u64,
+     help_turn: u64,
+     in_world_at: Option<u64>,
++    /// The last `server-events.txt` lines (`N LINE`).
++    server_events: VecDeque<String>,
++    /// `WOW_BG3_M5`: the last server-cmd.txt line sent (None until the file was first read: older
++    /// lines are not replayed).
++    m5: Option<Option<u64>>,
++    /// The bridge's encounter id last seen in fight.txt (a new one while idle: the bridge started
++    /// a fight by itself).
++    encounter: Option<String>,
++    /// World mode (`WOW_BG3_LEAD`): the hero acts in BG3, so no WoW key help.
++    world: bool,
+ }
+ 
+ /// One parsed `fight.txt`.
+@@ -104,12 +247,17 @@ struct Fight {
+ pub(crate) struct FightText {
+     pub(crate) seq: u64,
+     pub(crate) state: String,
++    pub(crate) encounter: Option<String>,
+     pub(crate) your_turn: bool,
+     pub(crate) turn: u64,
+     /// id, hp, max hp, WoW position
+     pub(crate) actors: Vec<(String, u32, u32, [f32; 3])>,
++    /// id, guid, entry, status
++    pub(crate) enemies: Vec<(String, u64, u32, String)>,
+     /// seq, actor, kind, spell, target, WoW path
+     pub(crate) anims: Vec<(u64, String, String, String, String, Vec<[f32; 3]>)>,
++    /// seq, actor, target, hit, damage
++    pub(crate) strikes: Vec<(u64, String, String, bool, u32)>,
+     pub(crate) log: Vec<(u64, String)>,
+     pub(crate) outcome: Option<String>,
+ }
+@@ -122,6 +270,7 @@ pub(crate) fn parse_fight(text: &str) -> FightText {
+         match key {
+             "seq" => f.seq = rest.trim().parse().unwrap_or(0),
+             "state" => f.state = rest.trim().to_string(),
++            "encounter" => f.encounter = Some(rest.trim().to_string()).filter(|e| !e.is_empty()),
+             "your_turn" => f.your_turn = rest.trim() == "1",
+             "turn" => f.turn = rest.trim().parse().unwrap_or(0),
+             "outcome" => f.outcome = Some(rest.trim().to_string()),
+@@ -138,6 +287,14 @@ pub(crate) fn parse_fight(text: &str) -> FightText {
+                     f.actors.push((id, v[0] as u32, v[1] as u32, [v[2], v[3], v[4]]));
+                 }
+             }
++            "enemy" => {
++                let v: Vec<&str> = w.collect();
++                if let [id, guid, entry, status] = v[..] {
++                    if let (Ok(g), Ok(e)) = (u64::from_str_radix(guid, 16), entry.parse()) {
++                        f.enemies.push((id.to_string(), g, e, status.to_string()));
++                    }
++                }
++            }
+             "anim" => {
+                 let seq = w.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                 let mut s = || w.next().unwrap_or("none").to_string();
+@@ -146,6 +303,15 @@ pub(crate) fn parse_fight(text: &str) -> FightText {
+                 let path = v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                 f.anims.push((seq, actor, kind, spell, target, path));
+             }
++            "strike" => {
++                let v: Vec<&str> = w.collect();
++                if let [seq, actor, target, result, damage, ..] = v[..] {
++                    if let (Ok(seq), Ok(damage)) = (seq.parse(), damage.parse()) {
++                        f.strikes
++                            .push((seq, actor.to_string(), target.to_string(), result == "hit", damage));
++                    }
++                }
++            }
+             _ => {}
+         }
+     }
+@@ -154,6 +320,9 @@ pub(crate) fn parse_fight(text: &str) -> FightText {
+ 
+ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+     info!("wowbg3: BG3 fights through {:?}", dir);
++    let auto = std::env::var("WOW_BG3_AUTOFIGHT")
++        .ok()
++        .map(|v| Auto { adds: v.trim() == "2", ..Auto::default() });
+     app.insert_resource(Fight {
+         dir,
+         seq: 0,
+@@ -162,22 +331,28 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+         your_turn: false,
+         printed: 0,
+         anim_seen: 0,
+-        wolf: None,
+-        wolf_track: VecDeque::new(),
+-        wolf_at: None,
++        active: false,
++        held: HashMap::new(),
++        asked: HashSet::new(),
++        joins: Vec::new(),
++        settled: HashMap::new(),
+         walk_to: None,
+         frame: 0,
+         started: false,
+         pulled_at: 0,
+-        auto: std::env::var_os("WOW_BG3_AUTOFIGHT").map(|_| Auto::default()),
++        auto,
+         turn: 0,
+         help_turn: 0,
+         in_world_at: None,
++        server_events: VecDeque::new(),
++        m5: std::env::var_os("WOW_BG3_M5").map(|_| None),
++        encounter: None,
++        world: std::env::var_os("WOW_BG3_LEAD").is_some(),
+     })
+-    .add_systems(Update, (fight_tick, fight_walk.after(fight_tick)))
++    .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
+     .add_systems(
+         PostUpdate,
+-        fight_hold_wolf.before(bevy::transform::TransformSystems::Propagate),
++        fight_hold.before(bevy::transform::TransformSystems::Propagate),
+     );
+ }
+ 
+@@ -194,6 +369,17 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+     std::fs::rename(&tmp, path)
+ }
+ 
++/// A JSON string body (quotes, backslashes and control characters escaped or dropped).
++fn json_text(s: &str) -> String {
++    s.chars()
++        .filter(|c| !c.is_control())
++        .flat_map(|c| match c {
++            '"' | '\\' => vec!['\\', c],
++            _ => vec![c],
++        })
++        .collect()
++}
++
+ impl Fight {
+     fn next_seq(&mut self) -> u64 {
+         let now = SystemTime::now()
+@@ -202,38 +388,90 @@ impl Fight {
+         self.seq = now.max(self.seq + 1);
+         self.seq
+     }
+-    fn active(&self) -> bool {
+-        self.wolf.is_some()
+-    }
+-    fn input(&mut self, kind: &str, target: Option<[f32; 3]>, spell: &str) {
++    fn input(&mut self, kind: &str, target: Option<[f32; 3]>, spell: &str, aim: Option<u64>) {
+         let seq = self.next_seq();
+         let target = target.map_or("null".to_string(), |t| format!("[{},{},{}]", t[0], t[1], t[2]));
+-        let body = format!(r#"{{"seq":{seq},"kind":"{kind}","target":{target},"spell":"{spell}"}}"#);
++        let aim = aim.map_or(String::new(), |g| format!(r#","target_guid":"{g:016x}""#));
++        let body =
++            format!(r#"{{"seq":{seq},"kind":"{kind}","target":{target},"spell":"{spell}"{aim}}}"#);
+         if let Err(e) = write_atomic(&self.dir.join("input.json"), &body) {
+             warn!("wowbg3 fight: cannot write input: {e}");
+         }
+     }
+     fn release(&mut self) {
+-        self.wolf = None;
+-        self.wolf_track.clear();
+-        self.wolf_at = None;
++        let frame = self.frame;
++        for g in self.asked.drain() {
++            self.settled.insert(g, frame);
++        }
++        self.held.clear();
++        self.joins.clear();
++        self.active = false;
+         self.your_turn = false;
+         self.help_turn = 0;
+         if let Ok(mut s) = SHARED.lock() {
+             s.active = false;
++            s.held.clear();
++        }
++    }
++    fn hold(&mut self, guid: u64, at: Vec3) {
++        self.held.entry(guid).or_insert_with(|| Held {
++            at: Some(at),
++            goal: Some(at),
++            ..Held::default()
++        });
++        if let Ok(mut s) = SHARED.lock() {
++            s.held.insert(guid);
+         }
+     }
++    fn settled(&self, guid: u64) -> bool {
++        self.settled
++            .get(&guid)
++            .is_some_and(|&at| self.frame < at + SETTLE_FRAMES)
++    }
+ }
+ 
+-fn unit_json(guid: u64, pos: [f32; 3], store: Option<&ObjectStore>) -> String {
+-    let max = store.and_then(|s| s.0.unit_max_health()).unwrap_or(1).max(1);
+-    let hp = store.and_then(|s| s.0.unit_health()).unwrap_or(max).min(max);
++/// One mob or the hero as a pull/join UNIT (WoW yards).
++fn unit_json(guid: u64, pos: [f32; 3], store: &ObjectStore, name: &str) -> String {
++    let max = store.0.unit_max_health().unwrap_or(1).max(1);
++    let hp = store.0.unit_health().unwrap_or(max).min(max);
++    let entry = store.0.object_entry().unwrap_or(0);
++    let level = store.0.unit_level().unwrap_or(0);
+     format!(
+-        r#""guid":"{guid:016x}","pos":[{},{},{}],"hp":{hp},"max_hp":{max}"#,
+-        pos[0], pos[1], pos[2]
++        r#"{{"guid":"{guid:016x}","entry":{entry},"name":"{}","level":{level},"pos":[{},{},{}],"hp":{hp},"max_hp":{max}}}"#,
++        json_text(name),
++        pos[0],
++        pos[1],
++        pos[2]
+     )
+ }
+ 
++/// A creature the WoW player may fight: alive, not a player or player pet, attackable.
++/// Returns whether it is hostile (aggroes by itself) or neutral.
++fn fightable(
++    store: &ObjectStore,
++    me: &ObjectStore,
++    factions: Option<&Factions>,
++    reps: &Reputations,
++) -> Option<bool> {
++    let f = &store.0;
++    if f.object_type() == Some(ObjectType::Player)
++        || f.unit_health().unwrap_or(0) == 0
++        || f.unit_flags() & PLAYER_CONTROLLED != 0
++        || !can_attack(Some(store), factions, reps, Some(me))
++    {
++        return None;
++    }
++    Some(ring_reaction(factions, reps, Some(store), Some(me)) < NEUTRAL)
++}
++
++/// What one scan of the world found (every 30 frames).
++struct Scan {
++    /// Attackable creatures: guid, entity position, hostile, creature entry.
++    attackable: Vec<(u64, Vec3, bool, u32)>,
++    /// Creatures in combat with you (their target is you, in combat), within `PACK_RANGE`.
++    in_combat: Vec<u64>,
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn fight_tick(
+     mut f: ResMut<Fight>,
+@@ -242,88 +480,293 @@ fn fight_tick(
+     me: Query<(&Guid, &ObjectStore), With<SelfPlayer>>,
+     units: Query<(&Guid, &ObjectStore, &Transform), Without<SelfPlayer>>,
+     mut chat: Option<ResMut<ChatLog>>,
++    factions: Option<Res<Factions>>,
++    reps: Option<Res<Reputations>>,
++    names: Option<Res<crate::names::NameCache>>,
+ ) {
+     f.frame += 1;
+-    if f.frame % 30 == 1 {
+-        let wolves: HashSet<u64> = units
+-            .iter()
+-            .filter(|(_, s, _)| s.0.object_entry() == Some(YOUNG_WOLF) && s.0.unit_health().unwrap_or(0) > 0)
+-            .map(|(g, _, _)| g.0)
+-            .collect();
++    let empty = Reputations(Vec::new());
++    let reps = reps.as_deref().unwrap_or(&empty);
++    let Ok((my_guid, my_store)) = me.single() else {
++        return;
++    };
++    let my_guid = my_guid.0;
++    let name_of = |store: &ObjectStore| {
++        store
++            .0
++            .object_entry()
++            .and_then(|e| names.as_deref()?.creature_record(e).map(|r| r.name.clone()))
++            .unwrap_or_default()
++    };
++    let unit_of = |guid: u64| units.iter().find(|(g, _, _)| g.0 == guid);
++    // The bridge's mirror list (`mirrored.txt`): stand-ins and turn-based freezes.
++    if f.frame % 30 == 2 {
++        let text = std::fs::read_to_string(f.dir.join("mirrored.txt")).unwrap_or_default();
++        let (mut m, mut h) = (HashSet::new(), HashSet::new());
++        for line in text.lines() {
++            match line.split_once(' ') {
++                Some(("m", g)) => m.extend(u64::from_str_radix(g.trim(), 16).ok()),
++                Some(("h", g)) => h.extend(u64::from_str_radix(g.trim(), 16).ok()),
++                _ => {}
++            }
++        }
+         if let Ok(mut s) = SHARED.lock() {
+-            s.enabled = player.active;
+-            s.wolves = wolves;
++            s.mirrored = m;
++            s.frozen = h;
++        }
++    }
++    let frozen: HashSet<u64> = SHARED.lock().map(|s| s.frozen.clone()).unwrap_or_default();
++    // The mobs near you for the bridge's mirrors (`mobs.txt`).
++    if f.frame % 12 == 5 && player.active {
++        let mut text = format!(
++            "seq {}\nhero {my_guid:016x} {} {} {} 0 {} {} {}\n",
++            f.frame,
++            bevy_to_wow(player.pos)[0],
++            bevy_to_wow(player.pos)[1],
++            bevy_to_wow(player.pos)[2],
++            my_store.0.unit_health().unwrap_or(1),
++            my_store.0.unit_max_health().unwrap_or(1).max(1),
++            my_store.0.unit_level().unwrap_or(0),
++        );
++        for (g, store, tf) in &units {
++            if player.pos.distance(tf.translation) > MIRROR_RANGE {
++                continue;
++            }
++            let Some(hostile) = fightable(store, my_store, factions.as_deref(), reps) else {
++                continue;
++            };
++            let s = &store.0;
++            let w = bevy_to_wow(tf.translation);
++            let flags = u32::from(s.unit_flags() & UNIT_FLAG_IN_COMBAT != 0)
++                | (u32::from(s.unit_target() == Some(my_guid)) << 1);
++            text += &format!(
++                "mob {:016x} {} {} {} {} {} {} {} {} {} {} {}\n",
++                g.0,
++                s.object_entry().unwrap_or(0),
++                s.unit_level().unwrap_or(0),
++                u8::from(hostile),
++                w[0],
++                w[1],
++                w[2],
++                tf.rotation.to_euler(EulerRot::YXZ).0,
++                s.unit_health().unwrap_or(0),
++                s.unit_max_health().unwrap_or(1).max(1),
++                flags,
++                name_of(store).replace(['\n', '\r'], " "),
++            );
++        }
++        if let Err(e) = write_atomic(&f.dir.join("mobs.txt"), &text) {
++            warn!("wowbg3 fight: cannot write mobs: {e}");
++        }
++    }
++    let scan = (f.frame % 30 == 1).then(|| {
++        let mut s = Scan {
++            attackable: Vec::new(),
++            in_combat: Vec::new(),
++        };
++        for (g, store, tf) in &units {
++            let Some(hostile) = fightable(store, my_store, factions.as_deref(), reps) else {
++                continue;
++            };
++            s.attackable
++                .push((g.0, tf.translation, hostile, store.0.object_entry().unwrap_or(0)));
++            if store.0.unit_target() == Some(my_guid)
++                && store.0.unit_flags() & UNIT_FLAG_IN_COMBAT != 0
++                && player.pos.distance(tf.translation) <= PACK_RANGE
++                && !frozen.contains(&g.0)
++            {
++                s.in_combat.push(g.0);
++            }
++        }
++        s
++    });
++    if let Some(s) = &scan {
++        if let Ok(mut shared) = SHARED.lock() {
++            shared.enabled = player.active;
++            shared.attackable = s.attackable.iter().map(|a| a.0).collect();
+         }
+     }
+     if player.active && f.in_world_at.is_none() {
+         f.in_world_at = Some(f.frame);
+     }
+-    autofight(&mut f, &player, &units);
+-    let events: Vec<Event> = SHARED.lock().map(|mut s| s.events.drain(..).collect()).unwrap_or_default();
++    autofight(&mut f, &player, scan.as_ref());
++    let events: Vec<Event> = SHARED
++        .lock()
++        .map(|mut s| s.events.drain(..).collect())
++        .unwrap_or_default();
++    // Mobs to pull (a new fight) or to join (the running one).
++    let mut pull: Vec<u64> = Vec::new();
++    let mut join: Vec<u64> = Vec::new();
+     for e in events {
+         match e {
+-            Event::Swing(guid) if !f.active() => {
+-                let Some((_, store, tf)) = units.iter().find(|(g, _, _)| g.0 == guid) else {
++            Event::Swing(guid) if !f.active => {
++                let Some((_, _, tf)) = unit_of(guid) else {
+                     continue;
+                 };
+                 let distance = player.pos.distance(tf.translation);
+                 if distance > PULL_RANGE {
+-                    say(&mut chat, format!("The wolf is {distance:.0} yards away; get within {PULL_RANGE:.0} yards for a BG3 fight"));
+-                    continue;
+-                }
+-                let Ok((my_guid, my_store)) = me.single() else {
+-                    continue;
+-                };
+-                let seq = f.next_seq();
+-                let body = format!(
+-                    r#"{{"seq":{seq},"map":0,"hero":{{{}}},"enemy":{{{},"entry":{YOUNG_WOLF},"name":"Young Wolf"}}}}"#,
+-                    unit_json(my_guid.0, bevy_to_wow(player.pos), Some(my_store)),
+-                    unit_json(guid, bevy_to_wow(tf.translation), Some(store)),
+-                );
+-                if let Err(e) = write_atomic(&f.dir.join("pull.json"), &body) {
+-                    say(&mut chat, format!("Cannot start a BG3 fight: {e}"));
++                    say(
++                        &mut chat,
++                        format!("That mob is {distance:.0} yards away; get within {PULL_RANGE:.0} yards for a BG3 fight"),
++                    );
+                     continue;
+                 }
+-                f.wolf = Some(guid);
+-                f.wolf_at = Some(tf.translation);
+-                f.started = false;
+-                f.pulled_at = f.frame;
+-                if let Ok(mut s) = SHARED.lock() {
+-                    s.active = true;
+-                }
+-                say(&mut chat, "Young Wolf pulled into a BG3 fight; BG3 is setting it up".into());
++                pull.push(guid);
+             }
+-            Event::Swing(guid) if Some(guid) == f.wolf => {
++            Event::Swing(guid) if f.held.contains_key(&guid) => {
+                 if f.your_turn {
+-                    f.input("cast", None, "Attack");
++                    f.input("cast", None, "Attack", Some(guid));
+                 } else {
+                     say(&mut chat, "Not your turn".into());
+                 }
+             }
+-            Event::Swing(_) => {}
++            // Attacking a mob that is not in the fight provokes it: it joins.
++            Event::Swing(guid) => {
++                if unit_of(guid).is_some_and(|(_, _, tf)| player.pos.distance(tf.translation) <= PACK_RANGE) {
++                    join.push(guid);
++                }
++            }
+             Event::Ground(at) => {
+                 if f.your_turn {
+-                    f.input("move", Some(bevy_to_wow(at)), "");
++                    f.input("move", Some(bevy_to_wow(at)), "", None);
+                 } else {
+                     say(&mut chat, "Not your turn".into());
+                 }
+             }
+         }
+     }
+-    if f.active() {
++    // The server's aggro holds pull or join like a client-seen aggro.
++    let (lines, aggro): (Vec<String>, Vec<u64>) = SHARED
++        .lock()
++        .map(|mut s| (s.server_lines.drain(..).collect(), s.server_aggro.drain(..).collect()))
++        .unwrap_or_default();
++    for g in aggro {
++        if unit_of(g).is_none() {
++            continue;
++        }
++        if !f.active && !pull.contains(&g) {
++            pull.push(g);
++        } else if f.active && !f.asked.contains(&g) && !join.contains(&g) {
++            join.push(g);
++        }
++    }
++    if !lines.is_empty() {
++        for line in lines {
++            let n = f.next_seq();
++            f.server_events.push_back(format!("{n} {line}"));
++            if f.server_events.len() > 128 {
++                f.server_events.pop_front();
++            }
++        }
++        let text = f.server_events.iter().map(|l| format!("{l}\n")).collect::<String>();
++        if let Err(e) = write_atomic(&f.dir.join("server-events.txt"), &text) {
++            warn!("wowbg3 fight: cannot write server events: {e}");
++        }
++    }
++    if let Some(s) = &scan {
++        let hostile: HashSet<u64> = s.attackable.iter().filter(|a| a.2).map(|a| a.0).collect();
++        if !f.active && pull.is_empty() {
++            // A hostile mob aggroed you: it pulls (neutral mobs only fight when attacked).
++            if let Some(&g) = s
++                .in_combat
++                .iter()
++                .find(|g| hostile.contains(g) && !f.settled(**g))
++            {
++                pull.push(g);
++            }
++        }
++        if !pull.is_empty() && !f.active {
++            // Every other mob in combat with you comes along (its pack, adds already on you).
++            for &g in &s.in_combat {
++                if !pull.contains(&g) && !f.settled(g) {
++                    pull.push(g);
++                }
++            }
++        } else if f.active {
++            for &g in &s.in_combat {
++                if !f.asked.contains(&g) && !join.contains(&g) {
++                    join.push(g);
++                }
++            }
++        }
++    }
++    let list: Vec<String> = if f.active {
++        Vec::new()
++    } else {
++        pull.iter()
++            .filter_map(|&g| {
++                unit_of(g).map(|(_, s, tf)| unit_json(g, bevy_to_wow(tf.translation), s, &name_of(s)))
++            })
++            .take(8)
++            .collect()
++    };
++    if !list.is_empty() {
++        let seq = f.next_seq();
++        let hero = unit_json(my_guid, bevy_to_wow(player.pos), my_store, "");
++        let body = format!(
++            r#"{{"seq":{seq},"map":0,"hero":{hero},"enemy":{},"enemies":[{}]}}"#,
++            list[0],
++            list.join(",")
++        );
++        if let Err(e) = write_atomic(&f.dir.join("pull.json"), &body) {
++            say(&mut chat, format!("Cannot start a BG3 fight: {e}"));
++        } else {
++            for &g in pull.iter().take(8) {
++                if let Some((_, _, tf)) = unit_of(g) {
++                    f.hold(g, tf.translation);
++                    f.asked.insert(g);
++                }
++            }
++            f.active = true;
++            f.started = false;
++            f.pulled_at = f.frame;
++            f.joins.clear();
++            if let Ok(mut s) = SHARED.lock() {
++                s.active = true;
++            }
++            let who = if list.len() == 1 { "1 mob".into() } else { format!("{} mobs", list.len()) };
++            say(&mut chat, format!("{who} pulled into a BG3 fight; BG3 is setting it up"));
++        }
++    }
++    if f.active && !join.is_empty() {
++        let mut added = 0;
++        for g in join {
++            if f.asked.contains(&g) {
++                continue;
++            }
++            if let Some((_, s, tf)) = unit_of(g) {
++                let unit = unit_json(g, bevy_to_wow(tf.translation), s, &name_of(s));
++                f.joins.push(unit);
++                f.asked.insert(g);
++                f.hold(g, tf.translation);
++                added += 1;
++            }
++        }
++        if added > 0 {
++            let seq = f.next_seq();
++            let body = format!(r#"{{"seq":{seq},"enemies":[{}]}}"#, f.joins.join(","));
++            if let Err(e) = write_atomic(&f.dir.join("join.json"), &body) {
++                warn!("wowbg3 fight: cannot write join: {e}");
++            }
++            say(&mut chat, format!("{added} more joining the BG3 fight"));
++        }
++    }
++    if f.active {
+         if keys.just_pressed(KeyCode::F11) {
+-            f.input("leave", None, "");
++            f.input("leave", None, "", None);
+         } else if keys.just_pressed(KeyCode::F9) || keys.just_pressed(KeyCode::F10) {
+             if !f.your_turn {
+                 say(&mut chat, "Not your turn".into());
+             } else if keys.just_pressed(KeyCode::F9) {
+-                f.input("cast", None, "FireBolt");
++                // At your WoW target when it is a fight mob, else BG3's nearest.
++                let aim = my_store.0.unit_target().filter(|g| f.held.contains_key(g));
++                f.input("cast", None, "FireBolt", aim);
+             } else {
+-                f.input("end_turn", None, "");
++                f.input("end_turn", None, "", None);
+             }
+         }
+     }
+-    if f.active() && !f.started && f.frame - f.pulled_at > 1800 {
++    if f.active && !f.started && f.frame - f.pulled_at > 1800 {
+         say(&mut chat, "The BG3 bridge did not answer; is it running?".into());
+         f.release();
+     }
+@@ -341,39 +784,110 @@ fn fight_tick(
+     if f.text_seq.is_none() {
+         // Whatever the bridge wrote before we started is old news.
+         f.printed = t.log.iter().map(|l| l.0).max().unwrap_or(0);
+-        f.anim_seen = t.anims.iter().map(|a| a.0).max().unwrap_or(0);
++        f.anim_seen = t
++            .anims
++            .iter()
++            .map(|a| a.0)
++            .chain(t.strikes.iter().map(|s| s.0))
++            .max()
++            .unwrap_or(0);
+     } else if t.seq == 0 || t.seq < previous || previous == 0 {
+         f.printed = 0;
+         f.anim_seen = 0;
+     }
++    let first_read = f.text_seq.is_none();
+     f.text_seq = Some(t.seq);
+     f.state = t.state.clone();
++    // A fight the bridge started by itself (BG3 combat with a mirrored mob): play it as a pull.
++    let live = matches!(t.state.as_str(), "starting" | "active");
++    if t.encounter.is_some() && t.encounter != f.encounter {
++        if !f.active && live && !first_read {
++            info!("wowbg3 fight: the bridge started {:?} (BG3 combat)", t.encounter);
++            f.active = true;
++            f.started = true;
++            f.pulled_at = f.frame;
++            f.joins.clear();
++            if let Ok(mut s) = SHARED.lock() {
++                s.active = true;
++            }
++            let n = t.enemies.iter().filter(|e| e.3 != "refused").count();
++            say(&mut chat, format!("BG3 started a fight with {n} mob(s)"));
++        }
++        if f.active || !live {
++            f.encounter = t.encounter.clone();
++        }
++    }
+     for (n, line) in &t.log {
+         if *n > f.printed {
+             f.printed = *n;
+-            if f.active() {
++            if f.active {
+                 say(&mut chat, line.clone());
+             }
+         }
+     }
+-    if !f.active() {
++    if !f.active {
+         return;
+     }
+-    for (seq, actor, kind, _spell, _target, path) in &t.anims {
+-        if *seq <= f.anim_seen {
++    // Fight ids to WoW mobs; refused mobs go back to WoW.
++    let mut by_id: HashMap<String, u64> = HashMap::new();
++    for (id, guid, _, status) in &t.enemies {
++        if status == "refused" {
++            f.held.remove(guid);
++            if let Ok(mut s) = SHARED.lock() {
++                s.held.remove(guid);
++            }
+             continue;
+         }
+-        f.anim_seen = *seq;
++        by_id.insert(id.clone(), *guid);
++        // Mobs the bridge brought in by itself (BG3 pulled their stand-ins into its combat).
++        if !f.held.contains_key(guid) && !matches!(status.as_str(), "dead") {
++            if let Some((_, _, tf)) = unit_of(*guid) {
++                let at = tf.translation;
++                f.hold(*guid, at);
++                f.asked.insert(*guid);
++            }
++        }
++        if let Some(h) = f.held.get_mut(guid) {
++            h.id = id.clone();
++        }
++    }
++    for (id, _, _, pos) in &t.actors {
++        if let Some(h) = by_id.get(id).and_then(|g| f.held.get_mut(g)) {
++            h.goal = Some(wow_to_bevy(*pos));
++        }
++    }
++    // Paths and attacks in the bridge's order: (seq, is a strike, index).
++    let mut steps: Vec<(u64, bool, usize)> = t
++        .anims
++        .iter()
++        .enumerate()
++        .map(|(i, a)| (a.0, false, i))
++        .chain(t.strikes.iter().enumerate().map(|(i, s)| (s.0, true, i)))
++        .collect();
++    steps.sort_by_key(|s| s.0);
++    for (seq, is_strike, i) in steps {
++        if seq <= f.anim_seen {
++            continue;
++        }
++        f.anim_seen = seq;
++        if is_strike {
++            let (_, actor, _, hit, damage) = &t.strikes[i];
++            if let Some(h) = by_id.get(actor).and_then(|g| f.held.get_mut(g)) {
++                h.strikes.push_back((*hit, *damage));
++            }
++            continue;
++        }
++        let (_, actor, kind, _, _, path) = &t.anims[i];
+         if actor == "hero" && kind == "move" {
+             if let Some(last) = path.last() {
+                 f.walk_to = Some(wow_to_bevy(*last));
+             }
+-        } else if actor == "wolf" {
+-            f.wolf_track = path.iter().map(|p| wow_to_bevy(*p)).collect();
++        } else if let Some(h) = by_id.get(actor).and_then(|g| f.held.get_mut(g)) {
++            h.track.extend(path.iter().map(|p| wow_to_bevy(*p)));
+         }
+     }
+     // The help once per turn of yours (your_turn also drops while an action is outstanding).
+-    if t.your_turn && t.turn != f.help_turn {
++    if t.your_turn && t.turn != f.help_turn && !f.world {
+         f.help_turn = t.turn;
+         say(&mut chat, HELP.into());
+     }
+@@ -389,9 +903,19 @@ fn fight_tick(
+     }
+ }
+ 
++/// The nearest attackable mob within `PULL_RANGE` that is not in `skip` (only `entry` if given).
++fn nearest_mob(scan: &Scan, from: Vec3, skip: &HashSet<u64>, entry: Option<u32>) -> Option<(u64, f32)> {
++    scan.attackable
++        .iter()
++        .filter(|(g, _, _, e)| !skip.contains(g) && entry.is_none_or(|want| *e == want))
++        .map(|(g, at, _, _)| (*g, from.distance(*at)))
++        .filter(|(_, d)| *d <= PULL_RANGE)
++        .min_by(|x, y| x.1.total_cmp(&y.1))
++}
++
+ /// `WOW_BG3_AUTOFIGHT`: the inputs a player would give, for harness runs.
+-fn autofight(f: &mut Fight, player: &Player, units: &Query<(&Guid, &ObjectStore, &Transform), Without<SelfPlayer>>) {
+-    let Some(mut a) = f.auto else {
++fn autofight(f: &mut Fight, player: &Player, scan: Option<&Scan>) {
++    let Some(mut a) = f.auto.take() else {
+         return;
+     };
+     let push = |e: Event| {
+@@ -399,16 +923,10 @@ fn autofight(f: &mut Fight, player: &Player, units: &Query<(&Guid, &ObjectStore,
+             s.events.push_back(e);
+         }
+     };
+-    if !f.active() {
++    if !f.active {
+         let ready = f.in_world_at.is_some_and(|at| f.frame > at + 600) && !a.pulled && f.frame >= a.next;
+-        if ready && SHARED.lock().map(|s| s.enabled).unwrap_or(false) {
+-            let nearest = units
+-                .iter()
+-                .filter(|(_, s, _)| s.0.object_entry() == Some(YOUNG_WOLF) && s.0.unit_health().unwrap_or(0) > 0)
+-                .map(|(g, _, tf)| (g.0, player.pos.distance(tf.translation)))
+-                .filter(|(_, d)| *d <= PULL_RANGE)
+-                .min_by(|x, y| x.1.total_cmp(&y.1));
+-            if let Some((guid, d)) = nearest {
++        if let Some(scan) = scan.filter(|_| ready && SHARED.lock().map(|s| s.enabled).unwrap_or(false)) {
++            if let Some((guid, d)) = nearest_mob(scan, player.pos, &HashSet::new(), Some(YOUNG_WOLF)) {
+                 info!("wowbg3 autofight: pulling Young Wolf {guid:#x} at {d:.1} yd");
+                 push(Event::Swing(guid));
+                 a.pulled = true;
+@@ -419,6 +937,7 @@ fn autofight(f: &mut Fight, player: &Player, units: &Query<(&Guid, &ObjectStore,
+         return;
+     }
+     if !f.your_turn || f.frame < a.next {
++        f.auto = Some(a);
+         return;
+     }
+     if f.turn != a.turn {
+@@ -426,31 +945,50 @@ fn autofight(f: &mut Fight, player: &Player, units: &Query<(&Guid, &ObjectStore,
+         a.turns += 1;
+         a.step = 0;
+     }
++    // `=2`: on the first turn, attack the nearest other mob (it joins the fight).
++    if a.adds && !a.added && a.turns == 1 {
++        if let Some(scan) = scan {
++            a.added = true;
++            let in_fight: HashSet<u64> = f.held.keys().copied().collect();
++            match nearest_mob(scan, player.pos, &in_fight, None) {
++                Some((guid, d)) => {
++                    info!("wowbg3 autofight: attacking add {guid:#x} at {d:.1} yd");
++                    push(Event::Swing(guid));
++                }
++                None => info!("wowbg3 autofight: no add within {PULL_RANGE} yd"),
++            }
++        }
++        f.auto = Some(a);
++        return;
++    }
+     a.next = f.frame + 240;
+-    if a.turns > 4 {
++    if a.turns > 6 {
+         if a.step == 0 {
+-            f.input("leave", None, "");
++            f.input("leave", None, "", None);
+             a.step = 99;
+         }
+     } else {
+         let plan: &[&str] = if a.turns == 1 { &["move", "cast", "end"] } else { &["cast", "end"] };
+         match plan.get(a.step as usize).copied().unwrap_or("end") {
+             "move" => {
+-                if let Some(wolf) = f.wolf_at {
+-                    let dir = (wolf - player.pos).normalize_or_zero();
++                if let Some(h) = f.held.values().find_map(|h| h.at) {
++                    let dir = (h - player.pos).normalize_or_zero();
+                     push(Event::Ground(player.pos + dir * 2.0));
+                 }
+             }
+-            "cast" => f.input("cast", None, "FireBolt"),
+-            _ => f.input("end_turn", None, ""),
++            "cast" => f.input("cast", None, "FireBolt", None),
++            _ => f.input("end_turn", None, "", None),
+         }
+         a.step += 1;
+     }
+     f.auto = Some(a);
+ }
+ 
+-#[derive(Clone, Copy, Default)]
++#[derive(Clone, Default)]
+ struct Auto {
++    /// `WOW_BG3_AUTOFIGHT=2`: attack a second mob on the first turn.
++    adds: bool,
++    added: bool,
+     pulled: bool,
+     turns: u32,
+     turn: u64,
+@@ -464,34 +1002,116 @@ fn fight_walk(mut f: ResMut<Fight>, mut auto: AutoMove) {
+     }
+ }
+ 
+-/// The wolf's model follows BG3's path and stays where BG3 put it, whatever the server says.
+-fn fight_hold_wolf(time: Res<Time>, mut f: ResMut<Fight>, mut units: Query<(&Guid, &mut Transform), Without<SelfPlayer>>) {
+-    let Some(guid) = f.wolf else {
++/// Fight mobs' models follow BG3: along its paths, then where it put them; an attack of the
++/// stand-in plays the WoW mob's own melee swing at you (`SwingMessage`, as a server swing would).
++fn fight_hold(
++    time: Res<Time>,
++    mut f: ResMut<Fight>,
++    me: Query<Entity, With<SelfPlayer>>,
++    mut units: Query<(Entity, &Guid, &mut Transform), Without<SelfPlayer>>,
++    mut swings: MessageWriter<SwingMessage>,
++    mut play_seq: ResMut<PlaySeq>,
++) {
++    if f.held.is_empty() {
+         return;
+-    };
+-    if let Some(next) = f.wolf_track.front().copied() {
+-        let at = f.wolf_at.unwrap_or(next);
+-        let step = WOLF_SPEED * time.delta_secs();
+-        let d = next - at;
+-        if d.length() <= step {
+-            f.wolf_at = Some(next);
+-            f.wolf_track.pop_front();
+-        } else {
+-            f.wolf_at = Some(at + d.normalize() * step);
++    }
++    let dt = time.delta_secs();
++    let victim = me.single().ok();
++    for (entity, g, mut tf) in &mut units {
++        let Some(h) = f.held.get_mut(&g.0) else {
++            continue;
++        };
++        h.since += dt;
++        let at = h.at.unwrap_or(tf.translation);
++        let next = h.track.front().copied().or(h.goal);
++        let mut moved = at;
++        if let Some(next) = next {
++            let step = MOB_SPEED * dt;
++            let d = next - at;
++            if d.length() <= step {
++                moved = next;
++                h.track.pop_front();
++            } else {
++                moved = at + d.normalize() * step;
++            }
++        }
++        h.at = Some(moved);
++        let walking = !h.track.is_empty() || h.goal.is_some_and(|g| g.distance(moved) > 0.05);
++        if !walking && h.since >= STRIKE_GAP {
++            if let Some((hit, damage)) = h.strikes.pop_front() {
++                h.since = 0.0;
++                swings.write(SwingMessage {
++                    attacker: entity,
++                    victim,
++                    hit_info: if hit { HIT_NORMAL } else { HIT_MISS },
++                    victim_state: hit as u32,
++                    damage,
++                    // BG3 shows its own numbers; WoW's floating text would repeat them.
++                    displayed: false,
++                    seq: play_seq.next(),
++                });
++                info!(
++                    "wowbg3 fight: {} (unit={entity}, guid {:#x}) plays its WoW attack ({}, {damage})",
++                    h.id,
++                    g.0,
++                    if hit { "hit" } else { "miss" }
++                );
++            }
++        }
++        let d = moved - tf.translation;
++        if Vec2::new(d.x, d.z).length() > 0.05 {
++            tf.look_to(Vec3::new(d.x, 0.0, d.z), Vec3::Y);
+         }
++        tf.translation = moved;
+     }
+-    let Some(at) = f.wolf_at else {
++}
++
++/// `WOW_BG3_M5=1`: the bridge's server requests (`server-cmd.txt`: `SEQ .wowbg3 ...` per line,
++/// SEQ rising) go out once each as SAY chat from the player's own session (the server patch reads them there).
++/// In the world it first sends `.wowbg3 arm` itself (the bridge's own may predate this session);
++/// in world mode `.wowbg3 arm sight` (server patch 0002: mobs never notice you by proximity, BG3's
++/// stand-ins decide who spots Tav and the bridge sends `begin` for them), otherwise
++/// `.wowbg3 arm nosight`.
++fn m5_send(mut f: ResMut<Fight>, net: Option<Res<NetCommands>>, player: Res<Player>) {
++    if f.frame % 15 != 0 || !player.active {
++        return;
++    }
++    let (Some(last), Some(net)) = (f.m5, net) else {
+         return;
+     };
+-    for (g, mut tf) in &mut units {
+-        if g.0 == guid {
+-            let d = at - tf.translation;
+-            if Vec2::new(d.x, d.z).length() > 0.05 {
+-                tf.look_to(Vec3::new(d.x, 0.0, d.z), Vec3::Y);
+-            }
+-            tf.translation = at;
++    let say = |text: &str| {
++        let _ = net.0.send(ClientCommand::Chat {
++            kind: ChatKind::Say,
++            target: None,
++            text: text.to_string(),
++            language: None,
++        });
++    };
++    let text = std::fs::read_to_string(f.dir.join("server-cmd.txt")).unwrap_or_default();
++    let lines: Vec<(u64, &str)> = text
++        .lines()
++        .filter_map(|l| {
++            let (n, command) = l.split_once(' ')?;
++            Some((n.parse().ok()?, command))
++        })
++        .filter(|(_, c)| c.starts_with(".wowbg3 "))
++        .collect();
++    let newest = lines.iter().map(|l| l.0).max().unwrap_or(0);
++    let Some(last) = last else {
++        // Outside world mode `nosight` (server p3) ends a sight mode left over from a world session.
++        let arm = if f.world { ".wowbg3 arm sight" } else { ".wowbg3 arm nosight" };
++        info!("wowbg3 fight: server requests on ({arm})");
++        say(arm);
++        f.m5 = Some(Some(newest));
++        return;
++    };
++    for (n, command) in lines {
++        if n > last {
++            info!("wowbg3 fight: server request {command}");
++            say(command);
+         }
+     }
++    f.m5 = Some(Some(newest.max(last)));
+ }
+ 
+ #[cfg(test)]
+@@ -501,17 +1121,48 @@ mod tests {
+     #[test]
+     fn parses_the_bridge_lines() {
+         let t = parse_fight(
+-            "seq 7\nstate active\nyour_turn 1\nactor hero 9 14 -8949.9 -132.5 83.5\n\
+-             actor wolf 6 11 -8945 -132 83\nanim 3 wolf cast Target_Bite_Wolf hero -8946 -132 83 -8947 -132 83\n\
+-             anim 4 hero cast FireBolt wolf\nlog 5 Turn 4: your turn\noutcome victory\n",
++            "seq 7\nstate active\nencounter pull-0a1b\nyour_turn 1\nactor hero 9 14 -8949.9 -132.5 83.5\n\
++             actor e1 6 11 -8945 -132 83\nenemy e1 f130000000012b01 299 in\n\
++             enemy e2 f130000000012b02 299 refused\n\
++             anim 3 e1 move none none -8946 -132 83 -8947 -132 83\n\
++             strike 4 e1 hero hit 3 Target_Bite_Wolf\nstrike 6 e1 hero miss 0 Target_Bite_Wolf\n\
++             anim 5 hero cast FireBolt e1\nlog 5 Turn 4: your turn\noutcome victory\n",
+         );
+         assert_eq!(t.seq, 7);
++        assert_eq!(t.encounter.as_deref(), Some("pull-0a1b"));
+         assert!(t.your_turn);
+-        assert_eq!(t.actors[1].0, "wolf");
++        assert_eq!(t.actors[1].0, "e1");
+         assert_eq!(t.actors[1].1, 6);
++        assert_eq!(t.enemies[0], ("e1".into(), 0xf130000000012b01, 299, "in".into()));
++        assert_eq!(t.enemies[1].3, "refused");
+         assert_eq!(t.anims[0].5.len(), 2);
+         assert!(t.anims[1].5.is_empty());
++        assert_eq!(t.strikes[0], (4, "e1".into(), "hero".into(), true, 3));
++        assert!(!t.strikes[1].3);
+         assert_eq!(t.log, vec![(5, "Turn 4: your turn".to_string())]);
+         assert_eq!(t.outcome.as_deref(), Some("victory"));
+     }
++
++    #[test]
++    fn mirrored_mobs_are_not_claimed_for_wow() {
++        if let Ok(mut s) = SHARED.lock() {
++            s.mirrored.insert(0xf130000000012b01);
++        }
++        assert!(!claims_hover(Some(0xf130000000012b01)));
++        assert!(claims_hover(Some(0xf130000000012b02)));
++        assert!(claims_hover(None));
++    }
++
++    #[test]
++    fn cursor_codes_follow_bg3s_table() {
++        use crate::target::CursorKind;
++        assert_eq!(cursor_code(CursorKind::Point), 0);
++        assert_eq!(cursor_code(CursorKind::Speak), 2);
++        assert_eq!(cursor_code(CursorKind::Cast), 16);
++    }
++
++    #[test]
++    fn json_text_escapes_names() {
++        assert_eq!(json_text("Defias \"Thug\"\\\n"), "Defias \\\"Thug\\\"\\\\");
++    }
+ }
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 397053f..6a9b6a2 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -287,6 +287,7 @@ fn forward_pointer(
+     object: Res<crate::target::HoveredObject>,
+     mut buttons: MessageWriter<bevy::input::mouse::MouseButtonInput>,
+     (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
++    world_cursor: Res<crate::target::WorldCursor>,
+ ) {
+     use bevy::input::mouse::MouseButtonInput;
+     use bevy::input::ButtonState;
+@@ -300,16 +301,25 @@ fn forward_pointer(
+             link.release = Some((button, frames - 1));
+         }
+     }
+-    // Tell BG3 what WoW has under the pointer (changes only).
+-    let flags = u32::from(over_ui.0) | (u32::from(hovered.any().is_some() || object.target.is_some()) << 1);
+-    if flags != link.hover_flags || link.hover_seq == 0 {
+-        link.hover_flags = flags;
++    // Tell BG3 what WoW has under the pointer (changes only). A mob with a BG3 stand-in is BG3's
++    // to click (patch 0009, `mirrored.txt`).
++    let unit = hovered.corpse.is_some()
++        || (hovered.target.is_some() && crate::wowbg3_fight::claims_hover(hovered.guid));
++    let flags = u32::from(over_ui.0) | (u32::from(unit || object.target.is_some()) << 1);
++    // Patch 0009: WoW's cursor kind and its grayed state follow (BG3 shows its closest cursor).
++    let kind = crate::wowbg3_fight::cursor_code(world_cursor.kind);
++    let key = flags | (kind << 8) | (u32::from(world_cursor.unable) << 16);
++    if key != link.hover_flags || link.hover_seq == 0 {
++        link.hover_flags = key;
+         link.hover_seq = link.hover_seq.wrapping_add(1).max(1);
+-        let mut rec = [0u8; 16];
++        let mut rec = [0u8; 28];
+         rec[0..4].copy_from_slice(b"WBH1");
+         rec[4..8].copy_from_slice(&link.hover_seq.to_le_bytes());
+         rec[8..12].copy_from_slice(&flags.to_le_bytes());
+         rec[12..16].copy_from_slice(&link.hover_seq.to_le_bytes());
++        rec[16..20].copy_from_slice(&kind.to_le_bytes());
++        rec[20..24].copy_from_slice(&u32::from(world_cursor.unable).to_le_bytes());
++        rec[24..28].copy_from_slice(&link.hover_seq.to_le_bytes());
+         let tmp = link.hover.with_extension("tmp");
+         if std::fs::write(&tmp, rec).is_ok() {
+             let _ = std::fs::rename(&tmp, &link.hover);
+@@ -332,7 +342,7 @@ fn forward_pointer(
+     if !(new_left || new_right) || link.release.is_some() {
+         return;
+     }
+-    let over_world = hovered.any().is_some() || object.target.is_some();
++    let over_world = unit || object.target.is_some();
+     let button = match (over_ui.0, over_world) {
+         // A right click over WoW's UI is a right click there; a left one a left one.
+         (true, _) => {
