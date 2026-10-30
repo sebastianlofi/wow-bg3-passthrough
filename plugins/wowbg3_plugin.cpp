@@ -557,6 +557,7 @@ struct PoolSub {
     int Xg = 0, Zg = 0;                     // placed: min corner in tiles (0.5 m)
     float BaseY = 0;
     std::vector<glm::ivec2> Live;           // placed: the patches it is registered in now
+    std::vector<std::uint8_t> Seams;        // placed: the tiles its section asks to be intersections
 };
 
 struct PoolState {
@@ -810,6 +811,7 @@ void pool_seams(PoolState& p) {
                 auto& t = tiles[c + r * kCellTiles];
                 std::uint64_t f = (t.Flags.Flags & ~kIntersectionBit) | kEdgeBit;
                 if ((w && side[0]) || (e && side[1]) || (s && side[2]) || (n && side[3])) f |= kIntersectionBit;
+                if (!a.Seams.empty() && a.Seams[c + r * kCellTiles]) f |= kIntersectionBit;
                 t.Flags.Flags = f;
             }
         }
@@ -1079,6 +1081,9 @@ void pool_unsurface_before_move(PoolState& p, PoolSub& s, char const* what) {
 //   <u8 walkable, f32 floor in BG3 metres>               (5 bytes: MinHeight = MaxHeight = floor), or
 //   <u8 flags, f32 min, f32 max in BG3 metres>           (9 bytes: flags 1 walkable, 2 Slope; the
 //                                                        tile's height range, MinHeight and MaxHeight)
+// In both, flags 4 and 8 make the tile a SubgridEdge and a SubgridIntersection: BG3's pathfinder steps
+// from one subgrid to another only on such tiles, so a storey stacked over a square (world_bridge.py)
+// joins the ground where its stairs meet it.
 bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::vector<unsigned char> const& raw,
                 int* counts, char const** why) {
     auto& p = g_pool[client ? 1 : 0];
@@ -1138,12 +1143,15 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
     // 1. Out of every lookup first, 2. rewritten, 3. registered where it now lies.
     for (auto q : s.Moved ? s.Live : s.Patches) patch_remove(m, q, s.Id);
     auto* tiles = sg->TileGrid->Tiles;
+    s.Seams.assign(kCellTiles * kCellTiles, 0);
     for (int i = 0; i < kCellTiles * kCellTiles; ++i) {
         auto& t = tiles[i];
         const unsigned char fl = raw[i * rec];
-        const bool walk = rec == 5 ? fl != 0 : (fl & 1) != 0;
+        const bool walk = (fl & 1) != 0;
         const bool slope = rec == 9 && (fl & 2) != 0;
-        t.Flags.Flags = (s.Tiles[i].Flags.Flags & ~kPoolOwnedBits) | (walk ? 0 : kArenaBlockBits) | (slope ? kSlopeBit : 0);
+        t.Flags.Flags = (s.Tiles[i].Flags.Flags & ~kPoolOwnedBits) | (walk ? 0 : kArenaBlockBits) | (slope ? kSlopeBit : 0)
+            | ((fl & 4) ? kEdgeBit : 0) | ((fl & 8) ? kIntersectionBit : 0);
+        s.Seams[i] = (fl & 8) != 0;
         t.MinHeight = heights[i];
         t.MaxHeight = tops[i];
         t.SurfaceMetaDataIndex = 0xffff;
@@ -2779,7 +2787,7 @@ constexpr float kEyeMarginM = 0.3f;   // stays this far in front of the face it 
 // room's, so the eye popped out above the room (harness: in Northshire Abbey's side rooms the eye stood
 // 1 m over the room's ceiling with nothing on the line) and back in a step later. Now: the line is thick
 // (four more lines kEyeRadiusM to its sides, the eye's own size), the eye stays kCeilingMarginM under the
-// ceiling over her (a WoW face within kCeilingReachM over her chest, the middle of five rays), and the eye
+// ceiling over her (a WoW face within kCeilingReachM over her chest, the middle of ceiling_hits' hits), and the eye
 // comes back out at most kEyeEaseOutMps (pulled in at once, as WoW's own camera does).
 // What eases is the pull-in, not the eye's distance: easing the distance held the eye in
 // whenever it grew, and it grows on its own at every Lua tick while she walks (link/tav.bin moves her
@@ -2790,9 +2798,48 @@ constexpr float kEyeMarginM = 0.3f;   // stays this far in front of the face it 
 // a line from Tav's chest to that eye crossed hills and pulled the camera toward her (26 m in his session).
 constexpr float kEyeRadiusM = 0.25f;
 constexpr float kCeilingReachM = 20.0f;
+constexpr int kCeilingRays = 9;       // ceiling_hits' rays
+constexpr int kCeilingHits = 4;       // of them, a ceiling
+constexpr float kUnroofNearM = 2.5f;  // free: the unroof walk stops this far from her chest
 constexpr float kCeilingMarginM = 0.45f;
+// Patch 0090/0091 (the see-through, benilla): what the eye clearance does, WOWBG3_CAM_INDOOR.
+// The design rule for what stands between the camera and the character (2026-10-29): ceilings,
+// bushes, skinny trees and posts phase out; walls get a see-through opening; mountains, rocks and
+// big trees the camera bumps into and goes around. benilla does the first two (0091 drops a
+// ceiling group, 0090 cuts the opening), so the eye clearance is left with the third.
+//   hold  0.1.0's rule: the eye stops short of the first terrain or WMO face on the line from her
+//         chest and stays under the ceiling over her. It never sits in a wall, but indoors it is
+//         pinned: measured in the Lion's Pride Inn, the served eye stopped at z 62.55 whatever the
+//         zoom while BG3's own eye wanted 6.51 m more.
+//   free  the default. The line test runs against **terrain only** (kTerrainKinds): hills and
+//         cliffs still push the eye in, walls and roofs do not, because benilla opens or drops
+//         them. The eye may not sit in a face (a ray from the eye toward her chest that hits a
+//         terrain, WMO or doodad face within kEyeSolidM moves it past that face), nor in a doodad
+//         (an M2 face within kEyeInM2M on the way to her). Indoors with her it may rise through the
+//         roof, which 0091 then takes away. The unroof walk (`g_unroof`, WOWBG3_CAM_UNROOF=1) pulled
+//         an eye that was indoors while she was not back along the line until no ceiling was over
+//         it: from an interior room WoW drew the outside only through its windows, so a cut wall
+//         showed the sky (the void outside the inn). benilla 0090 now draws the exterior while the
+//         cut is live, and the walk only hurt: under the inn's eave it put the eye at 3.6 yd in the
+//         porch planks with her out of view, once in a pumpkin. Off by default since 2026-10-29
+//         (proved both ways at the inn: `tmp/occl20261029/eaves.sh`, sheets ron*/roff*).
+// Not covered: big doodads (trees, rocks placed as M2s) are not in either kind set, because the
+// arena triangles do not tell a big tree from a bush, and bushes are meant to phase out.
+enum class IndoorMode { Hold, Free };
+IndoorMode g_indoor = IndoorMode::Free;
+bool g_unroof = false;  // free: the unroof walk (IndoorMode); WOWBG3_CAM_UNROOF=1 turns it on
+constexpr float kEyeSolidM = 1.5f;  // free: a face nearer than this to the eye is one it sits in
+// What the eye may not sit in: terrain, buildings and WoW's doodads (M2s: a pumpkin, a cart, a crate).
+// Only the first two push the eye in along the line; a doodad is never bumped into, but an eye inside
+// one is a picture of its inside (2026-10-29: under the Lion's Pride Inn's eave the eye ended up in a
+// Hallow's End pumpkin).
+constexpr std::uint32_t kM2Kinds = 1u << 3, kSolidKinds = kCameraKinds | kM2Kinds;
+constexpr float kEyeInM2M = 0.5f;   // free: an M2 face this near on the way to her: the eye is in it
+constexpr std::uint32_t kTerrainKinds = 1u << 0;  // free: what the eye bumps into on the line
 constexpr float kEyeEaseOutMps = 3.0f;
 constexpr float kLookReachM = 80.0f;     // how far along BG3's forward line its look point is searched
+constexpr float kLookNearM = 4.0f;       // a look point farther than this from her feet is not her
+constexpr float kSkyM = 300.0f;          // how far up the underground test looks for WoW's terrain
 constexpr float kAnchorJumpM = 4.0f;     // a look point this far from the last: a new target, no ease
 
 struct CamClear {
@@ -2821,6 +2868,14 @@ struct CamClear {
     // further than the one line did, eyes held in by the ease out.
     std::atomic<std::uint64_t> Indoor{0}, Capped{0}, Eased{0};
     std::atomic<std::uint64_t> Looked{0};  // lines started where BG3's camera looks, not at Tav's chest
+    // Look points refused (buried, or not near her: the line started at her chest instead), and eyes
+    // walked in because they were under WoW's terrain.
+    std::atomic<std::uint64_t> LookRefused{0}, Buried{0};
+    std::atomic<std::uint64_t> Unroofed{0};  // free: steps the eye took out from under a roof she is not under
+    // free: the most steps one eye took, and eyes the walk gave up on at f = 0.1 still under a roof (the
+    // void outside the inn coming back).
+    std::atomic<std::uint32_t> UnroofMost{0};
+    std::atomic<std::uint64_t> UnroofStuck{0};
     std::atomic<float> Ceiling{0.0f};  // the last ceiling's height over her chest (m), 0 outdoors
     // The ease out per controller (under Lock): how far the last served eye was pulled in along the line
     // (m), from which anchor, and when; Frame: lead_frame's count, so an easing entry is computed again
@@ -2985,11 +3040,24 @@ void clear_read_tav() {
     g_clear.TavGen.fetch_add(1, std::memory_order_release);
 }
 
+// Whether `p` is under WoW's terrain: a terrain face straight above it. WoW's terrain is a height field,
+// so this is exact outdoors; in a mine or a cave she is under it too, which is why callers ask about her
+// first.
+bool under_terrain(ArenaRays const& r, glm::vec3 const& p) {
+    float t = 2.0f;
+    glm::vec3 n{};
+    return wow_closest(r, p + glm::vec3(0.0f, 0.1f, 0.0f), p + glm::vec3(0.0f, kSkyM, 0.0f), t, n, kTerrainKinds);
+}
+
 // The point the clearance line starts from: where BG3's camera looks (the first WoW ground on its forward
 // line, found from the far end back so an eye inside a hill still finds it), kChestM above that ground
 // along the same line; Tav's chest when the line meets no ground (looking level or up, or off the
-// triangles).
-glm::vec3 clear_anchor(ArenaRays const& r, glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav) {
+// triangles). Searching from the far end finds what is buried first: beside the Stormwind gate it was a
+// tower's foundation under the grass, the line then started underground and pulled the eye in under the
+// ground (a void with the foundation seen from below). So a look point under the terrain while she is
+// not, or more than kLookNearM from her feet, is not where she stands, and the line starts at her chest.
+glm::vec3 clear_anchor(ArenaRays const& r, glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav,
+                       bool sheUnder) {
     const glm::vec3 chest = tav + glm::vec3(0.0f, kChestM, 0.0f);
     if (!(fwd.y < -0.15f)) return chest;
     const glm::vec3 deep = eye0 + fwd * kLookReachM;
@@ -2997,8 +3065,30 @@ glm::vec3 clear_anchor(ArenaRays const& r, glm::vec3 const& eye0, glm::vec3 cons
     glm::vec3 n{};
     if (!wow_closest(r, deep, eye0, t, n, kCameraKinds)) return chest;
     const glm::vec3 look = deep + (eye0 - deep) * t;
+    if (glm::length(look - tav) > kLookNearM || (!sheUnder && under_terrain(r, look))) {
+        g_clear.LookRefused.fetch_add(1, std::memory_order_relaxed);
+        return chest;
+    }
     g_clear.Looked.fetch_add(1, std::memory_order_relaxed);
     return look - fwd * (kChestM / -fwd.y);
+}
+
+// How many of nine rays up from `p` (its centre, four 0.5 m and four 1.5 m around it) meet a terrain or
+// WMO face within kCeilingReachM; the distances go into `hits` (room for kCeilingRays). kCeilingHits or
+// more is a ceiling: one beam or one hole does not decide. The outer four are for a roof with a hole
+// over her: in Razor Hill's inn the five rays within 0.5 m all went up a smoke hole, she counted as
+// outdoors, and the unroof walk pulled the eye into her hair.
+int ceiling_hits(ArenaRays const& r, glm::vec3 const& p, float* hits) {
+    int nh = 0;
+    for (glm::vec2 const& o : {glm::vec2(0.0f), glm::vec2(0.5f, 0.0f), glm::vec2(-0.5f, 0.0f), glm::vec2(0.0f, 0.5f),
+                               glm::vec2(0.0f, -0.5f), glm::vec2(1.5f, 0.0f), glm::vec2(-1.5f, 0.0f),
+                               glm::vec2(0.0f, 1.5f), glm::vec2(0.0f, -1.5f)}) {
+        const glm::vec3 a = p + glm::vec3(o.x, 0.0f, o.y);
+        float t = 2.0f;
+        glm::vec3 n{};
+        if (wow_closest(r, a, a + glm::vec3(0.0f, kCeilingReachM, 0.0f), t, n, kCameraKinds)) hits[nh++] = t * kCeilingReachM;
+    }
+    return nh;
 }
 
 // The eye moved out of WoW's ground and buildings, or false when it is clear already or there is
@@ -3010,7 +3100,8 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     *target = 1.0f;
     ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
     if (r == nullptr || r->Tris.empty() || !inside_square(*r, eye0)) return false;
-    const glm::vec3 chest = clear_anchor(*r, eye0, fwd, tav);
+    const bool sheUnder = under_terrain(*r, tav + glm::vec3(0.0f, kChestM, 0.0f));
+    const glm::vec3 chest = clear_anchor(*r, eye0, fwd, tav, sheUnder);
     *anchor = chest;
     const glm::vec3 d = eye0 - chest;
     const float len = glm::length(d);
@@ -3020,7 +3111,24 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     *tested = true;
     float f = 1.0f, t = 2.0f;
     glm::vec3 n{};
-    if (wow_closest(*r, chest, eye0, t, n, kCameraKinds)) f = std::max(0.0f, t - kEyeMarginM / len);
+    const bool free = g_indoor == IndoorMode::Free;
+    // What the eye bumps into on the line from her chest: terrain and buildings in `hold`, terrain
+    // alone in `free` (see IndoorMode).
+    const std::uint32_t lineKinds = free ? kTerrainKinds : kCameraKinds;
+    if (wow_closest(*r, chest, eye0, t, n, lineKinds)) {
+        f = std::max(0.0f, t - kEyeMarginM / len);
+    }
+    // `free`: the eye may not sit in a face. The ray runs from the eye back toward her chest, so its
+    // nearest hit is the face the eye is behind; within kEyeSolidM the eye is in a wall or a floor
+    // and moves to just past it. Clear air between the eye and a building is where a camera over a
+    // roof sits, and it is left there. The nearer of this and the terrain bump wins: an eye already
+    // pulled out of a hill is never put back into it.
+    if (free) {
+        t = 2.0f;
+        if (wow_closest(*r, eye0, chest, t, n, kSolidKinds) && t * len <= kEyeSolidM) {
+            f = std::min(f, std::max(0.0f, 1.0f - t - kEyeMarginM / len));
+        }
+    }
     const float thin = f;
     // The thick line: four lines kEyeRadiusM to the sides of the first. A hit within the
     // first kEyeRadiusM * 2 of a side line is a wall she stands against, not one between her and the eye.
@@ -3031,39 +3139,71 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     for (glm::vec3 const& o : {side, -side, up2, -up2}) {
         const glm::vec3 off = o * kEyeRadiusM;
         t = 2.0f;  // each ray its own nearest hit (a shared t only took hits nearer than the last ray's)
-        if (wow_closest(*r, chest + off, eye0 + off, t, n, kCameraKinds) && t * len > kEyeRadiusM * 2.0f) {
+        if (wow_closest(*r, chest + off, eye0 + off, t, n, lineKinds) && t * len > kEyeRadiusM * 2.0f) {
             f = std::min(f, std::max(0.0f, t - kEyeMarginM / len));
         }
     }
-    // The ceiling over her: the middle of five rays up from her chest (one beam or one hole does not
-    // decide); none or two hits of five: outdoors.
-    float hits[5];
-    int nh = 0;
-    for (glm::vec2 const& o : {glm::vec2(0.0f), glm::vec2(0.5f, 0.0f), glm::vec2(-0.5f, 0.0f), glm::vec2(0.0f, 0.5f),
-                               glm::vec2(0.0f, -0.5f)}) {
-        const glm::vec3 a = chest + glm::vec3(o.x, 0.0f, o.y);
-        t = 2.0f;
-        if (wow_closest(*r, a, a + glm::vec3(0.0f, kCeilingReachM, 0.0f), t, n, kCameraKinds)) hits[nh++] = t * kCeilingReachM;
-    }
-    if (nh >= 3) {
+    // The ceiling over her: the middle of the rays up from her chest that hit; too few hits, outdoors.
+    float hits[kCeilingRays];
+    const int nh = ceiling_hits(*r, chest, hits);
+    if (nh >= kCeilingHits) {
         std::sort(hits, hits + nh);
         const float ceiling = hits[nh / 2];
         g_clear.Indoor.fetch_add(1, std::memory_order_relaxed);
         g_clear.Ceiling.store(ceiling, std::memory_order_relaxed);
-        if (d.y > 1e-3f) f = std::min(f, std::max(0.0f, (ceiling - kCeilingMarginM) / d.y));
+        // `free`: the ceiling is still measured (the log reports it) but no longer caps the eye.
+        if (g_indoor == IndoorMode::Hold && d.y > 1e-3f) {
+            f = std::min(f, std::max(0.0f, (ceiling - kCeilingMarginM) / d.y));
+        }
     } else {
         g_clear.Ceiling.store(0.0f, std::memory_order_relaxed);
+        // `free`, and she is outdoors: the eye may not be indoors. Walked in along the line until no
+        // ceiling is over it (see IndoorMode for why: the void outside the inn), but never nearer her
+        // chest than kUnroofNearM: an eye left under an eave is a wall cut open, an eye in her hair is
+        // no picture at all.
+        float eyeHits[kCeilingRays];
+        std::uint32_t steps = 0;
+        bool roofed = false;
+        const float nearest = std::clamp(kUnroofNearM / len, 0.1f, 1.0f);
+        while (free && g_unroof && (roofed = ceiling_hits(*r, chest + d * f, eyeHits) >= kCeilingHits) && f > nearest) {
+            f -= 0.05f;
+            ++steps;
+        }
+        if (steps > 0) {
+            g_clear.Unroofed.fetch_add(steps, std::memory_order_relaxed);
+            if (steps > g_clear.UnroofMost.load(std::memory_order_relaxed)) g_clear.UnroofMost.store(steps, std::memory_order_relaxed);
+        }
+        if (roofed) g_clear.UnroofStuck.fetch_add(1, std::memory_order_relaxed);
     }
     if (f < thin - 1e-3f) g_clear.Capped.fetch_add(1, std::memory_order_relaxed);
+    // Clear: kEyeClearM of air under the eye, and (when she is above the terrain) not under it, which the
+    // short ray down cannot tell from below.
+    bool buried = false;
     auto clear = [&](glm::vec3 const& q) {
         float tt = 2.0f;
         glm::vec3 nn{};
-        return !wow_closest(*r, q + glm::vec3(0.0f, 0.05f, 0.0f), q - glm::vec3(0.0f, kEyeClearM, 0.0f), tt, nn,
-                            kCameraKinds);
+        if (wow_closest(*r, q + glm::vec3(0.0f, 0.05f, 0.0f), q - glm::vec3(0.0f, kEyeClearM, 0.0f), tt, nn,
+                        kCameraKinds)) {
+            return false;
+        }
+        // Not in a doodad: no M2 face within kEyeInM2M on the way to her.
+        const glm::vec3 toward = chest - q;
+        const float tl = glm::length(toward);
+        tt = 2.0f;
+        if (free && tl > kEyeInM2M
+            && wow_closest(*r, q, q + toward * (kEyeInM2M / tl), tt, nn, kM2Kinds)) {
+            return false;
+        }
+        if (!sheUnder && under_terrain(*r, q)) {
+            buried = true;
+            return false;
+        }
+        return true;
     };
     if (f >= 1.0f && clear(eye0)) return true;
     f = std::min(f, 1.0f);
     while (f > 0.1f && !clear(chest + d * f)) f -= 0.05f;
+    if (buried) g_clear.Buried.fetch_add(1, std::memory_order_relaxed);
     *target = std::max(f, 0.1f);
     return true;
 }
@@ -3240,11 +3380,14 @@ void lead_frame() {
     if (g_lead.Frames % 600 == 1) {
         logf("lead: eye clearance moved %llu of %llu eyes (last %.2f m, max %.2f m); indoors %llu (ceiling %.2f m "
              "over her chest), pulled in by the ceiling or the thick line %llu, held by the ease out %llu; "
-             "started where BG3 looks %llu",
+             "started where BG3 looks %llu (refused %llu), walked out from under the ground %llu, steps out from "
+             "under a roof %llu (at most %u for one eye, still under one at the end %llu)",
              (unsigned long long)g_clear.Moved.load(), (unsigned long long)g_clear.Computed.load(),
              g_clear.LastDist.load(), g_clear.MaxDist.load(), (unsigned long long)g_clear.Indoor.load(),
              g_clear.Ceiling.load(), (unsigned long long)g_clear.Capped.load(), (unsigned long long)g_clear.Eased.load(),
-             (unsigned long long)g_clear.Looked.load());
+             (unsigned long long)g_clear.Looked.load(), (unsigned long long)g_clear.LookRefused.load(),
+             (unsigned long long)g_clear.Buried.load(), (unsigned long long)g_clear.Unroofed.load(),
+             (unsigned)g_clear.UnroofMost.load(), (unsigned long long)g_clear.UnroofStuck.load());
     }
 }
 
@@ -5505,6 +5648,17 @@ extern "C" BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3
     }
     publish_out();
     if (char const* v = std::getenv("WOWBG3_CAM_CLEAR"); v != nullptr && std::strcmp(v, "0") == 0) g_clear.On = false;
+    // Patch 0090: WOWBG3_CAM_INDOOR=free leaves the roof and the walls to benilla's see-through
+    // circle instead of pinning the eye under them (see IndoorMode).
+    if (char const* v = std::getenv("WOWBG3_CAM_INDOOR"); v != nullptr) {
+        if (std::strcmp(v, "free") == 0) g_indoor = IndoorMode::Free;
+        if (std::strcmp(v, "hold") == 0) g_indoor = IndoorMode::Hold;
+    }
+    if (char const* v = std::getenv("WOWBG3_CAM_UNROOF"); v != nullptr && *v != 0) g_unroof = std::strcmp(v, "0") != 0;
+    logf("camera: unroof walk %s", g_unroof ? "on" : "off");
+    logf("camera: %s", g_indoor == IndoorMode::Free
+                           ? "free (bumps terrain only; never in a wall or a doodad)"
+                           : "hold (bumps terrain and buildings, held under the ceiling)");
     int rc = 0;
     rc |= host->add_setting(self, "channel", BG3LE_SETTING_INT, &g_set_channel, 0, 0);
     rc |= host->add_setting(self, "out_server_lo", BG3LE_SETTING_INT, &g_set_out[0], 0, 0);

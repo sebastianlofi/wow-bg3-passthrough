@@ -1008,7 +1008,7 @@ static int fxc_rows(const Recipe* r, uint32_t* bind, uint32_t* stride, uint32_t 
 #define FXC_RADIUS 25.0f
 #define FXC_RADIUS_VOID 120.0f
 static int g_keep_active;  // world mode's map-off state (defined with the void below)
-static int mesh_has(uint64_t ib);  // a character's or the level's index buffer (with the void below)
+static int mesh_draw(uint32_t count, uint32_t first, int32_t vo);  // a character's or the level's mesh (with the void below)
 static float fxc_radius(void) { return g_cc.void_ && g_keep_active ? FXC_RADIUS_VOID : FXC_RADIUS; }
 // Near BG3's camera counts too while the void is on: a
 // party member far from Tav (its own treadmill, hundreds of metres off) casts while BG3 shows that
@@ -1246,6 +1246,83 @@ static int fxc_unsup_draw(const Recipe* r) {
     }
     return 0;
 }
+// A spell's solid piece: an unblended, depth-tested, unskinned draw of the effects pass. BG3 draws
+// Grease's liquid burst (the blob leaving the hand and the splash) and other spells' solid parts as
+// opaque meshes there, next to their blended smoke, and draws the same geometry again in its depth
+// prepass and G-buffer, so the mesh test below calls their index buffer a character's. A figure's own
+// body is skinned and never drawn in this pass, so `nskin` tells them apart (a playtest report:
+// Grease showed its smoke alone).
+// The research filters name a recipe by one of its shader keys (the fxwhy line's `vs` and `fs`),
+// which are known from the first draw; its own key is only made when the recipe is first written.
+static int fxc_stage_is(const Recipe* r, uint64_t key) {
+    for (uint32_t s = 0; s < r->nstages; s++) if (r->st[s].key == key) return 1;
+    return 0;
+}
+static int fxc_solid(const Recipe* r) {
+    if (t_fx_surf) return 0;  // BG3's own ground surface: wowbg3_surf.inc.c draws it on WoW's ground
+    if (!(g_cc.fxsolid && r && (r->have & 1) && r->ncolor && !r->blend[0][0] && r->ztest && !r->nskin)) return 0;
+    // A piece whose depth test is equality draws only where its own depth was written first. BG3
+    // masks these inside this very pass: one recipe lays the mesh down with an alpha test and a
+    // depth write (zw1, greater-or-equal; fragment shader with an OpKill), the next draws the
+    // colour with equality and no write and has no discard of its own. The replay used to force
+    // every draw's depth write off, so the equality draws failed everywhere, which is why Grease's
+    // blob and splash never arrived; forcing the test to greater-or-equal instead drew the whole
+    // unmasked billboard (a black quad and black shards, 2026-10-28). benilla 0080 keeps the write
+    // and resets its own depth copy between the over-black and over-white runs, so the mask is
+    // back and these are taken like any other solid piece.
+    for (uint32_t k = 0; k < g_cc.n_solid_skip; k++) if (fxc_stage_is(r, g_cc.solid_skip[k])) return 0;
+    if (g_cc.n_solid_only) {
+        for (uint32_t k = 0; k < g_cc.n_solid_only; k++) if (fxc_stage_is(r, g_cc.solid_only[k])) return 1;
+        return 0;
+    }
+    if (!g_cc.fxsolidlog) return 1;  // research logging off the shipped path
+    // Research (word "fxsolidlog"): every recipe taken as solid, once, by the shader keys the filters name.
+    static uint64_t said[64];
+    static uint32_t nsaid;
+    uint64_t vs = 0, fs = 0;
+    for (uint32_t s = 0; s < r->nstages; s++) {
+        if (r->st[s].stage == VK_SHADER_STAGE_VERTEX_BIT) vs = r->st[s].key;
+        if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) fs = r->st[s].key;
+    }
+    int known = 0;
+    for (uint32_t k = 0; k < nsaid; k++) if (said[k] == vs) known = 1;
+    if (!known && nsaid < 64) {
+        said[nsaid++] = vs;
+        logf_("fxsolid: taking vs %016llx fs %016llx (zt%u zw%u zc%u nc%u)", (unsigned long long)vs, (unsigned long long)fs,
+              r->ztest, r->zwrite, r->zcmp, r->ncolor);
+    }
+    return 1;
+}
+// Not the figure itself: a blended, unskinned draw on a figure's index buffer is something BG3 hangs
+// on the character. BG3's hover highlight (the bright ring with arrows under the character it draws
+// under the pointer) comes in as an attachment visual, so TavPlan.lua lists its index buffer with
+// hers and the figure drop took it with her, for everyone (a playtest report). Such a draw goes on
+// through the effects capture instead; her skinned meshes (body, hair, eyelashes) still stop here.
+static int fxc_figure_extra(VkCommandBuffer cb) {
+    if (!g_cc.fxhl || t_bind_cb != cb || !t_pipe) return 0;
+    RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
+    Recipe* r = ri ? ri->r : NULL;
+    return r && (r->have & 1) && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite && !r->nskin;
+}
+// Research: every texture a spell's solid piece samples, once per recipe, with what the layer makes
+// of it (key 1 the scene depth, 2 the scene colour, 3 a render target it has no name for and benilla
+// binds black, 4 the linear depth, 5 the light grid, 6 the G-buffer normal; anything else an exported
+// texture). These shaders are BG3's forward-lit material ones, so a black stand-in for what they read
+// is why the pieces came out black.
+static void fxc_solid_tex(const Recipe* r, uint32_t set, uint32_t binding, uint64_t view, uint64_t key) {
+    if (!g_cc.fxsolidlog || !g_cc.fxsolid || !fxc_solid(r)) return;  // research only (word "fxsolidlog")
+    static uint64_t said[256];
+    static uint32_t nsaid;
+    uint64_t h = (uint64_t)r->key * 1315423911u + set * 64 + binding;
+    for (uint32_t k = 0; k < nsaid; k++) if (said[k] == h) return;
+    if (nsaid < 256) said[nsaid++] = h;
+    ViewInfo* v = (g_view && view) ? TABLE_FIND(g_view, VIEW_CAP, view, 0) : NULL;
+    ImgInfo* i = v && v->image ? TABLE_FIND(g_img, IMG_CAP, v->image, 0) : NULL;
+    logf_("fxsolid: pipe %016llx set %u binding %u -> key %llx%s (format %d %ux%u layers %u usage %x)",
+          (unsigned long long)r->key, set, binding, (unsigned long long)key, key == 3 ? " BLACK" : "",
+          i ? (int)i->fmt : -1, i ? i->w : 0, i ? i->hgt : 0, i ? i->layers : 0, i ? (unsigned)i->usage : 0);
+}
+static uint64_t g_fx_seen_at;  // present + 1 of the last effects-pass draw near Tav (fxprops' "a spell is on")
 static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi) {
     if (!g_fxc_on || t_bind_cb != cb || !t_pipe) return 0;
     if (route_pipe(t_pipe)) return route_draw(inst, fi);  // BG3's route line, from its own pass
@@ -1262,10 +1339,14 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
     if (!sight) {
         // Effects only: blended, depth-tested, not writing depth. The same pass also forward-renders
         // parts of BG3's level (opaque, or full-screen haze without a depth test); those stay BG3's.
-        if (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite) return 'N';
-        if (indexed && t_ib_cb == cb && mesh_has(t_ib)) return 'M';  // a character's or the level's mesh
+        const int solid = fxc_solid(r);
+        if (!solid && (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite)) return 'N';
+        // A character's or the level's mesh. A spell's solid piece shares its slice with the depth and
+        // G-buffer passes BG3 draws it in as well, so this test is for the blended draws.
+        if (!solid && indexed && t_ib_cb == cb && mesh_draw(count, first, vo)) return 'M';
         near = fxc_near_tav(r, fi);
         if (!near) { g_fxc.far++; return 'F'; }
+        __atomic_store_n(&g_fx_seen_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
     }
     // World-space vertices: the first vertex's position (lowest location float3 or float4 of a
     // per-vertex binding) decides once it is in the blob (fxc_late).
@@ -1491,13 +1572,19 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
             case VK_DESCRIPTOR_TYPE_SAMPLER:
                 by_u64(d, l->b[k].imm ? l->b[k].imm : sampler_key(sl ? sl->samp : 0));
                 break;
-            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-                by_u64(d, sl ? fxc_texkey(sl->res) : 3);
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: {
+                uint64_t tk = sl ? fxc_texkey(sl->res) : 3;
+                fxc_solid_tex(r, s, binding, sl ? sl->res : 0, tk);
+                by_u64(d, tk);
                 by_u64(d, l->b[k].imm ? l->b[k].imm : sampler_key(sl ? sl->samp : 0));
                 break;
-            default:  // sampled and storage images, input attachments
-                by_u64(d, sl ? (sight && s == 1 ? sight_key(binding, sl->res) : fxc_texkey(sl->res)) : 3);
+            }
+            default: {  // sampled and storage images, input attachments
+                uint64_t tk = sl ? (sight && s == 1 ? sight_key(binding, sl->res) : fxc_texkey(sl->res)) : 3;
+                fxc_solid_tex(r, s, binding, sl ? sl->res : 0, tk);
+                by_u64(d, tk);
                 break;
+            }
             }
         }
     }
@@ -2365,16 +2452,78 @@ static void keep_read(void) {
     pthread_mutex_unlock(&g_fxl_lock);
 }
 
+// The other characters near Tav (link/hide.txt, TavPlan.PublishKeep): the stand-ins and NPCs whose
+// BG3 bodies the void hides because WoW draws them. Read so "fxprops" never keeps them: a stand-in
+// that has just spawned has young mesh slices exactly like a spell's prop (the blob is skinned too),
+// and without this its BG3 body would be drawn over WoW's mob for the prop age (30 s). Characters have
+// Health and spell props do not, so the mod can tell them apart exactly; the layer cannot.
+static uint64_t g_hide[KEEP_CAP];
+static uint32_t g_hide_n;
+static struct timespec g_hide_seen;
+static int hide_has(uint64_t ib) {
+    if (!g_hide_n || !ib) return 0;
+    for (uint32_t i = hslot(ib, KEEP_CAP), n = 0; n < KEEP_CAP; n++, i = (i + 1) & (KEEP_CAP - 1)) {
+        if (g_hide[i] == ib) return 1;
+        if (!g_hide[i]) return 0;
+    }
+    return 0;
+}
+static void hide_read(void) {
+    if (!g_tav.init || !g_tav.plan[0]) return;
+    char path[sizeof g_tav.plan];
+    snprintf(path, sizeof path, "%s", g_tav.plan);
+    char* slash = strrchr(path, '/');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "hide.txt");
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (st.st_mtim.tv_sec == g_hide_seen.tv_sec && st.st_mtim.tv_nsec == g_hide_seen.tv_nsec) return;
+    if (st.st_mtim.tv_sec < g_tav.born.tv_sec) return;  // left over from an earlier BG3 run
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    g_hide_seen = st.st_mtim;
+    static uint64_t next[KEEP_CAP];
+    memset(next, 0, sizeof next);
+    uint32_t n = 0;
+    char line[64];
+    if (!fgets(line, sizeof line, f) || strncmp(line, "HIDE ", 5)) { fclose(f); return; }
+    while (fgets(line, sizeof line, f) && n < KEEP_CAP / 2) {
+        uint64_t ib = strtoull(line, NULL, 16);
+        if (!ib) continue;
+        uint32_t i = hslot(ib, KEEP_CAP);
+        while (next[i] && next[i] != ib) i = (i + 1) & (KEEP_CAP - 1);
+        if (!next[i]) { next[i] = ib; n++; }
+    }
+    fclose(f);
+    pthread_mutex_lock(&g_fxl_lock);
+    memcpy(g_hide, next, sizeof g_hide);
+    g_hide_n = n;
+    pthread_mutex_unlock(&g_fxl_lock);
+}
+
 // A pass begins (g_trace_lock held): is it one BG3's map draws into?
-// Mesh index buffers: index buffers drawn in BG3's G-buffer pass (the scene depth
-// and five targets) or a depth-only pass belong to characters and the level, never to effects.
+// Mesh slices: index data drawn in BG3's G-buffer pass (the scene depth and five targets) belongs to
+// characters and the level.
 // Placed by their object matrices, the blended parts of such meshes (fur, hair
 // edges of the WoW mobs' BG3 stand-ins, which WoW draws itself) would otherwise pass as effects
 // near Tav. Two insert-only tables, each cleared every MESH_EVERY presents in turn, so a buffer
 // stays known while it is drawn and a recycled handle is forgotten within 2 * MESH_EVERY.
+// Keyed by the slice a draw reads (ib_slice, as the prop ages below), not the buffer (2026-10-29): BG3
+// packs many meshes into one index buffer and recycles them, and an effect drawn from a buffer that
+// also held a mesh was taken for that mesh and voided -- the 399-spell sweep lost Ray of Sickness's
+// beam (346 draws 7 m from Tav), Lightning Bolt's, Gust of Wind's and Eyebite's pieces that way. A
+// fur or hair layer redraws its body's own slice, so it is still caught; the stand-ins' own buffers
+// (the hide list) count as meshes whole, as before, so a layer they draw only blended stays WoW's.
+// The key also holds the vertex data bound at binding 0 (buffer and offset): every particle quad of
+// every spell reads the same six indices, so by the index slice alone one effect's quad drawn in a
+// mesh pass made all of them meshes (the second sweep: Ray of Sickness, Ray of Frost, Scorching Ray,
+// Witch Bolt and Ice Knife still lost 44 to 195 draws each). And only the G-buffer pass registers
+// meshes now: every character and level mesh is drawn there, while the depth-only passes (the
+// prepass, the shadow maps) carry a spell's own particles and props as well.
 #define MESH_CAP 16384u
 #define MESH_EVERY 300u
 static uint64_t g_mesh[2][MESH_CAP];
+static uint64_t g_mesh_full;  // slices past the probe limit (then taken for an effect, not a mesh)
 static __thread VkCommandBuffer t_mesh_cb;
 static void mesh_add(uint64_t ib) {
     for (int t = 0; t < 2; t++) {
@@ -2386,6 +2535,7 @@ static void mesh_add(uint64_t ib) {
                 uint64_t zero = 0;
                 if (__atomic_compare_exchange_n(&g_mesh[t][i], &zero, ib, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || zero == ib) break;
             }
+            if (n == 63) __atomic_add_fetch(&g_mesh_full, 1, __ATOMIC_RELAXED);
         }
     }
 }
@@ -2401,9 +2551,170 @@ static int mesh_has(uint64_t ib) {
     }
     return 0;
 }
+// Word "fxprops" (2026-10-29): a spell's 3D props kept in the void. Grease's blobs -- the lumps
+// that pop during the cast animation and cast a shadow -- are ordinary opaque geometry: one mesh
+// drawn in BG3's depth prepass, its G-buffer and its normal pass, every draw of it thrown away by
+// `void_skip` because it is not on the keep list and not an effects-pass draw. Measured by grouping
+// fxwhy draws by index buffer (word "fxwib") within 20 m of Tav: a cast adds exactly one new mesh.
+// Proximity cannot tell a prop from the level (opaque and near Tav too), and skinning cannot tell it
+// from a character (the blob is skinned, skin1/skin2, exactly like the stand-ins the void hides).
+// Age can: a prop is made when the spell is cast. So a draw is kept while its mesh slice is younger
+// than `fxpropage` presents (900, about 30 s), with two guards against things that are also young:
+//  - after a load (BG3 leaves and re-enters Running) every slice is new: slices first seen within
+//    IBAGE_WARM presents of it count as scenery;
+//  - a stand-in that spawns, or level geometry that streams in, arrives as many new slices in one
+//    present; a spell's prop is one or a few. A present that brings more than `fxpropburst` new
+//    slices (8) is a bulk arrival and none of its slices are kept.
+// The identity is the slice a draw reads -- buffer, byte offset, first index, index count and vertex
+// offset -- not the buffer: BG3 recycles index buffers, and an age keyed on the handle called the
+// blob's mesh old; the vertex offset too, as meshes packed into one buffer can share an index range.
+//
+// Two generations, as `g_mesh`: every lookup writes the slice's first present into both, and one is
+// cleared every IBAGE_EVERY presents in turn, so a slice that keeps being drawn keeps its age for
+// ever while a table that only grew (the first version: insert-only, 4096 slices, after which no new
+// prop was ever kept) cannot fill. Lock-free (void_skip runs on BG3's recording threads in
+// parallel): `h` by compare-and-swap, `first` stored by the thread that claimed the slot.
+//
+// Age since the slice last came back, not since it was first ever seen (the 399-spell sweep, second
+// night): BG3 reuses one debris or shard mesh across spells -- the same chunk, the same slice, drawn
+// instanced -- so after one spell had used it the next spell's identical chunk was "older than 30 s"
+// and culled; which spells lost theirs depended on what was cast before. `last` is the present the
+// slice was last drawn; one that comes back after IBAGE_GAP presents without a draw is made again, so
+// its age starts over (and counts towards a bulk arrival like any new slice). Scenery coming back
+// into view is the same event as before, and the same guards keep it out: placed near Tav, no bulk.
+#define IBAGE_GAP 60u
+// And only while a spell is on (the build session's quiet-baseline check, 2026-10-29 night): with
+// ages that start over, arriving somewhere made the things around Tav young -- at Razor Hill's inn an
+// unskinned 21600-index mesh 11 m off was kept every frame with no cast, which the old binary culled.
+// A spell that makes a prop also draws effects, so a slice is made only within IBAGE_FX presents of an
+// effects-pass draw near Tav (fxc_draw); otherwise it counts as scenery until it next comes back. A
+// slice seen first with no spell on waits IBAGE_PENDING presents (marked IBAGE_PEND, not kept): BG3
+// draws the G-buffer before the effects, so a prop can come a frame or two before its spell's first
+// effect; if one comes in that time the slice was made when first seen.
+#define IBAGE_FX 300u
+#define IBAGE_PENDING 30u
+#define IBAGE_PEND (1ull << 63)
+#define IBAGE_CAP 16384u
+#define IBAGE_EVERY 3600u
+#define IBAGE_WARM 300u
+#define IBAGE_BURSTS 1024u
+typedef struct { uint64_t h; uint64_t first; uint64_t last; } IbAge;  // first, last: present + 1
+static IbAge g_ibage[2][IBAGE_CAP];
+static uint64_t g_ibage_warm;                 // slices first seen before this present are scenery
+static uint64_t g_ibage_burst[IBAGE_BURSTS];  // [p % IBAGE_BURSTS] == p + 1: present p was a bulk arrival
+static uint64_t g_ibage_new_at, g_ibage_new_n;  // new slices counted for one present
+static uint64_t g_fxprops_kept, g_fxprops_bulk, g_ibage_full, g_ibage_newmax;
+static uint64_t ib_slice(uint64_t ib, uint64_t off, uint32_t first, uint32_t count, int32_t vo) {
+    uint64_t k[4] = {ib, off, ((uint64_t)first << 32) | count, (uint64_t)(uint32_t)vo};
+    return fnv64(k, sizeof k, FNV0) | 1;
+}
+// The slice's entry in table t, NULL when absent.
+static IbAge* ibage_get(IbAge* t, uint64_t k) {
+    uint32_t i = hslot(k, IBAGE_CAP);
+    for (uint32_t n = 0; n < 64; n++, i = (i + 1) & (IBAGE_CAP - 1)) {
+        uint64_t h = __atomic_load_n(&t[i].h, __ATOMIC_ACQUIRE);
+        if (h == k) return &t[i];
+        if (!h) return NULL;
+    }
+    return NULL;
+}
+static void ibage_put(IbAge* t, uint64_t k, uint64_t first, uint64_t last) {
+    uint32_t i = hslot(k, IBAGE_CAP);
+    for (uint32_t n = 0; n < 64; n++, i = (i + 1) & (IBAGE_CAP - 1)) {
+        uint64_t h = __atomic_load_n(&t[i].h, __ATOMIC_ACQUIRE);
+        if (!h) {
+            uint64_t zero = 0;
+            if (__atomic_compare_exchange_n(&t[i].h, &zero, k, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&t[i].last, last, __ATOMIC_RELAXED);
+                __atomic_store_n(&t[i].first, first, __ATOMIC_RELEASE);  // overwrites a cleared slot's stale value
+                return;
+            }
+            h = zero;
+        }
+        if (h == k) {
+            uint64_t z = 0;
+            __atomic_compare_exchange_n(&t[i].first, &z, first, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&t[i].last, last, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+    __atomic_add_fetch(&g_ibage_full, 1, __ATOMIC_RELAXED);  // probe limit: the slice stays unaged (not kept)
+}
+// A spell's prop: a slice first seen (or back after a gap) within the last `fxpropage` presents,
+// outside a load's warm-up and not in a present that brought a bulk of new slices. Only skinned
+// slices count towards a bulk (`skinned`): the guard is for a body arriving (a stand-in spawning before
+// the hide list names it); scenery streaming in is kept out by the distance anyway, and a spell's
+// debris brings nine or ten unskinned meshes back at once (Chromatic Orb), which tripped it.
+static int ib_young(uint64_t k, int skinned) {
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    IbAge *ea = ibage_get(g_ibage[0], k), *eb = ibage_get(g_ibage[1], k);
+    uint64_t a = ea ? __atomic_load_n(&ea->first, __ATOMIC_ACQUIRE) : 0, b = eb ? __atomic_load_n(&eb->first, __ATOMIC_ACQUIRE) : 0;
+    uint64_t la = ea ? __atomic_load_n(&ea->last, __ATOMIC_RELAXED) : 0, lb = eb ? __atomic_load_n(&eb->last, __ATOMIC_RELAXED) : 0;
+    uint64_t f = a && b ? (a < b ? a : b) : (a ? a : b), l = la > lb ? la : lb;
+    if (f && l && now + 1 > l + IBAGE_GAP) f = a = b = 0;  // not drawn for a while: made again
+    uint64_t fx = __atomic_load_n(&g_fx_seen_at, __ATOMIC_RELAXED);
+    if (f & IBAGE_PEND) {
+        uint64_t p = f & ~IBAGE_PEND;  // the present + 1 it was first seen at
+        if (fx >= p && fx <= p + IBAGE_PENDING) f = p, a = b = 0;      // a spell came on right after: made then
+        else if (now + 1 > p + IBAGE_PENDING) f = 1, a = b = 0;        // none came: scenery
+    }
+    if (!f) {
+        f = now < __atomic_load_n(&g_ibage_warm, __ATOMIC_RELAXED) ? 1 : now + 1;  // stored as present + 1
+        if (f > 1 && now + 1 > fx + IBAGE_FX) f |= IBAGE_PEND;  // no spell on: wait and see
+        if (f > 1 && !(f & IBAGE_PEND) && skinned) {  // a new slice this present: count it towards a bulk arrival
+            if (__atomic_exchange_n(&g_ibage_new_at, now, __ATOMIC_ACQ_REL) != now) __atomic_store_n(&g_ibage_new_n, 0, __ATOMIC_RELAXED);
+            uint64_t c = __atomic_add_fetch(&g_ibage_new_n, 1, __ATOMIC_RELAXED);
+            if (c > __atomic_load_n(&g_ibage_newmax, __ATOMIC_RELAXED)) __atomic_store_n(&g_ibage_newmax, c, __ATOMIC_RELAXED);
+            if (c > g_cc.fxpropburst) __atomic_store_n(&g_ibage_burst[now % IBAGE_BURSTS], now + 1, __ATOMIC_RELAXED);
+        }
+    }
+    if (ea && !a) __atomic_store_n(&ea->first, f, __ATOMIC_RELEASE);
+    if (eb && !b) __atomic_store_n(&eb->first, f, __ATOMIC_RELEASE);
+    if (ea) __atomic_store_n(&ea->last, now + 1, __ATOMIC_RELAXED); else ibage_put(g_ibage[0], k, f, now + 1);
+    if (eb) __atomic_store_n(&eb->last, now + 1, __ATOMIC_RELAXED); else ibage_put(g_ibage[1], k, f, now + 1);
+    if (f <= 1 || now + 1 < f) return 0;
+    uint64_t p = f - 1;  // the present it was first seen at
+    if (__atomic_load_n(&g_ibage_burst[p % IBAGE_BURSTS], __ATOMIC_RELAXED) == p + 1) {
+        __atomic_add_fetch(&g_fxprops_bulk, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    return now - p <= (uint64_t)g_cc.fxpropage;
+}
+// Once per present: turn the generations over, and start a warm-up when BG3 comes back from a load.
+static void ibage_present(void) {
+    static int was_running = 1, was_void, started;
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    // The table learns slices only inside void_skip, so on the present the void engages (world mode
+    // starts: KEEP 1) every visible level slice is "first seen" at once; the same after a load.
+    if (!started || (g_bg3_running && !was_running) || (g_keep_active && !was_void)) {
+        __atomic_store_n(&g_ibage_warm, now + IBAGE_WARM, __ATOMIC_RELAXED);
+        started = 1;
+    }
+    was_running = g_bg3_running;
+    was_void = g_keep_active;
+    if (now && now % IBAGE_EVERY == 0) memset(g_ibage[(now / IBAGE_EVERY) & 1], 0, sizeof g_ibage[0]);
+    if (now && now % 300 == 0 && g_cc.fxprops)
+        logf_("fxprops: %llu draws kept as a spell's props, %llu of a bulk arrival not kept, busiest present %llu new slices "
+              "(bulk above %u), %llu slices past the probe limit",
+              (unsigned long long)__atomic_exchange_n(&g_fxprops_kept, 0, __ATOMIC_RELAXED),
+              (unsigned long long)__atomic_exchange_n(&g_fxprops_bulk, 0, __ATOMIC_RELAXED),
+              (unsigned long long)__atomic_exchange_n(&g_ibage_newmax, 0, __ATOMIC_RELAXED), g_cc.fxpropburst,
+              (unsigned long long)__atomic_exchange_n(&g_ibage_full, 0, __ATOMIC_RELAXED));
+}
 static void mesh_present(void) {
     static uint32_t presents;
-    if (++presents % MESH_EVERY == 0) memset(g_mesh[(presents / MESH_EVERY) & 1], 0, sizeof g_mesh[0]);
+    if (++presents % MESH_EVERY == 0) {
+        memset(g_mesh[(presents / MESH_EVERY) & 1], 0, sizeof g_mesh[0]);
+        uint64_t full = __atomic_exchange_n(&g_mesh_full, 0, __ATOMIC_RELAXED);
+        if (full) logf_("void: %llu mesh slices past the probe limit", (unsigned long long)full);
+    }
+}
+static uint64_t mesh_key(uint32_t count, uint32_t first, int32_t vo) {
+    uint64_t k[3] = {ib_slice(t_ib, t_ibo, first, count, vo), t_vb[0], t_vbo[0]};
+    return fnv64(k, sizeof k, FNV0) | 1;
+}
+static int mesh_draw(uint32_t count, uint32_t first, int32_t vo) {
+    return t_ib && (mesh_has(mesh_key(count, first, vo)) || hide_has(t_ib));
 }
 
 // Depth-only passes the void applies to: the world's shadow maps, square and 2048 or more (8192 and
@@ -2434,11 +2745,54 @@ static void void_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs) {
         if (is_depth_format(i->fmt)) { depth = 1; dimg = i; } else colors++;
     }
     if (scene || (depth && !colors && dimg && void_depth_only(dimg))) t_void_cb = cb;
-    t_mesh_cb = ((scene || depth) && !colors) || (scene && colors >= 5) ? cb : VK_NULL_HANDLE;
+    t_mesh_cb = scene && colors >= 5 ? cb : VK_NULL_HANDLE;  // BG3's G-buffer pass
+}
+// fxc_near_tav for a prop, decided now: a draw placed by its world-space vertices (fxc_place 3, the
+// capture decides those later from the blob) is placed by its first vertex when its index and vertex
+// data are mapped. A spell's mesh particles are such draws: debris and shards a particle system emits
+// as small opaque meshes (Ray of Frost, Witch Bolt, Horde Breaker; the index count changes every
+// frame as particles come and go), drawn in the prepass and the G-buffer, so only the void decides
+// them. 2 when it cannot tell (never kept). Near Tav only, not near BG3's camera as fxc_near_tav also
+// allows: a body near the camera but not near Tav is not on the hide list (it names characters within
+// 130 m of her), and the sweep caught one so, kept 510 m from Tav just after she moved spots.
+static int prop_near(const Recipe* r, uint32_t fi, uint32_t first, int32_t vo) {
+    float m[16], at[3];
+    int how = fxc_place(r, fi, at, m);
+    if (how == 1 || how == 2) {
+        float dx = at[0] - g_tav_root[0], dy = at[1] - g_tav_root[1], dz = at[2] - g_tav_root[2], rad = fxc_radius();
+        return dx * dx + dy * dy + dz * dz < rad * rad;
+    }
+    if (how != 3) return how == 4 ? 2 : 0;
+    uint32_t lloc = 99, lbind = 99, loff = 0, stride = 0;
+    for (uint32_t a = 0; a < r->nattr; a++) {
+        uint32_t loc = r->attr[a][0], b = r->attr[a][1], fmt = r->attr[a][2];
+        int rate = 0;
+        for (uint32_t k = 0; k < r->nbind; k++) if (r->bind[k][0] == b) rate = (int)r->bind[k][2];
+        if (rate || loc >= lloc || (fmt != VK_FORMAT_R32G32B32_SFLOAT && fmt != VK_FORMAT_R32G32B32A32_SFLOAT)) continue;
+        lloc = loc; lbind = b; loff = r->attr[a][3];
+    }
+    for (uint32_t k = 0; k < r->nbind; k++) if (r->bind[k][0] == lbind) stride = r->bind[k][1];
+    if (lbind >= 8 || !t_vb[lbind] || !stride) return 2;
+    uint32_t isz = t_ibt == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+    uint64_t left = 0;
+    const uint8_t* ip = buf_cpu(t_ib, t_ibo + (uint64_t)first * isz, &left);
+    if (!ip || left < isz) return 2;
+    int64_t v = (int64_t)(isz == 4 ? *(const uint32_t*)ip : *(const uint16_t*)ip) + vo;
+    if (v < 0) return 2;
+    const uint8_t* vp = buf_cpu(t_vb[lbind], t_vbo[lbind] + (uint64_t)v * stride + loff, &left);
+    if (!vp || left < 12) return 2;
+    float p[3], w[3];
+    memcpy(p, vp, 12);
+    const float* eye = (const float*)fxc_slot_cpu(0, 1, 112);
+    if (!eye) return 2;
+    for (int c = 0; c < 3; c++) w[c] = eye[24 + c] + p[0] * m[c] + p[1] * m[4 + c] + p[2] * m[8 + c] + m[12 + c];
+    float dx = w[0] - g_tav_root[0], dy = w[1] - g_tav_root[1], dz = w[2] - g_tav_root[2], rad = fxc_radius();
+    return dx * dx + dy * dy + dz * dz < rad * rad;  // NaN counts as far
 }
 // An indexed draw in such a pass: skip it unless it is a character's or an effect near Tav.
-static int void_skip(VkCommandBuffer cb, uint32_t fi) {
-    if (t_mesh_cb == cb && t_ib_cb == cb && t_ib) mesh_add(t_ib);
+static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t first, int32_t vo) {
+    t_prop_cb = VK_NULL_HANDLE;
+    if (t_mesh_cb == cb && t_ib_cb == cb && t_ib) mesh_add(mesh_key(count, first, vo));
     // BG3's own 3D screens (level up, respec, the mirror): stock BG3 shows the character against the
     // level's own scenery, and the only reason ours stood in an empty void is that the world mode's
     // voiding was still culling the level's draws while the screen was up. It is not wanted there: the
@@ -2447,10 +2801,32 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi) {
     if (g_screen && g_cc.screenlevel && !g_screen_dialog) return 0;
     if (t_void_cb != cb || !g_cc.void_ || !g_keep_active || t_ib_cb != cb || !t_ib) return 0;
     if (keep_has(t_ib)) return 0;
-    if ((t_fxl_cb == cb || (t_dec_cb == cb && g_cc.fxdecals)) && t_bind_cb == cb && t_pipe && !mesh_has(t_ib)) {
+    // A spell's 3D props (word "fxprops"): kept while their mesh is young, so BG3 draws them and the
+    // compositor shows them where BG3's geometry is nearer than WoW's ground.
+    // Aged before the other tests, so a character's slices grow old with it and one that leaves the
+    // hide list (out of its radius) is not taken for a new prop. First drawn is not first made: a
+    // level mesh entering BG3's frustum as the camera turns, or one switching level of detail, is new
+    // to this table too. A spell's prop is at the caster or its target, scenery that comes into view
+    // is almost always far off, so a young slice is kept only when it is placed near Tav.
+    // Not in the decal pass: every BG3 decal is the same 36-index box, so one slice stands for all of
+    // them, and with ages that start over when a slice comes back the footprints near Tav were kept as
+    // props. Decals near Tav are the word "fxdecals"'s to keep (below).
+    RecInfo* pri = g_cc.fxprops && t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
+    Recipe* pr = pri ? pri->r : NULL;
+    if (g_cc.fxprops && t_dec_cb != cb && ib_young(ib_slice(t_ib, t_ibo, first, count, vo), !pr || pr->nskin) && !hide_has(t_ib) && pr) {
+        if ((pr->have & 1) && g_tav_root_ok && prop_near(pr, fi, first, vo) == 1) {
+            __atomic_add_fetch(&g_fxprops_kept, 1, __ATOMIC_RELAXED);
+            t_prop_cb = cb;  // fxwhy shows it as decision Y
+            return 0;
+        }
+    }
+    if ((t_fxl_cb == cb || (t_dec_cb == cb && g_cc.fxdecals)) && t_bind_cb == cb && t_pipe) {
         RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
         Recipe* r = ri ? ri->r : NULL;
-        if (r && (r->have & 1) && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite && fxc_near_tav(r, fi)) return 0;
+        if (r && (r->have & 1) && fxc_near_tav(r, fi)) {
+            if (!mesh_draw(count, first, vo) && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite) return 0;
+            if (fxc_solid(r)) return 0;  // a spell's solid piece: fxc_draw records it for the replay
+        }
     }
     return 1;
 }
@@ -2459,11 +2835,12 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi) {
 // line, destination circle, cast effects, spell previews) and what the layer does with them. For
 // N presents every draw of every pass is counted by (pass, shaders, kind, pipeline state,
 // decision) into OUT_DIR/fxwhy.txt, with the first draw's details. Decisions: C captured for the
-// replay, F far from Tav or unplaced, N not an effect by the capture's test, M a mesh's index
-// buffer (characters, the level), B over the blob
+// replay, F far from Tav or unplaced, N not an effect by the capture's test, M a mesh's slice
+// (characters, the level), B over the blob
 // budget, R no recipe, U a texture the layer cannot export (benilla would skip it), V skipped by
-// the void, H Tav's own (WoW draws her), I indirect (never
-// captured), - drawn by BG3 outside the effects pass. Passes: attachments as WxH:format, D the
+// the void, Y kept through the void as a spell's young prop (word "fxprops"; P is the route line),
+// H Tav's own (WoW
+// draws her), I indirect (never captured), - drawn by BG3 outside the effects pass. Passes: attachments as WxH:format, D the
 // scene depth, L loaded, C cleared; "sec" a secondary command buffer inside a pass.
 
 static __thread VkCommandBuffer t_fxw_cb;
@@ -2471,7 +2848,7 @@ static __thread uint64_t t_fxw_pass;
 static __thread char t_fxw_desc[192];
 typedef struct {
     uint64_t h;
-    uint32_t order, n, inst_max, count0, flags, blendf;
+    uint32_t order, n, inst_max, count0, flags, blendf, nskin;
     char why, kind;
     int how;
     float dmin, dmax, at0[3], v0[4];
@@ -2550,7 +2927,12 @@ static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t ins
     }
     pthread_mutex_lock(&g_fxl_lock);
     if (!g_fxw) g_fxw = calloc(FXW_CAP, sizeof *g_fxw);
-    uint64_t key[8] = {t_fxw_cb == cb ? t_fxw_pass : 0, vs, fs, (uint64_t)kind, flags, (uint64_t)why, blendf, (uint64_t)(how > 0)};
+    // Word "fxwib" (2026-10-29): the index buffer joins the group key, so every distinct mesh is its
+    // own group instead of being collapsed with everything that shares its pipeline. Without it a
+    // thing that appears only during a cast (Grease's 3D blobs) cannot be told from the draws it
+    // shares shaders with: a cast grew a dozen groups by one or two draws each and named nothing.
+    uint64_t key[9] = {t_fxw_cb == cb ? t_fxw_pass : 0, vs, fs, (uint64_t)kind, flags, (uint64_t)why, blendf, (uint64_t)(how > 0),
+                       g_cc.fxwib && t_ib_cb == cb ? t_ib : 0};
     uint64_t h = fnv64(key, sizeof key, FNV0) | 1;
     FxwAgg* e = g_fxw && g_fxw_n < FXW_CAP / 2 ? TABLE_FIND(g_fxw, FXW_CAP, h, 1) : NULL;
     if (e) {
@@ -2559,6 +2941,7 @@ static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t ins
             snprintf(e->pass, sizeof e->pass, "%s", t_fxw_cb == cb ? t_fxw_desc : "(no pass seen)");
             e->vs = vs; e->fs = fs; e->pipe = t_pipe; e->kind = kind; e->flags = flags; e->blendf = blendf; e->why = (char)why;
             e->how = how; e->count0 = count; e->ib = t_ib_cb == cb ? t_ib : 0; e->keep = keep_has(e->ib);
+            e->nskin = r ? r->nskin : 0;
             memcpy(e->at0, at, sizeof at); memcpy(e->v0, v0, sizeof v0);
             e->dmin = 1e30f; e->dmax = -1;
         }
@@ -2588,10 +2971,10 @@ static void fxw_present(void) {
         for (uint32_t i = 0; list && i < n; i++) {
             FxwAgg* e = list[i];
             fprintf(g_fxw_f, "%c %c n%u cnt%u inst%u | %s | vs %016llx fs %016llx pipe %llx | bl%u zt%u zw%u zc%u cull%u topo%u nc%u bf %x |"
-                             " place %d d %.1f..%.1f at %.2f %.2f %.2f v0 %.3f %.3f %.3f %.3f ib %llx%s\n",
+                             " place %d skin%u d %.1f..%.1f at %.2f %.2f %.2f v0 %.3f %.3f %.3f %.3f ib %llx%s\n",
                     e->why, e->kind, e->n, e->count0, e->inst_max, e->pass, (unsigned long long)e->vs, (unsigned long long)e->fs,
                     (unsigned long long)e->pipe, e->flags & 1, e->flags >> 1 & 1, e->flags >> 2 & 1, e->flags >> 4 & 15, e->flags >> 8 & 15,
-                    e->flags >> 12 & 255, e->flags >> 20 & 15, e->blendf, e->how, e->dmin > 1e29f ? -1.0f : e->dmin, e->dmax, e->at0[0],
+                    e->flags >> 12 & 255, e->flags >> 20 & 15, e->blendf, e->how, e->nskin, e->dmin > 1e29f ? -1.0f : e->dmin, e->dmax, e->at0[0],
                     e->at0[1], e->at0[2], e->v0[0], e->v0[1], e->v0[2], e->v0[3], (unsigned long long)e->ib, e->keep ? " keep" : "");
         }
         free(list);
@@ -2609,9 +2992,11 @@ static void fxw_present(void) {
 
 static void fxc_present(QueueData* q) {
     mesh_present();
+    ibage_present();
     tav_log_present();
     fxw_present();
     if (g_cc.on && g_cc.void_) keep_read();
+    if (g_cc.on && g_cc.void_ && g_cc.fxprops) hide_read();
     int want = g_cc.on && g_cc.fxcopy && !g_tav.off;
     route_present(want);
     if (!want) {

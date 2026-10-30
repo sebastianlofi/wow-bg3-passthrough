@@ -68,7 +68,7 @@ lifecycle.log = log  # the watcher's lines in the same log
 def settings():
     """WOW-BG3/settings.conf: `key = value` lines, # comments."""
     s = {'debug_commands': '1', 'host': 'BGO_Main_A', 'wow_sound': '1', 'view_distance': '',
-         'compose': 'auto fxcopy void wowbar ground fxsight surf', 'inventory': '1'}
+         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid', 'inventory': '1'}
     try:
         for line in (HOME / 'settings.conf').read_text().splitlines():
             line = line.split('#', 1)[0].strip()
@@ -535,13 +535,14 @@ def db_env():
 
 def datagen_needed():
     return not ((LINK / 'items.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
-                and (IO / 'cursors/quest-turnin.cur').is_file())
+                and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file())
 
 
 def datagen():
     """`wowbg3-coord.py --datagen`: what the inventory and the quest cursors need, made once from the player's
     WoW files, BG3's paks and the server's database (link/tools wow_items.py, wow_icons.py, wowcursor.py; about
-    a minute). BG3 reads the icon atlas when it starts, so the icons show from the next start on."""
+    a minute), and BG3's see-through noise for benilla (seenoise.py, from BG3's paks). BG3 reads the icon atlas
+    when it starts, so the icons show from the next start on; benilla picks the noise up while it runs."""
     rc = 0
     steps = []
     if not (LINK / 'items.json').is_file():
@@ -552,6 +553,9 @@ def datagen():
                                   '--items', LINK / 'items.json')))
     if not (IO / 'cursors/quest-turnin.cur').is_file():
         steps.append(('cursors', py('wowcursor', '--data', WOW / 'Data', '--out', IO / 'cursors')))
+    if not (LINK / 'see-noise.r8').is_file() and game_data():
+        steps.append(('seenoise', [sys.executable, '-u', TOOLS / 'seenoise.py', '--bg3', game_data(),
+                                   '--out', LINK / 'see-noise.r8']))
     env = db_env()
     for name, argv in steps:
         t0 = time.time()

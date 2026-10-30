@@ -4,6 +4,7 @@
 wow_arena.py OUT_DIR --wow X Y [--size 40] --bg3 X Y Z [--mirror 1|0] [--islands largest|border]
              [--maps DIR] [--mmaps DIR] [--models [all|wmo]] [--walls auto|all|none] [--vmaps DIR]
              [--margin 0.5] [--max-triangles 60000] [--map 0|1]
+             [--slope-limit 50] [--steep-polys keep|drop] [--storeys 1|0]
 
 Reads the test server's published movement maps (Detour tiles) and terrain heights for map MAP
 (0 Eastern Kingdoms, the default; 1 Kalimdor)
@@ -17,6 +18,21 @@ and writes, for a square of SIZE metres centred on the WoW point:
                  more off WoW's ground on hills (Tav's feet sank or floated).
   spans.bin      (N*N) records <f f>: the ground's lowest and highest point in each tile (BG3 metres;
                  world_bridge.py can give BG3 these as the tile's MinHeight and MaxHeight)
+  slopes.bin     (N*N) bytes: the angle (whole degrees from level) of the surface the tile's floor
+                 sits on - WoW's terrain mesh or the model face under it - and 255 where there is
+                 none we know (deep water, an ADT hole). Diagnostics; --slope-limit uses the same
+                 numbers to decide what a WoW player may walk on.
+  storey.bin     (N*N) records <u8 walkable, f32 floor> like tiles.bin: the square's upper storey
+                 (--storeys 1, see STOREY_CLEAR), a second floor over the ground's for a second pool
+                 subgrid that lies one tile further +X (world mode keeps one subgrid to a lattice
+                 slot): record column c is the ground's column c + 1, the last one the next
+                 square's first. Flags 1 walkable, 4 | 8 a seam (where it meets the ground:
+                 SubgridEdge and SubgridIntersection); on base storey_base_m (arena.json), and
+                 where the storey has no floor of its own it carries the ground's tile wherever
+                 that lies over the base (see the code). Not written with --storeys 0.
+  seams.bin      (N*N) records <u8 flags, f32 floor> for the ground's own section where the storey
+                 meets it: 4 | 8 a seam on a ground tile, 1 | 4 | 8 a tile of the storey's copied
+                 into the ground at that floor (BG3 m), 0 elsewhere. Not written with --storeys 0.
   triangles.bin  float32 x 9 per triangle in BG3 world metres: WoW's terrain mesh (four triangles per
                  4.17 yd cell, ADT holes left out), flat tiles where a walkable floor is on no other
                  surface, plus 4.5 m walls along walkable/blocked tile edges
@@ -45,6 +61,44 @@ YD = 0.9144
 GRID = 533.33333
 TILE = 0.5
 
+# vmangos's NavTerrain flags on a movement-map polygon (src/game/Maps/MoveMapSharedDefines.h).
+NAV_GROUND = 0x01
+NAV_WATER = 0x08
+NAV_STEEP_SLOPES = 0x10   # "Slopes above player climb angle": NPCs climb them, players do not.
+# WoW's own ground rule, as the 1.12 client enforces it: a surface is walkable only while its normal
+# is within 50 degrees of up, and the player slides back down anything steeper. The number is the
+# client's own (benilla's reimplementation of its character controller: GROUND_COS = 0.642788 =
+# cos 50 degrees, "walkable iff the surface normal is within 50 degrees of up, the reference's limit;
+# steeper slides back", benilla-app/src/player/state.rs). vmangos's movement-map generator works to
+# the same rule with 52 degrees ("Player slope angle is fix (client side controlled)",
+# contrib/mmap/src/TileWorker.cpp) and marks every face between it and the NPC limit (75 degrees on
+# terrain, 61 on models) NAV_STEEP_SLOPES, which the server then excludes for players
+# (Map::GetWalkHitPosition, PathFinder::ExcludeSteepSlopes).
+# The client's companion rule, which the tiles do not carry: over something steeper the player still
+# climbs a rise of up to 1 yd (benilla STEP_UP_HEIGHT; 2 yd for everything that is not the player).
+# BG3's own rule between neighbour tiles is the walker's MovementStepUpHeight, set by Arena.lua.
+PLAYER_SLOPE_DEG = 50.0
+# Upper storeys (--storeys): a second floor per tile, for a second pool subgrid stacked over the
+# square, so a walker can go upstairs. A storey surface is a movement-map polygon at least
+# STOREY_CLEAR yd over the tile's ground floor (a walker's headroom) or, where the ground layer has
+# no floor, one 4 yd or more over the terrain (what the ground layer leaves out). It is kept only
+# where a walker reaches it from the ground floor stepping under STOREY_STEP_M between neighbour
+# tiles (BG3's own rule; Arena.lua's STEP_UP); a storey reaching the square's edge is followed
+# STOREY_MARGIN tiles into the neighbours (over the movement map's own polygons) for stairs up to it
+# there. Roofs, tower tops and the other surfaces nobody walks up to stay out, and so does any
+# storey not on a model face (so none without --models).
+STOREY_CLEAR = 2.0
+STOREY_STEP_M = 1.0
+STOREY_MARGIN = 32
+# The movement map's polygons are a coarse, eroded fit: on a narrow stair a tile's middle can miss
+# them, and over a landing they sit a step above the treads. So each tile keeps every model face
+# near its polygon, the walk up takes the one that goes on from its neighbour, and a tile with no
+# polygon there may take a stair's or a ramp's face (STOREY_RAMP_DEG up to the slope limit; never a
+# level one, so a sill or a wall's top leads nowhere).
+STOREY_RAMP_DEG = 15.0
+# A square keeps no storey when more than this share of it stands over walkable ground above its base.
+STOREY_WRONG_SHARE = 0.1
+
 def detour_polys(path):
     raw = path.read_bytes()
     magic, dtv, mmv, size, liquids = struct.unpack_from('<IIIIB', raw, 0)
@@ -63,12 +117,24 @@ def detour_polys(path):
             continue
         # Recast space (x, y, z) = WoW (y, z, x)
         pts = [(verts[3 * v + 2], verts[3 * v], verts[3 * v + 1]) for v in vidx[:nv]]
-        # vmangos NavTerrain flags: 1 ground, 8 water. A water-only polygon lies on the surface.
-        polys.append(WaterPoly(pts) if flags & 8 and not flags & 1 else pts)
+        polys.append(Poly(pts, flags))
     return polys
 
-class WaterPoly(list):
-    """A movement-map polygon on deep water (WoW swims there): BG3 walks its surface."""
+class Poly(list):
+    """A movement-map polygon: its corners in WoW space plus vmangos's NavTerrain flags."""
+    def __init__(self, pts, flags):
+        super().__init__(pts)
+        self.flags = flags
+
+    @property
+    def water(self):
+        """Deep water (WoW swims there): a water polygon with no ground under it. BG3 walks its surface."""
+        return bool(self.flags & NAV_WATER) and not self.flags & NAV_GROUND
+
+    @property
+    def steep(self):
+        """The generator found the ground here above the player's climb angle (NPCs only)."""
+        return bool(self.flags & NAV_STEEP_SLOPES)
 
 def inside(px, py, pts):
     hit = False
@@ -153,6 +219,23 @@ class Terrain:
             return h5 - h4 + (h2 + h4 - h5) * x + (h4 - h2) * y
         return h5 - h4 + (h4 - h3) * x + (h3 + h4 - h5) * y
 
+    CELL_YD = GRID / 128   # one terrain cell, 4.167 yd a side
+
+    def slope(self, x, y):
+        """The angle (degrees from level) of the terrain face WoW draws at (x, y): the surface the
+        client's movement rule tests. The same four triangles per cell as height(), so this is the
+        drawn mesh's own slope, not a movement-map polygon's simplified one."""
+        gx, gy, a, b, x, y = self._at(x, y)
+        v9, v8, _ = self.grid(gx, gy)
+        h1, h2 = v9[a * 129 + b], v9[(a + 1) * 129 + b]
+        h3, h4 = v9[a * 129 + b + 1], v9[(a + 1) * 129 + b + 1]
+        h5 = 2 * v8[a * 128 + b]
+        if x + y < 1:
+            du, dv = (h2 - h1, h5 - h1 - h2) if x > y else (h5 - h1 - h3, h3 - h1)
+        else:
+            du, dv = (h2 + h4 - h5, h4 - h2) if x > y else (h4 - h3, h3 + h4 - h5)
+        return math.degrees(math.atan(math.hypot(du, dv) / self.CELL_YD))
+
     def hole(self, x, y):
         gx, gy, a, b, _, _ = self._at(x, y)
         return self._cell_hole(self.grid(gx, gy)[2], a, b)
@@ -207,7 +290,7 @@ class Surfaces:
     CELL = 2.0
 
     def __init__(self, tris):
-        self.tris, self.cells = tris, {}
+        self.tris, self.cells, self.tilt, self.up = tris, {}, {}, {}
         for k in range(0, len(tris), 9):
             ax, ay, az, bx, by, bz, cx, cy, cz = tris[k:k + 9]
             ux, uy, uz, vx, vy, vz = bx - ax, by - ay, bz - az, cx - ax, cy - ay, cz - az
@@ -215,16 +298,29 @@ class Surfaces:
             n = math.sqrt(nx * nx + ny * ny + nz * nz)
             if n < 1e-9 or abs(nz) < 0.5 * n:
                 continue
+            self.tilt[k] = math.degrees(math.acos(min(1.0, abs(nz) / n)))
+            self.up[k] = nz > 0     # WoW winds its collision faces outward: floors up, ceilings down
             for i in range(int(math.floor(min(ax, bx, cx) / self.CELL)), int(math.floor(max(ax, bx, cx) / self.CELL)) + 1):
                 for j in range(int(math.floor(min(ay, by, cy) / self.CELL)), int(math.floor(max(ay, by, cy) / self.CELL)) + 1):
                     self.cells.setdefault((i, j), []).append(k)
 
     def heights(self, x, y):
+        """(height, angle from level) of every model face one could stand on in this column."""
         out = []
         for k in self.cells.get((int(math.floor(x / self.CELL)), int(math.floor(y / self.CELL))), ()):
             z = tri_z(self.tris[k:k + 9], x, y)
             if z is not None:
-                out.append(z)
+                out.append((z, self.tilt[k]))
+        return out
+
+    def floors(self, x, y):
+        """(height, angle from level) of the faces in this column that face up: floors and treads, not
+        the ceilings and stair undersides above a room."""
+        out = []
+        for k in self.cells.get((int(math.floor(x / self.CELL)), int(math.floor(y / self.CELL))), ()):
+            z = tri_z(self.tris[k:k + 9], x, y) if self.up[k] else None
+            if z is not None:
+                out.append((z, self.tilt[k]))
         return out
 
 def ensure_mmtiles(mmaps, maps, map_id, wx, wy, reach):
@@ -279,6 +375,19 @@ def main():
     p.add_argument('--margin', type=float, default=0.5)
     p.add_argument('--max-triangles', type=int, default=60000)
     p.add_argument('--map', type=int, choices=[0, 1], default=0)
+    # WoW's own ground rule in the stamp: no tile whose surface is steeper than this (degrees) is
+    # walkable, so BG3's movement circle covers what a WoW player can reach. 0 turns it off (the
+    # earlier state: every movement-map polygon counted, NPC-only steep slopes included).
+    p.add_argument('--slope-limit', type=float,
+                   default=float(os.environ.get('WOW_BG3_SLOPE_LIMIT') or PLAYER_SLOPE_DEG))
+    # Also drop tiles whose movement-map polygon is marked NAV_STEEP_SLOPES, where we have no surface
+    # of our own to test: deep water, an ADT hole, or --models off (a model floor then sits on the
+    # terrain under it). The flag is the generator's verdict over its simplified polygons, coarser
+    # than the mesh rule above, so where that rule tested the surface it wins.
+    p.add_argument('--steep-polys', choices=['keep', 'drop'],
+                   default=os.environ.get('WOW_BG3_STEEP_POLYS') or 'drop')
+    # Upper storeys (storey.bin, see STOREY_CLEAR). 0 writes exactly what was written before them.
+    p.add_argument('--storeys', type=int, choices=[0, 1], default=int(os.environ.get('WOW_BG3_STOREYS') or 1))
     a = p.parse_args()
     assert 2 <= a.size <= 120
     sx = 1.0 if a.mirror else -1.0  # BG3 x = sx * WoW y
@@ -323,17 +432,22 @@ def main():
     # Per tile: WoW's terrain height and the movement map's polygon height nearest to it (walkable
     # when there is one within 4 yd).
     ring = [(r, c) for r in range(-1, n + 1) for c in range(-1, n + 1)]   # rows BG3 +Z, columns +X
-    col, terr, mesh, water = {}, {}, {}, {}
+    col, terr, mesh, water, steep_poly = {}, {}, {}, {}, {}
+    poly_hs = {}    # every polygon height in the tile's middle column but deep water's (storeys)
     for r, c in ring:
         x, y = to_wow(-half + (c + 0.5) * TILE, -half + (r + 0.5) * TILE)
         th = terrain.height(x, y)
-        best, wet = None, False
+        best, wet, stp = None, False, False
+        hs = poly_hs[(r, c)] = []
         for pts in buckets.get((int(math.floor(x / CELL)), int(math.floor(y / CELL))), ()):
             if inside(x, y, pts):
                 h = poly_height(x, y, pts)
                 if best is None or abs(h - th) < abs(best - th):
-                    best, wet = h, isinstance(pts, WaterPoly)
+                    best, wet, stp = h, pts.water, pts.steep
+                if not pts.water:
+                    hs.append(h)
         col[(r, c)], terr[(r, c)], mesh[(r, c)], water[(r, c)] = (x, y), th, best, wet
+        steep_poly[(r, c)] = stp
 
     # WoW's collision models, cut from the vmaps for the square plus the margin, in WoW space. The z
     # range keeps what is near the ground: 30 yards below the lowest terrain to 100 above the highest
@@ -354,36 +468,55 @@ def main():
     # their own below), as does deep water's surface. Blocked tiles lie on the terrain.
     walk_ring, floor_ring, off_surface, on_terrain = {}, {}, set(), set()
     floor_kind = {'terrain': 0, 'model': 0, 'polygon': 0, 'water': 0}
+    tilt_ring = {}          # the angle of the surface each tile's floor sits on (None: none we know)
+    floor_yd = {}           # the same floors in WoW yards
+    steep_cut = {'mesh': 0, 'poly': 0}
     for rc in ring:
         x, y = col[rc]
         th, best = terr[rc], mesh[rc]
+        ts = terrain.slope(x, y)
         # Walkable: a movement-map polygon within 4 yd of the terrain. (Admitting polygons on model
         # floors farther off made the Northshire abbey's roofs and upper floors walkable islands;
         # city streets yards above the terrain, as in parts of Stormwind, stay blocked.)
         w = best is not None and abs(best - th) < 4.0
         models = surfaces.heights(x, y) if surfaces is not None and w else []
-        f = th
+        f, tilt = th, ts
         if w and water[rc] and best > th:
             # Deep water (WoW swims): its surface, as before (BG3 cannot swim), with flat triangles.
-            f = best
+            f, tilt = best, None
             off_surface.add(rc)
         elif w:
             hole = terrain.hole(x, y)
-            cands = ([] if hole else [th]) + models
-            f = min(cands, key=lambda h: abs(h - best)) if cands else best
+            cands = ([] if hole else [(th, ts)]) + models
+            f, tilt = min(cands, key=lambda c: abs(c[0] - best)) if cands else (best, None)
             if abs(f - best) > 2.0:
                 if hole:
-                    f = best    # nothing drawn there that we know of: the polygon's own height
+                    f, tilt = best, None   # nothing drawn there that we know of: the polygon's height
                     off_surface.add(rc)
                 else:
-                    f = th      # a coarse polygon on a steep slope: the terrain is the ground
+                    f, tilt = th, ts       # a coarse polygon on a steep slope: the terrain is the ground
         if w and rc not in off_surface and f == th:
             on_terrain.add(rc)
+        # WoW's own ground rule: the client walks ground up to the player's climb angle and slides
+        # the player back down anything steeper, so neither may BG3. The rule is tested on the
+        # surface the floor sits on (WoW's drawn terrain mesh, or the model face under the tile),
+        # which is finer than the movement map's own simplified polygons. Where we have no surface
+        # to test (a deep-water surface, an ADT hole, any model floor with --models off) the
+        # movement map's steep flag decides.
+        if w and a.slope_limit > 0:
+            if tilt is not None and tilt > a.slope_limit:
+                w = False
+                steep_cut['mesh'] += 1
+            elif a.steep_polys == 'drop' and steep_poly[rc] and (tilt is None or surfaces is None):
+                w = False
+                steep_cut['poly'] += 1
+        tilt_ring[rc] = tilt
         if w and 0 <= rc[0] < n and 0 <= rc[1] < n:
             floor_kind['water' if water[rc] and rc in off_surface else 'polygon' if rc in off_surface
                        else 'terrain' if f == th else 'model'] += 1
         walk_ring[rc] = w
         floor_ring[rc] = by + (f - wz) * YD
+        floor_yd[rc] = f
     walk = [[walk_ring[(r, c)] for c in range(n)] for r in range(n)]
     floor = [[floor_ring[(r, c)] for c in range(n)] for r in range(n)]
 
@@ -419,6 +552,152 @@ def main():
         for r in range(n):
             for c in range(n):
                 f.write(struct.pack('<Bf', 1 if walk[r][c] else 0, floor[r][c]))
+
+    # The upper storey (see STOREY_CLEAR): per ring tile the lowest polygon a storey may stand on,
+    # moved onto the model face WoW draws there (within 2 yd, the same as the ground's floors) and
+    # held to the slope rule; then only what a walker reaches from the ground floor.
+    storey = {}
+    if a.storeys:
+        limit = a.slope_limit if a.slope_limit > 0 else 90.0
+        cand = {}       # ring tile -> the heights a storey may stand at there (model faces)
+        for rc in ring:
+            if surfaces is None:
+                break
+            hs = poly_hs[rc]
+            low = floor_yd[rc] + STOREY_CLEAR if walk_ring[rc] else terr[rc] + 4.0
+            up = [h for h in hs if h > low] if walk_ring[rc] else [h for h in hs if h >= low]
+            faces = [fc for fc in surfaces.floors(*col[rc]) if fc[1] <= limit]
+            # A storey stands on a model (a building's floor, its stairs, a bridge): a polygon with no
+            # model face under it is the movement map's coarse fit of a hillside straying up.
+            opts = {round(z, 3) for z, t in faces if up and abs(z - min(up)) <= 2.0}
+            opts |= {round(z, 3) for z, t in faces if t >= STOREY_RAMP_DEG and z >= low}
+            if opts:
+                cand[rc] = sorted(opts)
+        def nbrs(rc):
+            r, c = rc
+            return ((r + 1, c), (r - 1, c), (r, c + 1), (r, c - 1))
+        def joins(f1, f2):
+            return abs(f1 - f2) * YD < STOREY_STEP_M
+        ground = {rc: floor_yd[rc] for rc in ring if walk_ring[rc]}
+        def step_to(rc, h):
+            # The height at rc a walker coming from height h stands on, or None.
+            best = min(cand[rc], key=lambda z: abs(z - h))
+            return best if joins(best, h) else None
+        def reach():
+            got, stack = {}, []
+            for rc in cand:
+                for q in nbrs(rc):
+                    if q in ground and (z := step_to(rc, ground[q])) is not None:
+                        got[rc] = z
+                        stack.append(rc)
+                        break
+            # Breadth first, so each tile takes the height of the nearest way up.
+            i = 0
+            while i < len(stack):
+                rc = stack[i]
+                i += 1
+                for q in nbrs(rc):
+                    if q in cand and q not in got and (z := step_to(q, got[rc])) is not None:
+                        got[q] = z
+                        stack.append(q)
+            return got
+        seen = reach()
+        if any(rc not in seen and (rc[0] in (-1, n) or rc[1] in (-1, n)) for rc in cand):
+            # A storey unreached at the square's edge: its stairs may lie in a neighbour. The margin's
+            # tiles from the movement map alone (ground: the polygon nearest the terrain within 4 yd;
+            # storey: as above, on the polygons' own heights), then the walk again over both.
+            m = STOREY_MARGIN
+            mreach = (half + m * TILE) / YD + 3
+            mbuckets = {}
+            for pts in polys:
+                x0, x1 = min(q[0] for q in pts), max(q[0] for q in pts)
+                y0, y1 = min(q[1] for q in pts), max(q[1] for q in pts)
+                if pts.water or x0 > wx + mreach or x1 < wx - mreach or y0 > wy + mreach or y1 < wy - mreach:
+                    continue
+                for i in range(int(math.floor(x0 / CELL)), int(math.floor(x1 / CELL)) + 1):
+                    for j in range(int(math.floor(y0 / CELL)), int(math.floor(y1 / CELL)) + 1):
+                        mbuckets.setdefault((i, j), []).append(pts)
+            for r in range(-1 - m, n + 1 + m):
+                for c in range(-1 - m, n + 1 + m):
+                    if -1 <= r <= n and -1 <= c <= n:
+                        continue
+                    x, y = to_wow(-half + (c + 0.5) * TILE, -half + (r + 0.5) * TILE)
+                    try:
+                        th = terrain.height(x, y)
+                    except (OSError, struct.error):
+                        continue
+                    hs = [poly_height(x, y, pts) for pts in mbuckets.get((int(math.floor(x / CELL)), int(math.floor(y / CELL))), ())
+                          if inside(x, y, pts)]
+                    low = [h for h in hs if abs(h - th) < 4.0]
+                    f0 = min(low, key=lambda h: abs(h - th)) if low else None
+                    up = [h for h in hs if (h - f0 > STOREY_CLEAR if f0 is not None else h - th >= 4.0)]
+                    if f0 is not None:
+                        ground[(r, c)] = f0
+                    if up:
+                        cand[(r, c)] = [min(up)]
+            seen = reach()
+        # BG3 takes a point's tile from the subgrid with the highest base at or under it (and a little
+        # over the point: a hall 1.3 m under a base still went to the storey), and Place takes no tile
+        # under its subgrid's base, so the base lies under the storey's lowest tile. Where much of the
+        # storey stands over walkable ground above that base a walker on the ground is the storey's,
+        # on the floor above (the Northshire abbey: 1590 of 1944 tiles, a walk across its hall ended
+        # on the level 14 m up). No base serves both there: such a square keeps its ground alone.
+        own = [rc for rc in seen if 0 <= rc[0] < n and 1 <= rc[1] <= n]
+        low = [seen[rc] for rc in own] + [floor_yd[q] for rc, z in seen.items() for q in nbrs(rc)
+                                          if walk_ring.get(q) and joins(floor_yd[q], z) and 0 <= q[0] < n and 1 <= q[1] <= n]
+        if sum(1 for rc in own if walk_ring.get(rc) and floor_yd[rc] >= min(low) - 0.5 / YD) > STOREY_WRONG_SHARE * len(own):
+            seen = {}
+        storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
+        # Where the storey and the ground meet (a walker steps from one onto the other): both tiles
+        # are seams, the only tiles BG3's pathfinder changes subgrids on (flags 4 SubgridEdge and 8
+        # SubgridIntersection in the plugin's Place).
+        seam_s, seam_g = set(), {}
+        for rc, z in list(seen.items()):
+            for q in nbrs(rc):
+                if walk_ring.get(q) and joins(floor_yd[q], z):
+                    seam_s.add(rc)
+                    seam_g.setdefault(q, None)
+                    # BG3 changes subgrids where two overlap only on a tile both have, each way: the
+                    # ground's tile goes into the storey at the ground's height and the storey's into
+                    # the ground (its section only, not tiles.bin) at the storey's, seams in both.
+                    if q not in seen:
+                        seen[q] = floor_yd[q]
+                        seam_s.add(q)
+                    if not walk_ring.get(rc):
+                        seam_g[rc] = by + (z - wz) * YD
+        storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
+        # The storey's section as the plugin takes it, on base storey_base_m. BG3 takes a point's tile
+        # from the subgrid with the highest base at or under it, so wherever the storey has no floor
+        # of its own and the ground lies over its base, it carries the ground's tile (walkable or not,
+        # at the ground's floor): a point there is the storey's, and must find the ground (seen in
+        # the Lion's Pride: a base under the ground sent every point upstairs to the ground floor; one
+        # under a raised ground blocked that ground).
+        storey_base = math.floor((min(storey.values()) - 0.5) * 50) / 50 if storey else None
+        with open(out / 'storey.bin', 'wb') as f:
+            for r in range(n):
+                for c in range(1, n + 1):
+                    s = storey.get((r, c))
+                    g = floor_ring[(r, c)]
+                    if s is not None:
+                        f.write(struct.pack('<Bf', 1 | (12 if (r, c) in seam_s else 0), s))
+                    elif storey_base is not None and g >= storey_base:
+                        # A copy of the ground: a seam in both where it is walkable, so a walker on
+                        # the ground there can be in either subgrid (BG3's pathfinder changes subgrids
+                        # only on seams; without them a hillside rising over the base lost its paths).
+                        if walk_ring[(r, c)]:
+                            f.write(struct.pack('<Bf', 13, g))
+                            if c < n and (r, c) not in seam_g:
+                                seam_g[(r, c)] = None
+                        else:
+                            f.write(struct.pack('<Bf', 0, g))
+                    else:
+                        f.write(struct.pack('<Bf', 0, storey_base if storey_base is not None else math.nan))
+        with open(out / 'seams.bin', 'wb') as f:
+            for r in range(n):
+                for c in range(n):
+                    h = seam_g.get((r, c))
+                    f.write(struct.pack('<Bf', 0 if (r, c) not in seam_g else 12 if h is None else 13,
+                                        math.nan if h is None else h))
     # spans.bin: each tile's ground height range (lowest, highest in BG3 metres) over its corners and
     # middle: the terrain's on terrain floors, the floor alone elsewhere (models, water, polygons).
     corner_h = {}
@@ -426,6 +705,11 @@ def main():
         if (r, c) not in corner_h:
             corner_h[(r, c)] = terrain.height(*to_wow(-half + c * TILE, -half + r * TILE))
         return corner_h[(r, c)]
+    with open(out / 'slopes.bin', 'wb') as f:
+        for r in range(n):
+            for c in range(n):
+                t = tilt_ring[(r, c)]
+                f.write(bytes([255 if t is None else min(90, int(round(t)))]))
     with open(out / 'spans.bin', 'wb') as f:
         for r in range(n):
             for c in range(n):
@@ -545,12 +829,24 @@ def main():
             'model_m2_triangles': sum(1 for s in sizes if s < 0), 'model_triangles_dropped': model_dropped,
             'wall_quads_dropped': walls_dropped, 'models': a.models or 'off', 'walls': keep_walls,
             'walkable_floors_on': floor_kind,
+            'slope_limit_deg': a.slope_limit, 'steep_polys': a.steep_polys,
+            'slope_blocked_tiles': steep_cut,
+            'storeys': a.storeys, 'storey_tiles': len(storey), 'storey_base_m': storey_base if a.storeys else None,
+            'storey_range_m': [min(storey.values()), max(storey.values())] if storey else None,
+            'walkable_slope_deg_max': max([tilt_ring[(r, c)] for r in range(n) for c in range(n)
+                                           if walk[r][c] and tilt_ring[(r, c)] is not None] or [0.0]),
             'floor_range_m': [min(min(row) for row in floor), max(max(row) for row in floor)],
             'mirror': bool(a.mirror),
             'mapping': 'WoW delta (x,y,z) yd -> BG3 (%sy, z, -x) * 0.9144 m + centre' % ('' if a.mirror else '-')}
     (out / 'arena.json').write_text(json.dumps(meta, indent=1))
-    # Full-resolution text preview: '#' blocked, '.' walkable, top row is BG3 max Z, left is min X.
-    (out / 'preview.txt').write_text('\n'.join(''.join('.' if walk[r][c] else '#' for c in range(n))
+    # Full-resolution text preview: '.' walkable, 's' blocked by the slope rule (too steep for a WoW
+    # player), '#' blocked otherwise; top row is BG3 max Z, left is min X.
+    def mark(r, c):
+        if walk[r][c]:
+            return '.'
+        t = tilt_ring[(r, c)]
+        return 's' if a.slope_limit > 0 and t is not None and t > a.slope_limit else '#'
+    (out / 'preview.txt').write_text('\n'.join(''.join(mark(r, c) for c in range(n))
                                                for r in range(n - 1, -1, -1)) + '\n')
     print(json.dumps(meta))
 

@@ -106,6 +106,7 @@ static struct {
     uint32_t copies_next;
     // statistics since the last log
     uint64_t injects, albs, nowow, nocam, decs, fwds, keeps, composed, nosurf, stale, other_frame;
+    uint64_t nodec, nofwd;  // the frame had one kind of copy but not the other (2026-10-29)
     uint64_t deepest;   // the furthest a recorded frame ran ahead of the presented one (SF_SLOTS must beat it)
     uint64_t last_serial;  // the newest frame recorded (for `deepest`)
     uint64_t endwhy[8];  // 6 sf_init failed, 7 BG3's view-projection not invertible
@@ -560,12 +561,36 @@ static void surf_submit_cb(uint64_t cb, uint64_t pending_serial) {
     pthread_mutex_unlock(&g_sf.m);
 }
 
-// begin_pass, at swapchain size (g_trace_lock held): remember the pass's attachments.
-static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin) {
+static void sf_scene_copy(VkCommandBuffer cb, uint64_t img, int32_t lay);
+// begin_pass, at swapchain size (g_trace_lock held): remember the pass's attachments. The hook runs
+// before BG3 records its own vkCmdBeginRenderPass, so a copy made here lands outside the pass.
+static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* ini, const uint8_t* load, const int32_t* fin) {
     t_sf_cb = VK_NULL_HANDLE;
     if (!g_cc.surf || !g_sf.ready || g_screen) return;  // a BG3 screen (screen_check): BG3's own picture
     int depth = 0;
     for (uint32_t k = 0; k < n; k++) depth |= imgs[k] == g_role.depth;
+    // Word "surfscene" (2026-10-29): take the surfaces' look from BG3's **lit** scene instead of its
+    // pre-lighting forward layer. Measured: the pre-lighting layer (H) is empty on WoW's ground in
+    // the void -- 40x it with no floor and nothing appears -- so all that reached WoW's picture was
+    // the decals' flat albedo change, while BG3's own picture shows the surface bright and lumpy.
+    // BG3's effects pass loads the lit scene, so copying that attachment here (before the pass, so
+    // before BG3's own effects are drawn into it) gives the surfaces lit as BG3 lights them, and
+    // nothing else: the void's ground is black, characters are excluded by the ground depth, and
+    // BG3's effects come later and are replayed by benilla instead. It goes into the same slot the
+    // forward layer used, so the compositor, its flag and the "sfwd=" / "sfloor=" weights are
+    // unchanged.
+    if (depth && g_cc.surfscene && !g_cc.surfpost) {
+        int colors = 0, at = -1;
+        for (uint32_t k = 0; k < n; k++) {
+            if (imgs[k] == g_role.depth || !imgs[k]) continue;
+            colors++;
+            ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh
+                && load[k] == VK_ATTACHMENT_LOAD_OP_LOAD && ini[k] > 0)
+                at = (int)k;
+        }
+        if (colors == 1 && at >= 0) sf_scene_copy(cb, imgs[at], ini[at]);
+    }
     if (!depth) return;
     t_sf_cb = cb;
     t_sf_n = n > 8 ? 8 : n;
@@ -607,6 +632,22 @@ static void sf_copy(DeviceData* d, VkCommandBuffer cb, VkImage src, VkImageLayou
 static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     if (t_sf_cb != cb) return;
     t_sf_cb = VK_NULL_HANDLE;
+    if (g_cc.surfscene && !g_cc.surfpost) t_sf_fwd = 0;  // the lit-scene copy at the pass's start holds that slot
+    // Word "surfpost" (research, 2026-10-29): take the copy at the END of BG3's effects pass instead
+    // of before it, so it carries BG3's effects as well as its surfaces. Tells whether a thing that
+    // is missing from WoW's picture (Grease's 3D burst blob) is drawn in that pass at all.
+    if (g_cc.surfpost && !t_sf_fwd) {
+        pthread_mutex_lock(&g_trace_lock);
+        int colors = 0, at = -1;
+        for (uint32_t k = 0; k < t_sf_n; k++) {
+            if (t_sf_img[k] == g_role.depth || !t_sf_img[k]) continue;
+            colors++;
+            ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, t_sf_img[k], 0);
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh) at = (int)k;
+        }
+        pthread_mutex_unlock(&g_trace_lock);
+        if (colors == 1 && at >= 0) t_sf_fwd = 1;
+    }
     if (!t_sf_dec && !t_sf_fwd) return;
     if (!g_cc.surf || !g_sf.ready || !d->CmdCopyImage) return;
     // the attachment to copy: BG3's albedo (decals), the swapchain-size B10G11R11 target (forward)
@@ -653,6 +694,27 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     __atomic_add_fetch(t_sf_fwd ? &g_sf.fwds : &g_sf.decs, 1, __ATOMIC_RELAXED);
 }
 
+// Word "surfscene": one copy of BG3's lit scene (the effects pass's colour attachment, before the
+// pass) into the copy slot the forward layer uses. Mirrors surf_pass_end's forward half.
+static void sf_scene_copy(VkCommandBuffer cb, uint64_t img, int32_t lay) {
+    DeviceData* d = device_for(cb);
+    if (!d || !d->CmdCopyImage || !g_sf.ready) return;
+    pthread_mutex_lock(&g_sf.m);
+    const uint64_t key = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    const int ci = (int)(key % SF_COPIES);
+    SfCopy* c = &g_sf.c[ci];
+    uint32_t w = g_role.ew, h = g_role.eh;
+    if (!g_sf.d || !w || !sf_copy_images(g_sf.d, c, w, h)) { pthread_mutex_unlock(&g_sf.m); return; }
+    if (c->key != key) { c->key = key; c->dec_serial = c->fwd_serial = 0; }
+    g_sf.copies[g_sf.copies_next % 32].cb = (uint64_t)(uintptr_t)cb;
+    g_sf.copies[g_sf.copies_next % 32].ci = ci;
+    g_sf.copies[g_sf.copies_next % 32].fwd = 1;
+    g_sf.copies_next++;
+    pthread_mutex_unlock(&g_sf.m);
+    sf_copy(d, cb, (VkImage)img, (VkImageLayout)lay, &c->h, w, h);
+    __atomic_add_fetch(&g_sf.fwds, 1, __ATOMIC_RELAXED);
+}
+
 // What the compositor needs for the frame it presents (g_lock and g_trace_lock held): the slot's
 // images (or the 1x1 stand-ins) and the camera block (wowbg3_compose.comp, Cam). Returns the flags
 // (0: no surfaces this frame). `cam_m` is the BGC1 record seq WoW's composited frame was drawn for.
@@ -670,6 +732,8 @@ static uint32_t surf_for_compose(DeviceData* d, uint64_t framed_serial, uint32_t
             if (g_sf.c[k].a1.img && g_sf.c[k].dec_serial == framed_serial) dec = k;
             if (g_sf.c[k].h.img && g_sf.c[k].fwd_serial == framed_serial) fwd = k;
         }
+        if (dec < 0 && fwd >= 0) g_sf.nodec++;
+        if (fwd < 0 && dec >= 0) g_sf.nofwd++;
         if (dec >= 0 || fwd >= 0) {
             fl = 1u | (dec >= 0 ? 2u : 0u) | (fwd >= 0 ? 4u : 0u);
             views[0] = s->z.view; views[1] = s->a0.view;
@@ -808,7 +872,7 @@ static void surf_present(void) {
     }
     if (g_sf.presents % 300 == 0) {
         logf_("surf: %llu injections (%llu idle: no surface drawn lately), %llu albedo passes (%.3f ms GPU), %llu decal copies (%.3f ms), %llu forward copies (%.3f ms); "
-              "no WoW frame %llu, no camera %llu; surface draws kept in the void %llu; composited %llu (no surface %llu, stale %llu of %d slots, deepest frame in flight %llu, a second copy of a kind in one frame %llu), "
+              "no WoW frame %llu, no camera %llu; surface draws kept in the void %llu; composited %llu (no surface %llu, no decal copy %llu, no forward copy %llu, stale %llu of %d slots, deepest frame in flight %llu, a second copy of a kind in one frame %llu), "
               "WoW frame of the albedo %.1f cameras before the composited one; pixels per frame: changed %.0f, ground matched %.0f, not matched %.0f; "
               "WoW camera vs BG3's axes (min dot) forward %.4f right %.4f up %.4f, eye apart up to %.2f m (%llu frames); "
               "albedo passes owed but not recorded: slot moved on %llu, no push constants %llu, off %llu, framebuffer %llu, no WoW copy %llu; "
@@ -816,7 +880,8 @@ static void surf_present(void) {
               (unsigned long long)g_sf.injects, (unsigned long long)g_sf.idle, (unsigned long long)g_sf.albs, g_sf.n_alb ? g_sf.gpu_alb / 1e6 / g_sf.n_alb : 0.0,
               (unsigned long long)g_sf.decs, g_sf.n_dec ? g_sf.gpu_dec / 1e6 / g_sf.n_dec : 0.0, (unsigned long long)g_sf.fwds,
               g_sf.n_fwd ? g_sf.gpu_fwd / 1e6 / g_sf.n_fwd : 0.0, (unsigned long long)g_sf.nowow, (unsigned long long)g_sf.nocam,
-              (unsigned long long)g_sf.keeps, (unsigned long long)g_sf.composed, (unsigned long long)g_sf.nosurf, (unsigned long long)g_sf.stale, SF_SLOTS,
+              (unsigned long long)g_sf.keeps, (unsigned long long)g_sf.composed, (unsigned long long)g_sf.nosurf, (unsigned long long)g_sf.nodec,
+              (unsigned long long)g_sf.nofwd, (unsigned long long)g_sf.stale, SF_SLOTS,
               (unsigned long long)g_sf.deepest,
               (unsigned long long)g_sf.other_frame,
               g_sf.kage_n ? (double)g_sf.kage_sum / g_sf.kage_n : 0.0, g_sf.px_frames ? (double)g_sf.px_sp / g_sf.px_frames : 0.0,
@@ -827,6 +892,7 @@ static void surf_present(void) {
               (unsigned long long)g_sf.endwhy[6], (unsigned long long)g_sf.endwhy[7], (unsigned long long)__atomic_exchange_n(&g_sf_ends, 0, __ATOMIC_RELAXED));
         memset(g_sf.endwhy, 0, sizeof g_sf.endwhy);
         g_sf.injects = g_sf.idle = g_sf.albs = g_sf.nowow = g_sf.nocam = g_sf.decs = g_sf.fwds = g_sf.keeps = g_sf.composed = g_sf.nosurf = g_sf.stale = 0;
+        g_sf.nodec = g_sf.nofwd = 0;
         g_sf.other_frame = 0;
         g_sf.gpu_alb = g_sf.gpu_dec = g_sf.gpu_fwd = g_sf.n_alb = g_sf.n_dec = g_sf.n_fwd = 0;
         g_sf.px_sp = g_sf.px_ok = g_sf.px_bad = g_sf.px_frames = 0;

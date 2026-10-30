@@ -341,8 +341,17 @@ function M.Start(runId)
     -- "Sneaking" crime (harness: 10 of them around one pickpocket, none a theft), which BG3 answers with
     -- a look and a bark, not a search; searching on it made the NPCs wander (a playtest report).
     M.QuietCrimes = {Sneaking = true}
-    local searching = {} -- stand-in uuid -> {Last, Post, MovedAt, At, Returning, Home}
+    local searching = {} -- stand-in uuid -> {Last, Post, MovedAt, At, Returning, Home, StepAt, Steps, Turn}
     M.SearchMax, M.SearchHome, M.CrimeQuiet, M.CrimeIdle = 5400, 1.5, 600, 450
+    -- The search walk. Letting BG3 run the crime flow does not make it walk the stand-in: in the void
+    -- its reaction is a look and a bark, so the victim stood on its spot for the whole search and its
+    -- WoW model with it (playtest feedback: "the npc didnt move"; every search in the playtest's logs ended after 20 to
+    -- 25 s, which is what the timers do when nothing ever moves). The walk is given to the stand-in
+    -- here, never to the WoW mob, so where the body goes is still BG3's and benilla's held model
+    -- follows it (patch 0067). It steps only while BG3 leaves it standing (M.SearchStill) and only for
+    -- a crime worth searching (M.QuietCrimes are still left alone), for M.SearchWalk ticks from the
+    -- last crime; then the idle timers below walk it back to its post as before.
+    M.SearchStill, M.SearchStep, M.SearchWalk, M.SearchRadius = 90, 240, 900, 6.0
     M.CrimeKinds = {}
     local function search(uuid)
         if not friendlyOf(uuid) then return end
@@ -383,6 +392,18 @@ function M.Start(runId)
             return
         end
         if not s.At or hdist(at, s.At) > 0.3 then s.At, s.MovedAt = at, ticks end
+        -- A step of the search walk: a point round the crime's spot, a different way each time (the
+        -- golden angle spreads them without a pattern), only while the stand-in is standing still.
+        if not s.Returning and ticks - s.Last <= M.SearchWalk and ticks - s.MovedAt >= M.SearchStill
+            and ticks - (s.StepAt or -M.SearchStep) >= M.SearchStep then
+            s.StepAt = ticks
+            s.Steps = (s.Steps or 0) + 1
+            s.Turn = (s.Turn or 0) + 2.3999632297
+            local c = s.Post or at
+            local r = M.SearchRadius * (0.4 + 0.3 * (s.Steps % 3))
+            pcall(Osi.CharacterMoveToPosition, m.Uuid, c[1] + r * math.cos(s.Turn), c[2],
+                c[3] + r * math.sin(s.Turn), "Walk", "", 1)
+        end
         if not s.Returning and s.Post and ticks - s.Last > M.CrimeQuiet and ticks - s.MovedAt > M.CrimeIdle then
             s.Returning = true
             if hdist(at, s.Post) > M.SearchHome then

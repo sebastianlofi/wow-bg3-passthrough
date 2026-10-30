@@ -55,7 +55,8 @@ TOOLS = ["lifecycle.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_brid
          "wow_vmap.py", "wow_mpq.py", "inventory_bridge.py", "wowlevel.py", "wow_items.py", "wow_items_rules.json"]
 TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthrough accounts, chat commands
                "tavtex.py", "bg3tex.py", "bg3pak.py", "bg3shade.py", "bg3index.py",  # Tav's textures (with --python)
-               "wow_icons.py", "wowcursor.py"]  # the icon atlas and the quest cursors (first run, with --python)
+               "wow_icons.py", "wowcursor.py",  # the icon atlas and the quest cursors (first run, with --python)
+               "seenoise.py"]  # BG3's see-through noise for benilla (first run, with --python)
 
 
 def version64(v: str) -> int:

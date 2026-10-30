@@ -397,21 +397,31 @@ end
 -- keeps blended draws near Tav). M.KeepOthers = true lists every character within the radius.
 M.KeepOthers = false
 local Hero = Ext.Require("Hero.lua")
-local lastKeep = nil
+local lastKeep, lastHide = nil, nil
 -- party: the figures WoW draws (the hero and her companions), kept like her.
+-- The characters it leaves out (a fight's stand-ins, NPCs) go to wow-bg3/link/hide.txt ("HIDE 1",
+-- then one hex VkBuffer handle a line): the layer's "fxprops" keeps a spell's young prop meshes
+-- through the void, and a stand-in that has just spawned has young meshes too, so it must be told
+-- which ones are characters. They have Health and a spell's props do not, so this side knows exactly.
+-- The hide list reaches further than the keep list: the layer keeps a young prop out to 120 m from Tav
+-- (FXC_RADIUS_VOID), and a character coming back into BG3's view is young again, so every character
+-- inside that radius must be listed.
+M.HideRadius = 130
 function M.PublishKeep(centre, radius, party)
-    local ids = {}
+    local ids, hide = {}, {}
     local mine = {}
     for _, u in ipairs(type(party) == "table" and party or {}) do mine[u] = true end
     for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Health")) do
         local ok, p = pcall(function() return e.Transform.Transform.Translate end)
+        local kept = true
         if ok and p and not M.KeepOthers then
             local okU, u = pcall(function() return e.Uuid.EntityUuid end)
-            if not (okU and (u == Hero.Uuid() or mine[u])) then ok = false end
+            if not (okU and (u == Hero.Uuid() or mine[u])) then kept = false end
         end
         if ok and p then
             local dx, dy, dz = p[1] - centre[1], p[2] - centre[2], p[3] - centre[3]
-            if dx * dx + dy * dy + dz * dz < radius * radius then pcall(indexBuffers, e, ids) end
+            local d2, r = dx * dx + dy * dy + dz * dz, kept and radius or math.max(radius, M.HideRadius)
+            if d2 < r * r then pcall(indexBuffers, e, kept and ids or hide) end
         end
     end
     table.sort(ids)
@@ -420,12 +430,19 @@ function M.PublishKeep(centre, radius, party)
         lastKeep = body
         Ext.IO.SaveFile("wow-bg3/link/keep.txt", body)
     end
+    table.sort(hide)
+    local hbody = "HIDE 1\n" .. table.concat(hide, "\n") .. "\n"
+    if hbody ~= lastHide then
+        lastHide = hbody
+        Ext.IO.SaveFile("wow-bg3/link/hide.txt", hbody)
+    end
     return #ids
 end
 
 function M.ClearKeep()
-    lastKeep = nil
+    lastKeep, lastHide = nil, nil
     Ext.IO.SaveFile("wow-bg3/link/keep.txt", "KEEP 0\n")
+    Ext.IO.SaveFile("wow-bg3/link/hide.txt", "HIDE 0\n")
 end
 
 return M

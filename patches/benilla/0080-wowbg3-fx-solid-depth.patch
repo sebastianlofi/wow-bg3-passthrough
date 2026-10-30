@@ -1,0 +1,189 @@
+WOW-BG3 benilla patch 0080: a solid effect piece keeps its depth write.
+
+BG3 masks a spell's solid (unblended) pieces with its own depth, inside the effects pass: one recipe
+lays the mesh down with an alpha test and a depth write (zw1, greater-or-equal, a fragment shader
+with an OpKill), and the next draws the colour with an EQUAL test, no write and no discard of its
+own. The replay forced `depth_write_enabled: false` on every draw, so the EQUAL draws failed
+everywhere and Grease's blob and splash never arrived; forcing their test to greater-or-equal
+instead (tried 2026-10-28) drew the whole unmasked billboard, a black quad and black shards.
+
+Now a draw writes depth exactly when BG3's recipe says it does. The replay's depth is its own copy
+of WoW's (`wowbg3_fx_depth`, written by the prep pass), so WoW's own depth is untouched; it is reset
+before the over-white run as well, so the over-black and over-white pair still answers the same
+question at every pixel and T = W - C stays right.
+
+That attachment can no longer be sampled while it is written, so the prep pass also writes the same
+depth into a colour target (`wowbg3_fx_depth_copy`, R32Float) and a draw that reads BG3's scene
+depth (special key 1) reads that. It holds the depth as the effects pass began, which is what BG3's
+own copy holds.
+
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -483,6 +483,11 @@
+     /// and their key 4, the receivers' linear depth (the far plane elsewhere).
+     decal_normal: wgpu::TextureView,
+     lin_r: wgpu::TextureView,
++    /// Patch 0080: a colour copy of the depth the prep pass writes. The draws now write into
++    /// `depth` (BG3's solid pieces mask each other with it), so a draw that reads BG3's scene depth
++    /// (special key 1) cannot read that attachment any more and reads this instead; it holds the
++    /// scene depth as the effects pass began, which is what BG3's own copy holds.
++    zcopy: wgpu::TextureView,
+ }
+ 
+ struct Base {
+@@ -543,6 +548,8 @@
+     decal_normal: wgpu::TextureView,
+     lin_r: wgpu::TextureView,
+     recv_pipeline: wgpu::RenderPipeline,
++    /// Patch 0080: the readable copy of the prep pass's depth (special key 1).
++    zcopy: wgpu::TextureView,
+ }
+ 
+ struct PreparedDraw {
+@@ -887,6 +894,7 @@
+                         Some(wgpu::TextureFormat::R32Float.into()),
+                         Some(COLOR_FMT.into()),
+                         Some(wgpu::TextureFormat::R32Float.into()),
++                        Some(wgpu::TextureFormat::R32Float.into()),
+                     ],
+                 }),
+                 multiview: None,
+@@ -1216,9 +1224,16 @@
+         };
+         // The Y flip keeps framebuffer positions, so BG3's winding holds.
+         let front_face = if r.front == 1 { wgpu::FrontFace::Cw } else { wgpu::FrontFace::Ccw };
++        // Patch 0080: a draw that writes depth in BG3 writes it here too. BG3 masks a spell's solid
++        // pieces with its own depth: one draw lays the mesh down with an alpha test and a depth
++        // write, the next draws the colour with an EQUAL test and no write. Dropping the write (as
++        // the replay did until now) made every such EQUAL draw fail everywhere, which is why
++        // Grease's blob and splash never arrived. The replay's depth is its own copy of WoW's
++        // (`wowbg3_fx_depth`), reset before each of the over-black and over-white runs, so writing
++        // into it leaves WoW's own depth alone.
+         let depth_stencil = wgpu::DepthStencilState {
+             format: DEPTH_FMT,
+-            depth_write_enabled: false,
++            depth_write_enabled: r.depth_test != 0 && r.depth_write != 0,
+             depth_compare: if r.depth_test != 0 { vk_compare(r.depth_compare) } else { wgpu::CompareFunction::Always },
+             stencil: wgpu::StencilState::default(),
+             bias: if r.bias_enable != 0 {
+@@ -1416,7 +1431,8 @@
+                 match key {
+                     // 3: BG3's fog volume, none (no in-scattering, full transmittance).
+                     0 | 3 => Ok(neutral),
+-                    1 if plain => Ok(t.depth.clone()),
++                    // Patch 0080: the copy, since `depth` is a written attachment during the replay.
++                    1 if plain => Ok(t.zcopy.clone()),
+                     2 if plain => Ok(t.scene.clone()),
+                     // Patch 0020: a projected decal reads the depth with Tav taken out.
+                     // Patch 0026: a projected decal reads WoW's receivers' depth (far elsewhere).
+@@ -1743,6 +1759,7 @@
+                 w2: mk("wowbg3_fx_over_white_2", COLOR_FMT, ra),
+                 decal_normal: mk("wowbg3_fx_decal_normal", COLOR_FMT, ra),
+                 lin_r: mk("wowbg3_fx_lin_receivers", wgpu::TextureFormat::R32Float, ra),
++                zcopy: mk("wowbg3_fx_depth_copy", wgpu::TextureFormat::R32Float, ra),
+             }
+         });
+         match made {
+@@ -1943,6 +1960,7 @@
+             decal_normal: t.decal_normal.clone(),
+             lin_r: t.lin_r.clone(),
+             recv_pipeline: base.recv_pipeline.clone(),
++            zcopy: t.zcopy.clone(),
+         })
+     }
+ }
+@@ -2600,13 +2618,20 @@
+         }
+     }
+ }
++
++/// How a pass uses the replay's depth (patch 0080): read it only, clear it and write, or keep what
++/// is there and write. `DEPTH_KEEP` is what the draws themselves need, since BG3's solid pieces
++/// mask each other with their own depth writes.
++const DEPTH_READ: u8 = 0;
++const DEPTH_CLEAR: u8 = 1;
++const DEPTH_KEEP: u8 = 2;
+ 
+ fn color_pass<'e>(
+     enc: &'e mut wgpu::CommandEncoder,
+     label: &str,
+     views: &[&wgpu::TextureView],
+     clear: wgpu::Color,
+-    depth: Option<(&wgpu::TextureView, bool)>,
++    depth: Option<(&wgpu::TextureView, u8)>,
+ ) -> wgpu::RenderPass<'e> {
+     let atts: Vec<Option<wgpu::RenderPassColorAttachment>> = views
+         .iter()
+@@ -2622,9 +2647,12 @@
+     enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+         label: Some(label),
+         color_attachments: &atts,
+-        depth_stencil_attachment: depth.map(|(view, write)| wgpu::RenderPassDepthStencilAttachment {
++        depth_stencil_attachment: depth.map(|(view, use_)| wgpu::RenderPassDepthStencilAttachment {
+             view,
+-            depth_ops: write.then_some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
++            depth_ops: (use_ != DEPTH_READ).then(|| wgpu::Operations {
++                load: if use_ == DEPTH_CLEAR { wgpu::LoadOp::Clear(0.0) } else { wgpu::LoadOp::Load },
++                store: wgpu::StoreOp::Store,
++            }),
+             stencil_ops: None,
+         }),
+         timestamp_writes: None,
+@@ -2707,9 +2735,9 @@
+                 let mut pass = color_pass(
+                     &mut enc,
+                     "wowbg3_fx_prep",
+-                    &[&r.lin_a, &r.lin_b, &r.scene, &r.lin_d],
++                    &[&r.lin_a, &r.lin_b, &r.scene, &r.lin_d, &r.zcopy],
+                     wgpu::Color::BLACK,
+-                    Some((&r.depth, true)),
++                    Some((&r.depth, DEPTH_CLEAR)),
+                 );
+                 pass.set_pipeline(&r.prep_pipeline);
+                 pass.set_bind_group(0, &r.chain_bg, &[]);
+@@ -2756,9 +2784,27 @@
+                 ([&r.c, &r.c2], wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }, "wowbg3_fx_over_black", false),
+                 ([&r.w, &r.w2], wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, "wowbg3_fx_over_white", true),
+             ] {
++                // Patch 0080: the draws write depth now (BG3's solid pieces mask each other with
++                // it), so the over-white run starts from WoW's depth again and not from what the
++                // over-black run left behind; otherwise the pair would not answer the same
++                // question and T = W - C would be wrong wherever a piece wrote.
++                if white {
++                    let mut pass = color_pass(
++                        &mut enc,
++                        "wowbg3_fx_prep_again",
++                        &[&r.lin_a, &r.lin_b, &r.scene, &r.lin_d, &r.zcopy],
++                        wgpu::Color::BLACK,
++                        Some((&r.depth, DEPTH_CLEAR)),
++                    );
++                    pass.set_pipeline(&r.prep_pipeline);
++                    pass.set_bind_group(0, &r.chain_bg, &[]);
++                    pass.set_bind_group(1, &r.table_bg, &[]);
++                    pass.set_bind_group(2, &prep_bg, &[]);
++                    pass.draw(0..3, 0..1);
++                }
+                 for (j, &a) in starts.iter().enumerate() {
+                     let b = starts.get(j + 1).copied().unwrap_or(n);
+-                    let mut pass = color_pass(&mut enc, label, &[views[j % 2]], clear, Some((&r.depth, false)));
++                    let mut pass = color_pass(&mut enc, label, &[views[j % 2]], clear, Some((&r.depth, DEPTH_KEEP)));
+                     replay(&mut pass, &r, &r.draws[a..b], white);
+                 }
+             }
+@@ -2997,6 +3043,8 @@
+     @location(1) lin_b: f32,
+     @location(2) scene: vec4<f32>,
+     @location(3) lin_d: f32,
++    // Patch 0080: the same depth as a colour, for the draws that read BG3's scene depth.
++    @location(4) zcopy: f32,
+ };
+ 
+ @fragment
+@@ -3027,6 +3075,7 @@
+             o.lin_d = 1.0;
+         }
+     }
++    o.zcopy = o.depth;
+     let w = textureLoad(wow_color, q, 0).rgb;
+     o.scene = vec4<f32>(inverse_chain(clamp(w, vec3<f32>(0.0), vec3<f32>(1.0))) / max(P.post.x, 1e-6), 1.0);
+     return o;

@@ -1,0 +1,1173 @@
+WOW-BG3 benilla patch 0090: BG3's see-through, ported from its own wall materials.
+
+BG3 cuts the geometry between its camera and the controlled character away, so the character is
+never hidden by a tree, a hut or a roof (open beta feedback: "when something stands between the
+camera and the player ... that circular see-through window BG3 draws"). In world mode the
+occluding geometry is WoW's and benilla draws it, so the cut is made here, with BG3's own law.
+
+Where BG3 does it: in every wall's own material shader. `Base_ST_FOR` and kin in `Materials.pak`
+(read with this repository's `release/lspk.py` and `tmp/occl20261029/spvdis.py`; the Vulkan build
+is stripped, the DX12 build keeps the names `g_SeeThroughPosition0`, `g_LocalCoverageScalar`,
+`_FadeOpacity`) read an engine block (set 0, binding 6): two capsules, each from one shared point to
+a target with a size `R`, and the materials' `SeeThroughEnabled` switch. They bind one texture by
+id, `9dc5807b-3697-4b8f-ab0f-b9c5c1bd7010`, which is `REF_Cloud_B` (512 x 512 cloud noise, BC1, in
+`Textures.pak`). Per fragment, line for line:
+  n = 2 * cloud(uv * 2).r - 1
+  for each capsule: q = the closest point of the segment to the fragment, clamped to the segment's
+      box; v = clamp(max(distance(fragment, q) + 0.5 * n, 0) / R, 0, 1)
+  discard where min(v0, v1) * k - 0.5 * k < 0   (k the object's own see-through scalar)
+Seen down the line of sight a capsule is the "circle" round her; because the noise is fixed to the
+wall's own texture coordinates while the capsule moves with her, its edge eats into the wall in
+ragged strokes that change as she or the camera moves. That is the whole effect: no dither, no
+blend, no mask pass. (The 4x4 Bayer stencil pattern BG3 also draws every frame, FadePatternOnePass,
+is a different fade and is not this.)
+
+How here: the same law in WoW's own world shaders, `wow_cut` in
+- static_gx.wgsl, the retained static pass: ADT doodads (trees, rocks, fences), WMO groups
+  (buildings, caves) and interior props. Most of the cut happens here.
+- terrain.wgsl: hills and cliffs, behind a switch that is off (a hill is the eye clearance's).
+- wow_model.wgsl, WMO batches alone (`model_flags.x`): a building's env-mapped and blended pieces,
+  which static_gx declines. Units, the hero and her party come through the same shader and are
+  never cut, which that flag settles without a per-mesh flag of its own.
+The shared point is the eye. The one change: BG3 opts each object in (`CanSeeThrough` in its level
+data), so its floors are never cut; WoW draws floors and walls with one shader, so a fragment is cut
+only when it stands between the camera and her, past `near` on two tests: toward the eye along the
+line to her (the floor at and in front of her feet stays) and in front of her on the ground plane,
+toward the camera (nothing behind her opens, at any height; with the first test alone a camera
+looking down steeply opened the top of the wall behind her).
+
+The capsules ride the shared light buffer, rows 21 to 24 (LIGHT_HEADER_ROWS 21 -> 25): two targets
+with their `R`, the eye with the noise's reach, and the noise's place, the margin, the noise's uv
+scale and the terrain switch. Only the three shaders above mirror those rows; liquid.wgsl, wdl.wgsl
+and wow_effect.wgsl stop before row 20 and are untouched. The eye row is also the gate that keeps a
+view drawn from somewhere else (a portrait booth, the minimap bake, the login backdrop) out of the
+cut, since they share the buffer. The noise is the buffer's new last region (one f32 a texel,
+uploaded once), reached by each shader from the start of its own struct's last array
+(`WOW_SEE_TAIL`, checked against the regions by a test in global_light.rs).
+
+The noise comes from the player's own BG3: `$WOW_BG3_LINK_DIR/see-noise.r8`, REF_Cloud_B's red
+channel as 512 x 512 bytes, which the mod's tools make from BG3's data (nothing of BG3's ships with
+benilla). Until it is there the edge is clean.
+
+Where it points (wowbg3_see.rs): from the eye to BG3's character from `tav.bin`, at chest height,
+the point the plugin's own eye clearance measures from. The second capsule can follow what the
+camera looks at (its forward ray crossing her height plane), for a fight where BG3's camera leaves
+her for whoever's turn it is, as BG3's second capsule does; off by default. `R` is 4.4 yd: BG3's own
+value is written by its engine straight into GPU memory and could not be read, so it is matched by
+eye to BG3's frames. Tune it live in `$WOW_BG3_LINK_DIR/seethrough.txt` (`radius=`, `screen=`,
+`near=`, `amp=`, `scale=`, `look=`, `apart=`, `terrain=`, `on=`), re-read twice a second, or with
+`WOW_BG3_SEE_RADIUS=` and friends; `WOW_BG3_SEE=0` switches it off. Every size is 0 without world
+mode, and the shaders then take their old path exactly.
+
+The room behind the cut, and the street behind it: wmo_portal floods the portal PVS a second time
+from where she stands when she is inside a building, and unions it into the visible set, so a cut
+through a wall from outside shows the room instead of the sky; and while the cut is live the
+exterior is drawn unrestricted (the outside leg's walk) even with the camera in a room, since the
+cut can open any of its walls, so a cut from inside shows the street instead of the sky.
+
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 91b7875..ae39a3b 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -200,6 +200,8 @@ mod wowbg3_lead;
+ mod wowbg3_offscreen;
+ mod wowbg3_pace;
+ mod wowbg3_party;
++// WOW-BG3 patch 0090: the see-through circle's producer.
++mod wowbg3_see;
+ mod wowbg3_tav;
+ mod wowbg3_teleport;
+ 
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+index 4518dbc..f878f59 100644
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -53,6 +53,8 @@ impl Plugin for WowBg3Plugin {
+         crate::wowbg3_party::build(app, PathBuf::from(&dir));
+         // Patch 0053: /wowbg3 commands typed in WoW's chat go to the WOW-BG3 helper.
+         crate::wowbg3_chatcmd::build(app, PathBuf::from(&dir));
++        // Patch 0090: the see-through circle BG3 cuts around the character.
++        crate::wowbg3_see::build(app, PathBuf::from(&dir));
+         app.insert_resource(CameraStream {
+             path: PathBuf::from(dir).join("camera.bin"),
+             file: None,
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 185a819..e65e452 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -531,7 +531,8 @@ fn hide_own_model(mut me: Query<&mut Visibility, With<crate::net::Embodied>>) {
+ }
+ 
+ #[derive(Resource)]
+-struct LeadStream {
++// Patch 0090 orders its see-through aim after `keep_bg3_pose`, which names this in its signature.
++pub(crate) struct LeadStream {
+     path: PathBuf,
+     file: Option<File>,
+     retry: u32,
+@@ -843,7 +844,10 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+ 
+ /// Patch 0026: BG3's camera of this frame (set in `Update` by [`follow_bg3`]) once more, just before
+ /// transforms propagate, over anything that wrote the world camera since.
+-fn keep_bg3_pose(s: Res<LeadStream>, mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>) {
++pub(crate) fn keep_bg3_pose(
++    s: Res<LeadStream>,
++    mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
++) {
+     let (Some((at, rot, fov)), Ok((mut tf, mut proj))) = (s.held, cam.single_mut()) else {
+         return;
+     };
+diff --git a/crates/benilla-app/src/wowbg3_see.rs b/crates/benilla-app/src/wowbg3_see.rs
+new file mode 100644
+index 0000000..e459787
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_see.rs
+@@ -0,0 +1,286 @@
++//! WOW-BG3 patch 0090: BG3's see-through, the producer half.
++//!
++//! BG3 cuts the geometry between its camera and the controlled character away with two capsules and
++//! a cloud noise in every wall's own material (the law is in [`benilla_world::see_through`]). In
++//! world mode that geometry is WoW's and benilla draws it, so the cut is made here: this module
++//! aims the capsules, loads the noise, and [`benilla_world::see_through::SeeThrough`] carries them
++//! to `lighting::global_light`, which packs them into the shared light buffer that `terrain.wgsl`,
++//! `static_gx.wgsl` and `wow_model.wgsl` read.
++//!
++//! Where they point: from the eye to BG3's character (`tav.bin`, the same position her figure is
++//! drawn at), at chest height. In a fight BG3's camera leaves her to follow whoever's turn it is, so
++//! the second capsule can follow what the camera looks at — the point where its forward ray crosses
++//! her height plane, which is the active combatant's ground when the camera has centred on one.
++//! That one is off by default (`look=1` switches it on): with the camera looking ahead while
++//! walking it eats into whatever stands in the distance, which nobody has asked for.
++//!
++//! The noise: `$WOW_BG3_LINK_DIR/see-noise.r8`, BG3's `REF_Cloud_B` red channel as 512 x 512 bytes,
++//! which the mod makes from the player's own BG3 data (nothing of BG3's ships with benilla). Until
++//! it is there the cut has a clean edge, tried again every half second.
++//!
++//! Tuning without a rebuild: `$WOW_BG3_LINK_DIR/seethrough.txt`, `key=value` a line, re-read every
++//! half second. The same keys are environment variables with a `WOW_BG3_SEE_` prefix
++//! (`WOW_BG3_SEE_RADIUS=4.4`), and `WOW_BG3_SEE=0` switches the whole thing off.
++
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use benilla_world::see_through::{Cut, SeeNoise, SeeThrough, SEE_NOISE_SIZE};
++use benilla_world::view::WorldCamera;
++use bevy::camera::Projection;
++use bevy::prelude::*;
++
++/// Her chest above her feet (yd): the plugin's own `kChestM` (1.37 m), which is where its eye
++/// clearance measures from, so both ends of the camera agree on what "she" is.
++const CHEST: f32 = 1.5;
++
++/// The see-through's settings. Defaults chosen for BG3's orbit camera, 5 to 12 yd from her.
++#[derive(Resource, Clone, Copy, Debug)]
++pub(crate) struct SeeSettings {
++    on: bool,
++    /// BG3's capsule size `R` in yards: the cut reaches `R / 2` from the line to her, give or take
++    /// the noise. BG3's own value is written by its engine straight into GPU memory and could not
++    /// be read (`tmp/occl20261029/stscan`); this one is matched by eye to BG3's frames.
++    radius: f32,
++    /// The cap that keeps the cut a window in the picture instead of the whole picture: its reach
++    /// (`R / 2`) never exceeds this share of the screen's half height at her distance. At BG3's
++    /// closest camera (6.75 yd from her chest, 55 degrees of vertical field) an uncapped cut is
++    /// wider than the screen, and then everything in front of her goes, the ground included:
++    /// A playtest showed exactly that, "the ground is going see-through at the bottom there, that
++    /// doesn't make sense" (2026-10-29).
++    screen: f32,
++    /// Whether WoW's terrain is cut with the rest. Off: a hill or the ground in front of her is
++    /// never removed, which is what the eye clearance already keeps the camera out of; the cut is
++    /// then doodads, buildings and props alone.
++    terrain: bool,
++    near: f32,
++    /// The noise's reach in yards: BG3's `0.5 · n` in its metres.
++    amp: f32,
++    /// The noise's scale on texture coordinates: BG3's `uv · 2`.
++    scale: f32,
++    /// The second capsule on what the camera looks at (off by default; see the module note).
++    look: bool,
++    /// How far the look point must be from her before the second capsule is used (yd).
++    look_apart: f32,
++}
++
++impl Default for SeeSettings {
++    fn default() -> Self {
++        Self {
++            on: true,
++            radius: 4.4,
++            screen: 0.45,
++            terrain: false,
++            // Her body's depth: a wall she stands against lies within it and must never count as
++            // in front of her (0.15 left a torn patch on the wall at her shoulder, 2026-10-29).
++            near: 0.6,
++            amp: 0.5 / 0.9144,
++            scale: 2.0,
++            look: false,
++            look_apart: 2.5,
++        }
++    }
++}
++
++impl SeeSettings {
++    /// One `key=value`; unknown keys are ignored so a file can carry notes.
++    fn set(&mut self, key: &str, value: &str) {
++        let num = value.parse::<f32>().ok();
++        let flag = || matches!(value, "1" | "on" | "true" | "yes");
++        match key {
++            "on" => self.on = flag(),
++            "look" => self.look = flag(),
++            "terrain" => self.terrain = flag(),
++            "radius" => self.radius = num.unwrap_or(self.radius),
++            "screen" => self.screen = num.unwrap_or(self.screen),
++            "near" => self.near = num.unwrap_or(self.near),
++            "amp" => self.amp = num.unwrap_or(self.amp),
++            "scale" => self.scale = num.unwrap_or(self.scale),
++            "apart" => self.look_apart = num.unwrap_or(self.look_apart),
++            _ => {}
++        }
++    }
++
++    fn from_env() -> Self {
++        let mut s = Self::default();
++        if std::env::var_os("WOW_BG3_SEE").is_some_and(|v| v == "0") {
++            s.on = false;
++        }
++        for key in ["radius", "screen", "terrain", "near", "amp", "scale", "look", "apart"] {
++            if let Ok(v) = std::env::var(format!("WOW_BG3_SEE_{}", key.to_uppercase())) {
++                s.set(key, v.trim());
++            }
++        }
++        s
++    }
++}
++
++/// The live settings file and when it was last read, and the noise file until it is loaded.
++#[derive(Resource)]
++struct SeeFile {
++    path: PathBuf,
++    next: Instant,
++    seen: Option<std::time::SystemTime>,
++    noise: Option<PathBuf>,
++}
++
++/// BG3's noise from `see-noise.r8` (512 x 512 bytes, the red channel), or `None` while it is not
++/// there or not that size.
++fn load_noise(path: &std::path::Path) -> Option<SeeNoise> {
++    let bytes = std::fs::read(path).ok()?;
++    (bytes.len() == SEE_NOISE_SIZE * SEE_NOISE_SIZE)
++        .then(|| SeeNoise(Arc::new(bytes.iter().map(|&b| f32::from(b) / 255.0).collect())))
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    let s = SeeSettings::from_env();
++    info!(
++        "wowbg3 see-through: {} ({:?}); tune it live in {:?}",
++        if s.on { "on" } else { "off" },
++        s,
++        dir.join("seethrough.txt")
++    );
++    app.insert_resource(s)
++        .insert_resource(SeeFile {
++            path: dir.join("seethrough.txt"),
++            next: Instant::now(),
++            seen: None,
++            noise: Some(dir.join("see-noise.r8")),
++        })
++        .add_systems(
++            PostUpdate,
++            (read_settings, aim)
++                .chain()
++                // After the frame's final camera pose (patch 0026's `keep_bg3_pose`) and before
++                // `lighting::global_light::build_light_data`, which runs after propagation.
++                .after(crate::wowbg3_lead::keep_bg3_pose)
++                .before(bevy::transform::TransformSystems::Propagate),
++        );
++}
++
++/// Re-reads `seethrough.txt` when it has changed, at most twice a second, and loads the noise
++/// once it is there.
++fn read_settings(mut commands: Commands, mut f: ResMut<SeeFile>, mut s: ResMut<SeeSettings>) {
++    if Instant::now() < f.next {
++        return;
++    }
++    f.next = Instant::now() + Duration::from_millis(500);
++    if let Some(path) = f.noise.clone() {
++        if let Some(noise) = load_noise(&path) {
++            info!("wowbg3 see-through: BG3's noise from {path:?}");
++            commands.insert_resource(noise);
++            f.noise = None;
++        }
++    }
++    let Ok(meta) = std::fs::metadata(&f.path) else {
++        // The file is gone: back to the environment's settings, once. Without this a file that said
++        // `on=0` and was then deleted kept the cut off for the rest of the session.
++        if f.seen.take().is_some() {
++            *s = SeeSettings::from_env();
++            info!("wowbg3 see-through: {:?} removed, back to {:?}", f.path, *s);
++        }
++        return;
++    };
++    let when = meta.modified().ok();
++    if when == f.seen {
++        return;
++    }
++    f.seen = when;
++    let Ok(text) = std::fs::read_to_string(&f.path) else {
++        return;
++    };
++    let mut fresh = SeeSettings::from_env();
++    for line in text.lines() {
++        let line = line.split('#').next().unwrap_or("").trim();
++        if let Some((k, v)) = line.split_once('=') {
++            fresh.set(k.trim(), v.trim());
++        }
++    }
++    info!("wowbg3 see-through: {:?} read: {fresh:?}", f.path);
++    *s = fresh;
++}
++
++/// Aims this frame's capsules.
++fn aim(
++    s: Res<SeeSettings>,
++    tav: Option<Res<crate::wowbg3_lead::TavFollow>>,
++    cam: Query<(&Transform, &Projection), With<WorldCamera>>,
++    mut out: ResMut<SeeThrough>,
++) {
++    let mut want = SeeThrough {
++        near: s.near.max(0.0),
++        noise_amp: s.amp.max(0.0),
++        noise_scale: s.scale,
++        terrain: s.terrain,
++        ..SeeThrough::default()
++    };
++    // Off, no world mode (no fresh `tav.bin`) or no camera: every size stays 0, which the shaders
++    // read as "cut nothing".
++    let here = crate::wowbg3_lead::tav_if_fresh(tav.as_deref());
++    if let (true, Some(at), Ok((tf, proj))) = (s.on, here, cam.single()) {
++        let chest = at + Vec3::Y * CHEST;
++        let eye = tf.translation;
++        want.eye = eye;
++        want.cuts[0] = Cut { at: chest, radius: radius_at(&s, proj, eye.distance(chest)) };
++        if s.look {
++            if let Some(look) = look_point(eye, *tf.forward(), chest.y) {
++                if look.distance(chest) > s.look_apart {
++                    want.cuts[1] = Cut { at: look, radius: radius_at(&s, proj, eye.distance(look)) };
++                }
++            }
++        }
++    }
++    if *out != want {
++        *out = want;
++    }
++}
++
++/// The capsule's size `R` in yards for a target `dist` away: the asked-for one, capped so that its
++/// reach (`R / 2`) on screen is never wider than `screen` of the half height (see
++/// [`SeeSettings::screen`]).
++fn radius_at(s: &SeeSettings, proj: &Projection, dist: f32) -> f32 {
++    let half = match proj {
++        Projection::Perspective(p) => (p.fov * 0.5).tan(),
++        _ => 0.5,
++    };
++    s.radius.min(2.0 * s.screen.max(0.0) * half * dist)
++}
++
++/// Where the camera's forward ray crosses the horizontal plane at `height`, while the camera looks
++/// down at it steeply enough for the crossing to mean anything and near enough to be in the scene.
++fn look_point(eye: Vec3, forward: Vec3, height: f32) -> Option<Vec3> {
++    let down = -forward.y;
++    if down < 0.2 {
++        return None;
++    }
++    let t = (eye.y - height) / down;
++    (t > 0.5 && t < 120.0).then(|| eye + forward * t)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_shallow_camera_has_no_look_point() {
++        assert!(look_point(Vec3::new(0.0, 10.0, 0.0), Vec3::new(1.0, -0.1, 0.0).normalize(), 1.5).is_none());
++    }
++
++    #[test]
++    fn a_camera_looking_down_meets_the_plane_where_it_points() {
++        let p = look_point(Vec3::new(0.0, 11.5, 0.0), Vec3::new(0.0, -1.0, 0.0), 1.5).expect("a point");
++        assert!((p - Vec3::new(0.0, 1.5, 0.0)).length() < 1e-3, "{p:?}");
++    }
++
++    #[test]
++    fn a_key_that_is_not_ours_leaves_the_settings_alone() {
++        let mut s = SeeSettings::default();
++        let before = s.radius;
++        s.set("colour", "red");
++        s.set("radius", "nonsense");
++        assert_eq!(s.radius, before);
++        s.set("radius", "6.25");
++        assert!((s.radius - 6.25).abs() < 1e-6);
++    }
++}
+diff --git a/crates/benilla-assets/src/shaders/terrain.wgsl b/crates/benilla-assets/src/shaders/terrain.wgsl
+index 638ac1d..a6f9006 100644
+--- a/crates/benilla-assets/src/shaders/terrain.wgsl
++++ b/crates/benilla-assets/src/shaders/terrain.wgsl
+@@ -45,7 +45,14 @@ struct WowLight {
+     // The dynamic point-light table (`global_light::build_light_data`): row 20 `.x` = live count,
+     // then two rows per light, `[pos.xyz, range]` and `[rgb, 0]`.
+     point_count: vec4<f32>,
++    // WOW-BG3 patch 0090, BG3's see-through capsules (`crate::see_through`): rows 21 to 24.
++    cut_a: vec4<f32>,      // 21 xyz = the first capsule's target; w = its size R in yd (0 = off)
++    cut_b: vec4<f32>,      // 22 the second capsule, the same
++    cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
++    cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
+     points: array<vec4<f32>, 512>,
++    // Patch 0090: everything after, read only for BG3's see-through noise (`WOW_SEE_TAIL`).
++    see_tail: array<vec4<f32>>,
+ };
+ @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
+ 
+@@ -164,6 +171,95 @@ fn vertex(in: Vertex) -> TerrainVsOut {
+     return out;
+ }
+ 
++// ── WOW-BG3 patch 0090: BG3's see-through, ported from its wall materials ──
++// BG3 cuts what stands between its camera and the character in every wall's own material shader
++// (`Base_*_FOR` in Materials.pak): two capsules from an engine block, each from one shared point to
++// a target with a size `R`, and the cloud noise `REF_Cloud_B` on the wall's own texture
++// coordinates. `n = 2·cloud(uv·2).r − 1`; per capsule `v = clamp(max(d + 0.5·n, 0) / R, 0, 1)`, `d`
++// the fragment's distance to the segment (its closest point clamped to the segment's box, BG3's
++// own clamp); the fragment goes where the smaller `v` is below one half. The noise is fixed to the
++// wall and the capsule moves with her, so the edge eats into the wall in ragged strokes as she
++// walks. Here the shared point is the eye, rows 21 to 24 of the shared light carry the capsules
++// (`lighting::global_light`, `crate::see_through`), and the noise is the buffer's last region.
++// The one change: BG3 opts each object in, so its floors are never cut; WoW draws floors and walls
++// with one shader, so only what is nearer the eye than the target (by `cut_params.y`) is cut.
++
++// Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
++// it. Checked against the buffer's regions by `global_light`'s tests.
++const WOW_SEE_TAIL: u32 = 537u;
++
++// One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
++fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
++    let k = u32(p.y & 511) * 512u + u32(p.x & 511);
++    return wow_light.see_tail[base - WOW_SEE_TAIL + k / 4u][k % 4u];
++}
++
++// The noise at `uv`, filtered as BG3's sampler does (bilinear, wrapping); 0.5 (no change to the
++// edge) while there is none.
++fn wow_see_noise(uv: vec2<f32>) -> f32 {
++    let base = u32(wow_light.cut_params.x);
++    if (base == 0u) {
++        return 0.5;
++    }
++    let p = fract(uv) * 512.0 - 0.5;
++    let i = vec2<i32>(floor(p));
++    let f = p - floor(p);
++    let a = mix(wow_see_texel(base, i), wow_see_texel(base, i + vec2<i32>(1, 0)), f.x);
++    let b = mix(wow_see_texel(base, i + vec2<i32>(0, 1)), wow_see_texel(base, i + vec2<i32>(1, 1)), f.x);
++    return mix(a, b, f.y);
++}
++
++// One capsule's coverage at `world_pos`, BG3's line for line: 1 untouched, under 0.5 cut.
++fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, amp: f32, near: f32) -> f32 {
++    if (c.w <= 0.0) {
++        return 1.0;
++    }
++    let ab = c.xyz - eye;
++    let ap = world_pos - eye;
++    let ab2 = dot(ab, ab);
++    if (ab2 < 1e-4) {
++        return 1.0;
++    }
++    // Only what stands between the camera and her, past `near` on both of two tests. Toward the
++    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
++    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
++    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
++    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    let from_her = world_pos - c.xyz;
++    let to_eye = eye - c.xyz;
++    if (dot(from_her, normalize(to_eye)) < near) {
++        return 1.0;
++    }
++    let level = vec3<f32>(to_eye.x, 0.0, to_eye.z);
++    if (dot(level, level) > 1e-6 && dot(from_her, normalize(level)) < near) {
++        return 1.0;
++    }
++    let t = dot(ap, ab) / ab2;
++    let q = clamp(eye + ab * t, min(eye, c.xyz), max(eye, c.xyz));
++    return clamp(max(n * amp + distance(world_pos, q), 0.0) / c.w, 0.0, 1.0);
++}
++
++// Does BG3's see-through take this fragment? (BG3: `v · k − 0.5 · k < 0`, `k` the object's own
++// see-through scalar, 1 for whatever WoW draws through here.)
++fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
++    let eye_for = wow_light.cut_eye;
++    // A view drawn from somewhere else (a portrait booth, the minimap bake, the login backdrop)
++    // shares this buffer and must not be cut; the eye the capsules start at says which.
++    let eye = view.world_position.xyz;
++    if (distance(eye, eye_for.xyz) > 0.25) {
++        return false;
++    }
++    let p = wow_light.cut_params;
++    if (wow_light.cut_a.w <= 0.0 && wow_light.cut_b.w <= 0.0) {
++        return false;
++    }
++    let n = wow_see_noise(uv * p.z) * 2.0 - 1.0;
++    let v = min(wow_see_capsule(wow_light.cut_a, eye, world_pos, n, eye_for.w, p.y),
++                wow_see_capsule(wow_light.cut_b, eye, world_pos, n, eye_for.w, p.y));
++    return v < 0.5;
++}
++
+ @fragment
+ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
+     // The far-clip wall: the reference clips the detailed world per pixel at its far plane
+@@ -175,6 +271,14 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
+         }
+     }
+ 
++    // Patch 0090: BG3's see-through, only where `cut_params.w` asks for terrain. Off by
++    // default: a close camera puts the ground right in front of her inside the circle, and ground
++    // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
++    // between BG3's camera and her is the eye clearance's job, not the circle's.
++    if (wow_light.cut_params.w > 0.5 && wow_cut(in.world_position.xyz, in.uv)) {
++        discard;
++    }
++
+     // Per-chunk array indices baked per vertex, COLOR the 4 layers and UV1.x the alpha; constant
+     // across a chunk, so they interpolate back to the integer.
+     let li = vec4<i32>(round(in.color));
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+index 0481947..013a501 100644
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -94,6 +94,11 @@ struct WowLight {
+     // Row 20 `.x` = the point-light count, then per light `[pos.xyz, range]`, `[rgb, 0]`. Here, not
+     // in Bevy's clusterables, which the view layout gives the fragment stage only.
+     point_count: vec4<f32>,
++    // WOW-BG3 patch 0090, BG3's see-through capsules (`crate::see_through`): rows 21 to 24.
++    cut_a: vec4<f32>,      // 21 xyz = the first capsule's target; w = its size R in yd (0 = off)
++    cut_b: vec4<f32>,      // 22 the second capsule, the same
++    cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
++    cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
+     points: array<vec4<f32>, 512>,
+     // The interior-prop SH probes, 7 rows per slot (`MAX_PROP_PROBES` = 8192 slots). Only this
+     // shader declares this tail; the other shaders bind the same buffer by its prefix.
+@@ -894,6 +899,95 @@ fn tav_bg3(
+ }
+ #endif
+ 
++// ── WOW-BG3 patch 0090: BG3's see-through, ported from its wall materials ──
++// BG3 cuts what stands between its camera and the character in every wall's own material shader
++// (`Base_*_FOR` in Materials.pak): two capsules from an engine block, each from one shared point to
++// a target with a size `R`, and the cloud noise `REF_Cloud_B` on the wall's own texture
++// coordinates. `n = 2·cloud(uv·2).r − 1`; per capsule `v = clamp(max(d + 0.5·n, 0) / R, 0, 1)`, `d`
++// the fragment's distance to the segment (its closest point clamped to the segment's box, BG3's
++// own clamp); the fragment goes where the smaller `v` is below one half. The noise is fixed to the
++// wall and the capsule moves with her, so the edge eats into the wall in ragged strokes as she
++// walks. Here the shared point is the eye, rows 21 to 24 of the shared light carry the capsules
++// (`lighting::global_light`, `crate::see_through`), and the noise is the buffer's last region.
++// The one change: BG3 opts each object in, so its floors are never cut; WoW draws floors and walls
++// with one shader, so only what is nearer the eye than the target (by `cut_params.y`) is cut.
++
++// Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
++// it. Checked against the buffer's regions by `global_light`'s tests.
++const WOW_SEE_TAIL: u32 = 64025u;
++
++// One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
++fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
++    let k = u32(p.y & 511) * 512u + u32(p.x & 511);
++    return wow_light.palettes[base - WOW_SEE_TAIL + k / 4u][k % 4u];
++}
++
++// The noise at `uv`, filtered as BG3's sampler does (bilinear, wrapping); 0.5 (no change to the
++// edge) while there is none.
++fn wow_see_noise(uv: vec2<f32>) -> f32 {
++    let base = u32(wow_light.cut_params.x);
++    if (base == 0u) {
++        return 0.5;
++    }
++    let p = fract(uv) * 512.0 - 0.5;
++    let i = vec2<i32>(floor(p));
++    let f = p - floor(p);
++    let a = mix(wow_see_texel(base, i), wow_see_texel(base, i + vec2<i32>(1, 0)), f.x);
++    let b = mix(wow_see_texel(base, i + vec2<i32>(0, 1)), wow_see_texel(base, i + vec2<i32>(1, 1)), f.x);
++    return mix(a, b, f.y);
++}
++
++// One capsule's coverage at `world_pos`, BG3's line for line: 1 untouched, under 0.5 cut.
++fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, amp: f32, near: f32) -> f32 {
++    if (c.w <= 0.0) {
++        return 1.0;
++    }
++    let ab = c.xyz - eye;
++    let ap = world_pos - eye;
++    let ab2 = dot(ab, ab);
++    if (ab2 < 1e-4) {
++        return 1.0;
++    }
++    // Only what stands between the camera and her, past `near` on both of two tests. Toward the
++    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
++    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
++    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
++    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    let from_her = world_pos - c.xyz;
++    let to_eye = eye - c.xyz;
++    if (dot(from_her, normalize(to_eye)) < near) {
++        return 1.0;
++    }
++    let level = vec3<f32>(to_eye.x, 0.0, to_eye.z);
++    if (dot(level, level) > 1e-6 && dot(from_her, normalize(level)) < near) {
++        return 1.0;
++    }
++    let t = dot(ap, ab) / ab2;
++    let q = clamp(eye + ab * t, min(eye, c.xyz), max(eye, c.xyz));
++    return clamp(max(n * amp + distance(world_pos, q), 0.0) / c.w, 0.0, 1.0);
++}
++
++// Does BG3's see-through take this fragment? (BG3: `v · k − 0.5 · k < 0`, `k` the object's own
++// see-through scalar, 1 for whatever WoW draws through here.)
++fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
++    let eye_for = wow_light.cut_eye;
++    // A view drawn from somewhere else (a portrait booth, the minimap bake, the login backdrop)
++    // shares this buffer and must not be cut; the eye the capsules start at says which.
++    let eye = view.world_position.xyz;
++    if (distance(eye, eye_for.xyz) > 0.25) {
++        return false;
++    }
++    let p = wow_light.cut_params;
++    if (wow_light.cut_a.w <= 0.0 && wow_light.cut_b.w <= 0.0) {
++        return false;
++    }
++    let n = wow_see_noise(uv * p.z) * 2.0 - 1.0;
++    let v = min(wow_see_capsule(wow_light.cut_a, eye, world_pos, n, eye_for.w, p.y),
++                wow_see_capsule(wow_light.cut_b, eye, world_pos, n, eye_for.w, p.y));
++    return v < 0.5;
++}
++
+ @fragment
+ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     // The UI model tile's cell clip: the reference gives each `<Model>` pane its widget rect as the
+@@ -914,6 +1008,19 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+             discard;
+         }
+     }
++    // Patch 0090: BG3's see-through, for WMO batches alone. The retained static pass
++    // (`static_gx.wgsl`) draws most of a building, and what is left here is its env-mapped and
++    // blended pieces (windows, water, shiny metal), which must be cut with the rest of the wall.
++    // Units, the hero and her party also come through this shader and are never cut, which
++    // `model_flags.x` settles without a per-mesh flag of its own.
++#ifdef VERTEX_UVS_A
++    let see_uv = in.uv;
++#else
++    let see_uv = vec2<f32>(0.0);
++#endif
++    if (m.model_flags.x > 0.5 && wow_cut(in.world_position.xyz, see_uv)) {
++        discard;
++    }
+ #ifdef WOW_WATER_CLIP
+     // The straddle split: a translucent model crossing its water plane draws on each side of the
+     // water pass (the far copy has `clutter_fade.z` bit 11) and each copy keeps its half, the
+diff --git a/crates/benilla-world/src/lib.rs b/crates/benilla-world/src/lib.rs
+index e007f2c..18cf18e 100644
+--- a/crates/benilla-world/src/lib.rs
++++ b/crates/benilla-world/src/lib.rs
+@@ -143,6 +143,8 @@ pub mod rig_anim;
+ pub mod rig_palette;
+ pub mod rig_rider;
+ pub mod schedule;
++// WOW-BG3 patch 0090: the see-through circle's parameters for the frame.
++pub mod see_through;
+ mod shaders;
+ pub mod sky;
+ pub mod sky_order;
+diff --git a/crates/benilla-world/src/lighting/global_light.rs b/crates/benilla-world/src/lighting/global_light.rs
+index 44a4b28..f337e85 100644
+--- a/crates/benilla-world/src/lighting/global_light.rs
++++ b/crates/benilla-world/src/lighting/global_light.rs
+@@ -27,7 +27,14 @@ use crate::view::WorldCamera;
+ ///   17 grade: `.x` the SIDN night fraction, `.yzw` the sun's SH DC at intensity 1 ·
+ ///   18 wmo_fog_color · 19 wmo_fog_params (x=start y=end): the interior fog triple, read by
+ ///      interior-tagged content in place of 4-5 ·
+-///   20 point_count (x = live entries) · 21+ the point-light table, two rows per light,
++///   20 point_count (x = live entries) ·
++///   21-24 WOW-BG3 patch 0090, BG3's see-through capsules ([`crate::see_through`]): 21 and 22 a
++///      capsule each, `.xyz` its target and `.w` its size `R` in yards (0 off); 23 `.xyz` the eye,
++///      which is each capsule's other end (a view whose own eye is elsewhere must not cut), `.w`
++///      the noise's reach in yards; 24 `.x` the noise's first row in this buffer
++///      ([`see_noise_offset`] / 16, 0 while there is none), `.y` the margin in front of a target,
++///      `.z` the noise's scale on texture coordinates, `.w` 1 when WoW's terrain is cut too ·
++///   25+ the point-light table, two rows per light,
+ ///      `[pos.xyz, range]` and `[rgb, 0]`, here because Bevy's clusterable buffer is
+ ///      fragment-only in the view layout and the point term is per vertex.
+ ///
+@@ -41,8 +48,13 @@ struct LightStd430 {
+     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
+ }
+ 
+-/// Header row count of the layout above (rows 0..=20), which every light blob sizes against.
+-pub const LIGHT_HEADER_ROWS: usize = 21;
++/// Header row count of the layout above (rows 0..=24), which every light blob sizes against.
++/// WOW-BG3 patch 0090 added rows 21 to 24; `terrain.wgsl`, `static_gx.wgsl` and `wow_model.wgsl`
++/// mirror them between `point_count` and `points`, and the other mirrors stop before row 20.
++pub const LIGHT_HEADER_ROWS: usize = 25;
++
++/// First of patch 0090's four see-through rows.
++pub(crate) const CUT_ROW: usize = 21;
+ 
+ /// Packs the model-lighting core from `(ambient, diffuse, sun_dir)` and leaves every other lane
+ /// alone: rows 0-2, the SH block (6-11 and 12 `.xyz`, ambient in the DC `.w` lanes) and the sun's
+@@ -123,7 +135,7 @@ struct WowLightData(LightStd430);
+ impl Default for WowLightData {
+     fn default() -> Self {
+         Self(LightStd430 {
+-            rows: [[0.0; 4]; 21],
++            rows: [[0.0; 4]; LIGHT_HEADER_ROWS],
+             points: [[0.0; 4]; 2 * MAX_POINT_LIGHTS],
+         })
+     }
+@@ -141,6 +153,7 @@ pub(super) fn register(app: &mut App) {
+         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
+         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
+         .add_plugins(ExtractResourcePlugin::<super::prop_probes::PropProbeExtract>::default())
++        .add_plugins(ExtractResourcePlugin::<crate::see_through::SeeNoise>::default())
+         // After transform propagation: a carried light (a torch in a hand) is a child of a moving
+         // joint, so its `GlobalTransform` is this frame's only once `Propagate` has run.
+         .add_systems(
+@@ -155,7 +168,7 @@ pub(super) fn register(app: &mut App) {
+     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+         render_app.add_systems(
+             Render,
+-            (upload_light, super::prop_probes::upload_prop_probes)
++            (upload_light, upload_see_noise, super::prop_probes::upload_prop_probes)
+                 .in_set(RenderSystems::PrepareResources),
+         );
+     }
+@@ -173,13 +186,24 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
+ }
+ 
+ /// The shared light buffer's full size: the per-frame blob ([`LIGHT_HEADER_ROWS`] rows and the
+-/// point table), the interior-prop probe region and the skin-palette regions. Every buffer bound
+-/// as `wow_light` must be this big: wgpu validates the bound size against `wow_model.wgsl`'s
+-/// whole layout at each draw.
++/// point table), the interior-prop probe region, the skin-palette regions and patch 0090's
++/// see-through noise. Every buffer bound as `wow_light` must be this big: wgpu validates the bound
++/// size against `wow_model.wgsl`'s whole layout at each draw.
+ pub fn light_blob_bytes() -> u64 {
+-    per_frame_blob_bytes()
+-        + (7 * MAX_PROP_PROBES * 16) as u64
+-        + crate::rig_palette::palette_regions_bytes()
++    see_noise_offset() + see_noise_bytes()
++}
++
++/// WOW-BG3 patch 0090: where BG3's see-through noise sits, after every other region, so nothing
++/// already mirrored moves. The shaders find it through row 24 `.x` (this / 16), each from the
++/// start of its own struct's last array (`WOW_SEE_TAIL` in each, checked by a test below).
++pub fn see_noise_offset() -> u64 {
++    per_frame_blob_bytes() + (7 * MAX_PROP_PROBES * 16) as u64 + crate::rig_palette::palette_regions_bytes()
++}
++
++/// The noise region: one f32 a texel (a bit pattern through a float load is not guaranteed to
++/// survive, a plain value is), [`crate::see_through::SEE_NOISE_SIZE`] squared.
++pub fn see_noise_bytes() -> u64 {
++    (crate::see_through::SEE_NOISE_SIZE * crate::see_through::SEE_NOISE_SIZE * 4) as u64
+ }
+ 
+ /// The per-frame prefix's size, which is also the probe region's offset.
+@@ -192,6 +216,10 @@ pub(super) fn per_frame_blob_bytes() -> u64 {
+ #[allow(clippy::type_complexity)]
+ fn build_light_data(
+     light: Res<WowLighting>,
++    // WOW-BG3 patch 0090: this frame's see-through capsules, rows 21 to 24, and whether the noise
++    // has been uploaded.
++    cut: Res<crate::see_through::SeeThrough>,
++    noise: Option<Res<crate::see_through::SeeNoise>>,
+     debug: Res<DebugState>,
+     view: Res<ViewDistance>,
+     cam: Query<&GlobalTransform, With<WorldCamera>>,
+@@ -231,6 +259,15 @@ fn build_light_data(
+         fog_enable,
+     ];
+     rows[19] = [l.wmo_fog_start, l.wmo_fog_end, 0.0, 0.0];
++    // Rows 21 to 24, patch 0090: the see-through capsules, their eye and the noise. A size of 0 is
++    // off, which is also what the default resource packs, so a run without the producer (or
++    // outside world mode) leaves every shader on its old path.
++    for (i, c) in cut.cuts.iter().enumerate() {
++        rows[CUT_ROW + i] = [c.at.x, c.at.y, c.at.z, c.radius.max(0.0)];
++    }
++    rows[CUT_ROW + 2] = [cut.eye.x, cut.eye.y, cut.eye.z, cut.noise_amp];
++    let noise_row = if noise.is_some() { (see_noise_offset() / 16) as f32 } else { 0.0 };
++    rows[CUT_ROW + 3] = [noise_row, cut.near, cut.noise_scale, f32::from(u8::from(cut.terrain))];
+     // Rows 0-2, 6-12.xyz and 17.yzw: the model-light core.
+     pack_model_core_rows(rows, l.ambient, l.diffuse, l.sun_dir);
+     // The point table: lights within [`POINT_PACK_RADIUS`], nearest first past capacity. Dividing
+@@ -362,10 +399,47 @@ fn upload_light(
+     queue.write_buffer(&buffer.0, 0, bytemuck::bytes_of(&data.0));
+ }
+ 
++/// Render world, in `PrepareResources`: WOW-BG3 patch 0090's see-through noise into its region,
++/// once per new noise (it never changes in a session; the extract hands a fresh `Arc` only then).
++fn upload_see_noise(
++    queue: Res<RenderQueue>,
++    buffer: Option<Res<SharedLightBuffer>>,
++    noise: Option<Res<crate::see_through::SeeNoise>>,
++    mut done: Local<Option<usize>>,
++) {
++    let (Some(buffer), Some(noise)) = (buffer, noise) else {
++        return;
++    };
++    let key = std::sync::Arc::as_ptr(&noise.0) as usize;
++    if *done == Some(key) || noise.0.len() as u64 * 4 != see_noise_bytes() {
++        return;
++    }
++    queue.write_buffer(&buffer.0, see_noise_offset(), bytemuck::cast_slice(noise.0.as_slice()));
++    *done = Some(key);
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    /// WOW-BG3 patch 0090: each shader reaches the see-through noise from the start of its own
++    /// struct's last array; those starts are constants there and must match the regions here.
++    #[test]
++    fn the_shaders_see_tail_starts_match_the_regions() {
++        let rows = |b: u64| b / 16;
++        let header = rows(per_frame_blob_bytes());
++        let probes = (7 * MAX_PROP_PROBES) as u64;
++        let palettes = rows(crate::rig_palette::palette_region_offset());
++        for (name, text, want) in [
++            ("terrain.wgsl", include_str!("../../../benilla-assets/src/shaders/terrain.wgsl"), header),
++            ("static_gx.wgsl", include_str!("../shaders/static_gx.wgsl"), header + probes),
++            ("wow_model.wgsl", include_str!("../../../benilla-assets/src/shaders/wow_model.wgsl"), palettes),
++        ] {
++            let line = format!("const WOW_SEE_TAIL: u32 = {want}u;");
++            assert!(text.contains(&line), "{name} must declare `{line}`");
++        }
++    }
++
+     /// `wow_model.wgsl`'s exterior doodad and entity lane over the packed rows gives
+     /// `E = A + I·D·(4/17)(0.375 + 2μ + 1.875μ²)`: ambient never scales by the intensity I, and
+     /// every sun band scales by it once. `eval_sh_lane` mirrors the WGSL line for line, so a swap
+diff --git a/crates/benilla-world/src/see_through.rs b/crates/benilla-world/src/see_through.rs
+new file mode 100644
+index 0000000..4b53f75
+--- /dev/null
++++ b/crates/benilla-world/src/see_through.rs
+@@ -0,0 +1,82 @@
++//! WOW-BG3 patch 0090: the see-through, the engine's half, ported from BG3's own wall materials.
++//!
++//! BG3 cuts the geometry between its camera and the character away, so she is never hidden by a
++//! tree, a hut or a roof. It does it in every wall's own material shader (`Base_*_FOR` and kin in
++//! `Materials.pak`; read with `tmp/occl20261029/spvdis.py`, its names from the DX12 build): an
++//! engine block (set 0, binding 6) carries two **capsules**, each from one shared point to a target
++//! with a size `R`, and a texture the materials bind by id, `REF_Cloud_B` (512 x 512 cloud noise).
++//! Per fragment: `n = 2·cloud(uv·2).r − 1`; for each capsule the distance `d` from the fragment to
++//! the segment (its closest point clamped to the segment's box, as BG3 does), then
++//! `v = clamp(max(d + 0.5·n, 0) / R, 0, 1)`; the fragment is discarded where the smaller `v` is
++//! below one half. Seen down the line of sight a capsule is the "circle" round her, and because the
++//! noise is fixed to the wall's own texture coordinates while the capsule moves with her, its edge
++//! eats into the wall in ragged strokes as she walks: the effect is the noise, not a dither.
++//!
++//! In world mode the occluder is WoW's and is drawn here, so the same law runs in WoW's shaders:
++//! [`crate::lighting::global_light`] packs this resource into the shared light buffer (rows 21 to
++//! 24) and uploads [`SeeNoise`] once into the buffer's last region, and `terrain.wgsl`,
++//! `static_gx.wgsl` and `wow_model.wgsl` (WMO batches alone) apply it. The shared point is the eye.
++//! One thing WoW lacks: BG3 opts each object in (`CanSeeThrough`), so its floors are never cut;
++//! WoW draws floors and walls with one shader, so a fragment is cut only when it is nearer the eye
++//! than the target by [`SeeThrough::near`].
++//!
++//! Who writes it: `benilla-app`'s `wowbg3_see`, from BG3's character (`tav.bin`) and the world
++//! camera, and the noise from `see-noise.r8` in the link folder (the mod makes it from the
++//! player's own BG3 data; nothing of BG3's ships with benilla). With [`SeeThrough::default`] (every
++//! size 0) the shaders take their old path.
++
++use std::sync::Arc;
++
++use bevy::prelude::*;
++use bevy::render::extract_resource::ExtractResource;
++
++/// One capsule: its target and its size.
++#[derive(Clone, Copy, Default, Debug, PartialEq)]
++pub struct Cut {
++    /// The capsule's far end in Bevy world space (the near end is the eye).
++    pub at: Vec3,
++    /// BG3's `R` in yards: the cut reaches `R / 2` from the segment, give or take the noise; `0`
++    /// switches this capsule off.
++    pub radius: f32,
++}
++
++/// This frame's see-through capsules. Two, as BG3's block has: the hero, and in a fight whoever
++/// the camera has moved on to.
++#[derive(Resource, Clone, Copy, Default, Debug, PartialEq)]
++pub struct SeeThrough {
++    pub cuts: [Cut; 2],
++    /// The eye the capsules start at: a view whose own eye is elsewhere (a portrait booth, the
++    /// minimap bake, the login backdrop) must not be cut, and comparing the eye is the one test that
++    /// needs nothing per view.
++    pub eye: Vec3,
++    /// How far in front of a target (yd) the cut stops, so the ground she stands on is never cut.
++    pub near: f32,
++    /// The noise's reach in yards: BG3's `0.5 · n` is in its metres, so 0.5 m.
++    pub noise_amp: f32,
++    /// The noise's scale on a mesh's texture coordinates: BG3's `uv · 2`.
++    pub noise_scale: f32,
++    /// Whether WoW's terrain is cut with the rest (`terrain.wgsl` reads it). Off by default: the
++    /// ground in front of her going see-through is not what anyone wants, and a hill between the
++    /// camera and her is already what the plugin's eye clearance moves the camera out of.
++    pub terrain: bool,
++}
++
++impl SeeThrough {
++    /// Is any capsule live? (`global_light` packs zeros otherwise, which the shaders read as off.)
++    pub fn live(&self) -> bool {
++        self.cuts.iter().any(|c| c.radius > 0.0)
++    }
++}
++
++/// BG3's `REF_Cloud_B` red channel, [`SEE_NOISE_SIZE`] squared, row-major, 0 to 1.
++#[derive(Resource, Clone, ExtractResource)]
++pub struct SeeNoise(pub Arc<Vec<f32>>);
++
++/// The noise's side in texels.
++pub const SEE_NOISE_SIZE: usize = 512;
++
++/// Registers the resource. The producer lives in `benilla-app`; a run without it leaves the
++/// default, and the shaders their old path.
++pub fn plugin(app: &mut App) {
++    app.init_resource::<SeeThrough>();
++}
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+index fd7888c..befdd65 100644
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -28,9 +28,16 @@ struct WowLight {
+     wmo_fog_color: vec4<f32>,
+     wmo_fog_params: vec4<f32>,
+     point_count: vec4<f32>,
++    // WOW-BG3 patch 0090, BG3's see-through capsules (`crate::see_through`): rows 21 to 24.
++    cut_a: vec4<f32>,      // 21 xyz = the first capsule's target; w = its size R in yd (0 = off)
++    cut_b: vec4<f32>,      // 22 the second capsule, the same
++    cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
++    cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
+     points: array<vec4<f32>, 512>,
+     // lighting::prop_probes: 8192 slots of 7 rows; the buffer's later regions are not mirrored.
+     prop_probes: array<vec4<f32>, 57344>,
++    // Patch 0090: everything after, read only for BG3's see-through noise (`WOW_SEE_TAIL`).
++    see_tail: array<vec4<f32>>,
+ }
+ @group(0) @binding(1) var<storage, read> wow_light: WowLight;
+ 
+@@ -177,6 +184,95 @@ fn vertex(v: GxVertex) -> GxVsOut {
+     return out;
+ }
+ 
++// ── WOW-BG3 patch 0090: BG3's see-through, ported from its wall materials ──
++// BG3 cuts what stands between its camera and the character in every wall's own material shader
++// (`Base_*_FOR` in Materials.pak): two capsules from an engine block, each from one shared point to
++// a target with a size `R`, and the cloud noise `REF_Cloud_B` on the wall's own texture
++// coordinates. `n = 2·cloud(uv·2).r − 1`; per capsule `v = clamp(max(d + 0.5·n, 0) / R, 0, 1)`, `d`
++// the fragment's distance to the segment (its closest point clamped to the segment's box, BG3's
++// own clamp); the fragment goes where the smaller `v` is below one half. The noise is fixed to the
++// wall and the capsule moves with her, so the edge eats into the wall in ragged strokes as she
++// walks. Here the shared point is the eye, rows 21 to 24 of the shared light carry the capsules
++// (`lighting::global_light`, `crate::see_through`), and the noise is the buffer's last region.
++// The one change: BG3 opts each object in, so its floors are never cut; WoW draws floors and walls
++// with one shader, so only what is nearer the eye than the target (by `cut_params.y`) is cut.
++
++// Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
++// it. Checked against the buffer's regions by `global_light`'s tests.
++const WOW_SEE_TAIL: u32 = 57881u;
++
++// One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
++fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
++    let k = u32(p.y & 511) * 512u + u32(p.x & 511);
++    return wow_light.see_tail[base - WOW_SEE_TAIL + k / 4u][k % 4u];
++}
++
++// The noise at `uv`, filtered as BG3's sampler does (bilinear, wrapping); 0.5 (no change to the
++// edge) while there is none.
++fn wow_see_noise(uv: vec2<f32>) -> f32 {
++    let base = u32(wow_light.cut_params.x);
++    if (base == 0u) {
++        return 0.5;
++    }
++    let p = fract(uv) * 512.0 - 0.5;
++    let i = vec2<i32>(floor(p));
++    let f = p - floor(p);
++    let a = mix(wow_see_texel(base, i), wow_see_texel(base, i + vec2<i32>(1, 0)), f.x);
++    let b = mix(wow_see_texel(base, i + vec2<i32>(0, 1)), wow_see_texel(base, i + vec2<i32>(1, 1)), f.x);
++    return mix(a, b, f.y);
++}
++
++// One capsule's coverage at `world_pos`, BG3's line for line: 1 untouched, under 0.5 cut.
++fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, amp: f32, near: f32) -> f32 {
++    if (c.w <= 0.0) {
++        return 1.0;
++    }
++    let ab = c.xyz - eye;
++    let ap = world_pos - eye;
++    let ab2 = dot(ab, ab);
++    if (ab2 < 1e-4) {
++        return 1.0;
++    }
++    // Only what stands between the camera and her, past `near` on both of two tests. Toward the
++    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
++    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
++    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
++    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    let from_her = world_pos - c.xyz;
++    let to_eye = eye - c.xyz;
++    if (dot(from_her, normalize(to_eye)) < near) {
++        return 1.0;
++    }
++    let level = vec3<f32>(to_eye.x, 0.0, to_eye.z);
++    if (dot(level, level) > 1e-6 && dot(from_her, normalize(level)) < near) {
++        return 1.0;
++    }
++    let t = dot(ap, ab) / ab2;
++    let q = clamp(eye + ab * t, min(eye, c.xyz), max(eye, c.xyz));
++    return clamp(max(n * amp + distance(world_pos, q), 0.0) / c.w, 0.0, 1.0);
++}
++
++// Does BG3's see-through take this fragment? (BG3: `v · k − 0.5 · k < 0`, `k` the object's own
++// see-through scalar, 1 for whatever WoW draws through here.)
++fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
++    let eye_for = wow_light.cut_eye;
++    // A view drawn from somewhere else (a portrait booth, the minimap bake, the login backdrop)
++    // shares this buffer and must not be cut; the eye the capsules start at says which.
++    let eye = view.world_position.xyz;
++    if (distance(eye, eye_for.xyz) > 0.25) {
++        return false;
++    }
++    let p = wow_light.cut_params;
++    if (wow_light.cut_a.w <= 0.0 && wow_light.cut_b.w <= 0.0) {
++        return false;
++    }
++    let n = wow_see_noise(uv * p.z) * 2.0 - 1.0;
++    let v = min(wow_see_capsule(wow_light.cut_a, eye, world_pos, n, eye_for.w, p.y),
++                wow_see_capsule(wow_light.cut_b, eye, world_pos, n, eye_for.w, p.y));
++    return v < 0.5;
++}
++
+ @fragment
+ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
+     // The hard farclip wall: per-pixel planar eye-Z, the same plane as the entity path.
+@@ -184,6 +280,11 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
+     if (wow_light.fog_params.w > 0.0 && eye_z > wow_light.fog_params.w) {
+         discard;
+     }
++    // Patch 0090: BG3's see-through. This pass draws the trees, rocks, fences, buildings and
++    // interior props, so it is where most of the cut happens.
++    if (wow_cut(in.world_position.xyz, in.uv)) {
++        discard;
++    }
+     // The sampler follows the wrap flags; a mixed batch clamps its clamped axis a half texel in.
+     // Every sample runs unconditionally: implicit derivatives need uniform control flow.
+     var base = vec4<f32>(1.0);
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+index f562c1a..a892e57 100644
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -269,10 +269,24 @@ impl Plugin for WmoPortalPlugin {
+ /// is not the room you are in.
+ const MAX_FLOOR_DROP: f32 = 1760.0;
+ 
++/// Patch 0090: how far outside a group's own box the circle's centre still counts as being in it
++/// (yd, WMO model space). A doorway, a porch step or a figure's own width puts her a little out.
++const ANCHOR_ROOM_MARGIN: f32 = 3.0;
++
++/// Is `p` (WMO model space, WoW axes) inside any group's box, grown by `margin`? Patch 0090's
++/// cheap gate: only the placement she stands in runs the second flood.
++fn inside_any_group(model: &WmoModel, p: [f32; 3], margin: f32) -> bool {
++    model.group_nav.iter().any(|n| {
++        (0..3).all(|i| p[i] >= n.bbox_min[i] - margin && p[i] <= n.bbox_max[i] + margin)
++    })
++}
++
+ /// Recompute each resident WMO's per-group visible set from the camera; a portal-less prop stays
+ /// all-visible.
+ fn compute_wmo_pvs(
+     wmos: Res<Assets<WmoModel>>,
++    // Patch 0090: where the see-through circle is centred, so the room it cuts into stays drawn.
++    cut: Res<crate::see_through::SeeThrough>,
+     cam: Query<(&GlobalTransform, &Projection), With<WorldCamera>>,
+     mut instances: Query<(Entity, &mut WmoPortalInstance)>,
+     streamer: Res<TerrainStreamer>,
+@@ -309,6 +323,9 @@ fn compute_wmo_pvs(
+         format!("eye world: {eye_world:?}\nforward: {fwd:?} fovy {fovy:.4} aspect {aspect:.4}\n")
+     });
+ 
++    // Patch 0090: the circle's centre this frame (the hero's chest), or none when it is off.
++    let cut_anchor = (cut.live() && cut.cuts[0].radius > 0.0 && cut.cuts[0].at.is_finite())
++        .then_some(cut.cuts[0].at);
+     // The fog target and the claim come from the flood's own seed; the first placement whose seed
+     // claims a non-exterior group wins both.
+     let mut fog_target: Option<WmoFogTarget> = None;
+@@ -359,6 +376,31 @@ fn compute_wmo_pvs(
+             &world_from_local,
+             &mut (&mut tap, &mut log),
+         );
++        // Patch 0090: her own room, when the see-through circle is live. The circle can cut a
++        // building's roof or wall away from a camera standing outside it, and the portal walk from
++        // that camera admits no room inside, so the hole would show the building's back faces —
++        // nothing, that is, and then the sky (playtest feedback, 2026-10-29: "the outside doesn't look like
++        // a cyan void ... it just continues rendering"). A second flood seeded where she stands,
++        // unioned into the visible set alone: the fog, the claim and the deferred windows stay the
++        // camera's, and only the placement she is actually inside pays for it.
++        if let Some(anchor) = cut_anchor {
++            let a_local = bevy_to_wow(local_from_world.transform_point3(anchor));
++            if inside_any_group(model, a_local, ANCHOR_ROOM_MARGIN) {
++                let a_terrain = terrain_height_under(&streamer, &adt_tiles, anchor)
++                    .map(|z| terrain_z_local(&local_from_world, anchor, z));
++                let hers = compute_pvs_traced(
++                    model,
++                    a_local,
++                    a_terrain,
++                    &clip_from_world,
++                    &world_from_local,
++                    &mut (),
++                );
++                for (v, h) in fresh.visible.iter_mut().zip(&hers.visible) {
++                    *v |= *h;
++                }
++            }
++        }
+         if inst.bypass_change_detection().visible != fresh.visible {
+             inst.bypass_change_detection().visible = fresh.visible;
+             inst.set_changed();
+@@ -448,9 +490,15 @@ fn compute_wmo_pvs(
+     if camera_claim.0 != claim {
+         camera_claim.0 = claim;
+     }
++    // Patch 0090: while the see-through is live the cut can open any wall of the room the camera is
++    // in, and the outside behind it must be there to see: the reference draws the exterior only
++    // through a room's windows, which left the sky where the street should be (playtest feedback: "the
++    // outside doesn't look like a cyan void but it just continues rendering the outside"). So the
++    // exterior walk is the outside leg's, unrestricted, and the walls left standing hide it as
++    // depth does everywhere else.
+     let want_windows = match windows {
+-        Some(rects) => ExteriorWindows::Windows(rects),
+-        None => ExteriorWindows::Unrestricted,
++        Some(rects) if cut_anchor.is_none() => ExteriorWindows::Windows(rects),
++        _ => ExteriorWindows::Unrestricted,
+     };
+     if *camera_windows != want_windows {
+         *camera_windows = want_windows;
+diff --git a/crates/benilla-world/src/world_plugins.rs b/crates/benilla-world/src/world_plugins.rs
+index 2ad9a86..d9946f0 100644
+--- a/crates/benilla-world/src/world_plugins.rs
++++ b/crates/benilla-world/src/world_plugins.rs
+@@ -56,6 +56,8 @@ impl PluginGroup for WorldPlugins {
+             // The ground-fx decal lane, which orders itself on the billboard place set.
+             .add(crate::ground_fx::plugin)
+             .add(crate::frame_pace::plugin)
++            // WOW-BG3 patch 0090: the see-through circle's resource (its producer is in benilla-app).
++            .add(crate::see_through::plugin)
+             // The skin palette: every rig's joint matrices, skinned in `wow_model.wgsl` in place of
+             // Bevy's `SkinnedMesh`.
+             .add(crate::rig_palette::plugin)

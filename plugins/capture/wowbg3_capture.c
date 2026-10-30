@@ -410,7 +410,7 @@ static void ground_note_scissor(VkCommandBuffer cb, uint32_t first, uint32_t n, 
 static void ground_note_pipeline(const VkGraphicsPipelineCreateInfo* ci);
 static void ground_present(void);
 // BG3's ground surfaces shown on WoW's ground (wowbg3_surf.inc.c, included at the end).
-static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin);
+static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* ini, const uint8_t* load, const int32_t* fin);
 static int surf_draw(VkCommandBuffer cb);
 static void surf_pass_end(DeviceData* d, VkCommandBuffer cb);
 static void surf_end_cb(DeviceData* d, VkCommandBuffer cb);
@@ -1031,7 +1031,20 @@ static void role_forget(VkImage img) {  // g_trace_lock held
 
 typedef struct {
     int on, ui, light, fx, bg3tav, fxcopy, void_, raw, cpu, fxsync, wowbar, fxdecals, fxsight, ground, fxwhole;
+    int fxsolid;   // a spell's unblended pieces in the effects pass captured too (word "fxsolid")
+    int fxsolidlog;  // ... and their recipes and textures logged (research, word "fxsolidlog")
+    // Research: "fxsolidonly=<hex>[,<hex>]" takes only those recipes as solid, "fxsolidskip=" leaves
+    // those out, so one piece of a spell can be looked at on its own without a restart.
+    uint64_t solid_only[8], solid_skip[8];
+    uint32_t n_solid_only, n_solid_skip;
+    int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
+    int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
+    int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
+    int fxwib;      // fxwhy groups a draw by its index buffer too, so each mesh is its own group (word "fxwib")
+    int fxprops;    // a spell's 3D props kept in the void (word "fxprops"; see void_skip)
+    uint32_t fxpropage;  // ... while their mesh is younger than this many presents ("fxpropage=", 900)
+    uint32_t fxpropburst;  // ... unless their present brought more new slices than this ("fxpropburst=", 8)
     float sdec, sfwd, sfloor, stol;
     int fxtav;     // Effects kept only near Tav, as before (default: near Tav or BG3's eye)
     int screenvoid;  // BG3's own 3D screens: the character over one dark colour (word "screenvoid")
@@ -1058,6 +1071,12 @@ static ComposeCfg g_cc;
 // "fxsync" (the effects readbacks wait at the present, as before; see fxj_main),
 // "wowbar" (WoW's frame kept in video memory, written through the BAR; see wr_main).
 // "fxdecals" (BG3's deferred decal draws recorded too; see fxc_draw).
+// "fxsolid" (a spell's unblended pieces in the effects pass captured too; see fxc_solid; "fxsolidlog"
+// logs each recipe and texture it takes, research only), with
+// "fxsolidonly=<hex>[,<hex>]" and "fxsolidskip=" naming recipes by a shader key for research.
+// "fxhl" (a figure's hover highlight captured instead of dropped with her; see fxc_figure_extra. Off
+// by default: BG3 draws that highlight on the character's own skinned meshes, which this does not
+// cover, and a stand-in's BG3 body is the wrong shape for WoW's model anyway).
 // "fxwhole" (the effects capture as before: BG3's skinned vertex stream and light index
 // lists copied whole instead of the parts a draw reads, see spv_meta, and draws benilla cannot
 // replay kept, see fxc_unsup_draw).
@@ -1066,7 +1085,7 @@ static ComposeCfg g_cc;
 // "wowraw" (WoW's frame bytes as they are: an earlier version encoded its sRGB target twice,
 // the old look), "wowgamma=<g>" (benilla's `gamma` CVar, default 1; see put_pixel_from_wow).
 // "surf" (with "ground": BG3's ground surfaces, water, grease, fire..., laid onto WoW's ground in the
-// composite with BG3's own look; "surfdbg", "surfpix", "sdec=", "sfwd=", "sfloor=", "stol=": see
+// composite with BG3's own look; "surfdbg", "surfpix", "sdec=", "sfwd=", "sfloor=", "stol=", "surfscene", "surfpost", "fxprops", "fxpropage=", "fxpropburst=": see
 // wowbg3_surf.inc.c).
 // "noscreenlevel" (BG3's own 3D screens keep the world mode's voiding, which is what 0.1.0 did: the
 // character stands in an empty void with whatever of the host level the voiding does not reach, his
@@ -1106,10 +1125,34 @@ static void compose_config(void) {
     g_cc.wowbar = has_word(line, "wowbar");
     g_cc.fxdecals = has_word(line, "fxdecals");
     g_cc.fxsight = has_word(line, "fxsight");
+    g_cc.fxsolid = has_word(line, "fxsolid");
+    g_cc.fxsolidlog = has_word(line, "fxsolidlog");
+    for (int which = 0; which < 2; which++) {
+        const char* w = strstr(line, which ? "fxsolidskip=" : "fxsolidonly=");
+        uint64_t* out = which ? g_cc.solid_skip : g_cc.solid_only;
+        uint32_t* n = which ? &g_cc.n_solid_skip : &g_cc.n_solid_only;
+        *n = 0;
+        for (const char* q = w ? w + 12 : NULL; q && *n < 8; ) {
+            char* end = NULL;
+            uint64_t v = strtoull(q, &end, 16);
+            if (end == q) break;
+            out[(*n)++] = v;
+            q = *end == ',' ? end + 1 : NULL;
+        }
+    }
+    g_cc.fxhl = has_word(line, "fxhl");
     g_cc.ground = has_word(line, "ground");
     g_cc.surf = g_cc.ground && has_word(line, "surf");
     g_cc.surfdbg = has_word(line, "surfdbg");
     g_cc.surfpix = has_word(line, "surfpix");
+    g_cc.surfscene = has_word(line, "surfscene");
+    g_cc.surfpost = has_word(line, "surfpost");
+    g_cc.fxwib = has_word(line, "fxwib");
+    g_cc.fxprops = has_word(line, "fxprops");
+    g_cc.fxpropage = 900;
+    { const char* w = strstr(line, "fxpropage="); if (w) { unsigned long v = strtoul(w + 10, NULL, 10); if (v) g_cc.fxpropage = (uint32_t)v; } }
+    g_cc.fxpropburst = 8;
+    { const char* w = strstr(line, "fxpropburst="); if (w) { unsigned long v = strtoul(w + 12, NULL, 10); if (v) g_cc.fxpropburst = (uint32_t)v; } }
     g_cc.slight = !has_word(line, "noslight");
     g_cc.screenlevel = !has_word(line, "noscreenlevel");
     g_cc.screenvoid = has_word(line, "screenvoid");
@@ -1955,7 +1998,8 @@ static __thread VkCommandBuffer t_fxl_cb;
 static __thread VkCommandBuffer t_dec_cb;  // BG3's deferred decal pass on this thread (fxl_pass)
 static __thread VkCommandBuffer t_void_cb;  // the pass on this thread is one BG3's map draws into (void_pass)
 static void void_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs);
-static int void_skip(VkCommandBuffer cb, uint32_t fi);
+static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t first, int32_t vo);
+static __thread VkCommandBuffer t_prop_cb;  // void_skip kept this draw as a spell's prop (fxwhy decision Y)
 static __thread VkCommandBuffer t_bind_cb;
 static __thread uint64_t t_pipe, t_vb[8], t_vbo[8], t_set[8], t_ibo;
 static __thread uint32_t t_ibt, t_pc, t_dyn[8][8], t_ndyn[8];
@@ -2132,6 +2176,8 @@ static volatile int g_fxc_on;  // effects capture on (fxc_present keeps it)
 static void fxc_pass_target(uint64_t image);
 static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi);
 static void fxp_draw(VkCommandBuffer cb);
+static int fxc_figure_extra(VkCommandBuffer cb);
+static __thread int t_fx_surf;  // this draw is one of BG3's ground surfaces (surf_draw)
 static void fxw_pass(VkCommandBuffer cb, const char* what, uint32_t n, const uint64_t* imgs, const uint8_t* load);
 static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi, int why);
 static void fxp_dispatch(VkCommandBuffer cb);
@@ -2451,7 +2497,7 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         }
         role_pass(cb, n, imgs, fin);
         ground_pass(cb, n, imgs, load, fin, w, h);
-        surf_pass_begin(cb, n, imgs, fin);
+        surf_pass_begin(cb, n, imgs, ini, load, fin);
         fx_pass(device_for(cb), cb, (uint64_t)fb, n, imgs, load, ini, fin);
         fxl_pass(cb, n, imgs, load);
         pthread_mutex_unlock(&g_trace_lock);
@@ -2667,6 +2713,7 @@ static void role_final_draw(VkCommandBuffer cb) {
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(VkCommandBuffer cb, uint32_t v, uint32_t i, uint32_t fv, uint32_t fi) {
     DeviceData* d = device_for(cb);
     if (!d) return;
+    t_fx_surf = 0;  // surfaces are indexed draws; do not leave the last one's answer standing
     fxl_draw(cb, "D", v, i, fv, 0, fi);
     int why = fxc_draw(cb, 0, v, i, fv, 0, fi);
     if (g_fxw_frames > 0) fxw_draw(cb, 'D', v, i, fv, 0, fi, why);
@@ -2689,15 +2736,23 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(VkCommandBuffer cb, uint3
     DeviceData* d = device_for(cb);
     if (!d) return;
     if (t_tavd_cb == cb && t_ib_cb == cb) tavd_note(cb, t_ib, fin);
-    if (tav_hidden_draw(cb)) { if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'H'); return; }
+    if (tav_hidden_draw(cb) && !fxc_figure_extra(cb)) {
+        if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'H');
+        return;
+    }
     // BG3's ground surfaces stay drawn in the void (they lie on WoW's ground; wowbg3_surf.inc.c).
     int surf = g_cc.surf ? surf_draw(cb) : 0;
-    if (void_skip(cb, fin)) {
+    // ... and the effects capture must not take them as well: a surface is an unblended mesh of the
+    // effects pass like a spell's solid pieces (fxc_solid), and replaying one put a black quad the
+    // size of the puddle over the ground Grease had just drawn properly.
+    t_fx_surf = surf;
+    if (void_skip(cb, fin, n, fi, vo)) {
         if (!surf) { if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'V'); return; }
         surf_kept();
     }
     fxl_draw(cb, "DI", n, i, fi, vo, fin);
     int why = fxc_draw(cb, 1, n, i, fi, vo, fin);
+    if (!why && t_prop_cb == cb) why = 'Y';
     if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, why);
     COUNT_DRAW(cb, (uint64_t)n * i);
     d->CmdDrawIndexed(cb, n, i, fi, vo, fin);

@@ -183,9 +183,17 @@ function M.Start(runId)
     end
     -- World mode's step height: BG3 paths only
     -- between neighbour tiles whose heights differ by less than the path's StepHeight, which comes
-    -- from the walker's template (MovementStepUpHeight, 0.6 m for Tav and the wolf), so it climbs
-    -- slopes up to about 50 degrees on its 0.5 m tiles. WoW's walkable
-    -- hillsides reach 57 to 62 degrees (0.75 to 0.93 m a tile). While the pool is out (world mode),
+    -- from the walker's template (MovementStepUpHeight, 0.6 m for Tav and the wolf). WoW's own rule
+    -- is two numbers (the 1.12 client's, from benilla's character controller): a surface is walkable
+    -- while its normal is within 50 degrees of up, and over anything steeper the player climbs only
+    -- a 1 yd rise (STEP_UP_HEIGHT; 2 yd for everything that is not the player). wow_arena.py
+    -- keeps the stamp to the 50 degree rule, so the ground BG3 is given is already what a WoW
+    -- player may stand on, and terrain never offers neighbour tiles more than 0.5 * tan 50
+    -- = 0.60 m apart (measured over seven squares). STEP_UP 1.0 m is the client's 1 yd rounded up:
+    -- the 9 percent it is generous by is spent only where a building meets the ground (stair treads
+    -- and floor joins, where our 0.5 m sampling makes the step look bigger than the client sees it;
+    -- 70 such pairs in the Northshire abbey square, 42 in the Goldshire inn's, none on terrain).
+    -- While the pool is out (world mode),
     -- the templates of the characters near Tav (Tav, the fights' stand-ins) take STEP_UP; poolOff
     -- puts every one back. A template that will not take the value is left alone (logged once).
     local STEP_UP = 1.0

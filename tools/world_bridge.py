@@ -75,6 +75,10 @@ AHEAD = 20.0     # metres from the window's node before squares are placed ahead
 # never join into one long cluster (the plugin refuses one over 1 km).
 KEEP_RAYS = 100.0
 SERIALS = 64     # section-<k>-<serial>.bin names in use (overwritten round robin)
+# What a square's tiles say a WoW player may stand on: wow_arena.py keeps them to the 1.12 client's
+# own rule (a surface within 50 degrees of up; steeper slides the player back), so BG3's movement
+# circle is WoW's. WOW_BG3_SLOPE_LIMIT changes the angle and 0 turns it off (the earlier state:
+# every movement-map polygon counted, and BG3 offered the NPC-only steep slopes too).
 # How the squares' tiles reach BG3's grid (WOW_BG3_TILE_MODE): flat (one height per tile, BG3's
 # MinHeight = MaxHeight = WoW's ground at the tile's middle), span (MinHeight and MaxHeight the
 # ground's lowest and highest point in the tile, wow_arena.py spans.bin), slope (one height, BG3's
@@ -84,6 +88,19 @@ SERIALS = 64     # section-<k>-<serial>.bin names in use (overwritten round robi
 # WoW's ground itself, is the default. See the m4b-world-mode notes, Ground fit.
 TILE_MODE = os.environ.get('WOW_BG3_TILE_MODE', 'flat')
 SLOPE_FLAG_M = 0.25
+# Upper storeys (WOW_BG3_STOREYS, 0 = off: one floor a tile, as before). A square whose cut has an
+# upper storey (wow_arena.py storey.bin: upstairs in an inn, the far side of its stairs) gets a
+# second pool subgrid stacked over it, one tile further +X (the plugin keeps one subgrid to a lattice
+# slot, and the storeys of neighbouring squares then meet edge to edge like the ground's). Its key is
+# (i, j, 1) beside the ground's (i, j); storeys take the pool subgrids the ground leaves (never one a
+# square of ground needs), and the pool asks for STOREY_SPARE more than --pool for them. A storey
+# with fewer than STOREY_MIN walkable tiles is left out.
+STOREYS = os.environ.get('WOW_BG3_STOREYS', '1') != '0'
+STOREY_SPARE = 2
+STOREY_MIN = 8
+# The flags a seam tile (where a storey meets the ground) gets in both sections: 4 SubgridEdge, 8
+# SubgridIntersection (the plugin's Place; BG3's pathfinder changes subgrids only on such tiles).
+SEAM_BITS = int(os.environ.get('WOW_BG3_SEAM_BITS') or 12) & 12
 
 
 def run_id():
@@ -249,7 +266,8 @@ class World:
         self.split = {}      # pool index -> squares it is at on one side or the other (sides disagree)
         self.cells = {}      # (i, j) -> cut square (cache, newest last)
         self.rays = None     # the squares whose triangles the plugin has (sorted), as last sent
-        self.pool = a.pool
+        self.ground_pool = a.pool                                   # squares of ground at most
+        self.pool = a.pool + (STOREY_SPARE if STOREYS else 0)    # pool subgrids, storeys included
         self.started = 0.0
 
     # ---- mapping ----
@@ -262,7 +280,8 @@ class World:
         return W[0] - (bz - C[2]) / YD, W[1] + (bx - C[0]) / YD
 
     def cell_min(self, ij):
-        return self.centre[0] + CELL * ij[0], self.centre[2] + CELL * ij[1]
+        # A storey (i, j, 1) lies one tile further +X than its square (see STOREYS).
+        return self.centre[0] + CELL * ij[0] + (0.5 if len(ij) == 3 else 0.0), self.centre[2] + CELL * ij[1]
 
     # ---- commands to WorldMode.lua ----
     def command(self, action, **fields):
@@ -308,7 +327,7 @@ class World:
         out.mkdir(parents=True, exist_ok=True)
         cmd = [sys.executable, str(ROOT / 'link/tools/wow_arena.py'), str(out), '--wow', str(wx), str(wy),
                '--bg3', str(cx), str(by), str(cz), '--size', str(CELL), '--islands', 'border',
-               '--map', str(self.map),
+               '--map', str(self.map), '--storeys', '1' if STOREYS else '0',
                '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         tiles = (out / 'tiles.bin').read_bytes()
@@ -335,7 +354,35 @@ class World:
         base = math.floor((min(floors) - 0.5) * 50) / 50
         assert max(floors) - base < 1300, 'a square spans more height than a subgrid holds'
         cell = {'ij': ij, 'min': (minx, minz), 'base': base, 'tiles': tiles, 'section': section, 'tris': tris,
-                'kinds': kinds}
+                'kinds': kinds, 'storey': None}
+        if STOREYS:
+            st = (out / 'storey.bin').read_bytes()
+            assert len(st) == TILES * TILES * 5, 'wow_arena.py wrote no storey'
+            meta = json.loads((out / 'arena.json').read_text())
+            ups = meta.get('storey_tiles') or 0
+            if ups >= STOREY_MIN:
+                # wow_arena.py's section as it is (the ground's tiles where the storey lies over it
+                # included), the seam bits as SEAM_BITS says.
+                section_s = b''.join(bytes([st[k * 5] & (1 | SEAM_BITS) if st[k * 5] & 1 else 0]) + st[k * 5 + 1:k * 5 + 5]
+                                     for k in range(TILES * TILES))
+                # The ground's own seams, in its section's flag byte, and the storey's tiles copied
+                # into it where the two meet (flags 1: walkable at that floor).
+                seams = (out / 'seams.bin').read_bytes()
+                assert len(seams) == TILES * TILES * 5, 'wow_arena.py wrote no seams'
+                rec = len(section) // (TILES * TILES)
+                g = bytearray(section)
+                for k in range(TILES * TILES):
+                    fl = seams[k * 5]
+                    if fl & 1:
+                        h = seams[k * 5 + 1:k * 5 + 5]
+                        g[k * rec:k * rec + rec] = bytes([1 | SEAM_BITS]) + h + (h if rec == 9 else b'')
+                    elif fl and g[k * rec] & 1:
+                        g[k * rec] |= fl & SEAM_BITS
+                cell['section'] = bytes(g)
+                cell['storey'] = {'min': (minx + 0.5, minz), 'base': meta['storey_base_m'],
+                                  'section': section_s, 'tiles': ups}
+                assert max(struct.unpack_from('<f', st, k * 5 + 1)[0] for k in range(TILES * TILES)) - meta['storey_base_m'] < 1300, \
+                    'a storey spans more height than a subgrid holds'
         self.cells[ij] = cell
         # Every placed square stays cached (its triangles go to the plugin at every Stream, and the
         # fall guard reads its floors): a pool of up to 128 squares, plus room for squares coming in.
@@ -469,8 +516,13 @@ class World:
             for ij in t:
                 if ij not in out:
                     out.append(ij)
-        out = out[:self.pool]
+        out = out[:self.ground_pool]
         self.write_floor(out)
+        if STOREYS:
+            # The storeys of the squares already cut (a new square's comes the round after its cut),
+            # in the squares' order, in the pool subgrids the ground leaves.
+            ups = [ij + (1,) for ij in out if (self.cells.get(ij) or {}).get('storey')]
+            out = out + ups[:max(0, self.pool - len(out))]
         return out
 
     def write_floor(self, squares):
@@ -518,7 +570,9 @@ class World:
         """Writes each square's tiles for the plugin (section-<k>-<serial>.bin) -> Cells for the mod."""
         out = []
         for k, ij in pairs:
-            cell = self.cut(ij)
+            cell = self.cut(ij[:2])
+            if len(ij) == 3:
+                cell = cell['storey']
             self.serial = self.serial % SERIALS + 1
             atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), cell['section'])
             out.append([k, cell['min'][0], cell['min'][1], cell['base'], self.serial])
@@ -527,7 +581,7 @@ class World:
     def write_triangles(self, squares):
         # What each triangle is (terrain, wall, WMO, M2, flat floor), for the plugin's camera clearance;
         # it reads both files at the next Rays command and ignores kinds of another count.
-        cells = [self.cut(ij) for ij in squares]
+        cells = [self.cut(ij) for ij in squares if len(ij) == 2]   # storeys bring no triangles of their own
         atomic_write(IO / 'arena-triangles.kinds', b''.join(c['kinds'] for c in cells))
         atomic_write(IO / 'arena-triangles.bin', b''.join(c['tris'] for c in cells))
 
@@ -540,7 +594,10 @@ class World:
             for e in entries:
                 ij = None
                 if e.get('Moved'):
-                    ij = (int(round((e['At'][0] - self.centre[0]) / CELL)), int(round((e['At'][2] - self.centre[2]) / CELL)))
+                    dx = e['At'][0] - self.centre[0]
+                    ij = (int(round(dx / CELL)), int(round((e['At'][2] - self.centre[2]) / CELL)))
+                    if abs(dx - CELL * ij[0] - 0.5) < 0.1:   # a storey: one tile further +X
+                        ij += (1,)
                 got[e['K']] = ij
             sides.append(got)
         return sides
@@ -554,6 +611,7 @@ class World:
             print('resync failed:', e, flush=True)
             return
         self.pool = min(self.pool, len(server), len(client))
+        self.ground_pool = min(self.ground_pool, self.pool)
         self.placed = {k: server[k] for k in server if k < self.pool and server[k] is not None and server[k] == client.get(k)}
         self.split = {k: {server.get(k), client.get(k)} - {None} for k in range(self.pool)
                       if server.get(k) != client.get(k) and ({server.get(k), client.get(k)} - {None})}
@@ -582,6 +640,7 @@ class World:
         try:
             server, client = self.pool_files()
             self.pool = min(self.pool, len(server), len(client))
+            self.ground_pool = min(self.ground_pool, self.pool)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         print('pool of', self.pool, 'squares; placed', self.placed, flush=True)

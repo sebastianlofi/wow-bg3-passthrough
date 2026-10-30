@@ -1,0 +1,437 @@
+WOW-BG3 benilla patch 0091: the storeys above the character are not drawn while she is below them.
+
+The design rule, given on 2026-10-29: what stands between the camera and the character is handled
+three ways depending on what it is: ceilings, bushes, skinny trees and posts **phase out**; walls get
+the **see-through opening** 0090 cuts; mountains, rocks and big trees the camera **bumps into**. And
+on floors, like BG3: "while on the first floor the second floor should just be fully faded out, and
+then come back when you do go upstairs".
+
+This is the first of the three: a ceiling, and every storey above her, goes. WoW's buildings are
+already grouped (a roof, a floor, a room are separate MOGP groups with their own bounds), so the
+piece to take is the group, and `GxSel::drawn` already decides that per frame per group.
+
+- wmo_portal: while the see-through is live, the indoor groups (MOGP `0x2000`) her chest is in, as
+  one world box per placement (every corner through the placement's transform, so a rotated
+  building's box is right), into the `SeeRooms` resource. None when she is in no indoor group.
+- static_gx/cull.rs: a group of that placement whose box lies entirely above her head and over that
+  room's footprint (grown 2 yd) is not drawn. Her own floor and the stairs reach down to her and
+  stay; walking past a house never opens it; a city WMO (Orgrimmar is one) loses only what is above
+  the room she is in, never a tower across the city. The props of those groups go with them (a prop
+  set whose referring rooms are all gone): a bed left floating where the floor was is not a storey
+  gone. So do the units standing on them (wmo_portal's `hide_units_above_her`, after the exterior
+  election, so they are back the frame she climbs up): the NPC upstairs no longer floats.
+
+History, so nobody walks it again: the first build had no height test and took the floor and the
+far walls with the roof, leaving her on a scrap of plank in open sky; a "does the box contain her,
+give or take 1.5 yd" test kept every low ceiling; a version that also asked the group to cross the
+line from the eye to her left half the upstairs standing round her (the bed, the far walls), which
+is not what BG3 does.
+
+It pays off with the plugin's `free` eye clearance (`WOWBG3_CAM_INDOOR`, the default), which lets the
+camera rise to BG3's own zoom indoors instead of pinning it under the ceiling.
+
+The storey does not pop: it fades out and back in with BG3's own per-object fade, the sixteen-step
+dissolve over the 4x4 Bayer table BG3 writes into its stencil every frame (`FadePatternOnePass.bshd`,
+`M[x%4][y%4] < k`), at BG3's own speed (`FadeOutSpeed` 5.0, the value on most objects that set one:
+a fifth of a second). cull.rs keeps each group's fade and walks it every frame; the level (0 to 16)
+rides in bits 15..19 of the item records' flags column (render.rs, synced like the fog bit), and
+static_gx.wgsl discards by it; a group fully faded is not drawn at all, and a prop set fades with the
+least faded of its rooms. The units standing up there are hidden and shown at once (their bodies are
+not static_gx draws).
+
+Not in this patch: the same treatment for bushes, skinny trees and posts, which are static_gx items rather
+than WMO groups; and big doodads (rocks, big trees) in the plugin's camera bump, which in `free`
+bumps into terrain only.
+
+diff --git a/crates/benilla-world/src/static_gx/cull.rs b/crates/benilla-world/src/static_gx/cull.rs
+index f1adab2..ebcb12d 100644
+--- a/crates/benilla-world/src/static_gx/cull.rs
++++ b/crates/benilla-world/src/static_gx/cull.rs
+@@ -130,6 +130,68 @@ fn spawn_exile(commands: &mut Commands, f: &GxFader, alpha: f32, admitted: bool)
+     ents
+ }
+ 
++/// WOW-BG3 patch 0091: the floors above her are not drawn while she is downstairs.
++///
++/// BG3 takes the storeys above the character away whole while she is on a lower one, and brings
++/// them back when she climbs up (playtest feedback, 2026-10-29: "while on the first floor the second floor
++/// should just be fully faded out, like in BG3, and then come back when you go upstairs"). The
++/// see-through (patch 0090) is only for what stands between the camera and her on her own level;
++/// walls get its opening. WoW's buildings are grouped — a roof, a floor, a room are separate MOGP
++/// groups with their own bounds — so the piece to take is the group, which `GxSel::drawn` already
++/// decides per frame.
++///
++/// Two conditions. She is in an **indoor group** of this building ([`crate::wmo_portal::SeeRooms`],
++/// MOGP `0x2000`, her chest within its box: walking past a house never opens it, and a city WMO
++/// counts only the room she is in). And the group's box lies **entirely above her head** and over
++/// that room's footprint: her own floor and the stairs reach down to her, so they stay; a tower
++/// across the city is not over her room. An earlier version also asked that the group cross the
++/// line from the eye to her, which left half the upstairs standing round her (the bed, the far
++/// walls); BG3 takes the whole storey. The first version without the height test took the floor
++/// and the far walls with the roof and left her standing on a scrap of plank in open sky
++/// (`tmp/occl20261029/shots/bed-on-0000.png`, kept as the counter-example).
++fn above_her(anchor: Vec3, room: (Vec3, Vec3), origin: Vec3, aabb: &bevy::camera::primitives::Aabb) -> bool {
++    let centre = origin + Vec3::from(aabb.center);
++    let half = Vec3::from(aabb.half_extents);
++    let (lo, hi) = (centre - half, centre + half);
++    // `HEAD` is her head above the chest the anchor sits at.
++    const HEAD: f32 = 0.7;
++    // How far beyond her room's footprint a storey above still counts as over it (yd): the floor
++    // upstairs is often wider than the room below.
++    const REACH: f32 = 2.0;
++    if lo.y < anchor.y + HEAD {
++        return false;
++    }
++    let (rlo, rhi) = room;
++    lo.x <= rhi.x + REACH && hi.x >= rlo.x - REACH && lo.z <= rhi.z + REACH && hi.z >= rlo.z - REACH
++}
++
++/// WOW-BG3 patch 0091: how fast a storey fades, in fractions of the whole fade a second: BG3's own
++/// `FadeOutSpeed`, 5.0 on most of the objects that set one (23 of 36 in Shared and Gustav's root
++/// templates and scenery; `FadeOutDelay` is 0.0 on 1554 of 1569), so a fade takes a fifth of a second.
++const FADE_SPEED: f32 = 5.0;
++
++/// One group's fade this frame: toward 1 while it is above her, back toward 0 once it is not.
++fn step_fade(
++    fades: &mut bevy::platform::collections::HashMap<(Entity, u16), f32>,
++    key: (Entity, u16),
++    gone: bool,
++    dt: f32,
++) -> f32 {
++    let f = fades.get(&key).copied().unwrap_or(0.0);
++    let f = if gone { (f + dt * FADE_SPEED).min(1.0) } else { (f - dt * FADE_SPEED).max(0.0) };
++    if f > 0.0 {
++        fades.insert(key, f);
++    } else {
++        fades.remove(&key);
++    }
++    f
++}
++
++/// A fade as BG3's sixteen dissolve steps (`static_gx.wgsl`'s `wow_fade_discard`).
++fn fade_level(f: f32) -> u8 {
++    (f * 16.0).round().clamp(0.0, 16.0) as u8
++}
++
+ /// The CPU scene walk into this frame's visible lists: frustum, farclip and the exterior window
+ /// gate per cell (conservative: overdraw, never a hole), plus the portal PVS per WMO group, the
+ /// camera's own building exempt from the gate. A re-admitted exile despawns and clears its kill
+@@ -150,6 +212,14 @@ pub(super) fn cull_cells(
+     windows: Res<crate::wmo_portal::ExteriorWindows>,
+     claim: Res<crate::wmo_portal::CameraInteriorClaim>,
+     instances: Query<&crate::wmo_portal::WmoPortalInstance>,
++    // WOW-BG3 patch 0091: where she is (the see-through's target) and the indoor room she is in,
++    // so the storeys above her can be taken out of the draw entirely.
++    see: Res<crate::see_through::SeeThrough>,
++    rooms_seen: Res<crate::wmo_portal::SeeRooms>,
++    // How far each storey group above her has faded (0 drawn, 1 gone), by placement and group, and
++    // the clock that walks it.
++    mut fades: Local<bevy::platform::collections::HashMap<(Entity, u16), f32>>,
++    time: Res<Time>,
+ ) {
+     let _t = super::gx_perf_guard(1);
+     for e in gx.pending_despawn.drain(..) {
+@@ -354,9 +424,19 @@ pub(super) fn cull_cells(
+             let Ok(inst) = instances.get(entity) else {
+                 continue;
+             };
++            // Patch 0091: the props of a storey above her fade with it (a bed left floating where
++            // the floor upstairs was is not a storey gone): a set takes the least faded of the rooms
++            // that refer to it, from the groups' fades (the WMO pass below, last frame's).
++            let set_fade = |rooms: &[u16]| -> f32 {
++                rooms
++                    .iter()
++                    .map(|&g| fades.get(&(entity, g)).copied().unwrap_or(0.0))
++                    .fold(1.0f32, f32::min)
++            };
+             let mut sel = crate::static_gx::render::GxSel {
+                 drawn: vec![false; draw.sets.len()],
+                 fog: vec![false; draw.sets.len()],
++                fade: vec![0; draw.sets.len()],
+             };
+             let mut any = false;
+             for (set, aabb) in &draw.groups {
+@@ -374,6 +454,11 @@ pub(super) fn cull_cells(
+                 if m.portal_cull && !set_admitted(&inst.visible, rooms) {
+                     continue;
+                 }
++                let f = if rooms.is_empty() { 0.0 } else { set_fade(rooms) };
++                if f >= 1.0 {
++                    continue;
++                }
++                sel.fade[usize::from(*set)] = fade_level(f);
+                 let center = draw.origin + Vec3::from(aabb.center);
+                 let radius = Vec3::from(aabb.half_extents).length();
+                 if !crate::view::within_farclip(view.farclip, cam_pos, cam_fwd, center, radius) {
+@@ -406,6 +491,9 @@ pub(super) fn cull_cells(
+         admitted.sort_unstable_by_key(|(d, _)| *d);
+         world.visible.extend(admitted.into_iter().map(|(_, v)| v));
+     }
++    // Patch 0091: the fade clock, and no state left for a placement that is gone.
++    let dt = time.delta_secs();
++    fades.retain(|(e, _), _| world.wmos.contains_key(e));
+     // WMO regions: the dev WMO toggle, then per-group admission, near-first.
+     if m.kind_visible[crate::model_render::kind_index(crate::model_render::ModelKind::Wmo)] {
+         let mut admitted: Vec<(u32, (Entity, crate::static_gx::render::GxSel))> = Vec::new();
+@@ -413,10 +501,16 @@ pub(super) fn cull_cells(
+             let Ok(inst) = instances.get(entity) else {
+                 continue;
+             };
++            // Patch 0091: she is in an indoor room of this building (wmo_portal's `SeeRooms`), so the
++            // storeys above her come out of the draw; every other building is untouched.
++            let opened = see.live().then_some(see.cuts[0].at).and_then(|a| {
++                rooms_seen.0.iter().find(|r| r.0 == entity).map(|r| (a, (r.1, r.2)))
++            });
+             let max_group = draw.groups.iter().map(|(g, _)| *g).max().unwrap_or(0);
+             let mut sel = crate::static_gx::render::GxSel {
+                 drawn: vec![false; usize::from(max_group) + 1],
+                 fog: vec![false; usize::from(max_group) + 1],
++                fade: vec![0; usize::from(max_group) + 1],
+             };
+             let mut any = false;
+             for (group, aabb) in &draw.groups {
+@@ -454,6 +548,15 @@ pub(super) fn cull_cells(
+                 {
+                     continue;
+                 }
++                // Patch 0091: a storey above her fades out (and back in when she climbs to it), and
++                // once gone is not drawn at all. The fog lane above is written either way, as it is
++                // for a group the PVS drops.
++                let gone = opened.is_some_and(|(a, room)| above_her(a, room, draw.origin, aabb));
++                let f = step_fade(&mut fades, (entity, *group), gone, dt);
++                if f >= 1.0 {
++                    continue;
++                }
++                sel.fade[usize::from(*group)] = fade_level(f);
+                 sel.drawn[usize::from(*group)] = true;
+                 any = true;
+             }
+diff --git a/crates/benilla-world/src/static_gx/render.rs b/crates/benilla-world/src/static_gx/render.rs
+index 3b7d54d..c4b3129 100644
+--- a/crates/benilla-world/src/static_gx/render.rs
++++ b/crates/benilla-world/src/static_gx/render.rs
+@@ -103,6 +103,9 @@ pub(crate) struct GxSel {
+     /// On the interior fog lane: the client's per-group `[0xca7f00]`, from the portal flood
+     /// ([`crate::wmo_portal::GroupPvs::interior_fog`]).
+     pub fog: Vec<bool>,
++    /// WOW-BG3 patch 0091: how far each group (or referrer set) has faded out, 0 to 16, BG3's
++    /// sixteen-step ordered dissolve (`static_gx.wgsl`'s `wow_fade_discard`); 0 everywhere else.
++    pub fade: Vec<u8>,
+ }
+ 
+ /// The published half the render world clones each frame. Regions sit behind `Arc`, so the clones
+@@ -124,6 +127,9 @@ use super::pool::GxTexturePool;
+ /// Record column w, bit 14: the item's interior fog lane, read by `static_gx.wgsl`. Bit 0 is the
+ /// kill bit and bits 1..=13 the probe slot.
+ const RECORD_FOG_BIT: u32 = 1 << 14;
++/// WOW-BG3 patch 0091: bits 15..=19 of the flags column, the item's fade level (0 to 16).
++const RECORD_FADE_SHIFT: u32 = 15;
++const RECORD_FADE_MASK: u32 = 31 << RECORD_FADE_SHIFT;
+ 
+ /// One coalesced draw run of adjacent live items sharing bind-group slot, pipeline bucket and
+ /// selection key; a killed item is never in one.
+@@ -153,6 +159,8 @@ struct GxCellGpu {
+     killed_applied: u32,
+     /// The [`GxSel::fog`] the records were last written from; empty until the first sync.
+     fog_applied: Vec<bool>,
++    /// WOW-BG3 patch 0091: the fade levels last written into the flags column.
++    fade_applied: Vec<u8>,
+ }
+ 
+ #[derive(Resource, Default)]
+@@ -475,9 +483,26 @@ fn prepare_static_gx(
+         render_queue.write_buffer(&gpu.record_table, 0, bytemuck::cast_slice(&gpu.records));
+         gpu.fog_applied.clone_from(&sel.fog);
+     };
++    // WOW-BG3 patch 0091: the fade sync, the same way, when a storey above her fades out or in.
++    let sync_fade = |gpu: &mut GxCellGpu, draw: &GxCellDraw, sel: &GxSel| {
++        if gpu.fade_applied == sel.fade {
++            return;
++        }
++        for (rec, item) in gpu.records.iter_mut().zip(&draw.draws) {
++            let k = item
++                .group
++                .and_then(|g| sel.fade.get(usize::from(g)).copied())
++                .unwrap_or(0)
++                .min(16);
++            rec[3] = (rec[3] & !RECORD_FADE_MASK) | (u32::from(k) << RECORD_FADE_SHIFT);
++        }
++        render_queue.write_buffer(&gpu.record_table, 0, bytemuck::cast_slice(&gpu.records));
++        gpu.fade_applied.clone_from(&sel.fade);
++    };
+     for (entity, sel) in &gx.visible_wmos {
+         if let (Some(gpu), Some(draw)) = (cache.wmos.get_mut(entity), gx.wmos.get(entity)) {
+             sync_fog(gpu, draw, sel);
++            sync_fade(gpu, draw, sel);
+         }
+     }
+     for vis in &gx.visible {
+@@ -486,6 +511,7 @@ fn prepare_static_gx(
+         };
+         if let (Some(gpu), Some(draw)) = (cache.props.get_mut(entity), gx.props.get(entity)) {
+             sync_fog(gpu, draw, sel);
++            sync_fade(gpu, draw, sel);
+         }
+     }
+ }
+@@ -578,6 +604,7 @@ fn assemble_region(
+         killed_applied: draw.killed_rev,
+         // Empty, so the first fog sync always writes.
+         fog_applied: Vec::new(),
++        fade_applied: Vec::new(),
+     })
+ }
+ 
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+index befdd65..773f9b1 100644
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -253,6 +253,23 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
+     return clamp(max(n * amp + distance(world_pos, q), 0.0) / c.w, 0.0, 1.0);
+ }
+ 
++// WOW-BG3 patch 0091: BG3's per-object fade. Every frame BG3 draws one full-screen triangle that writes
++// only stencil (`FadePatternOnePass.bshd`): `M[int(FragCoord.x) % 4][int(FragCoord.y) % 4] + 16` over the
++// plain 0..15 Bayer table, indexed `[x][y]`; a fading piece is drawn with a stencil test against a
++// reference walking sixteen steps. Here the same comparison per fragment: at level `k` the cells whose
++// value is under `k` are gone, so 16 is the whole piece gone and 0 the whole piece drawn.
++fn wow_fade_discard(k: u32, frag: vec2<f32>) -> bool {
++    var m = array<u32, 16>(
++        0u, 8u, 2u, 10u,
++        12u, 4u, 14u, 6u,
++        3u, 11u, 1u, 9u,
++        15u, 7u, 13u, 5u
++    );
++    let ix = u32(i32(frag.x % 4.0));
++    let iy = u32(i32(frag.y % 4.0));
++    return m[ix * 4u + iy] < k;
++}
++
+ // Does BG3's see-through take this fragment? (BG3: `v · k − 0.5 · k < 0`, `k` the object's own
+ // see-through scalar, 1 for whatever WoW draws through here.)
+ fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
+@@ -280,6 +297,11 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
+     if (wow_light.fog_params.w > 0.0 && eye_z > wow_light.fog_params.w) {
+         discard;
+     }
++    // Patch 0091: a storey above her fading out or back in, BG3's own per-object fade.
++    let fade = (recs[in.word & 0xffffu].w >> 15u) & 31u;
++    if (fade > 0u && wow_fade_discard(fade, in.position.xy)) {
++        discard;
++    }
+     // Patch 0090: BG3's see-through. This pass draws the trees, rocks, fences, buildings and
+     // interior props, so it is where most of the cut happens.
+     if (wow_cut(in.world_position.xyz, in.uv)) {
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+index a892e57..ec68be9 100644
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -249,6 +249,14 @@ impl Plugin for WmoPortalPlugin {
+         .init_resource::<CameraInteriorClaim>()
+         .init_resource::<ExteriorWindows>()
+         .init_resource::<WmoCullProbe>()
++        .init_resource::<SeeRooms>()
++        // Patch 0091: after the exterior election wrote the body roots' verdicts.
++        .add_systems(
++            PostUpdate,
++            hide_units_above_her
++                .after(crate::exterior_cull::ExteriorCullSet)
++                .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
++        )
+         .add_systems(
+             Update,
+             (
+@@ -273,6 +281,52 @@ const MAX_FLOOR_DROP: f32 = 1760.0;
+ /// (yd, WMO model space). A doorway, a porch step or a figure's own width puts her a little out.
+ const ANCHOR_ROOM_MARGIN: f32 = 3.0;
+ 
++/// Patch 0091: per WMO placement, the world box of the indoor groups (MOGP `0x2000`) her chest is in
++/// this frame, while the see-through is live. The ceiling rule (`static_gx::cull`) takes every group
++/// of that placement that lies above her head over that box: the floor upstairs while she is
++/// downstairs, back the moment she climbs to it. Empty when she is in no indoor group.
++#[derive(Resource, Default)]
++pub(crate) struct SeeRooms(pub(crate) Vec<(Entity, Vec3, Vec3)>);
++
++/// MOGP's indoor flag.
++const MOGP_INDOOR: u32 = 0x2000;
++
++/// Patch 0091: a unit standing on a storey that is gone (its feet above her head, over the room she
++/// is in) is not drawn either, as BG3 hides who stands on a level it has taken away; without this
++/// the NPC upstairs in the Lion's Pride Inn floated where the floor had been. Runs after the
++/// exterior election, which writes every body root's verdict each frame, so the next frame's
++/// election brings the unit back once she climbs up.
++fn hide_units_above_her(
++    rooms: Res<SeeRooms>,
++    see: Res<crate::see_through::SeeThrough>,
++    mut units: Query<(&GlobalTransform, &mut Visibility), With<crate::world_unit::WorldUnit>>,
++) {
++    if !see.live() || rooms.0.is_empty() {
++        return;
++    }
++    // Her head above the chest the see-through's target sits at, and the reach past her room's
++    // footprint, as `static_gx::cull`'s storey rule has them.
++    const HEAD: f32 = 0.7;
++    const REACH: f32 = 2.0;
++    let her = see.cuts[0].at;
++    for (gt, mut vis) in &mut units {
++        let p = gt.translation();
++        if p.y < her.y + HEAD {
++            continue;
++        }
++        let over = rooms.0.iter().any(|(_, lo, hi)| {
++            p.x >= lo.x - REACH && p.x <= hi.x + REACH && p.z >= lo.z - REACH && p.z <= hi.z + REACH
++        });
++        if over && *vis != Visibility::Hidden {
++            *vis = Visibility::Hidden;
++        }
++    }
++}
++
++/// Patch 0091: how far outside an indoor group's own box her chest still counts as in it (yd, model
++/// space): a doorway or a stair edge puts her a little out.
++const SEE_ROOM_MARGIN: f32 = 0.5;
++
+ /// Is `p` (WMO model space, WoW axes) inside any group's box, grown by `margin`? Patch 0090's
+ /// cheap gate: only the placement she stands in runs the second flood.
+ fn inside_any_group(model: &WmoModel, p: [f32; 3], margin: f32) -> bool {
+@@ -295,7 +349,10 @@ fn compute_wmo_pvs(
+     mut camera_fog: ResMut<CameraWmoFog>,
+     mut camera_claim: ResMut<CameraInteriorClaim>,
+     mut camera_windows: ResMut<ExteriorWindows>,
++    // Patch 0091: the indoor rooms she is in, for the ceiling rule.
++    mut see_rooms: ResMut<SeeRooms>,
+ ) {
++    see_rooms.0.clear();
+     // No world camera yet: keep last frame's sets, all visible.
+     let Some((cam_t, proj)) = cam.iter().next() else {
+         return;
+@@ -400,6 +457,29 @@ fn compute_wmo_pvs(
+                     *v |= *h;
+                 }
+             }
++            // Patch 0091: the indoor groups she stands in, as one world box (every corner through the
++            // placement's transform, so a rotated building's box is the right one).
++            let mut room: Option<(Vec3, Vec3)> = None;
++            for n in model.group_nav.iter().filter(|n| n.flags & MOGP_INDOOR != 0) {
++                let inside = (0..3).all(|i| {
++                    a_local[i] >= n.bbox_min[i] - SEE_ROOM_MARGIN && a_local[i] <= n.bbox_max[i] + SEE_ROOM_MARGIN
++                });
++                if !inside {
++                    continue;
++                }
++                for k in 0..8 {
++                    let c = [
++                        if k & 1 == 0 { n.bbox_min[0] } else { n.bbox_max[0] },
++                        if k & 2 == 0 { n.bbox_min[1] } else { n.bbox_max[1] },
++                        if k & 4 == 0 { n.bbox_min[2] } else { n.bbox_max[2] },
++                    ];
++                    let w = world_from_local.transform_point3(wow_to_bevy(c));
++                    room = Some(room.map_or((w, w), |(lo, hi)| (lo.min(w), hi.max(w))));
++                }
++            }
++            if let Some((lo, hi)) = room {
++                see_rooms.0.push((entity, lo, hi));
++            }
+         }
+         if inst.bypass_change_detection().visible != fresh.visible {
+             inst.bypass_change_detection().visible = fresh.visible;
