@@ -525,6 +525,7 @@ function M.Start(runId)
         local problems = {}
         for _, step in ipairs({
             function() arena({Action = "Lead", On = false}) end,
+            function() standIn({Action = "ClearSurfaces", Target = state.Hero or Hero.Uuid()}) end,
             function() standIn({Action = "Back"}) end,
             function() standIn({Action = "Return", Target = state.Hero or Hero.Uuid()}) end,
             function() wait(30) end,

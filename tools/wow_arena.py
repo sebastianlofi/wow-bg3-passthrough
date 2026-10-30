@@ -26,18 +26,20 @@ and writes, for a square of SIZE metres centred on the WoW point:
                  (--storeys 1, see STOREY_CLEAR), a second floor over the ground's for a second pool
                  subgrid that lies one tile further +X (world mode keeps one subgrid to a lattice
                  slot): record column c is the ground's column c + 1, the last one the next
-                 square's first. Flags 1 walkable, 4 | 8 a seam (where it meets the ground:
-                 SubgridEdge and SubgridIntersection); on base storey_base_m (arena.json), and
-                 where the storey has no floor of its own it carries the ground's tile wherever
-                 that lies over the base (see the code). Not written with --storeys 0.
+                 square's first. Flags 1 walkable, 4 | 8 a seam (where it meets the ground: SubgridEdge
+                 and SubgridIntersection), 8 alone on the rest inside the square (see the code); on base
+                 storey_base_m (arena.json), and where the storey has no floor its tile lies
+                 STOREY_FILL_M over that base. Not written with --storeys 0.
   seams.bin      (N*N) records <u8 flags, f32 floor> for the ground's own section where the storey
                  meets it: 4 | 8 a seam on a ground tile, 1 | 4 | 8 a tile of the storey's copied
-                 into the ground at that floor (BG3 m), 0 elsewhere. Not written with --storeys 0.
+                 into the ground at that floor (BG3 m), 8 alone a tile under the storey, 0 elsewhere.
+                 Not written with --storeys 0.
   triangles.bin  float32 x 9 per triangle in BG3 world metres: WoW's terrain mesh (four triangles per
                  4.17 yd cell, ADT holes left out), flat tiles where a walkable floor is on no other
                  surface, plus 4.5 m walls along walkable/blocked tile edges
   kinds.bin      one byte per triangle: 0 terrain, 4 flat floor WoW draws nothing at, 1 wall, 2 WMO,
-                 3 M2 (the plugin's camera clearance pushes BG3's eye out of terrain and WMOs only)
+                 3 M2, 5 M2 at least BIG_M2_YD thick (the plugin's camera clearance bumps into
+                 terrain and those; benilla's patch 0092 fades the thinner ones)
                  With --models, WoW's own collision models follow (link/tools/wow_vmap.py: the
                  server's vmaps, WMO buildings and M2 doodads such as trees and fences), clipped to
                  the square plus --margin metres; `--models wmo` leaves the M2s out, as WoW's spell
@@ -96,8 +98,17 @@ STOREY_MARGIN = 32
 # polygon there may take a stair's or a ramp's face (STOREY_RAMP_DEG up to the slope limit; never a
 # level one, so a sill or a wall's top leads nowhere).
 STOREY_RAMP_DEG = 15.0
-# A square keeps no storey when more than this share of it stands over walkable ground above its base.
-STOREY_WRONG_SHARE = 0.1
+# Where a storey has no floor its tile lies this far (m) over its base, out of every height lookup.
+STOREY_FILL_M = 1000.0
+# A piece of storey joins the ground within this much (m) of the top of its way up.
+STOREY_JOIN_M = 0.5
+
+# An M2 at least this thick (yards, the smallest side of its collision model in its own axes, times its
+# scale, so how it is turned does not matter) is big: the camera
+# bumps into it. benilla's patch 0092 draws the same line (phase_out::SMALL_YD). Counted over Elwynn's and
+# Durotar's M2s: trees 52% big, rocks 62%, posts 1%; no fence, barrel or bush. Height counts too: a low wide
+# piece (a planter) is seen over, and pulling the camera in for it would be wrong.
+BIG_M2_YD = 4.0
 
 def detour_polys(path):
     raw = path.read_bytes()
@@ -452,13 +463,13 @@ def main():
     # WoW's collision models, cut from the vmaps for the square plus the margin, in WoW space. The z
     # range keeps what is near the ground: 30 yards below the lowest terrain to 100 above the highest
     # (the plugin refuses a set spanning more than 400 m in height).
-    wt, sizes, surfaces = [], [], None
+    wt, sizes, thick, surfaces = [], [], [], None
     if a.models:
         import wow_vmap
         reach_yd = (half + a.margin) / YD
         zlo, zhi = min(terr.values()) - 30, max(terr.values()) + 100
         wt, sizes = wow_vmap.VMap(a.vmaps, a.map).triangles(wx - reach_yd, wx + reach_yd, wy - reach_yd, wy + reach_yd,
-                                                        zlo, zhi, m2=a.models == 'all')
+                                                        zlo, zhi, m2=a.models == 'all', thickness=thick)
         surfaces = Surfaces(wt)
 
     # Floors: the surface WoW draws in the tile's middle column nearest to the movement map's polygon
@@ -636,25 +647,34 @@ def main():
                     if up:
                         cand[(r, c)] = [min(up)]
             seen = reach()
-        # BG3 takes a point's tile from the subgrid with the highest base at or under it (and a little
-        # over the point: a hall 1.3 m under a base still went to the storey), and Place takes no tile
-        # under its subgrid's base, so the base lies under the storey's lowest tile. Where much of the
-        # storey stands over walkable ground above that base a walker on the ground is the storey's,
-        # on the floor above (the Northshire abbey: 1590 of 1944 tiles, a walk across its hall ended
-        # on the level 14 m up). No base serves both there: such a square keeps its ground alone.
-        own = [rc for rc in seen if 0 <= rc[0] < n and 1 <= rc[1] <= n]
-        low = [seen[rc] for rc in own] + [floor_yd[q] for rc, z in seen.items() for q in nbrs(rc)
-                                          if walk_ring.get(q) and joins(floor_yd[q], z) and 0 <= q[0] < n and 1 <= q[1] <= n]
-        if sum(1 for rc in own if walk_ring.get(rc) and floor_yd[rc] >= min(low) - 0.5 / YD) > STOREY_WRONG_SHARE * len(own):
-            seen = {}
         storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
         # Where the storey and the ground meet (a walker steps from one onto the other): both tiles
         # are seams, the only tiles BG3's pathfinder changes subgrids on (flags 4 SubgridEdge and 8
         # SubgridIntersection in the plugin's Place).
         seam_s, seam_g = set(), {}
-        for rc, z in list(seen.items()):
+        # Each piece of the storey joins the ground at the top of its way up only: below that it would
+        # repeat the ground's stair, and a point on the stair takes the higher twin.
+        piece = {}
+        for start in seen:
+            if start not in piece:
+                piece[start] = start
+                todo = [start]
+                while todo:
+                    t = todo.pop()
+                    for q in nbrs(t):
+                        if q in seen and q not in piece and joins(seen[q], seen[t]):
+                            piece[q] = start
+                            todo.append(q)
+        top = {}
+        for rc, z in seen.items():
             for q in nbrs(rc):
                 if walk_ring.get(q) and joins(floor_yd[q], z):
+                    top[piece[rc]] = max(top.get(piece[rc], floor_yd[q]), floor_yd[q])
+        for rc in [rc for rc in seen if piece[rc] in top and seen[rc] < top[piece[rc]] - STOREY_JOIN_M / YD]:
+            del seen[rc]
+        for rc, z in list(seen.items()):
+            for q in nbrs(rc):
+                if walk_ring.get(q) and joins(floor_yd[q], z) and floor_yd[q] >= top[piece[rc]] - STOREY_JOIN_M / YD:
                     seam_s.add(rc)
                     seam_g.setdefault(q, None)
                     # BG3 changes subgrids where two overlap only on a tile both have, each way: the
@@ -667,37 +687,30 @@ def main():
                         seam_g[rc] = by + (z - wz) * YD
         storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
         # The storey's section as the plugin takes it, on base storey_base_m. BG3 takes a point's tile
-        # from the subgrid with the highest base at or under it, so wherever the storey has no floor
-        # of its own and the ground lies over its base, it carries the ground's tile (walkable or not,
-        # at the ground's floor): a point there is the storey's, and must find the ground (seen in
-        # the Lion's Pride: a base under the ground sent every point upstairs to the ground floor; one
-        # under a raised ground blocked that ground).
-        storey_base = math.floor((min(storey.values()) - 0.5) * 50) / 50 if storey else None
+        # from the subgrid it last looked in, whatever the height, unless that tile has the
+        # Intersection or the Edge bit: then the tile holding the height wins (at the nearest, a blocked
+        # tile counts too, so the tiles without a floor lie far overhead). So every tile inside the square
+        # (the perimeter has Edge) has Intersection here and under the storey in the ground: flag 8
+        # without 4, which makes no crossing.
+        storey_base = math.floor(min(storey.values()) * 50) / 50 if storey else None
+        over = set(storey)
         with open(out / 'storey.bin', 'wb') as f:
             for r in range(n):
                 for c in range(1, n + 1):
                     s = storey.get((r, c))
-                    g = floor_ring[(r, c)]
+                    inner = 8 if 0 < r < n - 1 and 1 < c < n else 0
                     if s is not None:
-                        f.write(struct.pack('<Bf', 1 | (12 if (r, c) in seam_s else 0), s))
-                    elif storey_base is not None and g >= storey_base:
-                        # A copy of the ground: a seam in both where it is walkable, so a walker on
-                        # the ground there can be in either subgrid (BG3's pathfinder changes subgrids
-                        # only on seams; without them a hillside rising over the base lost its paths).
-                        if walk_ring[(r, c)]:
-                            f.write(struct.pack('<Bf', 13, g))
-                            if c < n and (r, c) not in seam_g:
-                                seam_g[(r, c)] = None
-                        else:
-                            f.write(struct.pack('<Bf', 0, g))
+                        f.write(struct.pack('<Bf', 1 | (12 if (r, c) in seam_s else inner), s))
                     else:
-                        f.write(struct.pack('<Bf', 0, storey_base if storey_base is not None else math.nan))
+                        f.write(struct.pack('<Bf', inner, storey_base + STOREY_FILL_M if storey_base is not None else math.nan))
         with open(out / 'seams.bin', 'wb') as f:
             for r in range(n):
                 for c in range(n):
                     h = seam_g.get((r, c))
-                    f.write(struct.pack('<Bf', 0 if (r, c) not in seam_g else 12 if h is None else 13,
-                                        math.nan if h is None else h))
+                    fl = 12 if h is None else 13
+                    if (r, c) not in seam_g:
+                        fl = 8 if (r, c) in over and 0 < r < n - 1 and 0 < c < n - 1 else 0
+                    f.write(struct.pack('<Bf', fl, math.nan if h is None else h))
     # spans.bin: each tile's ground height range (lowest, highest in BG3 metres) over its corners and
     # middle: the terrain's on terrain floors, the floor alone elsewhere (models, water, polygons).
     corner_h = {}
@@ -810,14 +823,17 @@ def main():
         model_dropped = len(model) - budget
         model = [model[i] for i in sorted(keep)]
         sizes = [sizes[i] for i in sorted(keep)]
+        thick = [thick[i] for i in sorted(keep)]
     tris.extend(model)
     with open(out / 'triangles.bin', 'wb') as f:
         for t in tris:
             f.write(struct.pack('<9f', *t))
-    # kinds.bin: one byte per triangle (the plugin's camera clearance tests terrain and WMOs only):
-    # 0 terrain mesh, 4 flat floor where WoW draws nothing (water surface, hole), 1 wall, 2 WMO, 3 M2.
+    # kinds.bin: one byte per triangle: 0 terrain mesh, 4 flat floor where WoW draws nothing (water
+    # surface, hole), 1 wall, 2 WMO, 3 M2, 5 big M2. The design rule for what stands between the camera
+    # and her: rocks and big trees the camera bumps into, bushes, skinny trees and posts fade out whole.
+    # The line is drawn on WoW's collision, the smallest side of the model in its own axes.
     kinds = (bytes([0]) * mesh_tris + bytes([4]) * (terrain_tris - mesh_tris) + bytes([1]) * wall_tris
-             + bytes(3 if s < 0 else 2 for s in sizes))
+             + bytes((5 if t >= BIG_M2_YD else 3) if s < 0 else 2 for s, t in zip(sizes, thick)))
     assert len(kinds) == len(tris)
     (out / 'kinds.bin').write_bytes(kinds)
 
@@ -827,6 +843,7 @@ def main():
             'island_tiles_blocked': islands, 'triangles': len(tris), 'wall_quads': walls,'detour_polys_near': len(near),
             'terrain_triangles': terrain_tris, 'wall_triangles': wall_tris, 'model_triangles': len(model),
             'model_m2_triangles': sum(1 for s in sizes if s < 0), 'model_triangles_dropped': model_dropped,
+            'model_big_m2_triangles': sum(1 for s, t in zip(sizes, thick) if s < 0 and t >= BIG_M2_YD),
             'wall_quads_dropped': walls_dropped, 'models': a.models or 'off', 'walls': keep_walls,
             'walkable_floors_on': floor_kind,
             'slope_limit_deg': a.slope_limit, 'steep_polys': a.steep_polys,

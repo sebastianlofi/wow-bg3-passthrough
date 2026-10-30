@@ -50,9 +50,9 @@ MID = 32 * GRID            # vmap space x, y = MID - WoW x, MID - WoW y
 SPLIT = 8                  # cache cells per ADT tile side
 CELL = GRID / SPLIT
 MAGIC = b'VMAP_7.0'
-CACHE_MAGIC = b'WBVMC001'
+CACHE_MAGIC = b'WBVMC003'
 M2, HAS_BOUND, NO_LOS = 1, 4, 8
-REC = 10                   # floats per cached triangle: 3 corners (WoW x, y, z), the object's size
+REC = 11                   # floats per cached triangle: 3 corners (WoW x, y, z), the object's size and thickness
 VMAPS = (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/storage/mangosd/extracted-data/vmaps'
 CACHE = Path(os.environ.get('WOW_VMAP_CACHE') or Path(__file__).resolve().parents[2] / 'tmp' / 'vmapcache')
 
@@ -243,6 +243,7 @@ class VMap:
         self.dir, self.map = Path(vmaps), map_id
         self.cache = Path(cache) / ('%03d' % map_id) if cache else None
         self.models, self.tiles, self.cells = {}, {}, {}
+        self.thick = {}
         self.stats = {'cells_cut': 0, 'cells_read': 0, 'models_read': 0}
 
     def tile_path(self, ty, tx):
@@ -267,6 +268,19 @@ class VMap:
             self.models[name] = read_model(p) if p.exists() else []
             self.stats['models_read'] += 1
         return self.models[name]
+
+    def thickness(self, name):
+        """A model's smallest side in its own axes (yards, unscaled): how a piece is turned must not change
+        what it is, and a fence at 45 degrees has a world box as wide as it is long."""
+        if name not in self.thick:
+            lo, hi = [1e9] * 3, [-1e9] * 3
+            for _, _, verts, _ in self.model(name):
+                for i in range(3):
+                    v = verts[i::3]
+                    if v:
+                        lo[i], hi[i] = min(lo[i], min(v)), max(hi[i], max(v))
+            self.thick[name] = max(0.0, min(hi[i] - lo[i] for i in range(3)))
+        return self.thick[name]
 
     # ---- cells ----
     def _file(self, c):
@@ -316,6 +330,7 @@ class VMap:
             if not groups:
                 continue
             size = max(bx1 - bx0, by1 - by0, bz1 - bz0)
+            thick = self.thickness(s.name) * s.scale
             tag = -size if s.flags & M2 else size
             m, t = placement(s)
             for lo, hi, verts, idx in groups:
@@ -337,10 +352,12 @@ class VMap:
                         if x0 >= cx0 and x1 <= cx1 and y0 >= cy0 and y1 <= cy1:
                             out[c].extend(tri)
                             out[c].append(tag)
+                            out[c].append(thick)
                         else:
                             for piece in clip_tri(tri, cx0, cx1, cy0, cy1):
                                 out[c].extend(piece)
                                 out[c].append(tag)
+                                out[c].append(thick)
         return out
 
     def load(self, cells):
@@ -367,12 +384,14 @@ class VMap:
                     print('wow_vmap: cache write failed: %s' % e, file=sys.stderr)
 
     # ---- queries ----
-    def triangles(self, x0, x1, y0, y1, z0=-1e9, z1=1e9, m2=True):
+    def triangles(self, x0, x1, y0, y1, z0=-1e9, z1=1e9, m2=True, thickness=None):
         """Collision triangles of every model instance in a WoW box (yards), clipped to its x and y
         sides; z only filters (a triangle wholly above z1 or below z0 is left out).
         Returns (tris, sizes): tris flat, 9 floats per triangle (WoW world x, y, z of 3 corners);
         sizes: per triangle, the largest side of its instance's bounds (yards), negative for M2s.
-        m2=False leaves M2 doodads (trees, fences, props) out, like vmangos's LoS."""
+        m2=False leaves M2 doodads (trees, fences, props) out, like vmangos's LoS.
+        thickness: a list to fill per triangle with the smallest side of its instance's model, in the
+        model's own axes times its scale (yards), which is how the camera tells a big tree from a post."""
         ci0, ci1 = int(math.floor((MID - x1) / CELL)), int(math.floor((MID - x0) / CELL))
         cj0, cj1 = int(math.floor((MID - y1) / CELL)), int(math.floor((MID - y0) / CELL))
         cells = [(ci, cj) for ci in range(ci0, ci1 + 1) for cj in range(cj0, cj1 + 1)]
@@ -399,9 +418,13 @@ class VMap:
                         for piece in clip_tri(d[k:k + 9], x0, x1, y0, y1):
                             tris.extend(piece)
                             sizes.append(tag)
+                            if thickness is not None:
+                                thickness.append(d[k + 10])
                         continue
                 tris.extend(d[k:k + 9])
                 sizes.append(tag)
+                if thickness is not None:
+                    thickness.append(d[k + 10])
         return tris, sizes
 
 

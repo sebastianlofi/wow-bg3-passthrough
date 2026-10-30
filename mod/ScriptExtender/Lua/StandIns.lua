@@ -388,6 +388,14 @@ function M.Start(runId)
                     end
                 end
                 return {Left = left, Asked = asked, Near = near}
+            elseif c.Action == "ClearSurfaces" then
+                -- World mode stops (a hearthstone, a graveyard port, /wowbg3 tp): BG3's surfaces stay at
+                -- their BG3 coordinates while the WoW point those coordinates stand for changes, so a
+                -- Grease patch would show up on the new place's ground (its inn's floor).
+                local u = c.Target  -- the hero, not one of the stand-ins live() is for
+                assert(type(u) == "string", "ClearSurfaces needs a Target")
+                for _, layer in ipairs({"Ground", "Cloud"}) do Osi.RemoveSurfaceLayer(u, layer, tonumber(c.Radius) or 130.0) end
+                return {Cleared = u}
             elseif c.Action == "Rescue" then
                 -- A party member that fell off the treadmill's ground (world_bridge.py's fall guard per
                 -- member) back to where it last stood on WoW ground: no home

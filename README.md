@@ -196,6 +196,9 @@ What works is listed above; this is what does not, or has not been tried:
   armour trails behind the character and can clip.
 - **Terrain.** Some ground is walkable in BG3 where WoW would stop you, like some steep hills and
   slopes, so the party can get to places a WoW character cannot.
+- **Swimming and flying NPCs.** BG3 cannot swim, and there is no handling for either yet. Deep water is
+  a walkable surface, so a mob under the water or in the air probably fights on the surface or the
+  ground below it. This has not been tested.
 - **Spell effects.** Some spells' visual effects are missing or only partly drawn on WoW's picture: the
   spell still works by BG3's rules, you just do not see all of it.
 - **Picture.** Enemy vision cones show on WoW's ground while you sneak, but their edges are ragged

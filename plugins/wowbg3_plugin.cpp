@@ -654,12 +654,14 @@ void patch_remove(RawPatchMap* m, glm::ivec2 p, bg3se::AiSubgridId id) {
     RawPatchNode* n = patch_find(m, patch_key(p));
     if (n == nullptr) return;
     auto& a = n->Ids;
-    for (std::uint32_t i = 0; i < a.Size; ++i) {
-        if (a.Buf[i] != id) continue;
+    for (std::uint32_t i = 0; i < a.Size;) {
+        if (a.Buf[i] != id) {
+            ++i;
+            continue;
+        }
         const std::uint32_t last = a.Size - 1;
         __atomic_store_n(&a.Buf[i], a.Buf[last], __ATOMIC_RELEASE);
         __atomic_store_n(&a.Size, last, __ATOMIC_RELEASE);
-        return;
     }
 }
 
@@ -788,6 +790,43 @@ std::string occupants_json(int k, PoolSub const& s, Occupants const& o) {
         j += buf;
     }
     return j + "]}";
+}
+
+// A storey (a subgrid one tile off the lattice, wow_arena.py storey.bin) stands on both sides of the
+// ground in its patches' lists, [storey, ground, storey]: with the ground first BG3's paths from the
+// ground never found the storey (from the storey they found the ground), with the storey first the
+// reverse. No storey at a patch: the list is left as it is. Readers on other threads see Size last.
+void pool_storeys_first(PoolState const& p, RawPatchMap* m, std::vector<glm::ivec2> const& patches) {
+    for (auto q : patches) {
+        RawPatchNode* n = patch_find(m, patch_key(q));
+        if (n == nullptr) continue;
+        auto& a = n->Ids;
+        std::vector<bg3se::AiSubgridId> st, gr;
+        for (std::uint32_t i = 0; i < a.Size; ++i) {
+            const auto id = a.Buf[i];
+            bool storey = false;
+            for (auto const& b : p.Subs) {
+                if (b.Id == id && b.Moved && b.Xg % kCellTiles != 0) storey = true;
+            }
+            auto& v = storey ? st : gr;
+            if (std::find(v.begin(), v.end(), id) == v.end()) v.push_back(id);
+        }
+        std::vector<bg3se::AiSubgridId> want = st;
+        want.insert(want.end(), gr.begin(), gr.end());
+        if (!gr.empty()) want.insert(want.end(), st.begin(), st.end());
+        if (want.size() > a.Capacity) {
+            const std::uint32_t cap = std::max<std::uint32_t>(8, (std::uint32_t)want.size() * 2);
+            auto* buf = static_cast<bg3se::AiSubgridId*>(g_api.Alloc(cap * sizeof(bg3se::AiSubgridId)));
+            if (buf == nullptr) continue;
+            std::memcpy(buf, want.data(), want.size() * sizeof(bg3se::AiSubgridId));
+            __atomic_store_n(&a.Buf, buf, __ATOMIC_RELEASE);
+            __atomic_store_n(&a.Capacity, cap, __ATOMIC_RELEASE);
+            __atomic_store_n(&a.Size, (std::uint32_t)want.size(), __ATOMIC_RELEASE);
+            continue;
+        }
+        for (std::uint32_t i = 0; i < want.size(); ++i) __atomic_store_n(&a.Buf[i], want[i], __ATOMIC_RELEASE);
+        __atomic_store_n(&a.Size, (std::uint32_t)want.size(), __ATOMIC_RELEASE);
+    }
 }
 
 // Seam flags: every perimeter tile is an edge; a side that meets another placed pool subgrid
@@ -1160,6 +1199,7 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
     sg->WorldPos = bg3se::AiWorldPos{.Xglobal = xg, .Zglobal = zg, .Xlocal = 0.0f, .Zlocal = 0.0f, .Y = baseY};
     const auto list = patches_of(xg, zg, kCellTiles, kCellTiles);
     int added = 0;
+    const auto left = s.Moved ? s.Live : s.Patches;
     for (auto q : list) {
         if (patch_add(m, q, s.Id) && patch_check(p.Grid, q, s.Id)) ++added;
     }
@@ -1169,6 +1209,8 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
     s.Zg = zg;
     s.BaseY = baseY;
     s.Live = list;
+    pool_storeys_first(p, m, left);
+    pool_storeys_first(p, m, list);
     pool_seams(p);
     pool_bounds(p);
     if (client) {
@@ -1276,7 +1318,7 @@ struct WowTri {
 // What a triangle is (arena-triangles.kinds, one byte each, from wow_arena.py via world_bridge.py):
 // 0 WoW's terrain mesh, 1 a synthetic wall along walkable/blocked tile edges, 2 a WMO (building),
 // 3 an M2 doodad (tree, fence), 4 a flat floor WoW draws nothing at (deep water's surface, an ADT
-// hole). Every query sees them all; BG3's camera clearance only the kinds WoW's camera collides
+// hole), 5 a big M2 (a boulder, a big tree: at least 4 yd on the smallest side of WoW's collision). Every query sees them all; BG3's camera clearance only the kinds WoW's camera collides
 // with (terrain and WMOs).
 constexpr std::uint32_t kKindAll = ~0u, kCameraKinds = (1u << 0) | (1u << 2);
 
@@ -2811,9 +2853,9 @@ constexpr float kCeilingMarginM = 0.45f;
 //         chest and stays under the ceiling over her. It never sits in a wall, but indoors it is
 //         pinned: measured in the Lion's Pride Inn, the served eye stopped at z 62.55 whatever the
 //         zoom while BG3's own eye wanted 6.51 m more.
-//   free  the default. The line test runs against **terrain only** (kTerrainKinds): hills and
-//         cliffs still push the eye in, walls and roofs do not, because benilla opens or drops
-//         them. The eye may not sit in a face (a ray from the eye toward her chest that hits a
+//   free  the default. The line test runs against **terrain and big doodads** (kBumpKinds): hills,
+//         cliffs, boulders and big trees push the eye in, walls and roofs do not, because benilla
+//         opens or drops them. The eye may not sit in a face (a ray from the eye toward her chest that hits a
 //         terrain, WMO or doodad face within kEyeSolidM moves it past that face), nor in a doodad
 //         (an M2 face within kEyeInM2M on the way to her). Indoors with her it may rise through the
 //         roof, which 0091 then takes away. The unroof walk (`g_unroof`, WOWBG3_CAM_UNROOF=1) pulled
@@ -2823,19 +2865,22 @@ constexpr float kCeilingMarginM = 0.45f;
 //         cut is live, and the walk only hurt: under the inn's eave it put the eye at 3.6 yd in the
 //         porch planks with her out of view, once in a pumpkin. Off by default since 2026-10-29
 //         (proved both ways at the inn: `tmp/occl20261029/eaves.sh`, sheets ron*/roff*).
-// Not covered: big doodads (trees, rocks placed as M2s) are not in either kind set, because the
-// arena triangles do not tell a big tree from a bush, and bushes are meant to phase out.
+// Big doodads (a boulder, a big tree: kind 5, at least 4 yd on the smallest side of WoW's collision) push the eye in
+// like a hill. Thinner ones never do: benilla's patch 0092 fades them, and it draws the same line on
+// the same hulls, so a piece does one or the other. A big tree's canopy is not in WoW's collision, so
+// the camera bumps its trunk only.
 enum class IndoorMode { Hold, Free };
 IndoorMode g_indoor = IndoorMode::Free;
 bool g_unroof = false;  // free: the unroof walk (IndoorMode); WOWBG3_CAM_UNROOF=1 turns it on
 constexpr float kEyeSolidM = 1.5f;  // free: a face nearer than this to the eye is one it sits in
 // What the eye may not sit in: terrain, buildings and WoW's doodads (M2s: a pumpkin, a cart, a crate).
-// Only the first two push the eye in along the line; a doodad is never bumped into, but an eye inside
-// one is a picture of its inside (2026-10-29: under the Lion's Pride Inn's eave the eye ended up in a
+// Terrain and big doodads push the eye in along the line; a small doodad is never bumped into, but an eye
+// inside one is a picture of its inside (2026-10-29: under the Lion's Pride Inn's eave the eye ended up in a
 // Hallow's End pumpkin).
-constexpr std::uint32_t kM2Kinds = 1u << 3, kSolidKinds = kCameraKinds | kM2Kinds;
+constexpr std::uint32_t kM2Kinds = (1u << 3) | (1u << 5), kSolidKinds = kCameraKinds | kM2Kinds;
 constexpr float kEyeInM2M = 0.5f;   // free: an M2 face this near on the way to her: the eye is in it
-constexpr std::uint32_t kTerrainKinds = 1u << 0;  // free: what the eye bumps into on the line
+constexpr std::uint32_t kTerrainKinds = 1u << 0;
+constexpr std::uint32_t kBumpKinds = kTerrainKinds | (1u << 5);  // free: what the eye bumps into on the line
 constexpr float kEyeEaseOutMps = 3.0f;
 constexpr float kLookReachM = 80.0f;     // how far along BG3's forward line its look point is searched
 constexpr float kLookNearM = 4.0f;       // a look point farther than this from her feet is not her
@@ -3113,8 +3158,8 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     glm::vec3 n{};
     const bool free = g_indoor == IndoorMode::Free;
     // What the eye bumps into on the line from her chest: terrain and buildings in `hold`, terrain
-    // alone in `free` (see IndoorMode).
-    const std::uint32_t lineKinds = free ? kTerrainKinds : kCameraKinds;
+    // and big doodads in `free` (see IndoorMode).
+    const std::uint32_t lineKinds = free ? kBumpKinds : kCameraKinds;
     if (wow_closest(*r, chest, eye0, t, n, lineKinds)) {
         f = std::max(0.0f, t - kEyeMarginM / len);
     }
@@ -5657,7 +5702,7 @@ extern "C" BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3
     if (char const* v = std::getenv("WOWBG3_CAM_UNROOF"); v != nullptr && *v != 0) g_unroof = std::strcmp(v, "0") != 0;
     logf("camera: unroof walk %s", g_unroof ? "on" : "off");
     logf("camera: %s", g_indoor == IndoorMode::Free
-                           ? "free (bumps terrain only; never in a wall or a doodad)"
+                           ? "free (bumps terrain and big doodads; never in a wall or a doodad)"
                            : "hold (bumps terrain and buildings, held under the ceiling)");
     int rc = 0;
     rc |= host->add_setting(self, "channel", BG3LE_SETTING_INT, &g_set_channel, 0, 0);

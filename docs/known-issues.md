@@ -85,6 +85,10 @@ This is the first public version. What we know is missing or rough:
   The weakest mobs therefore hit a little harder than WoW's exact ratio.
 - The two level curves are not tuned against each other yet: a BG3 level 1 character out-damages a
   level 4 WoW human.
+- Swimming and flying NPCs have no handling of their own, and neither has been tested. BG3 cannot swim:
+  deep water is cut as a walkable surface at water level, and a mob's stand-in is placed with a ground
+  snap. So a mob under the water or in the air probably stands on the surface or the ground below it,
+  away from its WoW model until a fight starts, and clicks or attacks may land on the wrong spot.
 
 ## Download size
 

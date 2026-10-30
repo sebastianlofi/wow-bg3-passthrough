@@ -1,0 +1,1266 @@
+WOW-BG3 benilla patch 0092: small doodads between the camera and her phase out, whole; so do the units on a storey going away.
+
+The design rule for what stands between the camera and the character: ceilings, bushes, skinny trees
+and posts phase out; walls get the see-through opening (0090); mountains, rocks and big trees the
+camera bumps into (the plugin's eye clearance). 0091 took the ceilings. This is the doodads.
+
+BG3 marks each object by hand on its root templates (`Fadeable`: the whole piece fades; `SeeThrough`:
+the capsule cut; `CollideWithCamera`, nearly unused). WoW has no such flag, so the line is drawn on
+WoW's collision hulls: a placement measuring under 4 yd on the smallest side of its own box (the
+model's axes times its scale, so turning a piece changes nothing) is BG3's `Fadeable`, and fades; one at 4 yd or more is what the camera bumps into; a WMO's own surfaces
+are BG3's `SeeThrough`. The plugin reads the same hulls through the server's vmaps (`wow_arena.py`
+tags a big M2 kind 5), so a piece does one or the other.
+
+- `phase_out.rs` (new): the line, the sight lines (eye to her feet, chest, head), the fade clock at
+  BG3's `FadeOutSpeed` 5.0, and the entity-path doodads (animated, billboarded, blended), whose level
+  rides in bits 14..=18 of the exterior `MeshTag` payload. An interior prop's tag holds its probe slot
+  there, a slot props with the same light share, so its level goes through the rig field instead: the
+  top sixteen rig slots are never allocated and each stands for one level.
+- static_gx: each cell and prop region keeps its small placements as of the last bake (box and items,
+  `GxPiece`); `cull.rs` walks their fades and publishes per-item levels; `render.rs` writes them into
+  the record's fade bits 0091 added, the larger of the storey's and the piece's winning.
+- `static_gx.wgsl`: a small placement's item (record bit 20) takes no see-through cut; it fades whole. A
+  big doodad keeps the cut: WoW's collision has a big tree's trunk and not its canopy, so the camera
+  bumps the trunk and ends up under leaves (BG3 marks 163 of its 345 trees `SeeThrough`).
+- Units: 0091 hid a unit on a storey going away at once, so it popped while the floor under it
+  dissolved. It now fades with the storey by rig slot (`UnitFades`, a region after 0090's noise,
+  read by `wow_model.wgsl` whichever payload the tag holds), its gear on rider slots with it, and is
+  hidden only once gone.
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+index 013a501..fa4aa93 100644
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -988,6 +988,33 @@ fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
+     return v < 0.5;
+ }
+ 
++// WOW-BG3 patch 0092: BG3's per-object fade (`FadePatternOnePass.bshd`, as in `static_gx.wgsl`): at level
++// `k` the cells of the 4x4 Bayer table under `k` are gone, so 16 is the whole piece and 0 none of it.
++fn wow_fade_discard(k: u32, frag: vec2<f32>) -> bool {
++    var m = array<u32, 16>(
++        0u, 8u, 2u, 10u,
++        12u, 4u, 14u, 6u,
++        3u, 11u, 1u, 9u,
++        15u, 7u, 13u, 5u
++    );
++    let ix = u32(i32(frag.x % 4.0));
++    let iy = u32(i32(frag.y % 4.0));
++    return m[ix * 4u + iy] < k;
++}
++
++// The noise's rows in the buffer's last regions: 512 x 512 floats, four a row. The unit fades follow.
++const WOW_SEE_NOISE_ROWS: u32 = 65536u;
++
++// A rig slot's fade level (`crate::phase_out::UnitFades`), 0 for slot 0 or while there is no noise
++// row to count from (no see-through in this run).
++fn wow_unit_fade(slot: u32) -> u32 {
++    let base = u32(wow_light.cut_params.x);
++    if (base == 0u || slot == 0u) {
++        return 0u;
++    }
++    return u32(wow_light.palettes[base - WOW_SEE_TAIL + WOW_SEE_NOISE_ROWS + slot / 4u][slot % 4u]);
++}
++
+ @fragment
+ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     // The UI model tile's cell clip: the reference gives each `<Model>` pane its widget rect as the
+@@ -1021,6 +1048,17 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     if (m.model_flags.x > 0.5 && wow_cut(in.world_position.xyz, see_uv)) {
+         discard;
+     }
++    // Patch 0092: BG3's per-object fade on the entity path. A small doodad in the way carries its level
++    // in the exterior tag (bits 14..=18, never a probe slot's there); a unit on a storey 0091 is taking
++    // away carries it by rig slot, whichever payload its tag holds.
++    let phase_tag = mesh_functions::get_tag(in.instance_index);
++    var phase = wow_unit_fade((phase_tag >> 19u) & 0x7ffu);
++    if (m.model_flags.x < 0.5 && m.model_flags.z < 0.5) {
++        phase = max(phase, (phase_tag >> 14u) & 31u);
++    }
++    if (phase > 0u && wow_fade_discard(phase, in.position.xy)) {
++        discard;
++    }
+ #ifdef WOW_WATER_CLIP
+     // The straddle split: a translucent model crossing its water plane draws on each side of the
+     // water pass (the far copy has `clutter_fade.z` bit 11) and each copy keeps its half, the
+diff --git a/crates/benilla-world/src/lib.rs b/crates/benilla-world/src/lib.rs
+index 18cf18e..0c03701 100644
+--- a/crates/benilla-world/src/lib.rs
++++ b/crates/benilla-world/src/lib.rs
+@@ -145,6 +145,7 @@ pub mod rig_rider;
+ pub mod schedule;
+ // WOW-BG3 patch 0090: the see-through circle's parameters for the frame.
+ pub mod see_through;
++pub mod phase_out;
+ mod shaders;
+ pub mod sky;
+ pub mod sky_order;
+diff --git a/crates/benilla-world/src/lighting/global_light.rs b/crates/benilla-world/src/lighting/global_light.rs
+index f337e85..064105a 100644
+--- a/crates/benilla-world/src/lighting/global_light.rs
++++ b/crates/benilla-world/src/lighting/global_light.rs
+@@ -187,10 +187,10 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
+ 
+ /// The shared light buffer's full size: the per-frame blob ([`LIGHT_HEADER_ROWS`] rows and the
+ /// point table), the interior-prop probe region, the skin-palette regions and patch 0090's
+-/// see-through noise. Every buffer bound as `wow_light` must be this big: wgpu validates the bound
+-/// size against `wow_model.wgsl`'s whole layout at each draw.
++/// see-through noise, then patch 0092's unit fades. Every buffer bound as `wow_light` must be this
++/// big: wgpu validates the bound size against `wow_model.wgsl`'s whole layout at each draw.
+ pub fn light_blob_bytes() -> u64 {
+-    see_noise_offset() + see_noise_bytes()
++    crate::phase_out::unit_fade_offset() + crate::phase_out::unit_fade_bytes()
+ }
+ 
+ /// WOW-BG3 patch 0090: where BG3's see-through noise sits, after every other region, so nothing
+@@ -525,6 +525,7 @@ mod tests {
+             .init_resource::<crate::view::ViewDistance>()
+             .init_resource::<WowLightData>()
+             .init_resource::<Time>()
++            .init_resource::<crate::see_through::SeeThrough>()
+             .add_systems(Update, build_light_data);
+         app.world_mut()
+             .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY));
+diff --git a/crates/benilla-world/src/lighting/mod.rs b/crates/benilla-world/src/lighting/mod.rs
+index 17800f5..5cf772f 100644
+--- a/crates/benilla-world/src/lighting/mod.rs
++++ b/crates/benilla-world/src/lighting/mod.rs
+@@ -13,7 +13,9 @@ mod prop_probes; // the interior-prop SH probe table
+ mod resolve; // the per-frame time-of-day resolve and the interior-fog crossfade
+ mod sh; // the model SH probe fold
+ pub use blob::LightBlob;
+-pub use global_light::{new_shared_light_buffer, LightRooms, SharedLightBuffer, WorldPointLight};
++pub use global_light::{
++    new_shared_light_buffer, see_noise_bytes, see_noise_offset, LightRooms, SharedLightBuffer, WorldPointLight,
++};
+ pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
+ // The std430 layout stays in the crate: off-world producers state values through `LightBlob`,
+ // never a row index.
+diff --git a/crates/benilla-world/src/mesh_tag.rs b/crates/benilla-world/src/mesh_tag.rs
+index 51ce2e8..e9d49f7 100644
+--- a/crates/benilla-world/src/mesh_tag.rs
++++ b/crates/benilla-world/src/mesh_tag.rs
+@@ -17,7 +17,7 @@
+ //! - Exterior payload (the default): bits 6..=13 are the ground-shade byte (`0` lit, `255` fully
+ //!   MCSH-shadowed), mixing the batch's lit sun level toward the shaded one (`wow_model.wgsl`).
+ //!   Entities ramp it ([`crate::entity_shade`]); statics leave it `0` and shade per material
+-//!   (`sun_scale.x`). Bits 14..=18 are reserved.
++//!   (`sun_scale.x`). Bits 14..=18 are WOW-BG3 patch 0092's phase-out level ([`with_phase`]).
+ //! - Interior probe slot (an interior M2 prop or entity: interior material, `model_flags.z` set,
+ //!   not a WMO): bits 6..=18 are the SH-probe table slot ([`crate::lighting::PropProbes`]).
+ //!   [`probe_bits`] always carries a non-zero alpha, so slot 0 is valid.
+@@ -71,6 +71,9 @@ const ALPHA_MAX: f32 = 63.0;
+ /// Bits 6..=13 of the exterior payload: the ground-shade byte.
+ const SHADE_MASK: u32 = 0x0000_3fc0;
+ const SHADE_SHIFT: u32 = 6;
++/// Bits 14..=18 of the exterior payload: patch 0092's phase-out level.
++const PHASE_MASK: u32 = 0x0007_c000;
++const PHASE_SHIFT: u32 = 14;
+ /// Bits 6..=18 of the interior payload: the SH-probe table slot (13 bits, 8192 slots).
+ const PROBE_MASK: u32 = 0x0007_ffc0;
+ const PROBE_SHIFT: u32 = 6;
+@@ -79,6 +82,13 @@ const RIG_MASK: u32 = 0x3ff8_0000;
+ const RIG_SHIFT: u32 = 19;
+ /// The 11-bit rig field's slot count, slot 0 (none) included; `crate::rig_palette` sizes to it.
+ pub const MAX_RIG_SLOTS: usize = 1 << 11;
++/// WOW-BG3 patch 0092: the top sixteen slots are never allocated. Each stands for one level of BG3's
++/// dissolve (`phase_out::UnitFades` holds that level at it): how a part with no rig of its own and no
++/// free payload bits, an interior prop on the entity path, says how far it has faded. Its tint and
++/// water clip there read as none, and an unskinned mesh reads no palette.
++pub const FADE_LEVEL_SLOTS: usize = 16;
++/// The slots `crate::rig_palette` may hand out, slot 0 included.
++pub const USABLE_RIG_SLOTS: usize = MAX_RIG_SLOTS - FADE_LEVEL_SLOTS;
+ 
+ /// An interior-probe spawn tag for a rig-less part (the static-prop spawner): the slot, an opaque
+ /// alpha and [`INTERIOR_FOG_BIT`] set. `apply_model_visibility` rewrites that bit every frame for
+@@ -176,6 +186,32 @@ pub(crate) fn with_shade(tag: u32, shade: u8, _: ExteriorPayload) -> u32 {
+     (tag & !(ALPHA_MASK | SHADE_MASK)) | carried_alpha(tag) | (u32::from(shade) << SHADE_SHIFT)
+ }
+ 
++/// WOW-BG3 patch 0092: bits 14..=18 of the exterior payload, a small doodad's phase-out level (0 to
++/// 16, BG3's sixteen-step dissolve). Only `phase_out` writes it, and only on a part of an exterior
++/// doodad ([`crate::phase_out::PhasePiece`]), so these bits are never a probe slot's. A level on an
++/// untagged `0` turns it opaque first, like [`with_shade`]; level 0 leaves such a tag alone.
++pub(crate) fn with_phase(tag: u32, level: u8) -> u32 {
++    if level == 0 {
++        return tag & !PHASE_MASK;
++    }
++    (tag & !(ALPHA_MASK | PHASE_MASK)) | carried_alpha(tag) | (u32::from(level.min(16)) << PHASE_SHIFT)
++}
++
++/// WOW-BG3 patch 0092: a part with no rig of its own points its rig field at the slot of this level
++/// (0 back to none). A part with a real rig is left alone: its own slot carries the level.
++pub(crate) fn with_fade_level_slot(tag: u32, level: u8) -> u32 {
++    let rig = rig_of(tag);
++    if rig != 0 && usize::from(rig) < USABLE_RIG_SLOTS {
++        return tag;
++    }
++    if level == 0 {
++        return tag & !RIG_MASK;
++    }
++    (tag & !(ALPHA_MASK | RIG_MASK))
++        | carried_alpha(tag)
++        | rig_bits((USABLE_RIG_SLOTS + usize::from(level.min(16)) - 1) as u16)
++}
++
+ /// Reads the alpha field as a fraction; the untagged `0` reads `1.0`.
+ pub fn alpha_of(tag: u32) -> f32 {
+     if tag == 0 {
+@@ -245,6 +281,33 @@ mod tests {
+         assert!(describe(HIGHLIGHT_BIT | INTERIOR_FOG_BIT | 1).contains("hi+fog"));
+     }
+ 
++    #[test]
++    fn a_fade_level_slot_leaves_a_real_rig_and_the_probe_alone() {
++        let t = probe_bits(6660);
++        let p = with_fade_level_slot(t, 16);
++        assert_eq!(usize::from(rig_of(p)), MAX_RIG_SLOTS - 1);
++        assert_eq!((p & PROBE_MASK) >> PROBE_SHIFT, 6660);
++        assert_eq!(usize::from(rig_of(with_fade_level_slot(t, 1))), USABLE_RIG_SLOTS);
++        assert_eq!(with_fade_level_slot(p, 0), t);
++        let rigged = t | rig_bits(77);
++        assert_eq!(with_fade_level_slot(rigged, 9), rigged);
++        assert_eq!(with_fade_level_slot(0, 0), 0);
++    }
++
++    #[test]
++    fn the_phase_level_keeps_every_other_field() {
++        let t = rig_bits(77) | HIGHLIGHT_BIT | with_shade(alpha_bits(0.5), 200, ext());
++        let p = with_phase(t, 9);
++        assert_eq!((p >> PHASE_SHIFT) & 31, 9);
++        assert_eq!(rig_of(p), 77);
++        assert_eq!(shade_of(p, ext()), 200);
++        assert_eq!(p & HIGHLIGHT_BIT, HIGHLIGHT_BIT);
++        assert_eq!(with_phase(p, 0), t);
++        // The untagged sentinel: staying 0 at level 0, and opaque (not alpha 0) under a level.
++        assert_eq!(with_phase(0, 0), 0);
++        assert_eq!(alpha_of(with_phase(0, 16)), 1.0);
++    }
++
+     #[test]
+     fn highlight_bit_is_orthogonal_to_both_payloads() {
+         for a in [0.0, f32::MIN_POSITIVE, 0.25, 0.5, 1.0] {
+diff --git a/crates/benilla-world/src/phase_out.rs b/crates/benilla-world/src/phase_out.rs
+new file mode 100644
+index 0000000..a2a0874
+--- /dev/null
++++ b/crates/benilla-world/src/phase_out.rs
+@@ -0,0 +1,385 @@
++//! WOW-BG3 patch 0092: the small pieces between the camera and her phase out, whole.
++//!
++//! The design rule for what stands between the camera and the character: ceilings,
++//! bushes, skinny trees and posts **phase out**; walls get the see-through opening (patch 0090);
++//! mountains, rocks and big trees the camera **bumps into** (the plugin's eye clearance). 0091 took
++//! the ceilings; this patch takes the small doodads, with the same per-object fade BG3 gives a piece
++//! marked `Fadeable`: the sixteen-step ordered dissolve over the 4x4 Bayer table
++//! (`FadePatternOnePass.bshd`) at BG3's `FadeOutSpeed` 5.0, so a fifth of a second out and back.
++//!
++//! **Small or big.** BG3 marks each object by hand (`Fadeable`, `SeeThrough`, `CollideWithCamera`
++//! on its root templates); WoW has no such flag, so the line is drawn on WoW's own collision: a
++//! placement whose collision hull measures under [`SMALL_YD`] on the smallest side of its own box
++//! (the model's axes, times its scale, so how a piece is turned does not change what it is) phases
++//! out, a larger one is something the camera bumps into. The plugin draws the same line on the same
++//! hulls (the server's vmaps are cut from them; `wow_arena.py` tags a big M2 kind 5), so no piece both
++//! fades and pushes the camera, and none does neither. A model with no hull (most bushes, grass,
++//! flowers) is thin. A low wide piece (a planter 1.2 yd tall) is small: it is seen over, and pulling
++//! the camera in for it would be wrong.
++//!
++//! **Between.** A piece fades while its drawn box (the render bound, canopy and all, not the hull)
++//! crosses a sight line from the eye to her feet, chest or head, and comes back once none does.
++//! The target is the see-through's own ([`crate::see_through::SeeThrough`]): no capsule live, no
++//! fade, so outside world mode nothing changes.
++//!
++//! A big doodad keeps 0090's cut in `static_gx`: WoW's collision has a big tree's trunk and not its
++//! canopy, so the camera bumps the trunk and ends up under leaves, and BG3 marks most of its trees
++//! `SeeThrough` for that picture. A small one is never cut, only faded.
++//!
++//! Where it runs: `static_gx` (cells and prop regions, the record's fade bits 0091 added) and here,
++//! for the doodad parts left on the entity path (animated, billboarded, blended), through bits
++//! 14..=18 of the exterior `MeshTag` payload ([`crate::mesh_tag::with_phase`]). An interior prop has
++//! no such bits (they hold its probe slot, which props with the same light share), so it says its level
++//! through its rig field ([`crate::mesh_tag::with_fade_level_slot`]) and [`UnitFades`]. Units standing
++//! on a storey 0091 takes away fade the same way through [`UnitFades`], one level per rig slot.
++
++use std::sync::Arc;
++
++use bevy::camera::primitives::Aabb;
++use bevy::mesh::MeshTag;
++use bevy::platform::collections::{HashMap, HashSet};
++use bevy::prelude::*;
++use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
++use bevy::render::renderer::RenderQueue;
++use bevy::render::{Render, RenderApp, RenderSystems};
++
++/// The line between small and big (yd): a collision hull under this on its own smallest side
++/// phases out; one this size or more the camera bumps into. `wow_arena.py`'s `BIG_M2_YD` is the same
++/// number.
++pub const SMALL_YD: f32 = 4.0;
++
++/// BG3's `FadeOutSpeed`, 5.0 on most objects that set one: a whole fade in a fifth of a second.
++pub const FADE_SPEED: f32 = 5.0;
++
++/// How far a piece's box is grown before the sight test (yd): her outline is wider than a line.
++const SIGHT_MARGIN: f32 = 0.25;
++
++/// Her feet and head from the see-through's target, which sits at her chest (yd).
++const FEET_BELOW: f32 = 0.9;
++const HEAD_ABOVE: f32 = 0.6;
++
++/// A placement's thickness: the smallest side of its collision hull's box in the model's own axes,
++/// times its scale (yd); `0` when it has no hull. Not the world box: a fence turned 45 degrees would
++/// read as wide as it is long.
++pub fn placement_thickness(hull: Option<&benilla_formats::CollisionMesh>, transform: &Transform) -> f32 {
++    let Some(hull) = hull.filter(|h| !h.is_empty() && !h.positions.is_empty()) else {
++        return 0.0;
++    };
++    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
++    for p in &hull.positions {
++        let v = Vec3::from_array(*p);
++        lo = lo.min(v);
++        hi = hi.max(v);
++    }
++    (hi - lo).min_element() * transform.scale.abs().max_element()
++}
++
++/// Does a placement this thick phase out (rather than stop the camera)?
++pub fn phases(thick: f32) -> bool {
++    thick < SMALL_YD
++}
++
++/// A placement's identity for the fade: its translation's bits. Every batch of a placement shares
++/// its transform, and the `uniqueId` will not do: a WMO's props all carry their building's.
++pub type PieceKey = [u32; 3];
++
++/// The key of the placement at `t`.
++pub fn piece_key(t: &Transform) -> PieceKey {
++    t.translation.to_array().map(f32::to_bits)
++}
++
++/// Marks a small doodad's entity-path part: the placement it fades with.
++#[derive(Component, Clone, Copy)]
++pub struct PhasePiece {
++    pub key: PieceKey,
++    /// An interior prop's part, whose tag has no bits for the level (`with_fade_level_slot`).
++    pub interior: bool,
++}
++
++/// This frame's sight lines, from the eye to her feet, chest and head.
++#[derive(Clone, Copy)]
++pub struct Sight {
++    eye: Vec3,
++    to: [Vec3; 3],
++}
++
++impl Sight {
++    /// From the see-through's state; `None` while no capsule is live.
++    pub fn of(see: &crate::see_through::SeeThrough) -> Option<Self> {
++        if !see.live() {
++            return None;
++        }
++        let at = see.cuts[0].at;
++        Some(Self {
++            eye: see.eye,
++            to: [at - Vec3::Y * FEET_BELOW, at, at + Vec3::Y * HEAD_ABOVE],
++        })
++    }
++
++    /// The box all three lines lie in, grown by the margin: a cheap first reject.
++    pub fn bounds(&self) -> (Vec3, Vec3) {
++        let lo = self.to.iter().fold(self.eye, |a, b| a.min(*b));
++        let hi = self.to.iter().fold(self.eye, |a, b| a.max(*b));
++        (lo - Vec3::splat(SIGHT_MARGIN), hi + Vec3::splat(SIGHT_MARGIN))
++    }
++
++    /// Does a world box stand across a sight line?
++    pub fn blocked_by(&self, lo: Vec3, hi: Vec3) -> bool {
++        let (blo, bhi) = self.bounds();
++        if lo.cmpgt(bhi).any() || hi.cmplt(blo).any() {
++            return false;
++        }
++        let (lo, hi) = (lo - Vec3::splat(SIGHT_MARGIN), hi + Vec3::splat(SIGHT_MARGIN));
++        self.to.iter().any(|t| segment_hits_box(self.eye, *t, lo, hi))
++    }
++}
++
++/// The slab test: does the segment `a`..`b` touch the box?
++pub fn segment_hits_box(a: Vec3, b: Vec3, lo: Vec3, hi: Vec3) -> bool {
++    let d = b - a;
++    let (mut t0, mut t1) = (0.0f32, 1.0f32);
++    for i in 0..3 {
++        if d[i].abs() < 1e-6 {
++            if a[i] < lo[i] || a[i] > hi[i] {
++                return false;
++            }
++            continue;
++        }
++        let (mut n, mut f) = ((lo[i] - a[i]) / d[i], (hi[i] - a[i]) / d[i]);
++        if n > f {
++            std::mem::swap(&mut n, &mut f);
++        }
++        t0 = t0.max(n);
++        t1 = t1.min(f);
++        if t0 > t1 {
++            return false;
++        }
++    }
++    true
++}
++
++/// A box under a transform, as a world box.
++pub fn world_box(gt: &GlobalTransform, aabb: &Aabb) -> (Vec3, Vec3) {
++    let a = gt.affine();
++    let c = a.transform_point3(Vec3::from(aabb.center));
++    let h = Vec3::from(aabb.half_extents);
++    let m = a.matrix3;
++    let e = m.x_axis.abs() * h.x + m.y_axis.abs() * h.y + m.z_axis.abs() * h.z;
++    (c - Vec3::from(e), c + Vec3::from(e))
++}
++
++/// One piece's fade this frame: toward 1 while it stands in the way, back toward 0 once it does not.
++pub fn step(f: f32, gone: bool, dt: f32) -> f32 {
++    if gone {
++        (f + dt * FADE_SPEED).min(1.0)
++    } else {
++        (f - dt * FADE_SPEED).max(0.0)
++    }
++}
++
++/// A fade as BG3's sixteen dissolve steps.
++pub fn level(f: f32) -> u8 {
++    (f * 16.0).round().clamp(0.0, 16.0) as u8
++}
++
++/// The entity-path half: every small doodad part whose placement stands in the way fades, all its
++/// parts together.
++pub(crate) fn phase_entity_doodads(
++    see: Res<crate::see_through::SeeThrough>,
++    time: Res<Time>,
++    mut parts: Query<(&PhasePiece, &GlobalTransform, &Aabb, &mut MeshTag)>,
++    mut table: ResMut<UnitFades>,
++    mut fades: Local<HashMap<PieceKey, f32>>,
++    mut hit: Local<HashSet<PieceKey>>,
++) {
++    let _t = crate::static_gx::gx_perf_guard(1);
++    hit.clear();
++    if let Some(sight) = Sight::of(&see) {
++        for (piece, gt, aabb, _) in &parts {
++            if hit.contains(&piece.key) {
++                continue;
++            }
++            let (lo, hi) = world_box(gt, aabb);
++            if sight.blocked_by(lo, hi) {
++                hit.insert(piece.key);
++            }
++        }
++    }
++    table.bypass_change_detection().parts.clear();
++    if hit.is_empty() && fades.is_empty() {
++        return;
++    }
++    let dt = time.delta_secs();
++    for &key in hit.iter() {
++        fades.entry(key).or_insert(0.0);
++    }
++    fades.retain(|key, f| {
++        *f = step(*f, hit.contains(key), dt);
++        *f > 0.0 || hit.contains(key)
++    });
++    for (piece, _, _, mut tag) in &mut parts {
++        let k = fades.get(&piece.key).map_or(0, |f| level(*f));
++        let t = if piece.interior {
++            let rig = crate::mesh_tag::rig_of(tag.0);
++            if k > 0 && rig != 0 && usize::from(rig) < crate::mesh_tag::USABLE_RIG_SLOTS {
++                table.bypass_change_detection().parts.push((rig, k));
++            }
++            crate::mesh_tag::with_fade_level_slot(tag.0, k)
++        } else {
++            crate::mesh_tag::with_phase(tag.0, k)
++        };
++        if t != tag.0 {
++            tag.0 = t;
++        }
++    }
++}
++
++/// The fade level (0 to 16) of every rig slot, for the units standing on a storey 0091 takes away
++/// (`wmo_portal`'s `fade_units_above_her`). Slot-keyed like [`crate::instance_tint`], so a unit's
++/// gear, on rider slots of its own, fades with it.
++#[derive(Resource, Clone, ExtractResource)]
++pub struct UnitFades {
++    slots: Arc<Vec<f32>>,
++    generation: u64,
++    /// This frame's animated interior props: their own rig slot and level.
++    parts: Vec<(u16, u8)>,
++}
++
++impl Default for UnitFades {
++    fn default() -> Self {
++        Self {
++            slots: Arc::new(vec![0.0; crate::mesh_tag::MAX_RIG_SLOTS]),
++            generation: 0,
++            parts: Vec::new(),
++        }
++    }
++}
++
++impl UnitFades {
++    /// Replaces the whole table from the units' levels, the animated props' and the sixteen slots
++    /// that stand for a level; uploads only when it changed.
++    pub fn publish(&mut self, levels: &[u8]) {
++        let mut v = vec![0.0; crate::mesh_tag::MAX_RIG_SLOTS];
++        for (d, s) in v.iter_mut().zip(levels) {
++            *d = f32::from(*s);
++        }
++        for &(slot, k) in &self.parts {
++            if let Some(d) = v.get_mut(usize::from(slot)) {
++                *d = d.max(f32::from(k));
++            }
++        }
++        for k in 0..crate::mesh_tag::FADE_LEVEL_SLOTS {
++            v[crate::mesh_tag::USABLE_RIG_SLOTS + k] = (k + 1) as f32;
++        }
++        if *self.slots != v {
++            self.slots = Arc::new(v);
++            self.generation += 1;
++        }
++    }
++}
++
++/// Where the unit fades sit in the shared light buffer: right after 0090's noise, so nothing
++/// already mirrored moves. One f32 a slot (a plain value survives a float load, a bit pattern
++/// need not); `wow_model.wgsl` reaches it from the noise's row.
++pub fn unit_fade_offset() -> u64 {
++    crate::lighting::see_noise_offset() + crate::lighting::see_noise_bytes()
++}
++
++/// The region's size: one f32 per rig slot.
++pub fn unit_fade_bytes() -> u64 {
++    crate::mesh_tag::MAX_RIG_SLOTS as u64 * 4
++}
++
++/// Render world: the whole region on a change.
++fn upload_unit_fades(
++    queue: Res<RenderQueue>,
++    shared: Option<Res<crate::lighting::SharedLightBuffer>>,
++    fades: Option<Res<UnitFades>>,
++    mut last: Local<Option<u64>>,
++) {
++    let (Some(shared), Some(fades)) = (shared, fades) else {
++        return;
++    };
++    if *last == Some(fades.generation) {
++        return;
++    }
++    *last = Some(fades.generation);
++    queue.write_buffer(&shared.0, unit_fade_offset(), bytemuck::cast_slice(fades.slots.as_slice()));
++}
++
++pub fn plugin(app: &mut App) {
++    app.init_resource::<UnitFades>()
++        .add_plugins(ExtractResourcePlugin::<UnitFades>::default())
++        .add_systems(PostUpdate, phase_entity_doodads);
++    if let Some(render) = app.get_sub_app_mut(RenderApp) {
++        render.add_systems(Render, upload_unit_fades.in_set(RenderSystems::PrepareResources));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_post_on_the_line_blocks_and_one_beside_it_does_not() {
++        let see = crate::see_through::SeeThrough {
++            cuts: [
++                crate::see_through::Cut { at: Vec3::new(0.0, 1.0, 0.0), radius: 4.4 },
++                Default::default(),
++            ],
++            eye: Vec3::new(0.0, 6.0, 10.0),
++            ..Default::default()
++        };
++        let s = Sight::of(&see).expect("live");
++        // A post half way along, 0.4 yd thick.
++        assert!(s.blocked_by(Vec3::new(-0.2, 0.0, 4.8), Vec3::new(0.2, 4.0, 5.2)));
++        // The same post 3 yd to the side.
++        assert!(!s.blocked_by(Vec3::new(2.8, 0.0, 4.8), Vec3::new(3.2, 4.0, 5.2)));
++        // Behind her, the far side from the camera.
++        assert!(!s.blocked_by(Vec3::new(-0.2, 0.0, -3.2), Vec3::new(0.2, 4.0, -2.8)));
++        // Nothing live, nothing fades.
++        assert!(Sight::of(&crate::see_through::SeeThrough::default()).is_none());
++    }
++
++    #[test]
++    fn the_cutoff_is_the_hulls_smallest_side() {
++        let hull = benilla_formats::CollisionMesh {
++            // 1 yd by 6 yd in WoW's model plane, 3 yd tall.
++            positions: vec![[0.0, 0.0, 0.0], [1.0, 6.0, 3.0], [1.0, 0.0, 0.0]],
++            indices: vec![0, 1, 2],
++        };
++        let t = placement_thickness(Some(&hull), &Transform::IDENTITY);
++        assert!((t - 1.0).abs() < 1e-4, "{t}");
++        assert!(phases(t));
++        // Turned 45 degrees, or any way at all, it is the same piece.
++        let turned = Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.785, 0.4, 0.2));
++        assert!((placement_thickness(Some(&hull), &turned) - 1.0).abs() < 1e-4);
++        assert!(phases(placement_thickness(None, &Transform::IDENTITY)));
++        let big = Transform::from_scale(Vec3::splat(5.0));
++        assert!(!phases(placement_thickness(Some(&hull), &big)));
++        // The table holds a level at each slot standing for one, whatever the units do.
++        let mut table = UnitFades::default();
++        table.publish(&[]);
++        assert_eq!(table.slots[crate::mesh_tag::USABLE_RIG_SLOTS], 1.0);
++        assert_eq!(table.slots[crate::mesh_tag::MAX_RIG_SLOTS - 1], 16.0);
++        // Wide and low, a planter: small whatever its footprint.
++        let planter = benilla_formats::CollisionMesh {
++            positions: vec![[0.0, 0.0, 0.0], [6.0, 6.0, 1.2], [6.0, 0.0, 0.0]],
++            indices: vec![0, 1, 2],
++        };
++        assert!(phases(placement_thickness(Some(&planter), &Transform::IDENTITY)));
++    }
++
++    #[test]
++    fn a_fade_takes_a_fifth_of_a_second() {
++        let mut f = 0.0;
++        for _ in 0..12 {
++            f = step(f, true, 1.0 / 60.0);
++        }
++        assert_eq!(level(f), 16);
++        for _ in 0..12 {
++            f = step(f, false, 1.0 / 60.0);
++        }
++        assert_eq!(level(f), 0);
++    }
++}
+diff --git a/crates/benilla-world/src/rig_palette.rs b/crates/benilla-world/src/rig_palette.rs
+index a8b5361..0d5ff19 100644
+--- a/crates/benilla-world/src/rig_palette.rs
++++ b/crates/benilla-world/src/rig_palette.rs
+@@ -198,7 +198,7 @@ impl RigPalettes {
+             .find(|(_, &(_, len))| len >= bones)?;
+         let slot = match self.free_slots.pop() {
+             Some(s) => s,
+-            None if self.slot_high < MAX_RIG_SLOTS => {
++            None if self.slot_high < crate::mesh_tag::USABLE_RIG_SLOTS => {
+                 self.slot_high += 1;
+                 (self.slot_high - 1) as u16
+             }
+@@ -542,7 +542,7 @@ impl RigPalettes {
+     /// Slots still allocatable: the doodad reaper reclaims parked rigs below
+     /// [`crate::doodad_anim::REAP_LOW_WATER`], and the unit heal waits for room.
+     pub fn slot_headroom(&self) -> usize {
+-        MAX_RIG_SLOTS - self.slot_high + self.free_slots.len()
++        crate::mesh_tag::USABLE_RIG_SLOTS - self.slot_high + self.free_slots.len()
+     }
+ }
+ 
+@@ -929,7 +929,7 @@ fn census_rig_palettes(
+          doodad={}({}) parked={}({}) unit={}({}) other={}({}) | \
+          bones/slot ≤2:{} 3-4:{} 5-8:{} 9-16:{} 17-32:{} 33+:{} | \
+          denied +{denied} | probes {p_live}/{p_peak} of {}",
+-        MAX_RIG_SLOTS - 1,
++        crate::mesh_tag::USABLE_RIG_SLOTS - 1,
+         doodad.0,
+         doodad.1,
+         doodad_parked.0,
+@@ -1120,7 +1120,7 @@ mod tests {
+         assert!(p.alloc(1).is_none(), "no bones left");
+         p.free(big);
+         // Slot exhaustion, separately from bone exhaustion.
+-        let taken: Vec<u16> = (0..MAX_RIG_SLOTS - 1)
++        let taken: Vec<u16> = (0..crate::mesh_tag::USABLE_RIG_SLOTS - 1)
+             .map(|_| p.alloc(1).unwrap().0)
+             .collect();
+         assert!(p.alloc(1).is_none(), "no slots left");
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+index 773f9b1..c3c75b6 100644
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -297,14 +297,17 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
+     if (wow_light.fog_params.w > 0.0 && eye_z > wow_light.fog_params.w) {
+         discard;
+     }
+-    // Patch 0091: a storey above her fading out or back in, BG3's own per-object fade.
++    // Patches 0091 and 0092: a storey above her, or a small doodad in the way, fading out or back
++    // in, BG3's own per-object fade.
+     let fade = (recs[in.word & 0xffffu].w >> 15u) & 31u;
+     if (fade > 0u && wow_fade_discard(fade, in.position.xy)) {
+         discard;
+     }
+-    // Patch 0090: BG3's see-through. This pass draws the trees, rocks, fences, buildings and
+-    // interior props, so it is where most of the cut happens.
+-    if (wow_cut(in.world_position.xyz, in.uv)) {
++    // Patch 0090: BG3's see-through, on everything but a small doodad, which patch 0092 fades whole
++    // (record bit 20). A wall takes it, and so does a big tree's canopy: WoW's collision has the trunk
++    // alone, so the camera bumps the trunk and ends up under leaves; BG3 marks 163 of its 345 trees
++    // `SeeThrough` for the same picture.
++    if ((recs[in.word & 0xffffu].w & 1048576u) == 0u && wow_cut(in.world_position.xyz, in.uv)) {
+         discard;
+     }
+     // The sampler follows the wrap flags; a mixed batch clamps its clamped axis a half texel in.
+diff --git a/crates/benilla-world/src/static_gx/bake.rs b/crates/benilla-world/src/static_gx/bake.rs
+index 32b0fb2..73b578d 100644
+--- a/crates/benilla-world/src/static_gx/bake.rs
++++ b/crates/benilla-world/src/static_gx/bake.rs
+@@ -60,6 +60,7 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
+         wmos,
+         props,
+         world,
++        phase_keys,
+         ..
+     } = &mut *gx;
+     for (&cell, state) in cells.iter_mut() {
+@@ -76,7 +77,9 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
+             .items
+             .sort_by_key(|i| ((u8::from(i.cutout) << 1) | u8::from(i.two_sided), i.texture));
+         remap_fader_items(state);
+-        let baked = bake_cell(&state.items, &mut meshes);
++        state.pieces = bake_pieces(&state.items, phase_keys);
++        let mut baked = bake_cell(&state.items, &mut meshes);
++        mark_small(&mut baked, &state.pieces);
+         debug!(
+             "static-gx: cell ({},{}) baked — {} item(s), {} vert(s)",
+             cell.0,
+@@ -129,7 +132,9 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
+                 i.prop.as_ref().map_or(0, |p| p.set),
+             )
+         });
++        state.pieces = bake_pieces(&state.items, phase_keys);
+         let mut baked = bake_cell(&state.items, &mut meshes);
++        mark_small(&mut baked, &state.pieces);
+         baked.sets = state.sets.clone();
+         debug!(
+             "static-gx: props {instance} baked — {} item(s), {} set(s), {} vert(s)",
+@@ -141,6 +146,44 @@ pub(super) fn flush_static_gx(mut gx: ResMut<StaticGx>, mut meshes: ResMut<Asset
+     }
+ }
+ 
++/// WOW-BG3 patch 0092: the small placements among a bake's items, in the post-sort order the record
++/// table has: each one's drawn box in the world and its item indices.
++fn bake_pieces(
++    items: &[GxItem],
++    keys: &bevy::platform::collections::HashSet<crate::phase_out::PieceKey>,
++) -> Vec<super::GxPiece> {
++    let mut pieces: Vec<super::GxPiece> = Vec::new();
++    for (idx, item) in items.iter().enumerate() {
++        let key = crate::phase_out::piece_key(&item.transform);
++        if !keys.contains(&key) {
++            continue;
++        }
++        let (lo, hi) = match &item.local_aabb {
++            Some(a) => crate::phase_out::world_box(&GlobalTransform::from(item.transform), a),
++            None => (item.transform.translation, item.transform.translation),
++        };
++        let idx = u16::try_from(idx).expect("gx cell under u16 items");
++        match pieces.iter_mut().find(|p| p.key == key) {
++            Some(p) => {
++                p.lo = p.lo.min(lo);
++                p.hi = p.hi.max(hi);
++                p.items.push(idx);
++            }
++            None => pieces.push(super::GxPiece { key, lo, hi, items: vec![idx] }),
++        }
++    }
++    pieces
++}
++
++/// WOW-BG3 patch 0092: the small placements' items, which fade whole and take no see-through cut.
++fn mark_small(baked: &mut render::GxCellDraw, pieces: &[super::GxPiece]) {
++    for &i in pieces.iter().flat_map(|p| &p.items) {
++        if let Some(d) = baked.draws.get_mut(usize::from(i)) {
++            d.small = true;
++        }
++    }
++}
++
+ /// Whether a dirty region bakes now: after the short quiet window first, the long one once
+ /// published, at the age cap, or on `now` ([`StaticGx::flush_now`]).
+ fn bake_due(state: &super::GxCell, published: bool, frame: u32, now: bool) -> bool {
+@@ -279,6 +322,7 @@ fn bake_cell(items: &[GxItem], meshes: &mut Assets<Mesh>) -> render::GxCellDraw
+             order: item.wmo.as_ref().map_or(0, |w| w.order),
+             sidn: item.wmo.as_ref().map_or([0; 3], |w| w.sidn),
+             slot: item.prop.as_ref().and_then(|p| p.slot).unwrap_or(0),
++            small: false,
+         });
+     }
+     // The shader rebuilds world = v + origin. The origin is the f32-rounded centre and the
+diff --git a/crates/benilla-world/src/static_gx/cull.rs b/crates/benilla-world/src/static_gx/cull.rs
+index ebcb12d..57d1817 100644
+--- a/crates/benilla-world/src/static_gx/cull.rs
++++ b/crates/benilla-world/src/static_gx/cull.rs
+@@ -187,6 +187,88 @@ fn step_fade(
+     f
+ }
+ 
++/// WOW-BG3 patch 0092: the region a small placement's items are in.
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++pub(super) enum PieceHome {
++    Cell((i32, i32)),
++    Prop(Entity),
++}
++
++/// WOW-BG3 patch 0092: walks every small placement's fade and publishes this frame's per-item levels.
++/// A placement fades while its drawn box crosses a sight line (`phase_out::Sight`), all its items
++/// together; the regions the sight lines' box misses are not walked.
++fn step_phase_fades(
++    see: &crate::see_through::SeeThrough,
++    cells: &bevy::platform::collections::HashMap<(i32, i32), super::GxCell>,
++    props: &bevy::platform::collections::HashMap<Entity, super::GxCell>,
++    world: &mut crate::static_gx::render::GxWorld,
++    fades: &mut bevy::platform::collections::HashMap<crate::phase_out::PieceKey, (f32, PieceHome)>,
++    dt: f32,
++) {
++    use crate::phase_out::{level, step, Sight};
++    world.phase_cells.clear();
++    world.phase_props.clear();
++    let sight = Sight::of(see);
++    let mut hit: Vec<crate::phase_out::PieceKey> = Vec::new();
++    if let Some(s) = &sight {
++        let (blo, bhi) = s.bounds();
++        let near = |draw: &crate::static_gx::render::GxCellDraw| {
++            let c = draw.origin + Vec3::from(draw.aabb.center);
++            let h = Vec3::from(draw.aabb.half_extents);
++            !((c - h).cmpgt(bhi).any() || (c + h).cmplt(blo).any())
++        };
++        for (&key, state) in cells {
++            if state.pieces.is_empty() || !world.cells.get(&key).is_some_and(|d| near(d)) {
++                continue;
++            }
++            for p in state.pieces.iter().filter(|p| s.blocked_by(p.lo, p.hi)) {
++                hit.push(p.key);
++                fades.entry(p.key).or_insert((0.0, PieceHome::Cell(key)));
++            }
++        }
++        for (&entity, state) in props {
++            if state.pieces.is_empty() || !world.props.get(&entity).is_some_and(|d| near(d)) {
++                continue;
++            }
++            for p in state.pieces.iter().filter(|p| s.blocked_by(p.lo, p.hi)) {
++                hit.push(p.key);
++                fades.entry(p.key).or_insert((0.0, PieceHome::Prop(entity)));
++            }
++        }
++    }
++    if fades.is_empty() {
++        return;
++    }
++    fades.retain(|key, (f, home)| {
++        let in_way = hit.contains(key);
++        *f = step(*f, in_way, dt);
++        if *f <= 0.0 && !in_way {
++            return false;
++        }
++        // A rebake moves the item indices, so they are read fresh; a placement gone is dropped.
++        let state = match home {
++            PieceHome::Cell(c) => cells.get(c),
++            PieceHome::Prop(e) => props.get(e),
++        };
++        let Some(piece) = state.and_then(|s| s.pieces.iter().find(|p| p.key == *key)) else {
++            return false;
++        };
++        let k = level(*f);
++        if k > 0 {
++            let list = match home {
++                PieceHome::Cell(c) => world.phase_cells.entry(*c).or_default(),
++                PieceHome::Prop(e) => world.phase_props.entry(*e).or_default(),
++            };
++            list.extend(piece.items.iter().map(|&i| (i, k)));
++        }
++        true
++    });
++    // The render side compares these lists: the same pieces must read the same every frame.
++    for list in world.phase_cells.values_mut().chain(world.phase_props.values_mut()) {
++        list.sort_unstable();
++    }
++}
++
+ /// A fade as BG3's sixteen dissolve steps (`static_gx.wgsl`'s `wow_fade_discard`).
+ fn fade_level(f: f32) -> u8 {
+     (f * 16.0).round().clamp(0.0, 16.0) as u8
+@@ -220,6 +302,8 @@ pub(super) fn cull_cells(
+     // the clock that walks it.
+     mut fades: Local<bevy::platform::collections::HashMap<(Entity, u16), f32>>,
+     time: Res<Time>,
++    // WOW-BG3 patch 0092: how far each small placement in the way has faded, and where it lives.
++    mut phase_fades: Local<bevy::platform::collections::HashMap<crate::phase_out::PieceKey, (f32, PieceHome)>>,
+ ) {
+     let _t = super::gx_perf_guard(1);
+     for e in gx.pending_despawn.drain(..) {
+@@ -493,6 +577,8 @@ pub(super) fn cull_cells(
+     }
+     // Patch 0091: the fade clock, and no state left for a placement that is gone.
+     let dt = time.delta_secs();
++    // Patch 0092: the small placements in the way.
++    step_phase_fades(&see, cells, props, world, &mut phase_fades, dt);
+     fades.retain(|(e, _), _| world.wmos.contains_key(e));
+     // WMO regions: the dev WMO toggle, then per-group admission, near-first.
+     if m.kind_visible[crate::model_render::kind_index(crate::model_render::ModelKind::Wmo)] {
+diff --git a/crates/benilla-world/src/static_gx/mod.rs b/crates/benilla-world/src/static_gx/mod.rs
+index d1ca947..8ef10fc 100644
+--- a/crates/benilla-world/src/static_gx/mod.rs
++++ b/crates/benilla-world/src/static_gx/mod.rs
+@@ -205,6 +205,15 @@ enum FaderState {
+     Gone,
+ }
+ 
++/// WOW-BG3 patch 0092: one small placement in a cell or prop region, as last baked: its drawn box
++/// (world) and its items in bake order. Only the placements `phase_out` called small have one.
++pub(crate) struct GxPiece {
++    pub key: crate::phase_out::PieceKey,
++    pub lo: Vec3,
++    pub hi: Vec3,
++    pub items: Vec<u16>,
++}
++
+ /// A WMO item's baked facts (see [`GxWmoBatch`]).
+ struct GxItemWmo {
+     group: u16,
+@@ -237,6 +246,8 @@ struct GxCell {
+     settled: Option<bool>,
+     /// A prop region's distinct referrer sets, indexed by [`GxItemProp::set`].
+     sets: Vec<Arc<[u16]>>,
++    /// WOW-BG3 patch 0092: the small placements of the last bake; empty on WMO regions.
++    pieces: Vec<GxPiece>,
+ }
+ 
+ /// The main-world collector and its published draw set.
+@@ -267,6 +278,8 @@ pub struct StaticGx {
+     fade_events: [u32; 3],
+     /// [`StaticGx::flush_now`]'s request, cleared by the next flush.
+     flush_now: bool,
++    /// WOW-BG3 patch 0092: the placements `phase_out` called small ([`StaticGx::note_phase`]).
++    phase_keys: bevy::platform::collections::HashSet<crate::phase_out::PieceKey>,
+ }
+ 
+ /// The divert hook's per-call facts, gathered at `assemble.rs`'s gate.
+@@ -553,6 +566,12 @@ impl StaticGx {
+         true
+     }
+ 
++    /// WOW-BG3 patch 0092: this placement is small, so its items fade whole when it stands between
++    /// the camera and her. The spawn site calls it, which knows the model's collision hull.
++    pub fn note_phase(&mut self, t: &Transform) {
++        self.phase_keys.insert(crate::phase_out::piece_key(t));
++    }
++
+     /// Count a prop the divert never sees: an exterior fader prop (the exile protocol has no prop
+     /// shape), or a prop of a placement without an instance entity.
+     pub fn tally_prop_declined(&mut self, no_instance: bool) {
+@@ -622,6 +641,7 @@ impl StaticGx {
+                 }
+             }
+         }
++        self.phase_keys.clear();
+         self.cells.clear();
+         self.wmos.clear();
+         self.props.clear();
+diff --git a/crates/benilla-world/src/static_gx/render.rs b/crates/benilla-world/src/static_gx/render.rs
+index c4b3129..8ac407e 100644
+--- a/crates/benilla-world/src/static_gx/render.rs
++++ b/crates/benilla-world/src/static_gx/render.rs
+@@ -51,6 +51,8 @@ pub(crate) struct GxItemDraw {
+     pub sidn: [u8; 3],
+     /// The interior prop's SH-probe slot, record column w bits 1..=13; 0 elsewhere.
+     pub slot: u16,
++    /// WOW-BG3 patch 0092: a small placement's item, which fades whole and is never cut.
++    pub small: bool,
+ }
+ 
+ /// One baked cell or region, published by the main-world flush.
+@@ -120,6 +122,10 @@ pub(crate) struct GxWorld {
+     pub props: HashMap<Entity, std::sync::Arc<GxCellDraw>>,
+     /// This frame's per-group admission per WMO region; the node draws only admitted runs.
+     pub visible_wmos: Vec<(Entity, GxSel)>,
++    /// WOW-BG3 patch 0092: the small placements fading this frame, as (item, level 1..=16) per cell
++    /// and per prop region. Empty nearly always, so the extract's clone costs nothing.
++    pub phase_cells: HashMap<(i32, i32), Vec<(u16, u8)>>,
++    pub phase_props: HashMap<Entity, Vec<(u16, u8)>>,
+ }
+ 
+ use super::pool::GxTexturePool;
+@@ -130,6 +136,8 @@ const RECORD_FOG_BIT: u32 = 1 << 14;
+ /// WOW-BG3 patch 0091: bits 15..=19 of the flags column, the item's fade level (0 to 16).
+ const RECORD_FADE_SHIFT: u32 = 15;
+ const RECORD_FADE_MASK: u32 = 31 << RECORD_FADE_SHIFT;
++/// WOW-BG3 patch 0092: bit 20, a small placement's item (`GxItemDraw::small`), read by `static_gx.wgsl`.
++const RECORD_SMALL_BIT: u32 = 1 << 20;
+ 
+ /// One coalesced draw run of adjacent live items sharing bind-group slot, pipeline bucket and
+ /// selection key; a killed item is never in one.
+@@ -161,6 +169,8 @@ struct GxCellGpu {
+     fog_applied: Vec<bool>,
+     /// WOW-BG3 patch 0091: the fade levels last written into the flags column.
+     fade_applied: Vec<u8>,
++    /// WOW-BG3 patch 0092: the per-item levels last written there.
++    phase_applied: Vec<(u16, u8)>,
+ }
+ 
+ #[derive(Resource, Default)]
+@@ -484,34 +494,51 @@ fn prepare_static_gx(
+         gpu.fog_applied.clone_from(&sel.fog);
+     };
+     // WOW-BG3 patch 0091: the fade sync, the same way, when a storey above her fades out or in.
+-    let sync_fade = |gpu: &mut GxCellGpu, draw: &GxCellDraw, sel: &GxSel| {
+-        if gpu.fade_applied == sel.fade {
++    // Patch 0092 joins it: a small placement's level per item, the larger of the two winning.
++    let sync_fade = |gpu: &mut GxCellGpu, draw: &GxCellDraw, fade: &[u8], phase: &[(u16, u8)]| {
++        if gpu.fade_applied == fade && gpu.phase_applied == phase {
+             return;
+         }
+         for (rec, item) in gpu.records.iter_mut().zip(&draw.draws) {
+             let k = item
+                 .group
+-                .and_then(|g| sel.fade.get(usize::from(g)).copied())
++                .and_then(|g| fade.get(usize::from(g)).copied())
+                 .unwrap_or(0)
+                 .min(16);
+             rec[3] = (rec[3] & !RECORD_FADE_MASK) | (u32::from(k) << RECORD_FADE_SHIFT);
+         }
++        for &(i, k) in phase {
++            if let Some(rec) = gpu.records.get_mut(usize::from(i)) {
++                let k = u32::from(k.min(16)).max((rec[3] & RECORD_FADE_MASK) >> RECORD_FADE_SHIFT);
++                rec[3] = (rec[3] & !RECORD_FADE_MASK) | (k << RECORD_FADE_SHIFT);
++            }
++        }
+         render_queue.write_buffer(&gpu.record_table, 0, bytemuck::cast_slice(&gpu.records));
+-        gpu.fade_applied.clone_from(&sel.fade);
++        gpu.fade_applied = fade.to_vec();
++        gpu.phase_applied = phase.to_vec();
+     };
+     for (entity, sel) in &gx.visible_wmos {
+         if let (Some(gpu), Some(draw)) = (cache.wmos.get_mut(entity), gx.wmos.get(entity)) {
+             sync_fog(gpu, draw, sel);
+-            sync_fade(gpu, draw, sel);
++            sync_fade(gpu, draw, &sel.fade, &[]);
+         }
+     }
+     for vis in &gx.visible {
+-        let GxDoodadVis::Prop(entity, sel) = vis else {
+-            continue; // cell items are never on the interior lane
+-        };
+-        if let (Some(gpu), Some(draw)) = (cache.props.get_mut(entity), gx.props.get(entity)) {
+-            sync_fog(gpu, draw, sel);
+-            sync_fade(gpu, draw, sel);
++        match vis {
++            GxDoodadVis::Prop(entity, sel) => {
++                if let (Some(gpu), Some(draw)) = (cache.props.get_mut(entity), gx.props.get(entity)) {
++                    sync_fog(gpu, draw, sel);
++                    let phase = gx.phase_props.get(entity).map_or(&[][..], Vec::as_slice);
++                    sync_fade(gpu, draw, &sel.fade, phase);
++                }
++            }
++            // Cell items are never on the interior lane, but small ones fade.
++            GxDoodadVis::Cell(cell) => {
++                if let (Some(gpu), Some(draw)) = (cache.cells.get_mut(cell), gx.cells.get(cell)) {
++                    let phase = gx.phase_cells.get(cell).map_or(&[][..], Vec::as_slice);
++                    sync_fade(gpu, draw, &[], phase);
++                }
++            }
+         }
+     }
+ }
+@@ -553,7 +580,9 @@ fn assemble_region(
+                 u32::from(item.sidn[0])
+                     | (u32::from(item.sidn[1]) << 8)
+                     | (u32::from(item.sidn[2]) << 16),
+-                kill_bit(&draw.killed, i) | (u32::from(item.slot) << 1),
++                kill_bit(&draw.killed, i)
++                    | (u32::from(item.slot) << 1)
++                    | (u32::from(item.small) * RECORD_SMALL_BIT),
+             ]
+         })
+         .collect();
+@@ -605,6 +634,7 @@ fn assemble_region(
+         // Empty, so the first fog sync always writes.
+         fog_applied: Vec::new(),
+         fade_applied: Vec::new(),
++        phase_applied: Vec::new(),
+     })
+ }
+ 
+@@ -858,6 +888,13 @@ pub(super) fn publish_gx_world(gx: Res<super::StaticGx>, mut out: ResMut<GxWorld
+     if out.visible_wmos != w.visible_wmos {
+         out.visible_wmos.clone_from(&w.visible_wmos);
+     }
++    // WOW-BG3 patch 0092: the small placements' levels.
++    if out.phase_cells != w.phase_cells {
++        out.phase_cells.clone_from(&w.phase_cells);
++    }
++    if out.phase_props != w.phase_props {
++        out.phase_props.clone_from(&w.phase_props);
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -866,6 +903,7 @@ mod tests {
+ 
+     fn item(index_range: Range<u32>, cutout: bool) -> GxItemDraw {
+         GxItemDraw {
++            small: false,
+             index_range,
+             texture: None,
+             cutout,
+diff --git a/crates/benilla-world/src/terrain_stream/spawn/mod.rs b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
+index b558df0..7090473 100644
+--- a/crates/benilla-world/src/terrain_stream/spawn/mod.rs
++++ b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
+@@ -235,6 +235,19 @@ pub(super) fn spawn_loaded_placements(
+                             .entity(*e)
+                             .insert(crate::exterior_cull::ExteriorScene);
+                     }
++                    // WOW-BG3 patch 0092: small or big, on this placement's collision hull.
++                    if crate::phase_out::phases(crate::phase_out::placement_thickness(
++                        m.collision.as_ref(),
++                        &p.transform,
++                    )) {
++                        if let Some(gx) = staticgx.as_deref_mut() {
++                            gx.note_phase(&p.transform);
++                        }
++                        let key = crate::phase_out::piece_key(&p.transform);
++                        for e in ents.iter().filter(|e| Some(**e) != anim_root) {
++                            commands.entity(*e).insert(crate::phase_out::PhasePiece { key, interior: false });
++                        }
++                    }
+                     // The collision hull, welded into the owner tile's batch, which carries the
+                     // `PickOccluder` clamp. A hull-less model (a tree canopy) stays pick-through,
+                     // as the reference's world trace tests only collision-flagged doodads.
+@@ -693,6 +706,20 @@ pub(super) fn spawn_loaded_placements(
+             // group's MODR list), so a prop is drawn from any of them. The anim-host root is
+             // skipped, as at the ADT site.
+             let anim_root = host.as_ref().map(|h| h.root);
++            // WOW-BG3 patch 0092: small or big, on this prop's collision hull.
++            if crate::phase_out::phases(crate::phase_out::placement_thickness(
++                m.collision.as_ref(),
++                &d.transform,
++            )) {
++                if let Some(gx) = staticgx.as_deref_mut() {
++                    gx.note_phase(&d.transform);
++                }
++                let key = crate::phase_out::piece_key(&d.transform);
++                let interior = interior_slot.is_some();
++                for e in ents.iter().filter(|e| Some(**e) != anim_root) {
++                    commands.entity(*e).insert(crate::phase_out::PhasePiece { key, interior });
++                }
++            }
+             if let (Some(instance), false) = (portal_instance, d.groups.is_empty()) {
+                 for &entity in ents.iter().filter(|e| Some(**e) != anim_root) {
+                     commands.entity(entity).insert((
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+index ec68be9..dd6464d 100644
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -253,8 +253,9 @@ impl Plugin for WmoPortalPlugin {
+         // Patch 0091: after the exterior election wrote the body roots' verdicts.
+         .add_systems(
+             PostUpdate,
+-            hide_units_above_her
++            fade_units_above_her
+                 .after(crate::exterior_cull::ExteriorCullSet)
++                .after(crate::phase_out::phase_entity_doodads)
+                 .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+         )
+         .add_systems(
+@@ -291,36 +292,77 @@ pub(crate) struct SeeRooms(pub(crate) Vec<(Entity, Vec3, Vec3)>);
+ /// MOGP's indoor flag.
+ const MOGP_INDOOR: u32 = 0x2000;
+ 
+-/// Patch 0091: a unit standing on a storey that is gone (its feet above her head, over the room she
+-/// is in) is not drawn either, as BG3 hides who stands on a level it has taken away; without this
+-/// the NPC upstairs in the Lion's Pride Inn floated where the floor had been. Runs after the
+-/// exterior election, which writes every body root's verdict each frame, so the next frame's
+-/// election brings the unit back once she climbs up.
+-fn hide_units_above_her(
++/// Patches 0091 and 0092: a unit standing on a storey that is going (its feet above her head, over the
++/// room she is in) fades with the storey, BG3's same sixteen steps at its speed, and once gone is not
++/// drawn, as BG3 hides who stands on a level it has taken away; without this the NPC upstairs in the
++/// Lion's Pride Inn floated where the floor had been. The level goes out by rig slot
++/// (`phase_out::UnitFades`, which `wow_model.wgsl` reads whichever payload the tag holds) and to the
++/// slots of whatever the unit wears. Runs after the exterior election, which writes every body
++/// root's verdict each frame, so the next frame's election brings the unit back once she climbs up.
++fn fade_units_above_her(
+     rooms: Res<SeeRooms>,
+     see: Res<crate::see_through::SeeThrough>,
+-    mut units: Query<(&GlobalTransform, &mut Visibility), With<crate::world_unit::WorldUnit>>,
++    time: Res<Time>,
++    mut table: ResMut<crate::phase_out::UnitFades>,
++    mut units: Query<
++        (Entity, &GlobalTransform, &mut Visibility, Option<&crate::rig_palette::RigSkin>),
++        With<crate::world_unit::WorldUnit>,
++    >,
++    riders: Query<
++        (&crate::rig_palette::RigSkin, &crate::model_fade::ParentModel),
++        Without<crate::world_unit::WorldUnit>,
++    >,
++    links: Query<&crate::model_fade::ParentModel>,
++    mut fades: Local<bevy::platform::collections::HashMap<Entity, f32>>,
++    mut levels: Local<Vec<u8>>,
+ ) {
+-    if !see.live() || rooms.0.is_empty() {
+-        return;
+-    }
++    let _t = crate::static_gx::gx_perf_guard(1);
+     // Her head above the chest the see-through's target sits at, and the reach past her room's
+     // footprint, as `static_gx::cull`'s storey rule has them.
+     const HEAD: f32 = 0.7;
+     const REACH: f32 = 2.0;
++    let dt = time.delta_secs();
+     let her = see.cuts[0].at;
+-    for (gt, mut vis) in &mut units {
++    let live = see.live() && !rooms.0.is_empty();
++    levels.clear();
++    levels.resize(crate::mesh_tag::MAX_RIG_SLOTS, 0);
++    let mut seen: bevy::platform::collections::HashMap<Entity, f32> = Default::default();
++    for (e, gt, mut vis, rig) in &mut units {
+         let p = gt.translation();
+-        if p.y < her.y + HEAD {
++        let gone = live
++            && p.y >= her.y + HEAD
++            && rooms.0.iter().any(|(_, lo, hi)| {
++                p.x >= lo.x - REACH && p.x <= hi.x + REACH && p.z >= lo.z - REACH && p.z <= hi.z + REACH
++            });
++        let f = crate::phase_out::step(fades.get(&e).copied().unwrap_or(0.0), gone, dt);
++        if f <= 0.0 {
+             continue;
+         }
+-        let over = rooms.0.iter().any(|(_, lo, hi)| {
+-            p.x >= lo.x - REACH && p.x <= hi.x + REACH && p.z >= lo.z - REACH && p.z <= hi.z + REACH
+-        });
+-        if over && *vis != Visibility::Hidden {
++        seen.insert(e, f);
++        if let Some(rig) = rig {
++            levels[usize::from(rig.slot)] = crate::phase_out::level(f);
++        }
++        if f >= 1.0 && *vis != Visibility::Hidden {
+             *vis = Visibility::Hidden;
+         }
+     }
++    if !seen.is_empty() {
++        for (rig, parent) in &riders {
++            let mut up = parent.0;
++            for _ in 0..crate::model_fade::MAX_MODEL_CHAIN {
++                if let Some(f) = seen.get(&up) {
++                    levels[usize::from(rig.slot)] = crate::phase_out::level(*f);
++                    break;
++                }
++                let Ok(next) = links.get(up) else {
++                    break;
++                };
++                up = next.0;
++            }
++        }
++    }
++    *fades = seen;
++    table.publish(&levels);
+ }
+ 
+ /// Patch 0091: how far outside an indoor group's own box her chest still counts as in it (yd, model
+diff --git a/crates/benilla-world/src/world_plugins.rs b/crates/benilla-world/src/world_plugins.rs
+index d9946f0..8eebe13 100644
+--- a/crates/benilla-world/src/world_plugins.rs
++++ b/crates/benilla-world/src/world_plugins.rs
+@@ -58,6 +58,7 @@ impl PluginGroup for WorldPlugins {
+             .add(crate::frame_pace::plugin)
+             // WOW-BG3 patch 0090: the see-through circle's resource (its producer is in benilla-app).
+             .add(crate::see_through::plugin)
++            .add(crate::phase_out::plugin)
+             // The skin palette: every rig's joint matrices, skinned in `wow_model.wgsl` in place of
+             // Bevy's `SkinnedMesh`.
+             .add(crate::rig_palette::plugin)

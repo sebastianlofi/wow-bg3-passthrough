@@ -361,9 +361,8 @@ class World:
             meta = json.loads((out / 'arena.json').read_text())
             ups = meta.get('storey_tiles') or 0
             if ups >= STOREY_MIN:
-                # wow_arena.py's section as it is (the ground's tiles where the storey lies over it
-                # included), the seam bits as SEAM_BITS says.
-                section_s = b''.join(bytes([st[k * 5] & (1 | SEAM_BITS) if st[k * 5] & 1 else 0]) + st[k * 5 + 1:k * 5 + 5]
+                # wow_arena.py's section as it is, the seam bits as SEAM_BITS says.
+                section_s = b''.join(bytes([st[k * 5] & (1 | SEAM_BITS)]) + st[k * 5 + 1:k * 5 + 5]
                                      for k in range(TILES * TILES))
                 # The ground's own seams, in its section's flag byte, and the storey's tiles copied
                 # into it where the two meet (flags 1: walkable at that floor).
@@ -376,7 +375,7 @@ class World:
                     if fl & 1:
                         h = seams[k * 5 + 1:k * 5 + 5]
                         g[k * rec:k * rec + rec] = bytes([1 | SEAM_BITS]) + h + (h if rec == 9 else b'')
-                    elif fl and g[k * rec] & 1:
+                    elif fl and (g[k * rec] & 1 or fl == 8):   # 8 alone: under the storey, blocked or not
                         g[k * rec] |= fl & SEAM_BITS
                 cell['section'] = bytes(g)
                 cell['storey'] = {'min': (minx + 0.5, minz), 'base': meta['storey_base_m'],
