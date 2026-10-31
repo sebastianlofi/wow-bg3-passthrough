@@ -855,7 +855,10 @@ static uint64_t fxc_texkey_plain(uint64_t view) {
 }
 
 // The texture key of an image view: special keys for render targets, else the image (queued for
-// export at present when new).
+// export at present when new). A figure's glow (t_fxc_glow, this draw is one: glow_draw) also binds BG3's
+// virtual texture cache, a layered image export cannot take, and benilla would wait for it forever and skip
+// the draw: the neutral stand-in's alpha of 1 is all the glow's alpha test needs.
+static __thread int t_fxc_glow;
 static uint64_t fxc_texkey(uint64_t view) {
     ViewInfo* v = (g_view && view) ? TABLE_FIND(g_view, VIEW_CAP, view, 0) : NULL;
     uint64_t image = v ? v->image : 0;
@@ -885,6 +888,7 @@ static uint64_t fxc_texkey(uint64_t view) {
     uint64_t key = fnv64(&image, 8, fnv64(&i->id, 4, FNV0)) | 4;
     char path[256];
     snprintf(path, sizeof path, "%s/tex/%016llx.bin", fxc_dir(), (unsigned long long)key);
+    if (t_fxc_glow && i->layers > 1 && i->type != VK_IMAGE_TYPE_3D) return 3;
     struct stat st;
     char bad[256];
     snprintf(bad, sizeof bad, "%s/tex/%016llx.unsupported", fxc_dir(), (unsigned long long)key);
@@ -1298,11 +1302,66 @@ static int fxc_solid(const Recipe* r) {
 // under the pointer) comes in as an attachment visual, so TavPlan.lua lists its index buffer with
 // hers and the figure drop took it with her, for everyone (a playtest report). Such a draw goes on
 // through the effects capture instead; her skinned meshes (body, hair, eyelashes) still stop here.
+//
+// Word "fxglow": a spell's glow on a figure (BG3's overlay materials: Stillness of Mind, Wholeness of
+// Body, Stunning Strike). BG3 redraws the figure's own meshes, blended, in the effects pass, and the
+// figure drop took those with her. WoW draws figures in BG3's pose, so the replay fits them. A figure's
+// own blended pieces (hair edges) are to stay dropped, and they differ by when they begin: they draw
+// from the moment the figure does, while a glow begins on a buffer that has long been drawing. So a
+// blended recipe is a glow when first seen on a figure's buffer GLOW_SETTLE presents or more after that
+// buffer first drew; the verdict stays for that pair. "A spell is on" (g_fx_seen_at) cannot decide
+// this: Stillness of Mind draws no effect but the glow. A stand-in is not a figure: its body is
+// culled, WoW's mob has another shape, so its glow is not shown.
+#define GLOW_SETTLE 60u
+#define GLOW_BUFS 4096u
+#define GLOW_PAIRS 4096u
+typedef struct { uint64_t h, v; } GlowSlot;
+static GlowSlot g_glow_buf[GLOW_BUFS];    // figure buffer -> present + 1 it first drew
+static GlowSlot g_glow_pair[GLOW_PAIRS];  // buffer and recipe -> 1 own, 2 glow
+static uint64_t g_glow_kept, g_glow_full;
+// The slot's value, set to `v` if the key is new. 0: past the probe limit.
+static uint64_t glow_slot(GlowSlot* t, uint32_t cap, uint64_t k, uint64_t v) {
+    uint32_t i = hslot(k, cap);
+    for (uint32_t n = 0; n < 64; n++, i = (i + 1) & (cap - 1)) {
+        uint64_t h = __atomic_load_n(&t[i].h, __ATOMIC_ACQUIRE);
+        if (!h) {
+            uint64_t zero = 0;
+            if (__atomic_compare_exchange_n(&t[i].h, &zero, k, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&t[i].v, v, __ATOMIC_RELEASE);
+                return v;
+            }
+            h = zero;
+        }
+        if (h == k) {
+            uint64_t got = __atomic_load_n(&t[i].v, __ATOMIC_ACQUIRE);
+            return got ? got : v;  // being stored by the thread that claimed it
+        }
+    }
+    __atomic_add_fetch(&g_glow_full, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+static void glow_forget(void) {  // a load: buffers are recycled
+    memset(g_glow_buf, 0, sizeof g_glow_buf);
+    memset(g_glow_pair, 0, sizeof g_glow_pair);
+}
+static int glow_draw(VkCommandBuffer cb, const Recipe* r) {
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    uint64_t first = glow_slot(g_glow_buf, GLOW_BUFS, t_ib | 1, now + 1);
+    if (t_fxl_cb != cb || !first || !r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite) return 0;
+    uint64_t k[2] = {t_ib, (uint64_t)t_pipe};
+    uint64_t verdict = glow_slot(g_glow_pair, GLOW_PAIRS, fnv64(k, sizeof k, FNV0) | 1, now + 1 >= first + GLOW_SETTLE ? 2 : 1);
+    if (verdict != 2) return 0;
+    t_fxc_glow = 1;
+    __atomic_add_fetch(&g_glow_kept, 1, __ATOMIC_RELAXED);
+    return 1;
+}
 static int fxc_figure_extra(VkCommandBuffer cb) {
-    if (!g_cc.fxhl || t_bind_cb != cb || !t_pipe) return 0;
+    if ((!g_cc.fxhl && !g_cc.fxglow) || t_bind_cb != cb || !t_pipe) return 0;
     RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
     Recipe* r = ri ? ri->r : NULL;
-    return r && (r->have & 1) && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite && !r->nskin;
+    if (!r || !(r->have & 1)) return 0;
+    if (g_cc.fxglow && glow_draw(cb, r)) return 1;
+    return g_cc.fxhl && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite && !r->nskin;
 }
 // Research: every texture a spell's solid piece samples, once per recipe, with what the layer makes
 // of it (key 1 the scene depth, 2 the scene colour, 3 a render target it has no name for and benilla
@@ -1588,6 +1647,7 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
             }
         }
     }
+    t_fxc_glow = 0;
     // Push constants only when the pipeline's layout declares them (t_pc can be left over from an
     // earlier pipeline in the command buffer).
     uint32_t pc = (pl && pl->npush) ? t_pc : 0;
@@ -2686,6 +2746,7 @@ static void ibage_present(void) {
     uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     // The table learns slices only inside void_skip, so on the present the void engages (world mode
     // starts: KEEP 1) every visible level slice is "first seen" at once; the same after a load.
+    if (g_bg3_running && !was_running) glow_forget();
     if (!started || (g_bg3_running && !was_running) || (g_keep_active && !was_void)) {
         __atomic_store_n(&g_ibage_warm, now + IBAGE_WARM, __ATOMIC_RELAXED);
         started = 1;
@@ -2693,6 +2754,9 @@ static void ibage_present(void) {
     was_running = g_bg3_running;
     was_void = g_keep_active;
     if (now && now % IBAGE_EVERY == 0) memset(g_ibage[(now / IBAGE_EVERY) & 1], 0, sizeof g_ibage[0]);
+    if (now && now % 300 == 0 && g_cc.fxglow)
+        logf_("fxglow: %llu draws of a figure's glow kept, %llu past the probe limit", (unsigned long long)__atomic_exchange_n(&g_glow_kept, 0, __ATOMIC_RELAXED),
+              (unsigned long long)__atomic_exchange_n(&g_glow_full, 0, __ATOMIC_RELAXED));
     if (now && now % 300 == 0 && g_cc.fxprops)
         logf_("fxprops: %llu draws kept as a spell's props, %llu of a bulk arrival not kept, busiest present %llu new slices "
               "(bulk above %u), %llu slices past the probe limit",

@@ -21,7 +21,7 @@ header. The tools' own folder constants are development defaults that `relenv.py
 |---|---|
 | `lifecycle.py` | follows BG3's sessions: new game, load, save, death; WoW characters and snapshots |
 | `wowsave.py`, `wowchar.py`, `wowaccount.py`, `wowserver.py` | WoW character snapshots, BG3 to WoW character mapping, playthrough accounts, the server's console and database |
-| `world_bridge.py`, `wow_arena.py`, `wow_vmap.py`, `wow_mpq.py` | world mode's ground squares from the server's map data |
+| `world_bridge.py`, `wow_arena.py`, `wow_stand.py`, `wow_vmap.py`, `wow_mpq.py` | world mode's ground squares from the server's map data |
 | `inventory_bridge.py`, `wow_items.py`, `wow_icons.py` | the merged inventory, item data and the icon atlas |
 | `wowlevel.py` | the hero's WoW level for BG3's progression |
 | `wowbg3-chatcmd.py`, `wowbg3cmd.py` | `/wowbg3` commands typed in WoW's chat |

@@ -30,6 +30,10 @@ and writes, for a square of SIZE metres centred on the WoW point:
                  and SubgridIntersection), 8 alone on the rest inside the square (see the code); on base
                  storey_base_m (arena.json), and where the storey has no floor its tile lies
                  STOREY_FILL_M over that base. Not written with --storeys 0.
+  storeyN.bin    The same for level N (N from 2), when a column holds more floors than the levels below
+                 took (--storey-levels, default 4; see STOREY_OFFSETS for each level's subgrid offset,
+                 arena.json storey_levels lists them). seamsN.bin overlays level N where level N + 1
+                 meets it, as seams.bin does the ground.
   seams.bin      (N*N) records <u8 flags, f32 floor> for the ground's own section where the storey
                  meets it: 4 | 8 a seam on a ground tile, 1 | 4 | 8 a tile of the storey's copied
                  into the ground at that floor (BG3 m), 8 alone a tile under the storey, 0 elsewhere.
@@ -102,6 +106,11 @@ STOREY_RAMP_DEG = 15.0
 STOREY_FILL_M = 1000.0
 # A piece of storey joins the ground within this much (m) of the top of its way up.
 STOREY_JOIN_M = 0.5
+# Where each upper level's subgrid lies from its square, in tiles (+X, +Z): world mode keeps one subgrid
+# to a lattice slot, so no two may share an offset, and all of them stay inside the cut's one-tile ring.
+STOREY_OFFSETS = ((1, 0), (1, 1), (0, 1), (-1, 0), (0, -1), (-1, -1), (1, -1), (-1, 1))
+# An upper level over the first with fewer tiles is left out.
+STOREY_MIN_LEVEL = 8
 
 # An M2 at least this thick (yards, the smallest side of its collision model in its own axes, times its
 # scale, so how it is turned does not matter) is big: the camera
@@ -130,6 +139,28 @@ def detour_polys(path):
         pts = [(verts[3 * v + 2], verts[3 * v], verts[3 * v + 1]) for v in vidx[:nv]]
         polys.append(Poly(pts, flags))
     return polys
+
+def main_polys(polys):
+    """The polygons (their id()) in the largest set the movement map joins by shared edges."""
+    par = list(range(len(polys)))
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]
+            a = par[a]
+        return a
+    edges = {}
+    for i, p in enumerate(polys):
+        for k in range(len(p)):
+            a, b = p[k], p[(k + 1) % len(p)]
+            ka, kb = (round(a[0], 1), round(a[1], 1), round(a[2])), (round(b[0], 1), round(b[1], 1), round(b[2]))
+            j = edges.setdefault((ka, kb) if ka < kb else (kb, ka), i)
+            if j != i:
+                par[find(i)] = find(j)
+    size = {}
+    for i in range(len(polys)):
+        size[find(i)] = size.get(find(i), 0) + 1
+    big = max(size, key=size.get) if size else None
+    return {id(p) for i, p in enumerate(polys) if find(i) == big}
 
 class Poly(list):
     """A movement-map polygon: its corners in WoW space plus vmangos's NavTerrain flags."""
@@ -399,6 +430,7 @@ def main():
                    default=os.environ.get('WOW_BG3_STEEP_POLYS') or 'drop')
     # Upper storeys (storey.bin, see STOREY_CLEAR). 0 writes exactly what was written before them.
     p.add_argument('--storeys', type=int, choices=[0, 1], default=int(os.environ.get('WOW_BG3_STOREYS') or 1))
+    p.add_argument('--storey-levels', type=int, default=int(os.environ.get('WOW_BG3_STOREY_LEVELS') or 4))
     a = p.parse_args()
     assert 2 <= a.size <= 120
     sx = 1.0 if a.mirror else -1.0  # BG3 x = sx * WoW y
@@ -457,6 +489,12 @@ def main():
                     best, wet, stp = h, pts.water, pts.steep
                 if not pts.water:
                     hs.append(h)
+            # Around the middle too, for the storey: a narrow door's polygon can miss a tile's middle.
+            elif a.storeys and not pts.water:
+                for ox, oy in ((0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3)):
+                    if inside(x + ox, y + oy, pts):
+                        hs.append(poly_height(x + ox, y + oy, pts))
+                        break
         col[(r, c)], terr[(r, c)], mesh[(r, c)], water[(r, c)] = (x, y), th, best, wet
         steep_poly[(r, c)] = stp
 
@@ -567,7 +605,7 @@ def main():
     # The upper storey (see STOREY_CLEAR): per ring tile the lowest polygon a storey may stand on,
     # moved onto the model face WoW draws there (within 2 yd, the same as the ground's floors) and
     # held to the slope rule; then only what a walker reaches from the ground floor.
-    storey = {}
+    storey, levels = {}, []
     if a.storeys:
         limit = a.slope_limit if a.slope_limit > 0 else 90.0
         cand = {}       # ring tile -> the heights a storey may stand at there (model faces)
@@ -577,10 +615,20 @@ def main():
             hs = poly_hs[rc]
             low = floor_yd[rc] + STOREY_CLEAR if walk_ring[rc] else terr[rc] + 4.0
             up = [h for h in hs if h > low] if walk_ring[rc] else [h for h in hs if h >= low]
-            faces = [fc for fc in surfaces.floors(*col[rc]) if fc[1] <= limit]
+            # A cellar under the ground counts too (Stormwind's sanctum, under the mage quarter).
+            up += [h for h in hs if h < (floor_yd[rc] if walk_ring[rc] else terr[rc]) - STOREY_CLEAR - 4.0]
+            x, y = col[rc]
+            faces = [fc for fc in surfaces.floors(x, y) if fc[1] <= limit]
+            # Around the middle too: a middle on the line between two triangles finds neither, and a
+            # diagonal of such tiles was a crack across a street.
+            if up and not any(any(abs(fc[0] - h) <= 2.0 for h in up) for fc in faces):
+                for ox, oy in ((0.15, 0.05), (-0.15, -0.05), (0.05, -0.15), (-0.05, 0.15)):
+                    faces += [fc for fc in surfaces.floors(x + ox, y + oy) if fc[1] <= limit]
             # A storey stands on a model (a building's floor, its stairs, a bridge): a polygon with no
             # model face under it is the movement map's coarse fit of a hillside straying up.
-            opts = {round(z, 3) for z, t in faces if up and abs(z - min(up)) <= 2.0}
+            # (every polygon, not only the lowest: Orgrimmar's streets run over its tunnels; the walk
+            # below takes the height that goes on from its neighbour.)
+            opts = {round(z, 3) for z, t in faces if any(abs(z - h) <= 2.0 for h in up)}
             opts |= {round(z, 3) for z, t in faces if t >= STOREY_RAMP_DEG and z >= low}
             if opts:
                 cand[rc] = sorted(opts)
@@ -590,13 +638,21 @@ def main():
         def joins(f1, f2):
             return abs(f1 - f2) * YD < STOREY_STEP_M
         ground = {rc: floor_yd[rc] for rc in ring if walk_ring[rc]}
+        opts_all = dict(cand)
         def step_to(rc, h):
             # The height at rc a walker coming from height h stands on, or None.
             best = min(cand[rc], key=lambda z: abs(z - h))
             return best if joins(best, h) else None
-        def reach():
-            got, stack = {}, []
+        def reach(start=(), keep=None):
+            # What a walk from below reached stays: the seeds only add (a roof must not take a door's
+            # tile from the stair that leads to it).
+            got, stack = dict(keep or {}), []
+            for rc, z in start:
+                got[rc] = z
+                stack.append(rc)
             for rc in cand:
+                if rc in got:
+                    continue
                 for q in nbrs(rc):
                     if q in ground and (z := step_to(rc, ground[q])) is not None:
                         got[rc] = z
@@ -612,8 +668,27 @@ def main():
                         got[q] = z
                         stack.append(q)
             return got
+        main = []
+        def reach_main(seen):
+            # Still unreached: a floor whose way up lies farther off (a city's level over buried
+            # terrain, Orgrimmar; rooms off Stormwind's streets). It stands where the movement map joins
+            # its polygon to the main part of the world.
+            if not any(rc not in seen and rc in col for rc in cand):
+                return seen
+            if not main:
+                main.append(main_polys(polys))
+            start = []
+            for rc in cand:
+                if rc not in seen and rc in col:
+                    x, y = col[rc]
+                    hs = [poly_height(x, y, pts) for pts in buckets.get((int(math.floor(x / CELL)), int(math.floor(y / CELL))), ())
+                          if id(pts) in main[0] and inside(x, y, pts)]
+                    zs = [z for z in cand[rc] if any(abs(z - h) <= 2.0 for h in hs)]
+                    if zs:
+                        start.append((rc, zs[0]))
+            return reach(start, seen) if start else seen
         seen = reach()
-        if any(rc not in seen and (rc[0] in (-1, n) or rc[1] in (-1, n)) for rc in cand):
+        if any(rc not in seen for rc in cand):
             # A storey unreached at the square's edge: its stairs may lie in a neighbour. The margin's
             # tiles from the movement map alone (ground: the polygon nearest the terrain within 4 yd;
             # storey: as above, on the polygons' own heights), then the walk again over both.
@@ -645,72 +720,125 @@ def main():
                     if f0 is not None:
                         ground[(r, c)] = f0
                     if up:
-                        cand[(r, c)] = [min(up)]
+                        cand[(r, c)] = sorted(up)
+            opts_all = dict(cand)
             seen = reach()
-        storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
-        # Where the storey and the ground meet (a walker steps from one onto the other): both tiles
-        # are seams, the only tiles BG3's pathfinder changes subgrids on (flags 4 SubgridEdge and 8
-        # SubgridIntersection in the plugin's Place).
-        seam_s, seam_g = set(), {}
-        # Each piece of the storey joins the ground at the top of its way up only: below that it would
-        # repeat the ground's stair, and a point on the stair takes the higher twin.
-        piece = {}
-        for start in seen:
-            if start not in piece:
-                piece[start] = start
-                todo = [start]
-                while todo:
-                    t = todo.pop()
-                    for q in nbrs(t):
-                        if q in seen and q not in piece and joins(seen[q], seen[t]):
-                            piece[q] = start
-                            todo.append(q)
-        top = {}
-        for rc, z in seen.items():
-            for q in nbrs(rc):
-                if walk_ring.get(q) and joins(floor_yd[q], z):
-                    top[piece[rc]] = max(top.get(piece[rc], floor_yd[q]), floor_yd[q])
-        for rc in [rc for rc in seen if piece[rc] in top and seen[rc] < top[piece[rc]] - STOREY_JOIN_M / YD]:
-            del seen[rc]
-        for rc, z in list(seen.items()):
-            for q in nbrs(rc):
-                if walk_ring.get(q) and joins(floor_yd[q], z) and floor_yd[q] >= top[piece[rc]] - STOREY_JOIN_M / YD:
-                    seam_s.add(rc)
-                    seam_g.setdefault(q, None)
-                    # BG3 changes subgrids where two overlap only on a tile both have, each way: the
-                    # ground's tile goes into the storey at the ground's height and the storey's into
-                    # the ground (its section only, not tiles.bin) at the storey's, seams in both.
-                    if q not in seen:
-                        seen[q] = floor_yd[q]
-                        seam_s.add(q)
-                    if not walk_ring.get(rc):
-                        seam_g[rc] = by + (z - wz) * YD
-        storey = {rc: by + (z - wz) * YD for rc, z in seen.items() if 0 <= rc[0] < n and 1 <= rc[1] <= n}
-        # The storey's section as the plugin takes it, on base storey_base_m. BG3 takes a point's tile
-        # from the subgrid it last looked in, whatever the height, unless that tile has the
-        # Intersection or the Edge bit: then the tile holding the height wins (at the nearest, a blocked
-        # tile counts too, so the tiles without a floor lie far overhead). So every tile inside the square
-        # (the perimeter has Edge) has Intersection here and under the storey in the ground: flag 8
-        # without 4, which makes no crossing.
-        storey_base = math.floor(min(storey.values()) * 50) / 50 if storey else None
-        over = set(storey)
-        with open(out / 'storey.bin', 'wb') as f:
-            for r in range(n):
-                for c in range(1, n + 1):
-                    s = storey.get((r, c))
-                    inner = 8 if 0 < r < n - 1 and 1 < c < n else 0
-                    if s is not None:
-                        f.write(struct.pack('<Bf', 1 | (12 if (r, c) in seam_s else inner), s))
-                    else:
-                        f.write(struct.pack('<Bf', inner, storey_base + STOREY_FILL_M if storey_base is not None else math.nan))
-        with open(out / 'seams.bin', 'wb') as f:
-            for r in range(n):
-                for c in range(n):
-                    h = seam_g.get((r, c))
-                    fl = 12 if h is None else 13
-                    if (r, c) not in seam_g:
-                        fl = 8 if (r, c) in over and 0 < r < n - 1 and 0 < c < n - 1 else 0
-                    f.write(struct.pack('<Bf', fl, math.nan if h is None else h))
+        seen = reach_main(seen)
+        # Level by level (STOREY_OFFSETS): each one stands on the level below as the first stands on the
+        # ground, and takes the floors over it that the level below left.
+        levels, taken = [], {}
+        below = {rc: floor_yd[rc] for rc in ring if walk_ring[rc]}
+        for level in range(min(a.storey_levels, len(STOREY_OFFSETS))):
+            if level:
+                cand = {}
+                for rc, zs in opts_all.items():
+                    # Over or under what the lower levels took: the walk reaches a deck before the
+                    # street beneath it as often as the other way round.
+                    left = [z for z in zs if all(abs(z - t) > STOREY_CLEAR for t in taken.get(rc, ()))]
+                    if left:
+                        cand[rc] = left
+                ground = below
+                seen = reach()
+                seen = reach_main(seen)
+            # Where a level meets the one below (a walker steps from one onto the other): both tiles
+            # are seams, the only tiles BG3's pathfinder changes subgrids on (flags 4 SubgridEdge and 8
+            # SubgridIntersection in the plugin's Place). It joins at the top of each way up only (the
+            # highest of the joins that touch): below that it would repeat the lower stair,
+            # and a point on the stair takes the higher twin, so those tiles, the ones by a lower floor
+            # of their height, go.
+            where, top_of = {}, {}
+            for rc, z in seen.items():
+                for q in nbrs(rc):
+                    if q in below and joins(below[q], z):
+                        where[q] = below[q]
+            for q0 in where:
+                if q0 not in top_of:
+                    group, t = [q0], where[q0]
+                    top_of[q0] = None
+                    for q in group:
+                        t = max(t, where[q])
+                        for i in range(-2, 3):
+                            for j in range(-2, 3):
+                                m = (q[0] + i, q[1] + j)
+                                if m in where and m not in top_of:
+                                    top_of[m] = None
+                                    group.append(m)
+                    for q in group:
+                        top_of[q] = t
+            def top_near(rc):
+                # The top of the way up beside this tile (its joins that touch), or None.
+                return max((top_of[(rc[0] + i, rc[1] + j)] for i in range(-3, 4) for j in range(-3, 4)
+                            if (rc[0] + i, rc[1] + j) in top_of), default=None)
+            def by_below(rc, z):
+                return any((rc[0] + i, rc[1] + j) in below and abs(below[(rc[0] + i, rc[1] + j)] - z) * YD < STOREY_STEP_M
+                           for i in range(-2, 3) for j in range(-2, 3))
+            # (Between upper levels a stair may pass back and forth, so every join stays.)
+            for rc in list(seen) if not level else ():
+                t = top_near(rc)
+                if t is not None and seen[rc] < t - STOREY_JOIN_M / YD and by_below(rc, seen[rc]):
+                    del seen[rc]
+            seam_up, seam_down = set(), {}
+            for rc, z in list(seen.items()):
+                for q in nbrs(rc):
+                    if q in below and joins(below[q], z) and (level or below[q] >= top_near(q) - STOREY_JOIN_M / YD):
+                        seam_up.add(rc)
+                        seam_down.setdefault(q, None)
+                        # BG3 changes subgrids where two overlap only on a tile both have, each way:
+                        # the lower tile goes into this level at its height and this level's into the
+                        # lower one (its section only, not tiles.bin) at this one's, seams in both.
+                        if q not in seen:
+                            seen[q] = below[q]
+                            seam_up.add(q)
+                        if rc not in below:
+                            seam_down[rc] = by + (z - wz) * YD
+            dc, dr = STOREY_OFFSETS[level]
+            inside_ = {rc: by + (z - wz) * YD for rc, z in seen.items() if dr <= rc[0] < n + dr and dc <= rc[1] < n + dc}
+            if level and len(inside_) < STOREY_MIN_LEVEL:
+                break
+            levels.append({'seen': seen, 'floors': inside_, 'seam_up': seam_up, 'seam_down': seam_down, 'off': (dc, dr)})
+            below = dict(seen)
+            for rc, z in seen.items():
+                taken.setdefault(rc, []).append(z)
+        # The sections as the plugin takes them, each on its base (arena.json storey_levels). BG3 takes
+        # a point's tile from the subgrid it last looked in, whatever the height, unless that tile has
+        # the Intersection or the Edge bit: then the tile holding the height wins (at the nearest, a
+        # blocked tile counts too, so the tiles without a floor lie far overhead). So every tile inside
+        # the square (the perimeter has Edge) has Intersection in each level and under them in the
+        # ground: flag 8 without 4, which makes no crossing.
+        def seams_file(name, off, seam, over):
+            with open(out / name, 'wb') as f:
+                for r in range(n):
+                    for c in range(n):
+                        rc = (r + off[1], c + off[0])
+                        h = seam.get(rc)
+                        fl = 12 if h is None else 13
+                        if rc not in seam:
+                            fl = 8 if rc in over and 0 < r < n - 1 and 0 < c < n - 1 else 0
+                        f.write(struct.pack('<Bf', fl, math.nan if h is None else h))
+        for i, lv in enumerate(levels):
+            # A level's floors, and what the level above copies into it, stand on its base.
+            incoming = list(levels[i + 1]['seam_down'].values()) if i + 1 < len(levels) else []
+            low = list(lv['floors'].values()) + [h for h in incoming if h is not None]
+            lv['base'] = math.floor(min(low) * 50) / 50 if low else None
+            dc, dr = lv['off']
+            with open(out / ('storey.bin' if i == 0 else 'storey%d.bin' % (i + 1)), 'wb') as f:
+                for r in range(n):
+                    for c in range(n):
+                        rc = (r + dr, c + dc)
+                        z = lv['floors'].get(rc)
+                        inner = 8 if 0 < r < n - 1 and 0 < c < n - 1 else 0
+                        if z is not None:
+                            f.write(struct.pack('<Bf', 1 | (12 if rc in lv['seam_up'] else inner), z))
+                        else:
+                            f.write(struct.pack('<Bf', inner, lv['base'] + STOREY_FILL_M if lv['base'] is not None else math.nan))
+            if i + 1 < len(levels):
+                seams_file('seams%d.bin' % (i + 1), lv['off'], levels[i + 1]['seam_down'], ())
+        over = set()
+        for lv in levels:
+            over |= set(lv['floors'])
+        seams_file('seams.bin', (0, 0), levels[0]['seam_down'] if levels else {}, over)
+        storey = levels[0]['floors'] if levels else {}
+        storey_base = levels[0]['base'] if levels else None
     # spans.bin: each tile's ground height range (lowest, highest in BG3 metres) over its corners and
     # middle: the terrain's on terrain floors, the floor alone elsewhere (models, water, polygons).
     corner_h = {}
@@ -849,6 +977,7 @@ def main():
             'slope_limit_deg': a.slope_limit, 'steep_polys': a.steep_polys,
             'slope_blocked_tiles': steep_cut,
             'storeys': a.storeys, 'storey_tiles': len(storey), 'storey_base_m': storey_base if a.storeys else None,
+            **({'storey_levels': [{'tiles': len(lv['floors']), 'base': lv['base'], 'off': lv['off']} for lv in levels]} if a.storeys else {}),
             'storey_range_m': [min(storey.values()), max(storey.values())] if storey else None,
             'walkable_slope_deg_max': max([tilt_ring[(r, c)] for r in range(n) for c in range(n)
                                            if walk[r][c] and tilt_ring[(r, c)] is not None] or [0.0]),

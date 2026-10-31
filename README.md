@@ -193,9 +193,9 @@ What works is listed above; this is what does not, or has not been tried:
   creature's own BG3 health at the WoW mob's health fraction; only its damage is scaled to WoW's.
 - **The level cap**: BG3 stops at 12 without a level-cap mod (see [Levelling](#levelling)).
 - **Indoors and big cities.** Walls, roofs and small props between the camera and your party fade out,
-  and big pieces push the camera in. Orgrimmar's raised floors are not fully walkable: deeper in the city
-  your party can end up on the ground under them, with the camera against that ground. Stairs have
-  been walked in only a few towns.
+  and big pieces push the camera in. Cities have raised floors, but they are new: heading back across
+  Orgrimmar's upper deck can jump, and rooms behind tall entrance steps cannot be reached on foot. Stairs
+  have been walked in only a few towns.
 - **Cloth and models.** BG3's cloth simulation is not carried onto WoW's picture, so a robe or heavy
   armour trails behind the character and can clip.
 - **Terrain.** Some ground is walkable in BG3 where WoW would stop you, like some steep hills and
@@ -204,14 +204,12 @@ What works is listed above; this is what does not, or has not been tried:
   a walkable surface, so a mob under the water or in the air probably fights on the surface or the
   ground below it. This has not been tested.
 - **Spell effects.** Some spells' visual effects are missing or only partly drawn on WoW's picture: the
-  spell still works by BG3's rules, you just do not see all of it. Glows on a character's body, like
-  Stillness of Mind and Wholeness of Body, do not show at all.
+  spell still works by BG3's rules, you just do not see all of it.
 - **Picture.** Enemy vision cones show on WoW's ground while you sneak, but their edges are ragged
   where WoW's ground and BG3's idea of it disagree in height; ground surfaces can look matte, and WoW's
   minimap and map icons are not drawn.
-- **Saves and death.** A save made during a fight cannot resume that fight yet: after the load the
-  fight is ended where everyone stands. Dying outside a fight (a fall, a surface) does not yet kill
-  your WoW character.
+- **Saves.** A save made during a fight cannot resume that fight yet: after the load the
+  fight is ended where everyone stands.
 
 Each of these in detail, with the smaller ones: [docs/known-issues.md](docs/known-issues.md).
 

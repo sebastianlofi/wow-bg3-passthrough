@@ -46,6 +46,20 @@ mdb_link() {
 say() { echo "wowbg3-server: $*"; }
 die() { echo "wowbg3-server: $*" >&2; exit 1; }
 alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+# A pid file left by a game that was killed: this start runs in a new container, whose low pids are handed out
+# again, so such a file can name a live process that is something else. `alive` would then say a server that is
+# not running is, and it would never be started (the character stays "online", benilla waits at the realm list).
+stale_pids() {
+    local p pid
+    for p in mangosd realmd console-holder mariadb; do
+        [ -f "$RUN/$p.pid" ] || continue
+        pid=$(cat "$RUN/$p.pid")
+        case "$p:$(cat "/proc/$pid/comm" 2>/dev/null)" in
+            mangosd:mangosd|realmd:realmd|console-holder:sleep|mariadb:mariadbd) ;;
+            *) say "$p's pid file names pid $pid, which is not $p: left over"; rm -f "$RUN/$p.pid" ;;
+        esac
+    done
+}
 secret() { grep "^$1=" "$V/secrets.env" | cut -d= -f2; }
 sql() { "$MDB/bin/mariadb" --socket="$SOCK" -uroot -p"$(secret ROOT_PASS)" "$@"; }
 
@@ -158,6 +172,7 @@ init() {
 OWN=0
 start() {
     [ -e "$V/.initialized" ] || die "not initialised (init WOW_DIR first)"
+    stale_pids
     db_start
     sid=setsid
     if [ "$OWN" = 1 ]; then sid=""; fi   # `set -e`: a plain `&&` test that fails would end the script
@@ -189,6 +204,7 @@ start() {
 }
 
 stop() {
+    stale_pids
     if alive mangosd; then
         echo "saveall" > "$RUN/console"; sleep 1
         kill -INT "$(cat "$RUN/mangosd.pid")"

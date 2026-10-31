@@ -794,7 +794,7 @@ std::string occupants_json(int k, PoolSub const& s, Occupants const& o) {
 }
 
 // A storey (a subgrid one tile off the lattice, wow_arena.py storey.bin) stands on both sides of the
-// ground in its patches' lists, [storey, ground, storey]: with the ground first BG3's paths from the
+// ground in its patches' lists, [storeys, ground, storeys]: with the ground first BG3's paths from the
 // ground never found the storey (from the storey they found the ground), with the storey first the
 // reverse. No storey at a patch: the list is left as it is. Readers on other threads see Size last.
 void pool_storeys_first(PoolState const& p, RawPatchMap* m, std::vector<glm::ivec2> const& patches) {
@@ -807,7 +807,7 @@ void pool_storeys_first(PoolState const& p, RawPatchMap* m, std::vector<glm::ive
             const auto id = a.Buf[i];
             bool storey = false;
             for (auto const& b : p.Subs) {
-                if (b.Id == id && b.Moved && b.Xg % kCellTiles != 0) storey = true;
+                if (b.Id == id && b.Moved && (b.Xg % kCellTiles != 0 || b.Zg % kCellTiles != 0)) storey = true;
             }
             auto& v = storey ? st : gr;
             if (std::find(v.begin(), v.end(), id) == v.end()) v.push_back(id);

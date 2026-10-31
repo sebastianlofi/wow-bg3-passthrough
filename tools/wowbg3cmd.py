@@ -550,12 +550,10 @@ def tele(ctx, args):
     if cross:
         # The other continent: WoW's character goes first to the named place there nearest the point
         # (a server teleport; world-console.py takes names of letters and digits only).
-        char = ctx.char
-        if not char:
-            rows = sql('SELECT name FROM characters WHERE online = 1 LIMIT 1;', 'characters').split()
-            char = rows[0] if rows else ''
-        if not char:
-            raise CmdError('tp: no online WoW character found (for the server teleport to %s)' % cont(mapid))
+        # An offline name would "work": the console only rewrites that character's saved position.
+        char = hero(ctx)
+        if char not in [c for c, _ in online_characters()]:
+            raise CmdError('tp: WoW character %s is not online (for the server teleport to %s)' % (char, cont(mapid)))
         via = [q for q in places() if q[1] == mapid and q[0].isalnum()]
         if not via:
             raise CmdError('tp: no named place on %s to go through' % cont(mapid))

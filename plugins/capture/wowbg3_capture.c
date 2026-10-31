@@ -1043,6 +1043,7 @@ typedef struct {
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
     int fxwib;      // fxwhy groups a draw by its index buffer too, so each mesh is its own group (word "fxwib")
     int fxprops;    // a spell's 3D props kept in the void (word "fxprops"; see void_skip)
+    int fxglow;     // a spell's glow on a figure captured, not dropped with her (word "fxglow"; see fxc_figure_extra)
     uint32_t fxpropage;  // ... while their mesh is younger than this many presents ("fxpropage=", 900)
     uint32_t fxpropburst;  // ... unless their present brought more new slices than this ("fxpropburst=", 8)
     float sdec, sfwd, sfloor, stol;
@@ -1077,6 +1078,7 @@ static ComposeCfg g_cc;
 // "fxhl" (a figure's hover highlight captured instead of dropped with her; see fxc_figure_extra. Off
 // by default: BG3 draws that highlight on the character's own skinned meshes, which this does not
 // cover, and a stand-in's BG3 body is the wrong shape for WoW's model anyway).
+// "fxglow" (a spell's glow on a figure captured instead of dropped with her; see glow_draw).
 // "fxwhole" (the effects capture as before: BG3's skinned vertex stream and light index
 // lists copied whole instead of the parts a draw reads, see spv_meta, and draws benilla cannot
 // replay kept, see fxc_unsup_draw).
@@ -1149,6 +1151,7 @@ static void compose_config(void) {
     g_cc.surfpost = has_word(line, "surfpost");
     g_cc.fxwib = has_word(line, "fxwib");
     g_cc.fxprops = has_word(line, "fxprops");
+    g_cc.fxglow = has_word(line, "fxglow");
     g_cc.fxpropage = 900;
     { const char* w = strstr(line, "fxpropage="); if (w) { unsigned long v = strtoul(w + 10, NULL, 10); if (v) g_cc.fxpropage = (uint32_t)v; } }
     g_cc.fxpropburst = 8;
@@ -2177,6 +2180,7 @@ static void fxc_pass_target(uint64_t image);
 static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi);
 static void fxp_draw(VkCommandBuffer cb);
 static int fxc_figure_extra(VkCommandBuffer cb);
+static __thread int t_fxc_glow;
 static __thread int t_fx_surf;  // this draw is one of BG3's ground surfaces (surf_draw)
 static void fxw_pass(VkCommandBuffer cb, const char* what, uint32_t n, const uint64_t* imgs, const uint8_t* load);
 static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi, int why);
@@ -2736,6 +2740,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(VkCommandBuffer cb, uint3
     DeviceData* d = device_for(cb);
     if (!d) return;
     if (t_tavd_cb == cb && t_ib_cb == cb) tavd_note(cb, t_ib, fin);
+    t_fxc_glow = 0;
     if (tav_hidden_draw(cb) && !fxc_figure_extra(cb)) {
         if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'H');
         return;

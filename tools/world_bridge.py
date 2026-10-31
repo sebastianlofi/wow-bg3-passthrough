@@ -47,6 +47,7 @@ LINK = IO / 'link'
 CELLS = Path('/tmp/wowbg3/cells')  # wow_arena.py output per square (tmpfs, overwritten)
 sys.path.insert(0, str(ROOT / 'link/tools'))
 import wow_arena  # noqa: E402
+import wow_stand  # noqa: E402
 
 
 YD = 0.9144
@@ -280,8 +281,9 @@ class World:
         return W[0] - (bz - C[2]) / YD, W[1] + (bx - C[0]) / YD
 
     def cell_min(self, ij):
-        # A storey (i, j, 1) lies one tile further +X than its square (see STOREYS).
-        return self.centre[0] + CELL * ij[0] + (0.5 if len(ij) == 3 else 0.0), self.centre[2] + CELL * ij[1]
+        # An upper level (i, j, k) lies a tile off its square (see STOREYS).
+        dc, dr = wow_arena.STOREY_OFFSETS[ij[2] - 1] if len(ij) == 3 else (0, 0)
+        return self.centre[0] + CELL * ij[0] + 0.5 * dc, self.centre[2] + CELL * ij[1] + 0.5 * dr
 
     # ---- commands to WorldMode.lua ----
     def command(self, action, **fields):
@@ -356,32 +358,40 @@ class World:
         cell = {'ij': ij, 'min': (minx, minz), 'base': base, 'tiles': tiles, 'section': section, 'tris': tris,
                 'kinds': kinds, 'storey': None}
         if STOREYS:
-            st = (out / 'storey.bin').read_bytes()
-            assert len(st) == TILES * TILES * 5, 'wow_arena.py wrote no storey'
             meta = json.loads((out / 'arena.json').read_text())
-            ups = meta.get('storey_tiles') or 0
-            if ups >= STOREY_MIN:
-                # wow_arena.py's section as it is, the seam bits as SEAM_BITS says.
-                section_s = b''.join(bytes([st[k * 5] & (1 | SEAM_BITS)]) + st[k * 5 + 1:k * 5 + 5]
-                                     for k in range(TILES * TILES))
-                # The ground's own seams, in its section's flag byte, and the storey's tiles copied
-                # into it where the two meet (flags 1: walkable at that floor).
-                seams = (out / 'seams.bin').read_bytes()
-                assert len(seams) == TILES * TILES * 5, 'wow_arena.py wrote no seams'
-                rec = len(section) // (TILES * TILES)
-                g = bytearray(section)
-                for k in range(TILES * TILES):
-                    fl = seams[k * 5]
-                    if fl & 1:
-                        h = seams[k * 5 + 1:k * 5 + 5]
-                        g[k * rec:k * rec + rec] = bytes([1 | SEAM_BITS]) + h + (h if rec == 9 else b'')
-                    elif fl and (g[k * rec] & 1 or fl == 8):   # 8 alone: under the storey, blocked or not
-                        g[k * rec] |= fl & SEAM_BITS
-                cell['section'] = bytes(g)
-                cell['storey'] = {'min': (minx + 0.5, minz), 'base': meta['storey_base_m'],
-                                  'section': section_s, 'tiles': ups}
-                assert max(struct.unpack_from('<f', st, k * 5 + 1)[0] for k in range(TILES * TILES)) - meta['storey_base_m'] < 1300, \
-                    'a storey spans more height than a subgrid holds'
+            ups = meta.get('storey_levels') or []
+            if ups and ups[0]['tiles'] >= STOREY_MIN:
+                # wow_arena.py's sections as they are, the seam bits as SEAM_BITS says; into each
+                # section below a level (the ground's for the first) go the seams and the tiles
+                # copied where the two meet (flags 1: walkable at that floor).
+                def overlay(section, name):
+                    seams = (out / name).read_bytes()
+                    assert len(seams) == TILES * TILES * 5, 'wow_arena.py wrote no seams'
+                    rec = len(section) // (TILES * TILES)
+                    g = bytearray(section)
+                    for k in range(TILES * TILES):
+                        fl = seams[k * 5]
+                        if fl & 1:
+                            h = seams[k * 5 + 1:k * 5 + 5]
+                            g[k * rec:k * rec + rec] = bytes([1 | SEAM_BITS]) + h + (h if rec == 9 else b'')
+                        elif fl and (g[k * rec] & 1 or fl == 8):   # 8 alone: under a level, blocked or not
+                            g[k * rec] |= fl & SEAM_BITS
+                    return bytes(g)
+                cell['section'] = overlay(section, 'seams.bin')
+                cell['storeys'] = []
+                for i, lv in enumerate(ups):
+                    st = (out / ('storey.bin' if i == 0 else 'storey%d.bin' % (i + 1))).read_bytes()
+                    assert len(st) == TILES * TILES * 5, 'wow_arena.py wrote no storey'
+                    section_s = b''.join(bytes([st[k * 5] & (1 | SEAM_BITS)]) + st[k * 5 + 1:k * 5 + 5]
+                                         for k in range(TILES * TILES))
+                    if i + 1 < len(ups):
+                        section_s = overlay(section_s, 'seams%d.bin' % (i + 1))
+                    dc, dr = lv['off']
+                    cell['storeys'].append({'min': (minx + 0.5 * dc, minz + 0.5 * dr), 'base': lv['base'],
+                                            'section': section_s, 'tiles': lv['tiles'], 'floors': st})
+                    assert max(struct.unpack_from('<f', st, k * 5 + 1)[0] for k in range(TILES * TILES)) - lv['base'] < 1300, \
+                        'a storey spans more height than a subgrid holds'
+                cell['storey'] = cell['storeys'][0]
         self.cells[ij] = cell
         # Every placed square stays cached (its triangles go to the plugin at every Stream, and the
         # fall guard reads its floors): a pool of up to 128 squares, plus room for squares coming in.
@@ -520,7 +530,8 @@ class World:
         if STOREYS:
             # The storeys of the squares already cut (a new square's comes the round after its cut),
             # in the squares' order, in the pool subgrids the ground leaves.
-            ups = [ij + (1,) for ij in out if (self.cells.get(ij) or {}).get('storey')]
+            ups = [ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in out
+                   if k < len((self.cells.get(ij) or {}).get('storeys') or ())]
             out = out + ups[:max(0, self.pool - len(out))]
         return out
 
@@ -571,7 +582,7 @@ class World:
         for k, ij in pairs:
             cell = self.cut(ij[:2])
             if len(ij) == 3:
-                cell = cell['storey']
+                cell = cell['storeys'][ij[2] - 1]
             self.serial = self.serial % SERIALS + 1
             atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), cell['section'])
             out.append([k, cell['min'][0], cell['min'][1], cell['base'], self.serial])
@@ -595,8 +606,9 @@ class World:
                 if e.get('Moved'):
                     dx = e['At'][0] - self.centre[0]
                     ij = (int(round(dx / CELL)), int(round((e['At'][2] - self.centre[2]) / CELL)))
-                    if abs(dx - CELL * ij[0] - 0.5) < 0.1:   # a storey: one tile further +X
-                        ij += (1,)
+                    off = (round((dx - CELL * ij[0]) * 2), round((e['At'][2] - self.centre[2] - CELL * ij[1]) * 2))
+                    if off != (0, 0):   # an upper level: a tile off its square
+                        ij += (wow_arena.STOREY_OFFSETS.index(off) + 1,)
                 got[e['K']] = ij
             sides.append(got)
         return sides
@@ -619,16 +631,47 @@ class World:
     # ---- session ----
     def start(self, at=None):
         """World mode at WoW's player, or at the WoW point `at` (x, y, z): its origin for the session."""
+        login = False
         if at:
             self.origin = tuple(at)
         else:
-            wx, wy, _ = player_wow()
+            wx, wy, wz = player_wow()
             self.origin = (wx, wy, self.terrain.height(wx, wy))
+            # WoW's player on a raised floor (a city street) starts on it, not on the terrain under it.
+            if STOREYS and abs(wz - self.origin[2]) > wow_arena.STOREY_CLEAR:
+                at, login = (wx, wy, wz), True
+                self.origin = tuple(at)
         w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
         w.node = (0, 0)
         want, _ = self.window(w, self.centre[0], self.centre[2])
         pairs = list(zip(range(4), want))
         cells = self.cells_for(pairs)
+        # A point on a raised floor (a city street): its storeys go down with the ground, or the hero
+        # teleported there finds only the terrain under them and stays on it.
+        if at and abs(at[2] - self.terrain.height(at[0], at[1])) > wow_arena.STOREY_CLEAR:
+            # A cut holds one storey a tile: where it kept another floor of this column, that one.
+            y = self.storey_floors(self.centre[0], self.centre[2])
+            if y is None and login:
+                self.origin = (at[0], at[1], self.terrain.height(at[0], at[1]))
+                print('start: no raised floor under WoW\'s player, the terrain', flush=True)
+                self.cells.clear()
+                cells = self.cells_for(pairs)
+            elif y is not None and abs(y - self.centre[1]) > wow_arena.STOREY_CLEAR * YD:
+                self.origin = (at[0], at[1], at[2] + (y - self.centre[1]) / YD)
+                print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.origin[2]), flush=True)
+                self.cells.clear()
+                cells = self.cells_for(pairs)
+            # A Start holds 12 squares: the level under the hero first, the others stream in after it.
+            def gap(u):
+                st = self.cells[u[:2]]['storeys'][u[2] - 1]
+                c0, r0 = int((self.centre[0] - st['min'][0]) // 0.5), int((self.centre[2] - st['min'][1]) // 0.5)
+                if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
+                    return abs(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0] - self.centre[1])
+                return math.inf
+            ups = list(zip(range(4, min(self.pool, 12)), sorted([ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in want
+                                                                 if k < len(self.cells[ij].get('storeys') or ())], key=gap)))
+            cells += self.cells_for(ups)
+            pairs += ups
         self.write_triangles(want)
         self.rays = sorted(want)
         seq = self.command('Start', Centre=list(self.centre), WowOrigin=list(self.origin), Cells=cells, PoolSize=self.pool,
@@ -651,6 +694,22 @@ class World:
         body = {'Active': active, 'WowOrigin': list(self.origin or (0, 0, 0)), 'Centre': list(self.centre), 'Map': self.map,
                 'Time': time.time()}
         atomic_write(LINK / 'world.json', json.dumps(body).encode())
+
+    def storey_floors(self, bx, bz, reach=4):
+        """The nearest walkable storey floor (BG3 y) in the squares already cut, within `reach` tiles of
+        BG3 (x, z), or None: the one a character put at (x, z) stands on."""
+        tiles = [(dc, dr) for dc in range(-reach, reach + 1) for dr in range(-reach, reach + 1)]
+        for dc, dr in sorted(tiles, key=lambda t: t[0] * t[0] + t[1] * t[1]):
+            x, z = bx + dc * 0.5, bz + dr * 0.5
+            i, j = int(math.floor((x - self.centre[0]) / CELL)), int(math.floor((z - self.centre[2]) / CELL))
+            found = []
+            for st in (self.cells.get((i, j)) or {}).get('storeys') or ():
+                c0, r0 = int((x - st['min'][0]) // 0.5), int((z - st['min'][1]) // 0.5)
+                if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
+                    found.append(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0])
+            if found:
+                return min(found, key=lambda v: abs(v - self.centre[1]))
+        return None
 
     def floor_at(self, bx, bz):
         """(walkable, floor y) of the placed square's tile under BG3 (x, z), or None."""
@@ -781,11 +840,18 @@ class World:
             answer(False, 'not during a BG3 fight')
             return self
         try:
-            h = wow_arena.Terrain(Path(self.a.maps), target).height(x, y)
+            terrain = wow_arena.Terrain(Path(self.a.maps), target)
+            h = terrain.height(x, y)
         except Exception as e:  # no height map there (off the continent, or an ocean tile)
             answer(False, 'no WoW ground there: %s' % e)
             return self
-        z = h if z is None else float(z)
+        if z is None:
+            try:
+                z = wow_stand.height(target, x, y, terrain)  # a city's floor, not the terrain under it
+            except Exception as e:  # noqa: BLE001  the terrain still works outdoors
+                print('no floor from the movement map, the terrain instead:', e, flush=True)
+                z = h
+        z = float(z)
         print(time.strftime('%H:%M:%S'), 'move to', m.get('What') or '', 'WoW %.1f %.1f %.1f map %d' % (x, y, z, target), flush=True)
         self.publish(False)
         seq = self.command('Stop')

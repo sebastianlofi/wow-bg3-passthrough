@@ -574,7 +574,7 @@ fn bridge_args(args: &[String]) -> Result<(), Error> {
         script_enemies: 1,
         script_adds: 0,
         stats: PathBuf::new(),
-        max_seconds: 900,
+        max_seconds: 14400, // hand-played fights of four run long; only a stuck bridge should reach this
     };
     o.stats = o.project.join("tmp/creature-stats.json");
     let num = |s: Option<&String>| -> Result<f64, Error> {
