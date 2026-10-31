@@ -1,4 +1,4 @@
-# Building WOW-BG3 from source
+# Building WOW-BG3 Passthrough from source
 
 Everything in the release zip is built from this repository plus pinned upstream sources. Every
 binary is built against Steam Runtime 3 ("sniper", glibc 2.31), the runtime Steam starts native BG3

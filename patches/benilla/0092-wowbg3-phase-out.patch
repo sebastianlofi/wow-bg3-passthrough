@@ -239,12 +239,42 @@ index 51ce2e8..e9d49f7 100644
      #[test]
      fn highlight_bit_is_orthogonal_to_both_payloads() {
          for a in [0.0, f32::MIN_POSITIVE, 0.25, 0.5, 1.0] {
+diff --git a/crates/benilla-world/src/particles/sim.rs b/crates/benilla-world/src/particles/sim.rs
+index fbcb999..2691cda 100644
+--- a/crates/benilla-world/src/particles/sim.rs
++++ b/crates/benilla-world/src/particles/sim.rs
+@@ -406,6 +406,7 @@ pub(super) fn simulate_particles(
+             Option<&RenderLayers>,
+             Option<&EffectLightOverride>,
+             Option<&crate::interior::EmitterLitBy>,
++            Option<&crate::phase_out::PhaseEmitter>,
+         ),
+         Without<WorldCamera>,
+     >,
+@@ -465,6 +466,7 @@ pub(super) fn simulate_particles(
+         layers,
+         light_override,
+         lit_by,
++        phase,
+     ) in &mut emitters
+     {
+         // The camera the quads face, the LOD measures from and the draw targets: a booth-layered
+@@ -690,7 +692,8 @@ pub(super) fn simulate_particles(
+         // The model's render alpha (`emitter+0x1a8 = Model+0x19c`, `0x718960` at `0x719073`): an
+         // entity cloud's composed model alpha, or a placed doodad's distance fade.
+         *alpha = alpha_src.map_or(1.0, |e| owner_mul.alpha(e))
+-            * fade.as_ref().map_or(1.0, |f| f.distance_alpha(cam_pos));
++            * fade.as_ref().map_or(1.0, |f| f.distance_alpha(cam_pos))
++            * phase.map_or(1.0, |p| p.alpha);
+         // The model's live translation, or the last known while the pool drains.
+         match *anchor {
+             Some(a) => {
 diff --git a/crates/benilla-world/src/phase_out.rs b/crates/benilla-world/src/phase_out.rs
 new file mode 100644
-index 0000000..a2a0874
+index 0000000..d70939e
 --- /dev/null
 +++ b/crates/benilla-world/src/phase_out.rs
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,416 @@
 +//! WOW-BG3 patch 0092: the small pieces between the camera and her phase out, whole.
 +//!
 +//! The design rule for what stands between the camera and the character: ceilings,
@@ -429,12 +459,32 @@ index 0000000..a2a0874
 +    (f * 16.0).round().clamp(0.0, 16.0) as u8
 +}
 +
++/// An emitter of a small doodad: its flames go with the piece, by the alpha every particle of an
++/// emitter already carries. Its own box is the owner's bounds, so a piece drawn on `static_gx`,
++/// which has no part on the entity path, still has something here to test.
++#[derive(Component, Clone, Copy)]
++pub struct PhaseEmitter {
++    key: PieceKey,
++    lo: Vec3,
++    hi: Vec3,
++    pub alpha: f32,
++}
++
++impl PhaseEmitter {
++    pub(crate) fn new(key: PieceKey, fade: &crate::particles::EmitterFade) -> Self {
++        // The box inside the owner's bounding sphere, as the sphere's corners stand far off the model.
++        let half = Vec3::splat(fade.radius * 0.577);
++        Self { key, lo: fade.center - half, hi: fade.center + half, alpha: 1.0 }
++    }
++}
++
 +/// The entity-path half: every small doodad part whose placement stands in the way fades, all its
-+/// parts together.
++/// parts and emitters together.
 +pub(crate) fn phase_entity_doodads(
 +    see: Res<crate::see_through::SeeThrough>,
 +    time: Res<Time>,
 +    mut parts: Query<(&PhasePiece, &GlobalTransform, &Aabb, &mut MeshTag)>,
++    mut emitters: Query<&mut PhaseEmitter>,
 +    mut table: ResMut<UnitFades>,
 +    mut fades: Local<HashMap<PieceKey, f32>>,
 +    mut hit: Local<HashSet<PieceKey>>,
@@ -449,6 +499,11 @@ index 0000000..a2a0874
 +            let (lo, hi) = world_box(gt, aabb);
 +            if sight.blocked_by(lo, hi) {
 +                hit.insert(piece.key);
++            }
++        }
++        for em in &emitters {
++            if sight.blocked_by(em.lo, em.hi) {
++                hit.insert(em.key);
 +            }
 +        }
 +    }
@@ -477,6 +532,12 @@ index 0000000..a2a0874
 +        };
 +        if t != tag.0 {
 +            tag.0 = t;
++        }
++    }
++    for mut em in &mut emitters {
++        let alpha = 1.0 - fades.get(&em.key).copied().unwrap_or(0.0);
++        if em.alpha != alpha {
++            em.alpha = alpha;
 +        }
 +    }
 +}
@@ -1099,22 +1160,23 @@ index c4b3129..8ac407e 100644
              texture: None,
              cutout,
 diff --git a/crates/benilla-world/src/terrain_stream/spawn/mod.rs b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
-index b558df0..7090473 100644
+index b558df0..0cb5f76 100644
 --- a/crates/benilla-world/src/terrain_stream/spawn/mod.rs
 +++ b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
-@@ -235,6 +235,19 @@ pub(super) fn spawn_loaded_placements(
+@@ -235,6 +235,20 @@ pub(super) fn spawn_loaded_placements(
                              .entity(*e)
                              .insert(crate::exterior_cull::ExteriorScene);
                      }
 +                    // WOW-BG3 patch 0092: small or big, on this placement's collision hull.
-+                    if crate::phase_out::phases(crate::phase_out::placement_thickness(
++                    let phase_key = crate::phase_out::phases(crate::phase_out::placement_thickness(
 +                        m.collision.as_ref(),
 +                        &p.transform,
-+                    )) {
++                    ))
++                    .then(|| crate::phase_out::piece_key(&p.transform));
++                    if let Some(key) = phase_key {
 +                        if let Some(gx) = staticgx.as_deref_mut() {
 +                            gx.note_phase(&p.transform);
 +                        }
-+                        let key = crate::phase_out::piece_key(&p.transform);
 +                        for e in ents.iter().filter(|e| Some(**e) != anim_root) {
 +                            commands.entity(*e).insert(crate::phase_out::PhasePiece { key, interior: false });
 +                        }
@@ -1122,19 +1184,40 @@ index b558df0..7090473 100644
                      // The collision hull, welded into the owner tile's batch, which carries the
                      // `PickOccluder` clamp. A hull-less model (a tree canopy) stays pick-through,
                      // as the reference's world trace tests only collision-flagged doodads.
-@@ -693,6 +706,20 @@ pub(super) fn spawn_loaded_placements(
+@@ -259,6 +273,7 @@ pub(super) fn spawn_loaded_placements(
+                             welds.add_tile(p.owner, verts, tris);
+                         }
+                     }
++                    let before_emitters = ents.len();
+                     spawn_emitters_for(
+                         &mut commands,
+                         &m.emitters,
+@@ -267,6 +282,11 @@ pub(super) fn spawn_loaded_placements(
+                         &fade,
+                         &mut ents,
+                     );
++                    if let Some(key) = phase_key {
++                        for e in &ents[before_emitters..] {
++                            commands.entity(*e).insert(crate::phase_out::PhaseEmitter::new(key, &fade));
++                        }
++                    }
+                     spawn_ribbons_for(
+                         &mut commands,
+                         &m.ribbons,
+@@ -693,6 +713,21 @@ pub(super) fn spawn_loaded_placements(
              // group's MODR list), so a prop is drawn from any of them. The anim-host root is
              // skipped, as at the ADT site.
              let anim_root = host.as_ref().map(|h| h.root);
 +            // WOW-BG3 patch 0092: small or big, on this prop's collision hull.
-+            if crate::phase_out::phases(crate::phase_out::placement_thickness(
++            let phase_key = crate::phase_out::phases(crate::phase_out::placement_thickness(
 +                m.collision.as_ref(),
 +                &d.transform,
-+            )) {
++            ))
++            .then(|| crate::phase_out::piece_key(&d.transform));
++            if let Some(key) = phase_key {
 +                if let Some(gx) = staticgx.as_deref_mut() {
 +                    gx.note_phase(&d.transform);
 +                }
-+                let key = crate::phase_out::piece_key(&d.transform);
 +                let interior = interior_slot.is_some();
 +                for e in ents.iter().filter(|e| Some(**e) != anim_root) {
 +                    commands.entity(*e).insert(crate::phase_out::PhasePiece { key, interior });
@@ -1143,6 +1226,26 @@ index b558df0..7090473 100644
              if let (Some(instance), false) = (portal_instance, d.groups.is_empty()) {
                  for &entity in ents.iter().filter(|e| Some(**e) != anim_root) {
                      commands.entity(entity).insert((
+@@ -729,6 +764,7 @@ pub(super) fn spawn_loaded_placements(
+                     welds.add_prop(unique_id, verts, tris);
+                 }
+             }
++            let before_emitters = ents.len();
+             spawn_emitters_for(
+                 &mut commands,
+                 &m.emitters,
+@@ -737,6 +773,11 @@ pub(super) fn spawn_loaded_placements(
+                 &fade,
+                 &mut ents,
+             );
++            if let Some(key) = phase_key {
++                for e in &ents[before_emitters..] {
++                    commands.entity(*e).insert(crate::phase_out::PhaseEmitter::new(key, &fade));
++                }
++            }
+             spawn_ribbons_for(
+                 &mut commands,
+                 &m.ribbons,
 diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
 index ec68be9..dd6464d 100644
 --- a/crates/benilla-world/src/wmo_portal/mod.rs

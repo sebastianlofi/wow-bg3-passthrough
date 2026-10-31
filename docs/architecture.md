@@ -1,4 +1,4 @@
-# How WOW-BG3 works
+# How WOW-BG3 Passthrough works
 
 Two real games run at once and talk through files and shared memory: Baldur's Gate 3, the game
 you see and control, and a WoW 1.12.1 client that nobody sees. Neither is rewritten; each gets a

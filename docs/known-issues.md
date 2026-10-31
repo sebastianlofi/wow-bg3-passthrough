@@ -29,13 +29,12 @@ This is the first public version. What we know is missing or rough:
 - BG3's cloth simulation is not carried onto WoW's picture: a garment with its own cloth mesh
   (Gale's robe, Karlach's armour) trails behind the character and can clip. Karlach's body mesh is
   also missing from the capture, so she looks wrong without armour.
+- Glows on a character's body from spells (Stillness of Mind, Wholeness of Body and others) do not show.
 
 ## Game
 
 - Dying outside a fight (a fall, a surface) does not kill the WoW character.
-- Nothing cuts away a WoW roof or wall between the camera and your party, so in houses and caves the
-  camera pushes against the building instead of looking through it. BG3's own levels fade the
-  geometry in the way; we do not do that yet.
+- Walls, roofs and small props between the camera and your party fade out, and big pieces push the camera in.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is
   ended where everyone stands (no WoW fight runs behind it any more).
 - Horde start zones, Teldrassil and Mulgore have had less testing than Northshire and Shadowglen.
@@ -43,6 +42,14 @@ This is the first public version. What we know is missing or rough:
   `settings.conf` (`wow_sound = 0`) if it misbehaves.
 - Quitting through BG3's own menu stops the WoW side as BG3 closes; check that
   `~/.local/share/wow-bg3/logs/server.log` ends with `stopped` if you see a problem on the next start.
+- Orgrimmar's raised floors are not fully walkable: deeper in the city your party can end up on the ground
+  under them, with the camera against that ground.
+- Stairs: from a hall, a click on anything at or above your ceiling goes through it to what is underneath, so
+  click lower on the stairs. Razor Hill's watchtower top has no walking route: moving up or back teleports. Stairs
+  have been walked in only a few towns.
+- The `tp` command fails between continents ("did not arrive"), and inside a city it can put you on the ground
+  under the city's floors.
+- Fading: ribbons and point lights of a faded prop stay visible.
 
 ## Levels and progression
 

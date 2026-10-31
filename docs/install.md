@@ -1,4 +1,4 @@
-# Installing WOW-BG3
+# Installing WOW-BG3 Passthrough
 
 The release zip has its own README with the same steps; this page adds what is behind them.
 
@@ -15,7 +15,7 @@ The release zip has its own README with the same steps; this page adds what is b
 
 ## Steps
 
-1. Download `WOW-BG3-<version>.zip` from the Releases page and unpack it anywhere.
+1. Download `WOW-BG3-<version>.zip` from the [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases) and unpack it anywhere.
 2. Copy `WOW-BG3.pak` and the `WOW-BG3/` folder into BG3's Mods folder,
    `~/.local/share/Larian Studios/Baldur's Gate 3/Mods/`, side by side.
 3. Copy your WoW 1.12.1 client into `Mods/WOW-BG3/WoW/`, so that `Mods/WOW-BG3/WoW/Data/` exists.

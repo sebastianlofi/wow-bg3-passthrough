@@ -1,4 +1,6 @@
-# WOW-BG3
+# WOW-BG3 Passthrough
+
+https://github.com/sebastianlofi/wow-bg3-passthrough
 
 Play vanilla World of Warcraft (1.12.1) as the world of a new Baldur's Gate 3 game.
 Your BG3 characters walk WoW's world; fights against WoW's mobs are BG3 fights;

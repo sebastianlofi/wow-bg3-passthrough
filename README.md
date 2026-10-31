@@ -1,4 +1,4 @@
-# WOW-BG3
+# WOW-BG3 Passthrough
 
 Play vanilla World of Warcraft (1.12.1) as the world of a Baldur's Gate 3 game.
 
@@ -8,6 +8,8 @@ turns and spells. BG3 saves keep the WoW side too.
 
 Linux only, with the native Linux build of BG3 from Steam. It needs your own WoW 1.12.1 client:
 this project contains no Blizzard or Larian files.
+
+The mod itself is called WOW-BG3: that is the name in BG3's mod manager, and in its files and folders.
 
 > **State: very much a work in progress.** 0.1.0 is a first playable beta. You can make a character,
 > walk Elwynn Forest, fight its mobs, quest, loot, trade, level up and recruit companions, but a lot
@@ -144,7 +146,7 @@ Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.c
 
 ## Install
 
-Download `WOW-BG3-<version>.zip` from this repository's Releases page; the README in it has every
+Download `WOW-BG3-<version>.zip` from this repository's [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases); the README in it has every
 step. In short:
 
 1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
@@ -190,8 +192,10 @@ What works is listed above; this is what does not, or has not been tried:
   with WoW gear adding AC and ability bonuses. A WoW mob fights as the nearest BG3 creature, with that
   creature's own BG3 health at the WoW mob's health fraction; only its damage is scaled to WoW's.
 - **The level cap**: BG3 stops at 12 without a level-cap mod (see [Levelling](#levelling)).
-- **Indoors.** Nothing cuts away a WoW roof or wall between the camera and your party, so in houses
-  and caves the camera pushes against the building instead of looking through it.
+- **Indoors and big cities.** Walls, roofs and small props between the camera and your party fade out,
+  and big pieces push the camera in. Orgrimmar's raised floors are not fully walkable: deeper in the city
+  your party can end up on the ground under them, with the camera against that ground. Stairs have
+  been walked in only a few towns.
 - **Cloth and models.** BG3's cloth simulation is not carried onto WoW's picture, so a robe or heavy
   armour trails behind the character and can clip.
 - **Terrain.** Some ground is walkable in BG3 where WoW would stop you, like some steep hills and
@@ -200,7 +204,8 @@ What works is listed above; this is what does not, or has not been tried:
   a walkable surface, so a mob under the water or in the air probably fights on the surface or the
   ground below it. This has not been tested.
 - **Spell effects.** Some spells' visual effects are missing or only partly drawn on WoW's picture: the
-  spell still works by BG3's rules, you just do not see all of it.
+  spell still works by BG3's rules, you just do not see all of it. Glows on a character's body, like
+  Stillness of Mind and Wholeness of Body, do not show at all.
 - **Picture.** Enemy vision cones show on WoW's ground while you sneak, but their edges are ragged
   where WoW's ground and BG3's idea of it disagree in height; ground surfaces can look matte, and WoW's
   minimap and map icons are not drawn.

@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -1321,6 +1322,11 @@ struct WowTri {
 // hole), 5 a big M2 (a boulder, a big tree: at least 4 yd on the smallest side of WoW's collision). Every query sees them all; BG3's camera clearance only the kinds WoW's camera collides
 // with (terrain and WMOs).
 constexpr std::uint32_t kKindAll = ~0u, kCameraKinds = (1u << 0) | (1u << 2);
+// BG3's cursor (query context 1) goes through what stands at or over the ceiling above her: benilla
+// fades those groups away, and a click on the floor seen through them landed on the roof, 9 yd over it.
+// Set each frame with the camera's ceiling; infinite outdoors. Never the terrain.
+std::atomic<float> g_pick_top{std::numeric_limits<float>::infinity()};
+constexpr float kPickTopSlackM = 0.3f;
 
 // One cluster's cell grid: CellTris holds indices into ArenaRays::Tris.
 struct RayGrid {
@@ -1475,8 +1481,12 @@ bool tri_hit(WowTri const& t, glm::vec3 const& a, glm::vec3 const& d, float& out
     return true;
 }
 
+float pick_top(int context) {
+    return context == 1 ? g_pick_top.load(std::memory_order_relaxed) : std::numeric_limits<float>::infinity();
+}
+
 bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
-                 std::uint32_t kinds = kKindAll) {
+                 std::uint32_t kinds = kKindAll, float top = std::numeric_limits<float>::infinity()) {
     if (r.Tris.empty() || !segment_touches(r, a, b)) return false;
     const glm::vec3 d = b - a;
     thread_local std::vector<std::uint32_t> mark;
@@ -1501,7 +1511,8 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
                 mark[i] = generation;
                 if (kinds != kKindAll && ((kinds >> (r.Kind.empty() ? 0 : r.Kind[i])) & 1u) == 0) continue;
                 float t;
-                if (tri_hit(r.Tris[i], a, d, t) && t < best) {
+                if (tri_hit(r.Tris[i], a, d, t) && t < best
+                    && (a.y + d.y * t <= top || r.Kind.empty() || r.Kind[i] == 0)) {
                     best = t;
                     normal = r.Tris[i].N;
                 }
@@ -1654,7 +1665,7 @@ bool hook_closest(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx
     }
     float t;
     glm::vec3 n;
-    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n) && (!got || t < hit.Distance)) {
+    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n, kKindAll, pick_top(context)) && (!got || t < hit.Distance)) {
         fill_wow_hit(*r, a, b, t, n, hit);
         s->Stats.Wow[0].fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1727,7 +1738,8 @@ bool hook_all(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hit
     }
     float t;
     glm::vec3 n;
-    if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n)
+    if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex)
+        && wow_closest(*r, a, b, t, n, kKindAll, pick_top(context))
         && allocator_ready()) {
         phx_hit wh{};
         fill_wow_hit(*r, a, b, t, n, wh);
@@ -3191,9 +3203,11 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     // The ceiling over her: the middle of the rays up from her chest that hit; too few hits, outdoors.
     float hits[kCeilingRays];
     const int nh = ceiling_hits(*r, chest, hits);
+    if (nh < kCeilingHits) g_pick_top.store(std::numeric_limits<float>::infinity(), std::memory_order_relaxed);
     if (nh >= kCeilingHits) {
         std::sort(hits, hits + nh);
         const float ceiling = hits[nh / 2];
+        g_pick_top.store(chest.y + ceiling - kPickTopSlackM, std::memory_order_relaxed);
         g_clear.Indoor.fetch_add(1, std::memory_order_relaxed);
         g_clear.Ceiling.store(ceiling, std::memory_order_relaxed);
         // `free`: the ceiling is still measured (the log reports it) but no longer caps the eye.
