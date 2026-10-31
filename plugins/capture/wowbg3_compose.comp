@@ -17,6 +17,8 @@
 // decal's change A1 - A0 is a change of unlit albedo; it is lit by that same light here (sflags.x 32,
 // light in sflags.y). Before, a decal showed its albedo as if under full white light: brighter and paler
 // than WoW's lit ground round it.
+// A trip to camp (flags 128): WoW's frame holds only its interface (benilla drew no world under it),
+// premultiplied, alpha in its own byte. It goes over BG3's scene and under BG3's HUD; BG3's depth has no say.
 // Regenerate wowbg3_compose_spv.h after editing (glslang-tools):
 //   glslangValidator -V --target-env vulkan1.0 --vn wowbg3_compose_spv -o wowbg3_compose_spv.h wowbg3_compose.comp
 #version 450
@@ -42,7 +44,7 @@ layout(std430, set = 0, binding = 9) readonly buffer Cam {
                     // 32 WoW's ground light in y (RGB gamma bytes)
 } cam;
 layout(push_constant) uniform PC {
-    uint W, H, ww, wh, cbpr, dbpr, code, flags;  // flags: 1 hud, 2 hud RGBA, 4 light, 8 D16, 16 D24, 32 scaled, 64 decode
+    uint W, H, ww, wh, cbpr, dbpr, code, flags;  // flags: 1 hud, 2 hud RGBA, 4 light, 8 D16, 16 D24, 32 scaled, 64 decode, 128 interface only
     float P22, P32, P23, P33, wnear, wzoff, far, wgamma;
 } pc;
 
@@ -153,7 +155,11 @@ void main() {
         float wdv = uintBitsToFloat(wow.w[(pc.cbpr * pc.wh + wy * pc.dbpr + wx * 4u) >> 2]);
         // Reverse infinite: view z = near / depth; plus how far WoW's eye sits ahead of BG3's (yards to metres).
         float wz = wdv > 0.0 ? (pc.wnear / wdv + pc.wzoff) * 0.9144 : 1e30;
-        if (!(bz < wz && bz < pc.far)) {
+        bool uionly = (pc.flags & 128u) != 0u;
+        // Its alpha, for the rule below; an ADD quad leaves alpha 0 but colour, so colour counts too.
+        uint wraw = uionly ? wow.w[(wy * pc.cbpr + wx * 4u) >> 2] : 0u;
+        int wa = int(wraw >> 24);
+        if (uionly ? wraw != 0u : !(bz < wz && bz < pc.far)) {
             wowpx = true;
             vec3 base;
             if (scaled) {
@@ -193,7 +199,10 @@ void main() {
             ivec3 res;
             for (int k = 0; k < 3; k++) {
                 int b = int(base[k]);
-                if ((pc.flags & 4u) != 0u) {  // "light": BG3's scene under the HUD, (final - hud) / (1 - a), added
+                if (uionly) {  // BG3's scene under the HUD, (final - hud) / (1 - a), under WoW's interface
+                    int sc = ua < 250 ? (oc[k] - uc[k]) * 255 / (255 - ua) : 0;
+                    b = min(b + max(sc, 0) * (255 - wa) / 255, 255);
+                } else if ((pc.flags & 4u) != 0u) {  // "light": BG3's scene under the HUD, (final - hud) / (1 - a), added
                     int sc = ua < 250 ? (oc[k] - uc[k]) * 255 / (255 - ua) : 0;
                     if (sc > 0) b += sc;
                     b = min(b, 255);

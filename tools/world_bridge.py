@@ -173,18 +173,33 @@ def camp_state(run):
     return s.get('RunId') == run and s.get('InCamp') is True
 
 
+# The compositor's words for a trip to camp: BG3's own picture (no void, no ground, no effects copy), with
+# Tav BG3's to draw, and WoW's interface over it. wowbar as the world's words have it: it is how the frame is read.
+CAMP_WORDS = 'camp bg3tav'
+
+
 def camp_compose(at_camp):
-    """A trip to camp (Camp.lua): the compositor's file aside, so BG3's own picture shows, and back. The
-    layer looks for the file every frame; the coordinator writes it new at each world-mode start."""
+    """A trip to camp (Camp.lua): BG3's own picture with WoW's interface over it, and back. benilla draws
+    its interface without the world while link/wowcamp.flag exists; the compositor takes the words at once
+    and, back from camp, shows no WoW frame until one follows BG3's camera again. The coordinator writes
+    `compose` new at each world-mode start."""
     d = os.environ.get('WOWBG3_CAPTURE_DIR')
     cap = Path(d) if d else ROOT / 'bg3/private/logs/capture'
-    on, off = cap / 'compose', cap / 'compose.camp'
+    on, off, flag = cap / 'compose', cap / 'compose.camp', LINK / 'wowcamp.flag'
     try:
         if at_camp and on.exists():
-            on.replace(off)
-        elif not at_camp and off.exists():
-            off.replace(on)
-            os.utime(on)  # the layer reads the file when its time changes
+            words = on.read_text()
+            if not off.exists():
+                off.write_text(words)
+            tmp = cap / 'compose.tmp'
+            tmp.write_text(' '.join([CAMP_WORDS] + (['wowbar'] if 'wowbar' in words.split() else [])) + '\n')
+            tmp.replace(on)  # a new file, a new time: the layer reads it
+            flag.touch()
+        elif not at_camp:
+            flag.unlink(missing_ok=True)
+            if off.exists():
+                off.replace(on)
+                os.utime(on)  # the layer reads the file when its time changes
     except OSError as e:
         print('camp: compose file:', e, flush=True)
 
@@ -1047,6 +1062,11 @@ def main():
     w.start()
     moved = 0
     at_camp = False
+    # A bridge that died at camp left benilla without its world.
+    try:
+        (LINK / 'wowcamp.flag').unlink(missing_ok=True)
+    except OSError as e:
+        print('camp: flag:', e, flush=True)
     while not stop['now']:
         time.sleep(0.5)
         try:

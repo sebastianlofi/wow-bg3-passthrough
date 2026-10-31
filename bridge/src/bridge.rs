@@ -1421,6 +1421,12 @@ fn drive(
         }
         // The mirrors: kept in sync beside the fight; mirrored mobs BG3 pulled into its combat join.
         if o.mirrors && !o.script {
+            mirror.in_fight = f
+                .enemies
+                .iter()
+                .filter(|c| c.status == "in")
+                .map(|c| c.guid.clone())
+                .collect();
             mirror.poll(
                 &o.link,
                 &f.guids(),
@@ -1829,6 +1835,7 @@ pub fn run(o: &Options) -> Result<(), Error> {
             let mut found = read_json(&o.link.join("pull.json"))
                 .filter(|p| p.get("seq").and_then(Value::as_u64).unwrap_or(0) > last_pull);
             if found.is_none() && o.mirrors {
+                mirror.in_fight.clear();
                 mirror.poll(
                     &o.link,
                     &[],

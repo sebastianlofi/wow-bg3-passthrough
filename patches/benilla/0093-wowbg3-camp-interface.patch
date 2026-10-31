@@ -1,0 +1,89 @@
+diff --git a/crates/benilla-app/src/world_backdrop.rs b/crates/benilla-app/src/world_backdrop.rs
+--- a/crates/benilla-app/src/world_backdrop.rs
++++ b/crates/benilla-app/src/world_backdrop.rs
+@@ -235,9 +235,11 @@ fn claim_backdrop(
+     cameras: Query<(Entity, &Camera), With<WorldCamera>>,
+     mut ui: Query<&mut FfxBackdrop, With<PlayerUiCamera>>,
+ ) {
++    // WOW-BG3 (patch 0093): at BG3's camp only the interface goes to BG3, on a clear target.
+     let source = cameras
+         .iter()
+-        .find_map(|(entity, camera)| camera.is_active.then_some(entity));
++        .find_map(|(entity, camera)| camera.is_active.then_some(entity))
++        .filter(|_| !crate::wowbg3_frames::interface_only());
+     for mut backdrop in &mut ui {
+         // Compare first: a write would trip change detection for nothing.
+         if backdrop.source != source {
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -25,12 +25,17 @@
+ //! wait for the whole frame's GPU work and the 40 MB write at 3440x1440 every frame). A frame
+ //! whose pair is still being written is not exported (counted in the log).
+ //!
++//! Patch 0093 (a trip to BG3's camp): while `$WOW_BG3_LINK_DIR/wowcamp.flag` exists (the world bridge
++//! makes it) the player-UI camera draws no world under its quads, so the frame is WoW's interface
++//! alone, premultiplied, with its coverage in the colour's alpha; flags bit 1 in the header says so, and
++//! the compositor lays only that over BG3's camp.
++//!
+ //! The colour is normally the player-UI camera's target just after its quads (the world with
+ //! benilla's UI over it, in the gamma bytes WoW shows, so chat, minimap and dialogs reach BG3's
+ //! window too); `WOW_BG3_FRAMES_SOURCE=world` takes the world camera's tonemapped colour instead.
+ 
+ use std::fs::OpenOptions;
+-use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+ use std::sync::mpsc;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+@@ -57,6 +62,29 @@ use benilla_world::view::WorldCamera;
+ 
+ pub(crate) const HEADER: usize = 64;
+ 
++/// Patch 0093: the frames carry WoW's interface without the world (see the module notes).
++static INTERFACE_ONLY: AtomicBool = AtomicBool::new(false);
++
++pub(crate) fn interface_only() -> bool {
++    INTERFACE_ONLY.load(Ordering::Relaxed)
++}
++
++/// First in a frame, so the backdrop and the frame's tag agree. Every 6 frames: one `stat`.
++fn watch_camp(mut frame: Local<u32>, mut flag: Local<Option<std::path::PathBuf>>) {
++    *frame = frame.wrapping_add(1);
++    if *frame % 6 != 0 {
++        return;
++    }
++    if flag.is_none() {
++        *flag = std::env::var_os("WOW_BG3_LINK_DIR").map(|d| std::path::PathBuf::from(d).join("wowcamp.flag"));
++    }
++    let Some(path) = flag.as_ref() else { return };
++    let on = path.exists();
++    if INTERFACE_ONLY.swap(on, Ordering::Relaxed) != on {
++        info!("wowbg3 frames: {}", if on { "at camp: the interface alone" } else { "back from camp: the world again" });
++    }
++}
++
+ /// Patch 0019: a rect of the frame (x, y, w, h as fractions from the
+ /// top left) whose depth is written as the near plane (reverse-Z 1.0), so the compositor's "BG3
+ /// scene nearer" test never lets BG3's scene (Tav) cover WoW there: WoW's world map shown inside
+@@ -139,6 +167,7 @@ pub(crate) fn build(app: &mut App) {
+     sink.inner.lock().unwrap().ui_source = ui;
+     app.insert_resource(sink)
+         .add_systems(Update, (arm, arm_ui))
++        .add_systems(First, watch_camp)
+         .add_plugins(ExtractComponentPlugin::<FrameExportView>::default())
+         .add_plugins(ExtractComponentPlugin::<FrameExportUi>::default())
+         .add_plugins(ExtractResourcePlugin::<crate::wowbg3_pace::FrameTag>::default());
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -262,7 +262,8 @@ fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLigh
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+-        flags: u32::from(p.current.is_some()),
++        // Bit 1, patch 0093: drawn without the world.
++        flags: u32::from(p.current.is_some()) | u32::from(crate::wowbg3_frames::interface_only()) << 1,
+         depth_offset: crate::wowbg3_lead::depth_offset(),
+         ground_light: lighting.map_or([0; 4], |l| ground_light(&l)),
+     };

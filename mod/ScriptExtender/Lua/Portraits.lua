@@ -8,8 +8,10 @@
 -- as WoW's target frame shows it) and link/portraits/guids.txt ("<guid hex> <display id>" lines); the
 -- wowbg3 plugin (op 40) fills the component's buffer from that file, and both components are
 -- replicated: the client decodes the image into the stand-in's ecl::CustomIconTextureComponent and
--- BG3's turn order (and anything else that shows the character's portrait) binds that texture. Tav,
--- and anything that is not a mirrored stand-in, is never touched.
+-- BG3's turn order (and anything else that shows the character's portrait) binds that texture. A mob
+-- that joins a fight with no mirror yet (a guard WoW just summoned, one out of mirror reach) gets a
+-- stand-in from the fight instead (LinkLive.lua, StandIns.lua Spawn, WOWBG3FightSpawned), treated the
+-- same. Tav, and anything that is not such a stand-in, is never touched.
 --
 -- Levels (display only): BG3's hover popup ("Lv."), tooltips and turn order show the level the
 -- client holds in its copy of eoc::LevelComponent, which the server replicates. Each stand-in's
@@ -172,7 +174,9 @@ function M.Start(runId, context)
         if ticks % EVERY ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         pcall(research, runId, rstate)
         local ok, err = pcall(function()
-            local owned = WOWBG3MirrorOwned or {}
+            local owned = {}
+            for uuid, guid in pairs(WOWBG3MirrorOwned or {}) do owned[uuid] = guid end
+            for uuid, guid in pairs(WOWBG3FightSpawned or {}) do owned[uuid] = guid end
             if M.Portraits then
                 readIndex()
                 for uuid, guid in pairs(owned) do

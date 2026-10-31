@@ -1,0 +1,632 @@
+WOW-BG3 benilla patch 0095: indoors. The see-through is for indoors, floors stay, the storeys above go whole.
+
+A playtest in the Lion's Pride Inn: "whats the point of the seethought wall if they are gonna bump
+your camera in anyways. the seethrough i think should be kept for indoors only, once indoors cameras should
+not be bumped up or down, thats what the seethrough is for." And: floors keep going see-through, the
+second floor does not go seen from outside, and disable the objects' fade for now.
+
+- Indoors only. The plugin measures the ceiling over her chest and says so in `bg3cam.bin`'s flags (bit 2).
+  `wowbg3_see` opens the capsule then, over a quarter of a second, and closes it when she leaves. The
+  plugin stops moving the eye with the same flag, and outdoors it bumps into buildings again. `outdoors=1` in
+  `seethrough.txt` (or `WOW_BG3_SEE_OUTDOORS=1`) cuts outdoors as before.
+- Floors. BG3 opts its walls in, WoW draws floors and walls with one shader, so 0090 kept floors by two
+  tests along the line to her. From above, a floor a few yards in front of her passes both: it is nearer the
+  camera than she is. Now nothing lower than 0.35 yd over her feet is cut, at any camera angle.
+- The storeys above her. WMO groups do not always fall along storeys: the Lion's Pride Inn's outer shell is
+  one group from the ground to the roof, and its hall another up to the upper floor's ceiling, so 0091, which
+  takes groups whole, left the outside of the upper storey standing, and from outside that is all one sees. A
+  new per-fragment clip takes what lies over the top of her storey inside her building's footprint (shared
+  light buffer rows 25 and 26, `SeeClip`, written by `compute_wmo_pvs`), at 0091's fade and speed: the bottom
+  of the lowest group wholly above her, or on the top floor a room's height over her chest while the
+  building has an outer shell (a cave keeps its rock). Terrain takes it too, for a cellar under the ground.
+  0091's room-sized footprint left the floor over the next room standing, so a placement no wider than 90 yd
+  now counts as one house. A larger one (a city is one WMO) stays with the room she is in.
+- Objects' fade. Patch 0092's fade of the small doodads in the way is off by default (`phase=1` or
+  `WOW_BG3_SEE_PHASE=1` puts it back). With it off they take the indoor cut like the rest, so its record bit
+  only counts while it runs (row 25's `.z`). Units on a storey going away still fade with the storey.
+
+The plugin's cursor goes through what is cut and clipped here, by the same tests without the noise; change
+`wow_see_capsule` and its `in_see_cut` together.
+
+
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index e65e452..2eacf13 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -172,6 +172,13 @@ static ERRAND_ASK: Mutex<Option<ErrandAsk>> = Mutex::new(None);
+ static ERRAND_CANCEL: AtomicBool = AtomicBool::new(false);
+ /// BG3's character is in a BG3 combat (`tav.bin` flags bit 1).
+ static TAV_COMBAT: AtomicBool = AtomicBool::new(false);
++/// Patch 0095: she has a ceiling over her, as the plugin measures it (`bg3cam.bin` flags bit 2): the
++/// see-through runs then and the plugin leaves the camera alone.
++static INDOORS: AtomicBool = AtomicBool::new(false);
++
++pub(crate) fn she_is_indoors() -> bool {
++    INDOORS.load(Ordering::Relaxed)
++}
+ /// When the last new `tav.bin` record came ([`clock_ms`]; 0: never).
+ static TAV_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+ /// Patch 0030: BG3's own sound is muted (`tav.bin` flags bit 2): BG3's master volume RTPC is 0, as
+@@ -551,7 +558,8 @@ pub(crate) struct LeadPose {
+     pub(crate) forward: [f32; 3],
+     pub(crate) up: [f32; 3],
+     pub(crate) fovy: f32,
+-    /// Patch 0011: the record's flags at 52 (1: the plugin's eye clearance tested this eye).
++    /// Patch 0011: the record's flags at 52 (1: the plugin's eye clearance tested this eye; 2, patch
++    /// 0093: she is indoors).
+     pub(crate) flags: u32,
+ }
+ 
+@@ -946,8 +954,10 @@ fn follow_bg3(
+     }
+     let fresh = s.last_at.is_some_and(|t| t.elapsed().as_secs_f32() < 0.5);
+     let Some(pose) = s.pose.filter(|_| fresh) else {
++        INDOORS.store(false, Ordering::Relaxed);
+         return;
+     };
++    INDOORS.store(pose.flags & 2 != 0, Ordering::Relaxed);
+     CAMERA_SEQ.store(s.last_seq, Ordering::Relaxed);
+     let Ok((mut tf, mut proj)) = cam.single_mut() else {
+         return;
+diff --git a/crates/benilla-app/src/wowbg3_see.rs b/crates/benilla-app/src/wowbg3_see.rs
+index e459787..c1fb5ea 100644
+--- a/crates/benilla-app/src/wowbg3_see.rs
++++ b/crates/benilla-app/src/wowbg3_see.rs
+@@ -35,6 +35,9 @@ use bevy::prelude::*;
+ /// clearance measures from, so both ends of the camera agree on what "she" is.
+ const CHEST: f32 = 1.5;
+ 
++/// Patch 0095: a quarter of a second to open or close at a door.
++const OPEN_SPEED: f32 = 4.0;
++
+ /// The see-through's settings. Defaults chosen for BG3's orbit camera, 5 to 12 yd from her.
+ #[derive(Resource, Clone, Copy, Debug)]
+ pub(crate) struct SeeSettings {
+@@ -63,6 +66,11 @@ pub(crate) struct SeeSettings {
+     look: bool,
+     /// How far the look point must be from her before the second capsule is used (yd).
+     look_apart: f32,
++    /// Patch 0095: cut outdoors too. Off: the see-through is for indoors, where the camera is not
++    /// bumped; outdoors the plugin's eye clearance bumps it (playtest feedback, 2026-10-31).
++    outdoors: bool,
++    /// Patch 0095: patch 0092's fade of the small doodads in the way. Off for now (playtest feedback).
++    phase: bool,
+ }
+ 
+ impl Default for SeeSettings {
+@@ -79,6 +87,8 @@ impl Default for SeeSettings {
+             scale: 2.0,
+             look: false,
+             look_apart: 2.5,
++            outdoors: false,
++            phase: false,
+         }
+     }
+ }
+@@ -92,6 +102,8 @@ impl SeeSettings {
+             "on" => self.on = flag(),
+             "look" => self.look = flag(),
+             "terrain" => self.terrain = flag(),
++            "outdoors" => self.outdoors = flag(),
++            "phase" => self.phase = flag(),
+             "radius" => self.radius = num.unwrap_or(self.radius),
+             "screen" => self.screen = num.unwrap_or(self.screen),
+             "near" => self.near = num.unwrap_or(self.near),
+@@ -107,7 +119,7 @@ impl SeeSettings {
+         if std::env::var_os("WOW_BG3_SEE").is_some_and(|v| v == "0") {
+             s.on = false;
+         }
+-        for key in ["radius", "screen", "terrain", "near", "amp", "scale", "look", "apart"] {
++        for key in ["radius", "screen", "terrain", "near", "amp", "scale", "look", "apart", "outdoors", "phase"] {
+             if let Ok(v) = std::env::var(format!("WOW_BG3_SEE_{}", key.to_uppercase())) {
+                 s.set(key, v.trim());
+             }
+@@ -207,14 +219,20 @@ fn aim(
+     tav: Option<Res<crate::wowbg3_lead::TavFollow>>,
+     cam: Query<(&Transform, &Projection), With<WorldCamera>>,
+     mut out: ResMut<SeeThrough>,
++    time: Res<Time>,
++    // Patch 0095: how far it has opened, 0 to 1, walking in through a door or out of it.
++    mut open: Local<f32>,
+ ) {
+     let mut want = SeeThrough {
+         near: s.near.max(0.0),
+         noise_amp: s.amp.max(0.0),
+         noise_scale: s.scale,
+         terrain: s.terrain,
++        phase: s.phase,
+         ..SeeThrough::default()
+     };
++    let wanted = s.outdoors || crate::wowbg3_lead::she_is_indoors();
++    *open = (*open + if wanted { OPEN_SPEED } else { -OPEN_SPEED } * time.delta_secs()).clamp(0.0, 1.0);
+     // Off, no world mode (no fresh `tav.bin`) or no camera: every size stays 0, which the shaders
+     // read as "cut nothing".
+     let here = crate::wowbg3_lead::tav_if_fresh(tav.as_deref());
+@@ -222,11 +240,11 @@ fn aim(
+         let chest = at + Vec3::Y * CHEST;
+         let eye = tf.translation;
+         want.eye = eye;
+-        want.cuts[0] = Cut { at: chest, radius: radius_at(&s, proj, eye.distance(chest)) };
++        want.cuts[0] = Cut { at: chest, radius: radius_at(&s, proj, eye.distance(chest)) * *open };
+         if s.look {
+             if let Some(look) = look_point(eye, *tf.forward(), chest.y) {
+                 if look.distance(chest) > s.look_apart {
+-                    want.cuts[1] = Cut { at: look, radius: radius_at(&s, proj, eye.distance(look)) };
++                    want.cuts[1] = Cut { at: look, radius: radius_at(&s, proj, eye.distance(look)) * *open };
+                 }
+             }
+         }
+diff --git a/crates/benilla-assets/src/shaders/terrain.wgsl b/crates/benilla-assets/src/shaders/terrain.wgsl
+index a6f9006..924ebb6 100644
+--- a/crates/benilla-assets/src/shaders/terrain.wgsl
++++ b/crates/benilla-assets/src/shaders/terrain.wgsl
+@@ -50,6 +50,8 @@ struct WowLight {
+     cut_b: vec4<f32>,      // 22 the second capsule, the same
+     cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
+     cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
++    cut_clip: vec4<f32>,   // 25 patch 0095: x = the height the storeys above her go from (yd), y = their fade level, z = 1 while 0092 fades
++    cut_box: vec4<f32>,    // 26 and the building's footprint: x, z min then x, z max
+     points: array<vec4<f32>, 512>,
+     // Patch 0090: everything after, read only for BG3's see-through noise (`WOW_SEE_TAIL`).
+     see_tail: array<vec4<f32>>,
+@@ -186,7 +188,7 @@ fn vertex(in: Vertex) -> TerrainVsOut {
+ 
+ // Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
+ // it. Checked against the buffer's regions by `global_light`'s tests.
+-const WOW_SEE_TAIL: u32 = 537u;
++const WOW_SEE_TAIL: u32 = 539u;
+ 
+ // One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
+ fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
+@@ -226,6 +228,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
+     // nothing behind her stays open at any height. (With the first test alone, a camera looking down
+     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
++    // floor a few yards in front of her passes both tests below, and floors went see-through.
++    // (The target is her chest, 1.5 yd over her feet.)
++    if (world_pos.y < c.y - 1.15) {
++        return 1.0;
++    }
+     let from_her = world_pos - c.xyz;
+     let to_eye = eye - c.xyz;
+     if (dot(from_her, normalize(to_eye)) < near) {
+@@ -260,6 +268,38 @@ fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
+     return v < 0.5;
+ }
+ 
++// BG3's per-object fade (`static_gx.wgsl` has the notes).
++fn wow_fade_discard(k: u32, frag: vec2<f32>) -> bool {
++    var m = array<u32, 16>(
++        0u, 8u, 2u, 10u,
++        12u, 4u, 14u, 6u,
++        3u, 11u, 1u, 9u,
++        15u, 7u, 13u, 5u
++    );
++    let ix = u32(i32(frag.x % 4.0));
++    let iy = u32(i32(frag.y % 4.0));
++    return m[ix * 4u + iy] < k;
++}
++
++// WOW-BG3 patch 0095: what lies over the height her storey ends at, inside her building's footprint,
++// dissolves with BG3's per-object fade: the upper part of a building's outer shell and of a tall hall,
++// which one WMO group holds from the ground to the roof, so 0091 cannot take it whole. A view from
++// somewhere else (a portrait booth, the minimap bake) shares this buffer and is left alone.
++fn wow_storey_clip(world_pos: vec3<f32>, frag: vec2<f32>) -> bool {
++    let c = wow_light.cut_clip;
++    if (c.y < 0.5 || world_pos.y <= c.x) {
++        return false;
++    }
++    let b = wow_light.cut_box;
++    if (world_pos.x < b.x || world_pos.z < b.y || world_pos.x > b.z || world_pos.z > b.w) {
++        return false;
++    }
++    if (distance(view.world_position.xyz, wow_light.cut_eye.xyz) > 0.25) {
++        return false;
++    }
++    return wow_fade_discard(u32(c.y), frag);
++}
++
+ @fragment
+ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
+     // The far-clip wall: the reference clips the detailed world per pixel at its far plane
+@@ -271,6 +311,11 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
+         }
+     }
+ 
++    // Patch 0095: the ground over her head, in a cellar under her building.
++    if (wow_storey_clip(in.world_position.xyz, in.clip_position.xy)) {
++        discard;
++    }
++
+     // Patch 0090: BG3's see-through, only where `cut_params.w` asks for terrain. Off by
+     // default: a close camera puts the ground right in front of her inside the circle, and ground
+     // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
+diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
+index fa4aa93..6998d4d 100644
+--- a/crates/benilla-assets/src/shaders/wow_model.wgsl
++++ b/crates/benilla-assets/src/shaders/wow_model.wgsl
+@@ -99,6 +99,8 @@ struct WowLight {
+     cut_b: vec4<f32>,      // 22 the second capsule, the same
+     cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
+     cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
++    cut_clip: vec4<f32>,   // 25 patch 0095: x = the height the storeys above her go from (yd), y = their fade level, z = 1 while 0092 fades
++    cut_box: vec4<f32>,    // 26 and the building's footprint: x, z min then x, z max
+     points: array<vec4<f32>, 512>,
+     // The interior-prop SH probes, 7 rows per slot (`MAX_PROP_PROBES` = 8192 slots). Only this
+     // shader declares this tail; the other shaders bind the same buffer by its prefix.
+@@ -914,7 +916,7 @@ fn tav_bg3(
+ 
+ // Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
+ // it. Checked against the buffer's regions by `global_light`'s tests.
+-const WOW_SEE_TAIL: u32 = 64025u;
++const WOW_SEE_TAIL: u32 = 64027u;
+ 
+ // One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
+ fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
+@@ -954,6 +956,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
+     // nothing behind her stays open at any height. (With the first test alone, a camera looking down
+     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
++    // floor a few yards in front of her passes both tests below, and floors went see-through.
++    // (The target is her chest, 1.5 yd over her feet.)
++    if (world_pos.y < c.y - 1.15) {
++        return 1.0;
++    }
+     let from_her = world_pos - c.xyz;
+     let to_eye = eye - c.xyz;
+     if (dot(from_her, normalize(to_eye)) < near) {
+@@ -1015,6 +1023,25 @@ fn wow_unit_fade(slot: u32) -> u32 {
+     return u32(wow_light.palettes[base - WOW_SEE_TAIL + WOW_SEE_NOISE_ROWS + slot / 4u][slot % 4u]);
+ }
+ 
++// WOW-BG3 patch 0095: what lies over the height her storey ends at, inside her building's footprint,
++// dissolves with BG3's per-object fade: the upper part of a building's outer shell and of a tall hall,
++// which one WMO group holds from the ground to the roof, so 0091 cannot take it whole. A view from
++// somewhere else (a portrait booth, the minimap bake) shares this buffer and is left alone.
++fn wow_storey_clip(world_pos: vec3<f32>, frag: vec2<f32>) -> bool {
++    let c = wow_light.cut_clip;
++    if (c.y < 0.5 || world_pos.y <= c.x) {
++        return false;
++    }
++    let b = wow_light.cut_box;
++    if (world_pos.x < b.x || world_pos.z < b.y || world_pos.x > b.z || world_pos.z > b.w) {
++        return false;
++    }
++    if (distance(view.world_position.xyz, wow_light.cut_eye.xyz) > 0.25) {
++        return false;
++    }
++    return wow_fade_discard(u32(c.y), frag);
++}
++
+ @fragment
+ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     // The UI model tile's cell clip: the reference gives each `<Model>` pane its widget rect as the
+@@ -1048,6 +1075,10 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
+     if (m.model_flags.x > 0.5 && wow_cut(in.world_position.xyz, see_uv)) {
+         discard;
+     }
++    // Patch 0095: what lies over her storey, the building's own batches alone.
++    if (m.model_flags.x > 0.5 && wow_storey_clip(in.world_position.xyz, in.position.xy)) {
++        discard;
++    }
+     // Patch 0092: BG3's per-object fade on the entity path. A small doodad in the way carries its level
+     // in the exterior tag (bits 14..=18, never a probe slot's there); a unit on a storey 0091 is taking
+     // away carries it by rig slot, whichever payload its tag holds.
+diff --git a/crates/benilla-world/src/lighting/global_light.rs b/crates/benilla-world/src/lighting/global_light.rs
+index 064105a..778fab9 100644
+--- a/crates/benilla-world/src/lighting/global_light.rs
++++ b/crates/benilla-world/src/lighting/global_light.rs
+@@ -34,6 +34,9 @@ use crate::view::WorldCamera;
+ ///      the noise's reach in yards; 24 `.x` the noise's first row in this buffer
+ ///      ([`see_noise_offset`] / 16, 0 while there is none), `.y` the margin in front of a target,
+ ///      `.z` the noise's scale on texture coordinates, `.w` 1 when WoW's terrain is cut too ·
++///   25-26 WOW-BG3 patch 0095, the storey clip ([`crate::see_through::SeeClip`]): 25 `.x` the height,
++///      `.y` the fade level (0 off), `.z` 1 while patch 0092's small doodads fade; 26 the footprint,
++///      `.xy` its x, z minimum and `.zw` its maximum ·
+ ///   25+ the point-light table, two rows per light,
+ ///      `[pos.xyz, range]` and `[rgb, 0]`, here because Bevy's clusterable buffer is
+ ///      fragment-only in the view layout and the point term is per vertex.
+@@ -51,7 +54,7 @@ struct LightStd430 {
+ /// Header row count of the layout above (rows 0..=24), which every light blob sizes against.
+ /// WOW-BG3 patch 0090 added rows 21 to 24; `terrain.wgsl`, `static_gx.wgsl` and `wow_model.wgsl`
+ /// mirror them between `point_count` and `points`, and the other mirrors stop before row 20.
+-pub const LIGHT_HEADER_ROWS: usize = 25;
++pub const LIGHT_HEADER_ROWS: usize = 27;
+ 
+ /// First of patch 0090's four see-through rows.
+ pub(crate) const CUT_ROW: usize = 21;
+@@ -220,6 +223,8 @@ fn build_light_data(
+     // has been uploaded.
+     cut: Res<crate::see_through::SeeThrough>,
+     noise: Option<Res<crate::see_through::SeeNoise>>,
++    // Patch 0095: rows 25 and 26.
++    clip: Res<crate::see_through::SeeClip>,
+     debug: Res<DebugState>,
+     view: Res<ViewDistance>,
+     cam: Query<&GlobalTransform, With<WorldCamera>>,
+@@ -268,6 +273,8 @@ fn build_light_data(
+     rows[CUT_ROW + 2] = [cut.eye.x, cut.eye.y, cut.eye.z, cut.noise_amp];
+     let noise_row = if noise.is_some() { (see_noise_offset() / 16) as f32 } else { 0.0 };
+     rows[CUT_ROW + 3] = [noise_row, cut.near, cut.noise_scale, f32::from(u8::from(cut.terrain))];
++    rows[CUT_ROW + 4] = [clip.y, f32::from(clip.level()), f32::from(u8::from(cut.phase)), 0.0];
++    rows[CUT_ROW + 5] = [clip.lo.x, clip.lo.y, clip.hi.x, clip.hi.y];
+     // Rows 0-2, 6-12.xyz and 17.yzw: the model-light core.
+     pack_model_core_rows(rows, l.ambient, l.diffuse, l.sun_dir);
+     // The point table: lights within [`POINT_PACK_RADIUS`], nearest first past capacity. Dividing
+@@ -526,6 +533,7 @@ mod tests {
+             .init_resource::<WowLightData>()
+             .init_resource::<Time>()
+             .init_resource::<crate::see_through::SeeThrough>()
++            .init_resource::<crate::see_through::SeeClip>()
+             .add_systems(Update, build_light_data);
+         app.world_mut()
+             .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY));
+diff --git a/crates/benilla-world/src/phase_out.rs b/crates/benilla-world/src/phase_out.rs
+index d70939e..dcf28f9 100644
+--- a/crates/benilla-world/src/phase_out.rs
++++ b/crates/benilla-world/src/phase_out.rs
+@@ -106,7 +106,8 @@ pub struct Sight {
+ impl Sight {
+     /// From the see-through's state; `None` while no capsule is live.
+     pub fn of(see: &crate::see_through::SeeThrough) -> Option<Self> {
+-        if !see.live() {
++        // Patch 0095: this fade is off unless asked for (playtest feedback: "disable the objects' fade").
++        if !see.live() || !see.phase {
+             return None;
+         }
+         let at = see.cuts[0].at;
+@@ -359,6 +360,7 @@ mod tests {
+                 Default::default(),
+             ],
+             eye: Vec3::new(0.0, 6.0, 10.0),
++            phase: true,
+             ..Default::default()
+         };
+         let s = Sight::of(&see).expect("live");
+diff --git a/crates/benilla-world/src/see_through.rs b/crates/benilla-world/src/see_through.rs
+index 4b53f75..512e02a 100644
+--- a/crates/benilla-world/src/see_through.rs
++++ b/crates/benilla-world/src/see_through.rs
+@@ -59,6 +59,45 @@ pub struct SeeThrough {
+     /// ground in front of her going see-through is not what anyone wants, and a hill between the
+     /// camera and her is already what the plugin's eye clearance moves the camera out of.
+     pub terrain: bool,
++    /// WOW-BG3 patch 0095: whether patch 0092 fades the small doodads in the way. Off: they are left
++    /// alone, and indoors the capsule cuts them with the rest.
++    pub phase: bool,
++}
++
++/// WOW-BG3 patch 0095: where the storeys above her end. One WMO group can hold a building's outer
++/// shell from the ground to the roof, or a tall hall, so taking groups whole (patch 0091) leaves the
++/// outside of the upper storey standing round her. This takes what lies over `y` inside the footprint,
++/// per fragment, with the same fade. [`SeeClip::default`] is off.
++#[derive(Resource, Clone, Copy, Default, Debug, PartialEq)]
++pub struct SeeClip {
++    pub y: f32,
++    /// How far it has faded in, 0 to 1.
++    pub fade: f32,
++    /// The footprint's x, z minimum and maximum.
++    pub lo: Vec2,
++    pub hi: Vec2,
++}
++
++impl SeeClip {
++    /// This frame's clip from what it wants (`Some((height, x z min, x z max))`, or none with nothing to
++    /// take): fades in and out as a storey does, and a new height is walked to while it shows.
++    pub fn step(&mut self, want: Option<(f32, Vec2, Vec2)>, dt: f32) {
++        /// How fast the height moves while the clip shows (yd a second): a storey's height in a fifth of
++        /// a second, the fade's own time.
++        const WALK: f32 = 40.0;
++        let was = self.fade;
++        self.fade = crate::phase_out::step(was, want.is_some(), dt);
++        if let Some((y, lo, hi)) = want {
++            self.y = if was <= 0.0 { y } else { self.y + (y - self.y).clamp(-WALK * dt, WALK * dt) };
++            self.lo = lo;
++            self.hi = hi;
++        }
++    }
++
++    /// The fade as BG3's sixteen steps; 0 draws everything.
++    pub fn level(&self) -> u8 {
++        crate::phase_out::level(self.fade)
++    }
+ }
+ 
+ impl SeeThrough {
+@@ -78,5 +117,5 @@ pub const SEE_NOISE_SIZE: usize = 512;
+ /// Registers the resource. The producer lives in `benilla-app`; a run without it leaves the
+ /// default, and the shaders their old path.
+ pub fn plugin(app: &mut App) {
+-    app.init_resource::<SeeThrough>();
++    app.init_resource::<SeeThrough>().init_resource::<SeeClip>();
+ }
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+index c3c75b6..497429b 100644
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -33,6 +33,8 @@ struct WowLight {
+     cut_b: vec4<f32>,      // 22 the second capsule, the same
+     cut_eye: vec4<f32>,    // 23 xyz = the eye, each capsule's other end; w = the noise's reach in yd
+     cut_params: vec4<f32>, // 24 x = the noise's first row, y = margin in front of a target, z = noise uv scale, w = terrain
++    cut_clip: vec4<f32>,   // 25 patch 0095: x = the height the storeys above her go from (yd), y = their fade level, z = 1 while 0092 fades
++    cut_box: vec4<f32>,    // 26 and the building's footprint: x, z min then x, z max
+     points: array<vec4<f32>, 512>,
+     // lighting::prop_probes: 8192 slots of 7 rows; the buffer's later regions are not mirrored.
+     prop_probes: array<vec4<f32>, 57344>,
+@@ -199,7 +201,7 @@ fn vertex(v: GxVertex) -> GxVsOut {
+ 
+ // Where this struct's last array starts, in rows: the noise's row (`cut_params.x`) is reached from
+ // it. Checked against the buffer's regions by `global_light`'s tests.
+-const WOW_SEE_TAIL: u32 = 57881u;
++const WOW_SEE_TAIL: u32 = 57883u;
+ 
+ // One texel of the noise (`REF_Cloud_B`'s red, 512 x 512, wrapping), 0 to 1.
+ fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
+@@ -239,6 +241,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
+     // nothing behind her stays open at any height. (With the first test alone, a camera looking down
+     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
++    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
++    // floor a few yards in front of her passes both tests below, and floors went see-through.
++    // (The target is her chest, 1.5 yd over her feet.)
++    if (world_pos.y < c.y - 1.15) {
++        return 1.0;
++    }
+     let from_her = world_pos - c.xyz;
+     let to_eye = eye - c.xyz;
+     if (dot(from_her, normalize(to_eye)) < near) {
+@@ -270,6 +278,25 @@ fn wow_fade_discard(k: u32, frag: vec2<f32>) -> bool {
+     return m[ix * 4u + iy] < k;
+ }
+ 
++// WOW-BG3 patch 0095: what lies over the height her storey ends at, inside her building's footprint,
++// dissolves with BG3's per-object fade: the upper part of a building's outer shell and of a tall hall,
++// which one WMO group holds from the ground to the roof, so 0091 cannot take it whole. A view from
++// somewhere else (a portrait booth, the minimap bake) shares this buffer and is left alone.
++fn wow_storey_clip(world_pos: vec3<f32>, frag: vec2<f32>) -> bool {
++    let c = wow_light.cut_clip;
++    if (c.y < 0.5 || world_pos.y <= c.x) {
++        return false;
++    }
++    let b = wow_light.cut_box;
++    if (world_pos.x < b.x || world_pos.z < b.y || world_pos.x > b.z || world_pos.z > b.w) {
++        return false;
++    }
++    if (distance(view.world_position.xyz, wow_light.cut_eye.xyz) > 0.25) {
++        return false;
++    }
++    return wow_fade_discard(u32(c.y), frag);
++}
++
+ // Does BG3's see-through take this fragment? (BG3: `v · k − 0.5 · k < 0`, `k` the object's own
+ // see-through scalar, 1 for whatever WoW draws through here.)
+ fn wow_cut(world_pos: vec3<f32>, uv: vec2<f32>) -> bool {
+@@ -303,11 +330,16 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
+     if (fade > 0u && wow_fade_discard(fade, in.position.xy)) {
+         discard;
+     }
+-    // Patch 0090: BG3's see-through, on everything but a small doodad, which patch 0092 fades whole
+-    // (record bit 20). A wall takes it, and so does a big tree's canopy: WoW's collision has the trunk
++    // Patch 0095: what lies over her storey.
++    if (wow_storey_clip(in.world_position.xyz, in.position.xy)) {
++        discard;
++    }
++    // Patch 0090: BG3's see-through, on everything but a small doodad while patch 0092 fades those whole
++    // (record bit 20; with that fade off, row 25's z, it is cut with the rest). A wall takes it, and so does a big tree's canopy: WoW's collision has the trunk
+     // alone, so the camera bumps the trunk and ends up under leaves; BG3 marks 163 of its 345 trees
+     // `SeeThrough` for the same picture.
+-    if ((recs[in.word & 0xffffu].w & 1048576u) == 0u && wow_cut(in.world_position.xyz, in.uv)) {
++    if (((recs[in.word & 0xffffu].w & 1048576u) == 0u || wow_light.cut_clip.z < 0.5)
++        && wow_cut(in.world_position.xyz, in.uv)) {
+         discard;
+     }
+     // The sampler follows the wrap flags; a mixed batch clamps its clamped axis a half texel in.
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+index dd6464d..7df9898 100644
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -291,6 +291,19 @@ pub(crate) struct SeeRooms(pub(crate) Vec<(Entity, Vec3, Vec3)>);
+ 
+ /// MOGP's indoor flag.
+ const MOGP_INDOOR: u32 = 0x2000;
++/// MOGP's outdoor flag: a building's outer shell.
++const MOGP_EXTERIOR: u32 = 0x8;
++/// Patch 0095: a placement no wider than this (yd) is a house, its storeys taken whole; the Lion's Pride
++/// Inn is 58 long, and a city far more.
++const CLIP_HOUSE_YD: f32 = 90.0;
++/// Past the footprint, as `static_gx::cull`'s storey rule: an eave, an upper floor wider than below.
++const CLIP_REACH: f32 = 2.0;
++/// Her head over her chest, the see-through's target, as that rule has it.
++const CLIP_HEAD: f32 = 0.7;
++/// Under a storey's own box, for the ceiling below it (yd).
++const CLIP_UNDER: f32 = 0.3;
++/// On the top floor: a room's height over her chest (yd).
++const CLIP_TOP_FLOOR: f32 = 3.5;
+ 
+ /// Patches 0091 and 0092: a unit standing on a storey that is going (its feet above her head, over the
+ /// room she is in) fades with the storey, BG3's same sixteen steps at its speed, and once gone is not
+@@ -393,8 +406,12 @@ fn compute_wmo_pvs(
+     mut camera_windows: ResMut<ExteriorWindows>,
+     // Patch 0091: the indoor rooms she is in, for the ceiling rule.
+     mut see_rooms: ResMut<SeeRooms>,
++    // Patch 0095: where her storey ends, and the clock that fades it.
++    mut see_clip: ResMut<crate::see_through::SeeClip>,
++    time: Res<Time>,
+ ) {
+     see_rooms.0.clear();
++    let mut clip_want: Option<(f32, Vec2, Vec2)> = None;
+     // No world camera yet: keep last frame's sets, all visible.
+     let Some((cam_t, proj)) = cam.iter().next() else {
+         return;
+@@ -520,7 +537,60 @@ fn compute_wmo_pvs(
+                 }
+             }
+             if let Some((lo, hi)) = room {
+-                see_rooms.0.push((entity, lo, hi));
++                // Patch 0095: a house goes storey by storey over all of it, wherever in it she stands: a
++                // room's own footprint left the upper floor over the next room standing. Only a
++                // placement too big for that (a city is one WMO) stays with the room she is in.
++                let boxes: Vec<(u32, Vec3, Vec3)> = model
++                    .group_nav
++                    .iter()
++                    .map(|n| {
++                        let (mut l, mut h) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
++                        for k in 0..8 {
++                            let c = [
++                                if k & 1 == 0 { n.bbox_min[0] } else { n.bbox_max[0] },
++                                if k & 2 == 0 { n.bbox_min[1] } else { n.bbox_max[1] },
++                                if k & 4 == 0 { n.bbox_min[2] } else { n.bbox_max[2] },
++                            ];
++                            let w = world_from_local.transform_point3(wow_to_bevy(c));
++                            l = l.min(w);
++                            h = h.max(w);
++                        }
++                        (n.flags, l, h)
++                    })
++                    .collect();
++                let whole = boxes.iter().fold((lo, hi), |(l, h), b| (l.min(b.1), h.max(b.2)));
++                let house = (whole.1.x - whole.0.x).max(whole.1.z - whole.0.z) <= CLIP_HOUSE_YD;
++                let (flo, fhi) = if house { whole } else { (lo, hi) };
++                see_rooms.0.push((entity, flo, fhi));
++                let over = |b: &(u32, Vec3, Vec3)| {
++                    b.1.x <= fhi.x + CLIP_REACH
++                        && b.2.x >= flo.x - CLIP_REACH
++                        && b.1.z <= fhi.z + CLIP_REACH
++                        && b.2.z >= flo.z - CLIP_REACH
++                };
++                // Her storey ends where the lowest group wholly above her head starts. With none above
++                // (the top floor), a building's roof goes from a room's height over her feet; a cave,
++                // with no outer shell, keeps its rock.
++                let above = boxes
++                    .iter()
++                    .filter(|b| over(b) && b.1.y >= anchor.y + CLIP_HEAD)
++                    .map(|b| b.1.y)
++                    .fold(f32::MAX, f32::min);
++                let y = if above < f32::MAX {
++                    Some(above - CLIP_UNDER)
++                } else {
++                    boxes
++                        .iter()
++                        .any(|b| b.0 & MOGP_EXTERIOR != 0 && over(b))
++                        .then_some(anchor.y + CLIP_TOP_FLOOR)
++                };
++                if let (Some(y), None) = (y, clip_want) {
++                    clip_want = Some((
++                        y,
++                        Vec2::new(flo.x - CLIP_REACH, flo.z - CLIP_REACH),
++                        Vec2::new(fhi.x + CLIP_REACH, fhi.z + CLIP_REACH),
++                    ));
++                }
+             }
+         }
+         if inst.bypass_change_detection().visible != fresh.visible {
+@@ -622,6 +692,7 @@ fn compute_wmo_pvs(
+         Some(rects) if cut_anchor.is_none() => ExteriorWindows::Windows(rects),
+         _ => ExteriorWindows::Unrestricted,
+     };
++    see_clip.step(clip_want, time.delta_secs());
+     if *camera_windows != want_windows {
+         *camera_windows = want_windows;
+     }

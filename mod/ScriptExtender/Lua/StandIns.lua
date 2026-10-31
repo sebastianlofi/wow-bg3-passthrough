@@ -1,7 +1,7 @@
 -- Server-side stand-in setup for the action tests on a disposable save (approved
 -- design: Osiris spawn calls for stand-in setup only, never as proof of legal actions).
 -- Driven by wow-bg3/stand-in-command.json (one command per sequence, never retried):
---   Spawn    {From = UUID | Template = ID, Position = {x,y,z}, Name, Percent}
+--   Spawn    {From = UUID | Template = ID, Position = {x,y,z}, Name, Percent, Guid}
 --                                                temporary copy of an existing character's template,
 --                                                or of a character root template (a BG3 wolf for
 --                                                WoW's Young Wolf); Name: the WoW mob's name shown in
@@ -9,7 +9,10 @@
 --                                                as a percentage of its max, set in the tick that
 --                                                creates it (BG3 applies it when it fills Health, the
 --                                                next tick; checked then: the WoW mob's
---                                                fraction, so BG3 never shows another value)
+--                                                fraction, so BG3 never shows another value);
+--                                                Guid: the WoW mob's, for a fight's stand-in of a mob
+--                                                with no mirror (WOWBG3FightSpawned: Portraits.lua
+--                                                gives it the mob's portrait and level)
 --   Templates {Name}                             read-only: character root templates whose name
 --                                                contains Name (at most 24)
 --   Visible  {Target, Visible = true|false}      model visibility only (Osiris SetVisible);
@@ -290,6 +293,10 @@ function M.Start(runId)
                 local made = Osi.CreateAt(template, p[1], p[2], p[3], 1, 0, "")
                 local uuid = assert(uuidOf(made), "CreateAt returned no character: " .. tostring(made))
                 created[uuid] = true
+                if type(c.Guid) == "string" then
+                    WOWBG3FightSpawned = WOWBG3FightSpawned or {}
+                    WOWBG3FightSpawned[uuid] = c.Guid
+                end
                 -- Tagged for Cleanup.lua: a stand-in a save carried goes after a load.
                 pcall(function() Ext.Require("Cleanup.lua").Mark(uuid) end)
                 -- BG3 heals a hurt NPC out of combat by itself about 4 s after its HP dropped
@@ -346,10 +353,12 @@ function M.Start(runId)
             elseif c.Action == "Remove" then
                 local uuid = live(c.Target)
                 assert(created[uuid], "Mirrors remove their own stand-ins")
+                if WOWBG3FightSpawned then WOWBG3FightSpawned[uuid] = nil end
                 Osi.RequestDeleteTemporary(uuid)
                 return {Requested = uuid}
             elseif c.Action == "Clear" then
                 local left, asked = 0, 0
+                WOWBG3FightSpawned = {}
                 local all = {}
                 for uuid in pairs(created) do all[uuid] = true end
                 for uuid in pairs(WOWBG3MirrorOwned or {}) do all[uuid] = true end

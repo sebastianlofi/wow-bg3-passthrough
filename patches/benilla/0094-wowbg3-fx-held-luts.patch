@@ -1,0 +1,74 @@
+WOW-BG3 benilla patch 0094: effects keep BG3's colours while a new LUT is on its way.
+
+BG3 re-renders its grading LUT as the light changes. A frame naming one not yet read fell to the plain
+sRGB composite, which clips bright effects. The last usable pair now serves until the new one arrives.
+Once a second, the log says why frames had no effects: an empty BG3 frame, a stale one or none picked.
+
+--- a/crates/benilla-app/src/wowbg3_fx.rs
++++ b/crates/benilla-app/src/wowbg3_fx.rs
+@@ -1074,6 +1074,8 @@
+ 
+ #[derive(Resource)]
+ struct FxLoader {
++    gaps: (u32, u32, u32, u32),
++    gaps_since: std::time::Instant,
+     tav_dir: PathBuf,
+     fx_dir: PathBuf,
+     /// `WOW_BG3_LINK_DIR` (`tav.bin`, for the mapping to BG3's coordinates; patch 0012).
+@@ -1247,6 +1249,23 @@
+         .as_ref()
+         .filter(|f| !f.draws.is_empty() && now - f.wall < STALE_SECS && f.wall - now < 5.0)
+         .cloned();
++    // Once a second: frames with effects, and why the others had none (effects that blink).
++    match (&live, &l.frame) {
++        (Some(_), _) => l.gaps.0 += 1,
++        (None, Some(f)) if f.draws.is_empty() => l.gaps.1 += 1,
++        (None, Some(_)) => l.gaps.2 += 1,
++        (None, None) => l.gaps.3 += 1,
++    }
++    if l.gaps_since.elapsed().as_secs_f32() >= 1.0 {
++        if l.gaps.0 > 0 && l.gaps.1 + l.gaps.2 + l.gaps.3 > 0 {
++            info!(
++                "wowbg3 fx: last second: {} frames with effects, {} on an empty BG3 frame, {} on a stale one, {} with none picked (camera seq {cam})",
++                l.gaps.0, l.gaps.1, l.gaps.2, l.gaps.3
++            );
++        }
++        l.gaps = (0, 0, 0, 0);
++        l.gaps_since = std::time::Instant::now();
++    }
+     let Some(frame) = live else {
+         if ext.set.is_some() {
+             ext.set = None;
+@@ -1443,6 +1462,8 @@
+         exposure,
+         strip,
+         stamp: None,
++        gaps: (0, 0, 0, 0),
++        gaps_since: std::time::Instant::now(),
+         history: VecDeque::new(),
+         frame: None,
+         dirty: true,
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -624,6 +624,10 @@
+     last: Option<Arc<FxFrameSet>>,
+     ready: Option<Arc<Ready>>,
+     last_counts: (usize, usize),
++    /// The last LUT pair BG3's chain could use: BG3 re-renders its grading LUT as the light changes, so a
++    /// frame can name one still on its way. Without this, effects fell to the plain sRGB composite
++    /// (clipped to white) until it arrived.
++    held_luts: Option<(wgpu::TextureView, wgpu::TextureView)>,
+     mode: f32,
+     logged: HashSet<String>,
+     stats: Stats,
+@@ -1898,6 +1902,10 @@
+         }
+         self.last_counts = (draws.len(), skipped);
+         let luts = self.luts(dev, queue, set);
++        if luts.is_some() {
++            self.held_luts = luts.clone();
++        }
++        let luts = luts.or_else(|| self.held_luts.clone());
+         self.mode = if luts.is_some() { 1.0 } else { 0.0 };
+         if luts.is_none() && set.frame.post.is_some() {
+             self.log_once("BG3's grading or display LUT unusable: plain sRGB composite".to_string());

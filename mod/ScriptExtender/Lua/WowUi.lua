@@ -237,13 +237,15 @@ end
 -- east to west (WoW yards); the image's first row is north, its first column west. World mode:
 -- BG3 = Centre + (dy, dz, -dx) x 0.9144 from WowOrigin, so WoW's west is BG3's +x and WoW's north
 -- BG3's -z: on BG3's map (+x right, +z up) the image shows turned half round (the layer's fixed
--- ScaleTransform -1, -1 about the image's middle).
-local function minimapRect(mmj, wj, centre, size, w, h)
+-- ScaleTransform -1, -1 about the image's middle). At camp `shift` (BG3 metres x, z) lays it round the
+-- hero there: she stands on the spot she left (the WoW body waits there), and it does not move under her.
+local function minimapRect(mmj, wj, centre, size, w, h, shift)
     local O, C = wj.WowOrigin, wj.Centre
-    local xEast = C[1] + (mmj.Y0 - O[2]) * YD
-    local xWest = C[1] + (mmj.Y1 - O[2]) * YD
-    local zNorth = C[3] - (mmj.X1 - O[1]) * YD
-    local zSouth = C[3] - (mmj.X0 - O[1]) * YD
+    local sx, sz = shift and shift[1] or 0, shift and shift[2] or 0
+    local xEast = C[1] + sx + (mmj.Y0 - O[2]) * YD
+    local xWest = C[1] + sx + (mmj.Y1 - O[2]) * YD
+    local zNorth = C[3] + sz - (mmj.X1 - O[1]) * YD
+    local zSouth = C[3] + sz - (mmj.X0 - O[1]) * YD
     local kx, kz = w / size[1], h / size[2]
     return {w / 2 + (xEast - centre[1]) * kx, h / 2 - (zSouth - centre[2]) * kz,
         (xWest - xEast) * kx, (zSouth - zNorth) * kz}
@@ -354,10 +356,25 @@ local function startMinimap(runId, s)
         ticks = ticks + 1
         if ticks % 6 ~= 5 then return end
         local ok, err = pcall(function()
-            local active = World.IsActive and World.IsActive()
+            -- World mode, at camp too: WoW's minimap stays.
+            local active = World.Running and World.Running()
             if not active then
                 if MM.Shown then hide(minimapParts()) end
                 return
+            end
+            local shift = nil
+            if World.InCamp and World.InCamp() then
+                if not MM.CampShift then
+                    local cs = readJsonFile("wow-bg3/camp-state.json")
+                    local from = cs and cs.From
+                    local okp, p = pcall(Ext.Require("ActionProbe.lua").HostPosition)
+                    if not (type(from) == "table" and okp and type(p) == "table") then return end
+                    MM.CampShift = {p[1] - from[1], p[3] - from[3]}
+                    shown = nil
+                end
+                shift = MM.CampShift
+            elseif MM.CampShift then
+                MM.CampShift, shown = nil, nil
             end
             local mmj = readJsonFile("wow-bg3/link/minimap.json")
             local wj = readJsonFile("wow-bg3/link/world.json")
@@ -381,7 +398,7 @@ local function startMinimap(runId, s)
                 MM.Error = "no map frame yet"
                 return
             end
-            local r = minimapRect(mmj, wj, centre, size, w, h)
+            local r = minimapRect(mmj, wj, centre, size, w, h, shift)
             local path = se .. "/wow-bg3/link/minimap/" .. mmj.File .. "?" .. tostring(mmj.Run) .. "-" .. tostring(mmj.Seq)
             if prop(parts.Source, "Text") ~= path then parts.Source:SetProperty("Text", path) end
             parts.Image:SetProperty("Margin", {r[1], r[2], 0.0, 0.0})
@@ -395,6 +412,9 @@ local function startMinimap(runId, s)
             MM.Seq, MM.File, MM.Rect, MM.Error = mmj.Seq, mmj.File, r, nil
         end)
         if not ok then MM.Error = tostring(err) end
+        if ticks % 150 == 5 then
+            pcall(function() Ext.IO.SaveFile("wow-bg3/minimap-status.json", Ext.Json.Stringify(MM)) end)
+        end
     end)
 end
 

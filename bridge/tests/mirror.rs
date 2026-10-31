@@ -161,6 +161,11 @@ fn bg3_combat_with_mirrors_makes_a_pull() {
     assert!(text.contains("c f130000000012b03\n"));
     // A robbed NPC searching: benilla holds its model where BG3 walks the stand-in.
     assert!(text.contains("s f130000000012b01\n") && !text.contains("s f130000000012b02"));
+    // A mob that joined the fight with no mirror has a stand-in all the same (portrait, clicks).
+    m.in_fight = vec!["f130000044000001".into(), "f130000000012b01".into()];
+    let text = m.mirrored_text();
+    assert!(text.contains("m f130000044000001\n"));
+    assert_eq!(text.matches("m f130000000012b01\n").count(), 1);
     m.status.tav_combat = false;
     assert!(m.in_bg3_combat(0).is_empty());
 }

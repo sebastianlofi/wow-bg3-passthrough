@@ -615,8 +615,12 @@ def main():
             hs = poly_hs[rc]
             low = floor_yd[rc] + STOREY_CLEAR if walk_ring[rc] else terr[rc] + 4.0
             up = [h for h in hs if h > low] if walk_ring[rc] else [h for h in hs if h >= low]
-            # A cellar under the ground counts too (Stormwind's sanctum, under the mage quarter).
-            up += [h for h in hs if h < (floor_yd[rc] if walk_ring[rc] else terr[rc]) - STOREY_CLEAR - 4.0]
+            # A cellar under the ground counts too (Stormwind's sanctum, under the mage quarter), and so
+            # does the way down to it: every polygon a walker's headroom under the tile's floor, or under
+            # what the ground layer can take where it has none. (Six yards here left a band of stairs in
+            # no layer, and the Lion's Pride Inn's cellar, 6.5 yd under its hall, out of reach.)
+            under = floor_yd[rc] - STOREY_CLEAR if walk_ring[rc] else terr[rc] - 4.0
+            up += [h for h in hs if h < under]
             x, y = col[rc]
             faces = [fc for fc in surfaces.floors(x, y) if fc[1] <= limit]
             # Around the middle too: a middle on the line between two triangles finds neither, and a
@@ -630,6 +634,9 @@ def main():
             # below takes the height that goes on from its neighbour.)
             opts = {round(z, 3) for z, t in faces if any(abs(z - h) <= 2.0 for h in up)}
             opts |= {round(z, 3) for z, t in faces if t >= STOREY_RAMP_DEG and z >= low}
+            # The same for a stair going down, only with a polygon near to say someone walks there.
+            opts |= {round(z, 3) for z, t in faces if t >= STOREY_RAMP_DEG and z < under
+                     and any(abs(z - h) <= 2.0 for h in hs)}
             if opts:
                 cand[rc] = sorted(opts)
         def nbrs(rc):

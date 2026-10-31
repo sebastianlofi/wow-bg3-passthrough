@@ -29,7 +29,8 @@
 //!   `Pos`/`Dir` here are the fallback and the spawn point.
 //! - `mirror-status.json` (`Mirrors.lua`): per mirrored guid its stand-in uuid, BG3 HP and whether
 //!   it is in Tav's BG3 combat; Tav's HP, combat and turn-based state.
-//! - `mirrored.txt` (bridge, for benilla): `m GUID` per mob with a live stand-in (BG3 takes clicks
+//! - `mirrored.txt` (bridge, for benilla): `m GUID` per mob with a live stand-in, a mirror's or one the
+//!   running fight spawned for a mob with no mirror ([`Mirror::in_fight`]) (BG3 takes clicks
 //!   on it) and `c GUID` per dead one whose stand-in's corpse is still there (BG3 takes clicks on
 //!   that corpse too: BG3's own loot window, filled with the WoW loot by `Inventory.lua`, not WoW's),
 //!   and `s GUID` per robbed NPC searching for the thief (BG3 walks its stand-in; benilla 0067).
@@ -671,6 +672,9 @@ pub struct Mirror {
     seq: u64,
     written_at: Option<u64>,
     mirrored_text: String,
+    /// The running fight's living enemies, whose stand-ins BG3 runs: a mob that joined with no
+    /// mirror has a stand-in all the same, so it is listed for benilla (portrait, clicks).
+    pub in_fight: Vec<String>,
 }
 
 /// Set by SIGTERM or SIGINT once [`catch_stop`] ran: the bridge's loops end at the next
@@ -1030,6 +1034,12 @@ impl Mirror {
                 std::iter::once(first).chain(search)
             })
             .collect();
+        lines.extend(
+            self.in_fight
+                .iter()
+                .filter(|g| !self.status.mobs.contains_key(*g))
+                .map(|g| format!("m {g}")),
+        );
         lines.sort();
         lines.join("\n") + "\n"
     }

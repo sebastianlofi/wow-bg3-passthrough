@@ -1031,6 +1031,9 @@ static void role_forget(VkImage img) {  // g_trace_lock held
 
 typedef struct {
     int on, ui, light, fx, bg3tav, fxcopy, void_, raw, cpu, fxsync, wowbar, fxdecals, fxsight, ground, fxwhole;
+    int camp, camp_hold;           // camp_hold: 1 asked, 2 running (compose_gpu)
+    uint32_t camp_hold_seq;        // bg3cam.bin's record when the hold began
+    uint64_t camp_hold_ns;
     int fxsolid;   // a spell's unblended pieces in the effects pass captured too (word "fxsolid")
     int fxsolidlog;  // ... and their recipes and textures logged (research, word "fxsolidlog")
     // Research: "fxsolidonly=<hex>[,<hex>]" takes only those recipes as solid, "fxsolidskip=" leaves
@@ -1071,6 +1074,9 @@ static ComposeCfg g_cc;
 // "cpu" (the CPU compositor instead of the GPU one, for comparisons; wowbg3_compose_gpu.inc.c),
 // "fxsync" (the effects readbacks wait at the present, as before; see fxj_main),
 // "wowbar" (WoW's frame kept in video memory, written through the BAR; see wr_main).
+// "camp" (a trip to BG3's camp, world_bridge.py: BG3's own picture with only WoW's interface over it,
+// from frames benilla draws without the world, WBF1 flag 2; see compose_gpu). When the word goes,
+// the backdrop stays until a WoW frame drawn for BG3's camera again arrives (camp_hold).
 // "fxdecals" (BG3's deferred decal draws recorded too; see fxc_draw).
 // "fxsolid" (a spell's unblended pieces in the effects pass captured too; see fxc_solid; "fxsolidlog"
 // logs each recipe and texture it takes, research only), with
@@ -1114,6 +1120,12 @@ static void compose_config(void) {
     char line[256] = {0};
     if (!fgets(line, sizeof line, f)) line[0] = 0;
     fclose(f);
+    {
+        const int camp = has_word(line, "camp");
+        if (g_cc.camp && !camp) g_cc.camp_hold = 1;
+        if (camp) g_cc.camp_hold = 0;
+        g_cc.camp = camp;
+    }
     g_cc.ui = !has_word(line, "noui");
     g_cc.light = has_word(line, "light");
     g_cc.fx = has_word(line, "fx");
@@ -1486,7 +1498,8 @@ static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index,
     }
     // A screen's dark backdrop is the GPU path's work: the CPU path has no rule for it and WoW's
     // frame does not belong on such a screen, so BG3's own picture is presented as it is.
-    if (g_screen) return VK_NULL_HANDLE;
+    // The same for a trip to camp and the wait after it: the rule is the GPU path's.
+    if (g_screen || g_cc.camp || g_cc.camp_hold) return VK_NULL_HANDLE;
     DeviceData* d = q->dev;
     if (c->format != VK_FORMAT_B8G8R8A8_UNORM && c->format != VK_FORMAT_B8G8R8A8_SRGB) return VK_NULL_HANDLE;
     VkImage depth = (VkImage)g_role.depth;

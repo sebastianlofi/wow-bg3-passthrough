@@ -396,6 +396,7 @@ local function newBackend(actors, void, runId, session)
         local percent = wowPercent(sp)
         local v = standIn({Action = "Spawn", Template = template, Position = {w[1], w[2] + 1, w[3]},
             Name = sp and type(sp.Name) == "string" and sp.Name ~= "" and sp.Name or nil,
+            Guid = a.wow_guid,
             Percent = percent and percent < 100 and percent or nil})
         local uuid = assert(v.Created, "spawn returned no stand-in")
         made[#made + 1], actors[a.id], byUuid[uuid], guids[a.id] = uuid, uuid, a.id, a.wow_guid

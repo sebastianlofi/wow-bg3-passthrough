@@ -1322,11 +1322,23 @@ struct WowTri {
 // hole), 5 a big M2 (a boulder, a big tree: at least 4 yd on the smallest side of WoW's collision). Every query sees them all; BG3's camera clearance only the kinds WoW's camera collides
 // with (terrain and WMOs).
 constexpr std::uint32_t kKindAll = ~0u, kCameraKinds = (1u << 0) | (1u << 2);
-// BG3's cursor (query context 1) goes through what stands at or over the ceiling above her: benilla
-// fades those groups away, and a click on the floor seen through them landed on the roof, 9 yd over it.
-// Set each frame with the camera's ceiling; infinite outdoors. Never the terrain.
+// BG3's cursor (query context 1) goes through what benilla is not drawing, so a click lands on what the
+// player sees there. Two things go, both only while she is indoors. What stands at or over the ceiling above
+// her: benilla takes the storeys up there away, and a click on the floor seen through them landed on the
+// roof, 9 yd over it (set each frame with the camera's ceiling; infinite outdoors; the terrain too only while
+// she is under it, in a cellar). And what the see-through has cut (benilla's `wow_see_capsule`, without
+// its noise): a click on the floor seen through the opening landed on the wall.
 std::atomic<float> g_pick_top{std::numeric_limits<float>::infinity()};
+std::atomic<bool> g_pick_terrain{false};
 constexpr float kPickTopSlackM = 0.3f;
+std::atomic<bool> g_indoors{false};  // she is under a ceiling: see IndoorMode; bit 2 of bg3cam.bin's flags
+std::atomic<float> g_pick_eye[3];    // the eye the see-through's capsule starts at, as served
+std::atomic<float> g_pick_her[3];    // and where it ends: her chest
+constexpr float kCutRadiusM = 4.4f * 0.9144f;  // benilla's SeeSettings: R, the cut reaches half of it
+constexpr float kCutScreen = 0.45f * 0.52f;    // and its cap, a share of the half height at her distance
+constexpr float kCutNearM = 0.6f * 0.9144f;    // nothing nearer her than this toward the camera is cut
+constexpr float kCutFloorM = 0.35f * 0.9144f;  // nothing lower than this over her feet is cut
+constexpr float kCutChestM = 1.37f;            // kChestM, her chest over her feet, where the capsule ends
 
 // One cluster's cell grid: CellTris holds indices into ArenaRays::Tris.
 struct RayGrid {
@@ -1481,12 +1493,51 @@ bool tri_hit(WowTri const& t, glm::vec3 const& a, glm::vec3 const& d, float& out
     return true;
 }
 
-float pick_top(int context) {
-    return context == 1 ? g_pick_top.load(std::memory_order_relaxed) : std::numeric_limits<float>::infinity();
+// What a query goes through: none but the cursor's, none while she is outdoors.
+struct PickFilter {
+    bool On = false;
+    float Top = std::numeric_limits<float>::infinity();
+    bool Terrain = false;
+    bool Cut = false;
+    glm::vec3 Eye{}, Her{};
+};
+
+PickFilter pick_filter(int context) {
+    PickFilter f;
+    if (context != 1) return f;
+    f.Top = g_pick_top.load(std::memory_order_relaxed);
+    f.Terrain = g_pick_terrain.load(std::memory_order_relaxed);
+    f.Cut = g_indoors.load(std::memory_order_relaxed);
+    f.On = f.Cut || std::isfinite(f.Top);
+    for (int i = 0; i < 3; ++i) {
+        f.Eye[i] = g_pick_eye[i].load(std::memory_order_relaxed);
+        f.Her[i] = g_pick_her[i].load(std::memory_order_relaxed);
+    }
+    return f;
+}
+
+// Does the see-through take this point? benilla's `wow_see_capsule`, without its noise.
+bool in_see_cut(PickFilter const& f, glm::vec3 const& p) {
+    const glm::vec3 toEye = f.Eye - f.Her;
+    const float len = glm::length(toEye);
+    if (!(len > 0.1f) || p.y < f.Her.y - kCutChestM + kCutFloorM) return false;
+    const glm::vec3 fromHer = p - f.Her;
+    if (glm::dot(fromHer, toEye / len) < kCutNearM) return false;
+    const glm::vec3 level(toEye.x, 0.0f, toEye.z);
+    const float ll = glm::length(level);
+    if (ll > 1e-3f && glm::dot(fromHer, level / ll) < kCutNearM) return false;
+    const float t = std::clamp(glm::dot(p - f.Eye, -toEye) / (len * len), 0.0f, 1.0f);
+    const float reach = 0.5f * std::min(kCutRadiusM, 2.0f * kCutScreen * len);
+    return glm::length(p - (f.Eye - toEye * t)) < reach;
+}
+
+bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind) {
+    if (kind == 0) return f.Terrain && p.y > f.Top;
+    return p.y > f.Top || (f.Cut && in_see_cut(f, p));
 }
 
 bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
-                 std::uint32_t kinds = kKindAll, float top = std::numeric_limits<float>::infinity()) {
+                 std::uint32_t kinds = kKindAll, PickFilter const& pick = PickFilter{}) {
     if (r.Tris.empty() || !segment_touches(r, a, b)) return false;
     const glm::vec3 d = b - a;
     thread_local std::vector<std::uint32_t> mark;
@@ -1512,7 +1563,7 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
                 if (kinds != kKindAll && ((kinds >> (r.Kind.empty() ? 0 : r.Kind[i])) & 1u) == 0) continue;
                 float t;
                 if (tri_hit(r.Tris[i], a, d, t) && t < best
-                    && (a.y + d.y * t <= top || r.Kind.empty() || r.Kind[i] == 0)) {
+                    && (!pick.On || !pick_ignores(pick, a + d * t, r.Kind.empty() ? 0 : r.Kind[i]))) {
                     best = t;
                     normal = r.Tris[i].N;
                 }
@@ -1665,7 +1716,7 @@ bool hook_closest(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx
     }
     float t;
     glm::vec3 n;
-    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n, kKindAll, pick_top(context)) && (!got || t < hit.Distance)) {
+    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context)) && (!got || t < hit.Distance)) {
         fill_wow_hit(*r, a, b, t, n, hit);
         s->Stats.Wow[0].fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1739,7 +1790,7 @@ bool hook_all(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hit
     float t;
     glm::vec3 n;
     if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex)
-        && wow_closest(*r, a, b, t, n, kKindAll, pick_top(context))
+        && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context))
         && allocator_ready()) {
         phx_hit wh{};
         fill_wow_hit(*r, a, b, t, n, wh);
@@ -2865,12 +2916,15 @@ constexpr float kCeilingMarginM = 0.45f;
 //         chest and stays under the ceiling over her. It never sits in a wall, but indoors it is
 //         pinned: measured in the Lion's Pride Inn, the served eye stopped at z 62.55 whatever the
 //         zoom while BG3's own eye wanted 6.51 m more.
-//   free  the default. The line test runs against **terrain and big doodads** (kBumpKinds): hills,
-//         cliffs, boulders and big trees push the eye in, walls and roofs do not, because benilla
-//         opens or drops them. The eye may not sit in a face (a ray from the eye toward her chest that hits a
+//   free  the default, the design rule of 2026-10-31: the see-through is for indoors, and indoors the
+//         camera is not bumped up or down, that is what the see-through is for ("whats the point of the
+//         seethrough wall if they are gonna bump your camera in anyways"). So with a ceiling over her
+//         (g_indoors, her chest's own rays) the eye stays BG3's whatever it meets: it rises through the
+//         roof, 0091 and 0095 take the storeys away and 0090 opens the walls. Outdoors benilla cuts nothing,
+//         and the line test runs against terrain, buildings and big doodads (kBumpKinds). The eye may not
+//         sit in a face (a ray from the eye toward her chest that hits a
 //         terrain, WMO or doodad face within kEyeSolidM moves it past that face), nor in a doodad
-//         (an M2 face within kEyeInM2M on the way to her). Indoors with her it may rise through the
-//         roof, which 0091 then takes away. The unroof walk (`g_unroof`, WOWBG3_CAM_UNROOF=1) pulled
+//         (an M2 face within kEyeInM2M on the way to her). The unroof walk (`g_unroof`, WOWBG3_CAM_UNROOF=1) pulled
 //         an eye that was indoors while she was not back along the line until no ceiling was over
 //         it: from an interior room WoW drew the outside only through its windows, so a cut wall
 //         showed the sky (the void outside the inn). benilla 0090 now draws the exterior while the
@@ -2878,8 +2932,7 @@ constexpr float kCeilingMarginM = 0.45f;
 //         porch planks with her out of view, once in a pumpkin. Off by default since 2026-10-29
 //         (proved both ways at the inn: `tmp/occl20261029/eaves.sh`, sheets ron*/roff*).
 // Big doodads (a boulder, a big tree: kind 5, at least 4 yd on the smallest side of WoW's collision) push the eye in
-// like a hill. Thinner ones never do: benilla's patch 0092 fades them, and it draws the same line on
-// the same hulls, so a piece does one or the other. A big tree's canopy is not in WoW's collision, so
+// like a hill. Thinner ones never do. A big tree's canopy is not in WoW's collision, so
 // the camera bumps its trunk only.
 enum class IndoorMode { Hold, Free };
 IndoorMode g_indoor = IndoorMode::Free;
@@ -2892,7 +2945,8 @@ constexpr float kEyeSolidM = 1.5f;  // free: a face nearer than this to the eye 
 constexpr std::uint32_t kM2Kinds = (1u << 3) | (1u << 5), kSolidKinds = kCameraKinds | kM2Kinds;
 constexpr float kEyeInM2M = 0.5f;   // free: an M2 face this near on the way to her: the eye is in it
 constexpr std::uint32_t kTerrainKinds = 1u << 0;
-constexpr std::uint32_t kBumpKinds = kTerrainKinds | (1u << 5);  // free: what the eye bumps into on the line
+constexpr std::uint32_t kBumpKinds = kCameraKinds | (1u << 5);  // free, outdoors: what the eye bumps into on the line
+constexpr double kOutdoorHoldS = 0.5;  // a ceiling gone for this long is outdoors: a doorway's gap does not flip it
 constexpr float kEyeEaseOutMps = 3.0f;
 constexpr float kLookReachM = 80.0f;     // how far along BG3's forward line its look point is searched
 constexpr float kLookNearM = 4.0f;       // a look point farther than this from her feet is not her
@@ -2934,6 +2988,7 @@ struct CamClear {
     std::atomic<std::uint32_t> UnroofMost{0};
     std::atomic<std::uint64_t> UnroofStuck{0};
     std::atomic<float> Ceiling{0.0f};  // the last ceiling's height over her chest (m), 0 outdoors
+    double RoofAt = -1e9;              // when her chest last had a ceiling over it (under Lock)
     // The ease out per controller (under Lock): how far the last served eye was pulled in along the line
     // (m), from which anchor, and when; Frame: lead_frame's count, so an easing entry is computed again
     // once a frame.
@@ -3157,9 +3212,29 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     *target = 1.0f;
     ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
     if (r == nullptr || r->Tris.empty() || !inside_square(*r, eye0)) return false;
-    const bool sheUnder = under_terrain(*r, tav + glm::vec3(0.0f, kChestM, 0.0f));
+    const glm::vec3 herChest = tav + glm::vec3(0.0f, kChestM, 0.0f);
+    const bool sheUnder = under_terrain(*r, herChest);
     const glm::vec3 chest = clear_anchor(*r, eye0, fwd, tav, sheUnder);
     *anchor = chest;
+    // The ceiling over her: the middle of the rays up from her chest that hit; too few hits, outdoors.
+    float hits[kCeilingRays];
+    const int nh = ceiling_hits(*r, herChest, hits);
+    const double when = mono_seconds();
+    if (nh >= kCeilingHits) {
+        std::sort(hits, hits + nh);
+        const float ceiling = hits[nh / 2];
+        g_pick_top.store(herChest.y + ceiling - kPickTopSlackM, std::memory_order_relaxed);
+        g_pick_terrain.store(sheUnder, std::memory_order_relaxed);
+        g_clear.Indoor.fetch_add(1, std::memory_order_relaxed);
+        g_clear.Ceiling.store(ceiling, std::memory_order_relaxed);
+        g_clear.RoofAt = when;
+        g_indoors.store(true, std::memory_order_relaxed);
+    } else if (when - g_clear.RoofAt > kOutdoorHoldS) {
+        g_pick_top.store(std::numeric_limits<float>::infinity(), std::memory_order_relaxed);
+        g_pick_terrain.store(false, std::memory_order_relaxed);
+        g_clear.Ceiling.store(0.0f, std::memory_order_relaxed);
+        g_indoors.store(false, std::memory_order_relaxed);
+    }
     const glm::vec3 d = eye0 - chest;
     const float len = glm::length(d);
     // An eye 60 m or more from the anchor is BG3's camera before it caught up with her (a world mode
@@ -3169,8 +3244,10 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     float f = 1.0f, t = 2.0f;
     glm::vec3 n{};
     const bool free = g_indoor == IndoorMode::Free;
-    // What the eye bumps into on the line from her chest: terrain and buildings in `hold`, terrain
-    // and big doodads in `free` (see IndoorMode).
+    // `free`, indoors: never bumped (see IndoorMode). What it was pulled in by outside eases off.
+    if (free && g_indoors.load(std::memory_order_relaxed)) return true;
+    // What the eye bumps into on the line from her chest: terrain and buildings in `hold`, and
+    // big doodads too in `free` (see IndoorMode).
     const std::uint32_t lineKinds = free ? kBumpKinds : kCameraKinds;
     if (wow_closest(*r, chest, eye0, t, n, lineKinds)) {
         f = std::max(0.0f, t - kEyeMarginM / len);
@@ -3200,22 +3277,12 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
             f = std::min(f, std::max(0.0f, t - kEyeMarginM / len));
         }
     }
-    // The ceiling over her: the middle of the rays up from her chest that hit; too few hits, outdoors.
-    float hits[kCeilingRays];
-    const int nh = ceiling_hits(*r, chest, hits);
-    if (nh < kCeilingHits) g_pick_top.store(std::numeric_limits<float>::infinity(), std::memory_order_relaxed);
+    // `hold`: the ceiling over her caps the eye.
     if (nh >= kCeilingHits) {
-        std::sort(hits, hits + nh);
-        const float ceiling = hits[nh / 2];
-        g_pick_top.store(chest.y + ceiling - kPickTopSlackM, std::memory_order_relaxed);
-        g_clear.Indoor.fetch_add(1, std::memory_order_relaxed);
-        g_clear.Ceiling.store(ceiling, std::memory_order_relaxed);
-        // `free`: the ceiling is still measured (the log reports it) but no longer caps the eye.
         if (g_indoor == IndoorMode::Hold && d.y > 1e-3f) {
-            f = std::min(f, std::max(0.0f, (ceiling - kCeilingMarginM) / d.y));
+            f = std::min(f, std::max(0.0f, (hits[nh / 2] - kCeilingMarginM) / d.y));
         }
     } else {
-        g_clear.Ceiling.store(0.0f, std::memory_order_relaxed);
         // `free`, and she is outdoors: the eye may not be indoors. Walked in along the line until no
         // ceiling is over it (see IndoorMode for why: the void outside the inn), but never nearer her
         // chest than kUnroofNearM: an eye left under an eave is a wall cut open, an eye in her hair is
@@ -3335,6 +3402,12 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     }
     const bool moved = wasTested && served < 0.999f;
     const glm::vec3 eye = chest + (eye0 - chest) * served;
+    if (slot == 0) {  // the see-through's ends, for the cursor
+        for (int k = 0; k < 3; ++k) {
+            g_pick_eye[k].store(eye[k], std::memory_order_relaxed);
+            g_pick_her[k].store(tav[k] + (k == 1 ? kChestM : 0.0f), std::memory_order_relaxed);
+        }
+    }
     CamClear::Entry& e = ring[g_clear.Next[slot]];
     e.Controller = self;
     e.Key = eye0;
@@ -3411,8 +3484,9 @@ void lead_frame() {
     std::memcpy(rec + 4, &seq, 4);
     std::memcpy(rec + 8, vals, sizeof(vals));
     // Flags at 52 (was padding): 1 = the eye clearance tested this eye against WoW's ground (benilla
-    // then leaves it alone: its own clearance is only for eyes the plugin could not test).
-    const std::uint32_t flags = tested ? 1u : 0u;
+    // then leaves it alone: its own clearance is only for eyes the plugin could not test); 2 = she is
+    // indoors, which is when benilla's see-through runs (patch 0095).
+    const std::uint32_t flags = (tested ? 1u : 0u) | (g_indoors.load(std::memory_order_relaxed) ? 2u : 0u);
     std::memcpy(rec + 52, &flags, 4);
     const double now = mono_seconds();
     std::memcpy(rec + 56, &now, 8);
@@ -5716,7 +5790,7 @@ extern "C" BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3
     if (char const* v = std::getenv("WOWBG3_CAM_UNROOF"); v != nullptr && *v != 0) g_unroof = std::strcmp(v, "0") != 0;
     logf("camera: unroof walk %s", g_unroof ? "on" : "off");
     logf("camera: %s", g_indoor == IndoorMode::Free
-                           ? "free (bumps terrain and big doodads; never in a wall or a doodad)"
+                           ? "free (indoors never bumped; outdoors bumps terrain, buildings and big doodads)"
                            : "hold (bumps terrain and buildings, held under the ceiling)");
     int rc = 0;
     rc |= host->add_setting(self, "channel", BG3LE_SETTING_INT, &g_set_channel, 0, 0);

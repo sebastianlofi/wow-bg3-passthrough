@@ -296,6 +296,34 @@ static void* wr_main(void* arg) {
         int torn = ok && (!wr_pread(fd[k], after, 64, 0) || memcmp(after + 4, h[k] + 4, 4) || memcmp(after + 56, h[k] + 56, 4));
         uint64_t t1 = now_ns();
         for (int j = 0; j < 2; j++) if (fd[j] >= 0) close(fd[j]);
+        if (ok && !torn) {   // Flash recorder: WoW's picture jumping in brightness between two frames goes in the log, with that
+            // frame's colour rows on disk and BG3's next frames as a capture (at most 8 in a session).
+            static float flash_last = -1;
+            static int flash_n;
+            uint64_t sum = 0, count = 0;
+            for (uint32_t sy = wh / 40 + 1; sy < wh; sy += wh / 20 + 1)
+                for (uint32_t sx = ww / 80 + 1; sx < ww; sx += ww / 40 + 1) {
+                    uint32_t px;  // one read: the frame may be in video memory, slow to read
+                    memcpy(&px, (const uint8_t*)w->b.map + (size_t)sy * cbpr + (size_t)sx * 4, 4);
+                    sum += (px & 255) + ((px >> 8) & 255) + ((px >> 16) & 255);
+                    count += 3;
+                }
+            float mean = count ? (float)sum / count : 0;
+            if (flash_last >= 0 && !g_cc.camp && !g_cc.camp_hold && fabsf(mean - flash_last) > 30) {
+                logf_("compose: WoW frame %u jumps in brightness, %.0f to %.0f", s[k], flash_last, mean);
+                if (flash_n < 8) {
+                    char tag[32], path[256];
+                    flash_n++;
+                    snprintf(tag, sizeof tag, "wflash%d-%u", flash_n, s[k]);
+                    snprintf(path, sizeof path, "/%s.bgra-%ux%u-%u", tag, ww, wh, cbpr);
+                    FILE* f = fopen(outp(path), "wb");
+                    if (f) { fwrite(w->b.map, 1, (size_t)cbpr * wh, f); fclose(f); }
+                    f = fopen(outp("/request"), "w");
+                    if (f) { fprintf(f, "6 1 %s\n", tag); fclose(f); }
+                }
+            }
+            flash_last = mean;
+        }
         pthread_mutex_lock(&g_wr.m);
         if (!ok || torn) {
             w->state = 0;
@@ -552,7 +580,7 @@ static int gc_dark_frame(DeviceData* d, WowSlot* w) {
 }
 
 #define GSKIP(r) { g_cc.skipped++; g_cc.why[(r) & 7]++; \
-    if (g_cc.skipped % 300 == 1) logf_("compose: skipping (reason %d; %llu skipped, %llu frames; depth %llx l%d ui %llx l%d ext %ux%u)", (r), \
+    if (g_cc.skipped < 200 || g_cc.skipped % 300 == 1) logf_("compose: skipping (reason %d; %llu skipped, %llu frames; depth %llx l%d ui %llx l%d ext %ux%u)", (r), \
         (unsigned long long)g_cc.skipped, (unsigned long long)g_cc.frames, (unsigned long long)g_role.depth, g_role.dlayout, \
         (unsigned long long)g_role.ui, g_role.ulayout, g_role.ew, g_role.eh); \
     return 0; }
@@ -570,7 +598,7 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     // WoW's frame has nothing to do with the close-up camera such a screen renders from, so the
     // backdrop frame takes its place and the picture becomes the character over one dark colour.
     // Without the HUD the frame is left alone: the backdrop must never paint over the screen itself.
-    const int dark = g_screen && g_cc.screenvoid && !g_screen_dialog;
+    int dark = g_screen && g_cc.screenvoid && !g_screen_dialog;
     if (dark && !ui) GSKIP(1)
     VkImageLayout dlayout = (VkImageLayout)g_role.dlayout, ulayout = (VkImageLayout)g_role.ulayout;
     VkFormat dfmt = g_role.dfmt, ufmt = g_role.ufmt;
@@ -599,6 +627,21 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
         if (sc[0] || sc[1] || sc[2]) surf_counts(sc[0], sc[1], sc[2]);
         g_gc.wow_px += n;
         g_gc.px += (uint64_t)c->extent.width * c->extent.height;
+        {   // A short run of frames with little of WoW in them is BG3's void flashing through: each run in the log.
+            static uint64_t dip_frames;
+            static uint32_t dip_low;
+            uint64_t all = (uint64_t)c->extent.width * c->extent.height;
+            if ((uint64_t)n * 100 < all * 97) {
+                if (!dip_frames) dip_low = n;
+                if (n < dip_low) dip_low = n;
+                dip_frames++;
+            } else if (dip_frames) {
+                logf_("compose: dip over: %llu frames with under 97%% WoW, lowest %.1f%%, at frame %llu, screen %d, ui %d, WoW seq %u, %llu skipped",
+                      (unsigned long long)dip_frames, 100.0 * dip_low / all, (unsigned long long)g_cc.frames, (int)g_screen,
+                      (int)g_role.ulayout, (unsigned)g_pt.seq, (unsigned long long)g_cc.skipped);
+                dip_frames = 0;
+            }
+        }
         uint64_t ts[2];
         if (g_gc.qp && d->GetQueryPoolResults(d->device, g_gc.qp, 2 * k, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             uint64_t ns = (uint64_t)((double)((ts[1] - ts[0]) & g_gc.ts_mask) * g_gc.tick_ns);
@@ -644,6 +687,39 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
         g_pt.seq = w.seq; g_pt.packet = w.packet; g_pt.cam = w.cam; g_pt.wtime = w.wtime; g_pt.ready_ns = w.ready_ns;
         if (g_gc.cur < 0 || !w.b.buf) GSKIP(3)
     }
+    // A trip to camp: BG3's own picture, and of WoW's frame only its interface (WBF1 flag 2: drawn
+    // without the world, its alpha says where the interface is). A frame with the world, from before
+    // benilla heard, is not shown.
+    int ui_only = 0;
+    if (g_cc.camp && !dark) {
+        if (!(w.wflags & 2u)) return 0;
+        ui_only = 1;
+    }
+    // Back from camp: WoW's camera stood still and the frames in hand were drawn for the camera BG3 had
+    // when the trip began, so they show the wrong angle. The backdrop until a frame with the world
+    // follows a camera record newer than the hold's start (BG3's lead is on again); never longer than
+    // CAMP_HOLD_NS, should the lead not come.
+#define CAMP_HOLD_NS 4000000000ull
+    if (g_cc.camp_hold && !g_cc.camp && !dark) {
+        if (g_cc.camp_hold == 1) {
+            memcpy(&g_cc.camp_hold_seq, cam + 4, 4);
+            g_cc.camp_hold_ns = now_ns();
+            g_cc.camp_hold = 2;
+            logf_("compose: back from camp: holding the backdrop from camera %u", g_cc.camp_hold_seq);
+        }
+        const int match = !(w.wflags & 2u) && w.cam && (int32_t)(w.cam - g_cc.camp_hold_seq) > 0;
+        const uint64_t waited = now_ns() - g_cc.camp_hold_ns;
+        if (match || waited > CAMP_HOLD_NS) {
+            logf_("compose: back from camp: WoW frame %u for camera %u shown after %.0f ms%s", w.seq, w.cam, waited / 1e6, match ? "" : " (gave up waiting)");
+            g_cc.camp_hold = 0;
+        } else {
+            if (!ui) return 0;
+            if (!gc_dark_frame(d, &w)) GSKIP(3)
+            dark = 1;
+        }
+    }
+    // Any other frame without the world (the last of a trip, the wait given up) is never the picture.
+    if (!ui_only && !dark && (w.wflags & 2u)) return 0;
 
     const uint32_t W = c->extent.width, H = c->extent.height;
     const int db = depth_bytes(dfmt);
@@ -687,6 +763,7 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     else if (dfmt == VK_FORMAT_X8_D24_UNORM_PACK32 || dfmt == VK_FORMAT_D24_UNORM_S8_UINT) pc.flags |= 16u;
     if (w.ww != W || w.wh != H) pc.flags |= 32u;
     if (w.code == 2 && !g_cc.wowraw) pc.flags |= 64u;  // WoW's bytes decoded once
+    if (ui_only) pc.flags |= 128u;
 
     VkCommandBuffer cmd = g_gc.cmd[k];
     d->ResetCommandBuffer(cmd, 0);
