@@ -31,6 +31,7 @@ local PREFIX_STATS = "WOWBG3_I_"
 local client = Ext.IsClient()
 local tick = 0 -- server ticks since Start (all timing below counts these)
 -- Hero.lua (the controlled character); a stand-in when loaded outside bootstrap (harness research).
+local Camp = Ext.Require("Camp.lua") -- the switch `camp`
 local okHero, Hero = pcall(Ext.Require, "Hero.lua")
 if not okHero or type(Hero) ~= "table" then
     Hero = {Uuid = function()
@@ -45,6 +46,18 @@ pcall(Ext.Vars.RegisterUserVariable, ENTRY_VAR, {Server = true, Client = false, 
 -- On a party member: the boosts of the WoW-only pieces (shoulders, legs, ...) its WoW character wears.
 local WORN_VAR = "WowBg3Worn"
 pcall(Ext.Vars.RegisterUserVariable, WORN_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+local wornLooked = {} -- member -> this Lua state (a load rebuilds it) has read its boosts
+local function hasWornBoost(e)
+    local ok, found = pcall(function()
+        for _, b in ipairs(e.BoostsContainer.Boosts) do
+            for _, x in ipairs(b.Boosts) do
+                if tostring(x.BoostInfo.Cause.Cause) == "WowBg3Worn" then return true end
+            end
+        end
+        return false
+    end)
+    return ok and found
+end
 
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
@@ -74,10 +87,56 @@ function M.Items()
     if ok and type(t) == "table" and type(t.Items) == "table" then
         for _, r in ipairs(t.Items) do items[r.e] = r end
         M.CopperPerGold = t.CopperPerGold or 1
+        -- The effects switch (wow_items.py --effects): absent from the table when off.
+        M.EffectRules = t.Effects
+        for _, p in ipairs(t.Props or {}) do M.Props = M.Props or {}; M.Props[p.id] = p end
+        M.Pools = t.Pools
     end
     return items
 end
 function M.Item(entry) return M.Items()[math.tointeger(entry) or -1] end
+
+-- A WoW random suffix ("of the Bear"): the same row and stats entry with the suffix in its name and
+-- text under its own string handles; what the suffix gives comes through M.EffectBoosts.
+function M.Variant(row, rand)
+    M.Items()
+    local id = rand and math.tointeger(rand)
+    local p = id and M.Props and M.Props[id]
+    if not p then return row end
+    return setmetatable({
+        NameKey = M.NameHandle(row.e) .. "_" .. tostring(id),
+        DescKey = M.DescHandle(row.e) .. "_" .. tostring(id),
+        n = (row.n or "") .. " " .. p.n,
+        wd = (row.wd and row.wd .. "\n" or "") .. (p.t or ""),
+    }, {__index = row})
+end
+
+-- What a member wears (WoW's list), on-equip points and suffix points added up by kind, as boosts.
+function M.EffectBoosts(wornItems)
+    M.Items()
+    local rules, out = M.EffectRules, {}
+    if not rules then return out end
+    local pts = {}
+    local function add(ef) for kind, v in pairs(ef or {}) do pts[kind] = (pts[kind] or 0) + v end end
+    for _, it in ipairs(wornItems) do
+        if it.Bag == 255 and it.Slot < 19 then
+            add((M.Item(it.Entry) or {}).ef)
+            add(((M.Props or {})[it.Rand or 0] or {}).ef)
+        end
+    end
+    for kind, v in pairs(pts) do
+        local r = rules[kind]
+        if r then
+            local n = math.floor(math.abs(v) / r.per + 0.000001)
+            n = math.floor(math.min(n, r.cap)) * (v < 0 and -1 or 1)
+            if n > 0 or (n < 0 and r.b:find("{[np]}")) then -- a boost with no number has no minus side
+                local text = r.b:gsub("{n}", tostring(n)):gsub("{p}", tostring(100 + n))
+                for b in text:gmatch("[^;]+") do out[#out + 1] = b end
+            end
+        end
+    end
+    return out
+end
 
 -- Icons the atlas holds (wow_icons.py): only those names are given to items, others keep the base's.
 function M.IconName(row)
@@ -157,15 +216,26 @@ makeStats = function(row, sync)
         if row.r then s.Rarity = row.r end
         s.ValueOverride = math.max(0, math.floor((row.bp or 0) / (M.CopperPerGold or 1)))
     end)
+    -- WoW's food and drink are BG3's camp supplies (switch `camp`; `sv` from wow_items.py). BG3's water has
+    -- no supply value and no supply tag of its own, its food has both.
+    if row.sv and Camp.On() then
+        pcall(function()
+            s.SupplyValue = row.sv
+            local old = tostring(base.DefaultBoosts or "")
+            if not old:find("CAMPSUPPLIES", 1, true) then
+                s.DefaultBoosts = (old ~= "" and old .. ";" or "") .. "Tag(CAMPSUPPLIES)"
+            end
+        end)
+    end
     if sync then pcall(function() s:Sync() end) end
     return name
 end
 
 function M.MakeStrings(row)
-    Ext.Loca.UpdateTranslatedString(M.NameHandle(row.e), row.n or ("WoW item " .. row.e))
+    Ext.Loca.UpdateTranslatedString(row.NameKey or M.NameHandle(row.e), row.n or ("WoW item " .. row.e))
     local desc = row.wd or ""
     if row.k == "worn" then desc = "Worn in WoW (" .. tostring(row.s) .. ").\n" .. desc end
-    Ext.Loca.UpdateTranslatedString(M.DescHandle(row.e), desc)
+    Ext.Loca.UpdateTranslatedString(row.DescKey or M.DescHandle(row.e), desc)
 end
 
 -- Strings for every entry, on both sides (cheap: a hash insert each). Stats entries are made only for
@@ -185,12 +255,21 @@ function M.MakeUsed()
     Ext.Log.Print(string.format("WOW-BG3 inventory: %d used item stats in %d ms (%s)", n, M.UsedMs, client and "client" or "server"))
 end
 
-function M.MakeAll()
-    if made then return end
+function M.MakeAll(again)
+    if made and not again then return end
     made = true
     local t0, n = Ext.Utils.MonotonicTime(), 0
     for _, row in pairs(M.Items()) do
         if pcall(M.MakeStrings, row) then n = n + 1 end
+    end
+    -- Every suffix an item can roll: the client has no other way to learn the strings (handles are cheap).
+    local pools = {}
+    for _, p in ipairs(M.Pools or {}) do pools[p.id] = p.p end
+    for _, row in pairs(M.Items()) do
+        for _, rand in ipairs(pools[row.rp or -1] or {}) do
+            local v = M.Variant(row, rand)
+            if v ~= row and pcall(M.MakeStrings, v) then n = n + 1 end
+        end
     end
     M.MadeMs = Ext.Utils.MonotonicTime() - t0
     Ext.Log.Print(string.format("WOW-BG3 inventory: %d item names in %d ms (%s)", n, M.MadeMs, client and "client" or "server"))
@@ -216,7 +295,7 @@ end
 function M.Dress(u, row)
     local e = Ext.Entity.Get(u)
     if not e then return false end
-    local name = M.NameHandle(row.e)
+    local name = row.NameKey or M.NameHandle(row.e)
     pcall(setHandle, e.DisplayName.Name, name)
     pcall(function() setHandle(e.ServerDisplayNameList.Names[1].NameKey, name) end)
     local icon = M.IconName(row)
@@ -233,8 +312,8 @@ end
 local function dress(e, row)
     local t = e.ServerItem:CreateCacheTemplate()
     pcall(function() t.Stats = M.StatsName(row.e) end)
-    pcall(function() t.DisplayName = M.NameHandle(row.e) end) -- a TranslatedString is its handle in Lua
-    pcall(function() t.Description = M.DescHandle(row.e) end)
+    pcall(function() t.DisplayName = row.NameKey or M.NameHandle(row.e) end) -- a TranslatedString is its handle in Lua
+    pcall(function() t.Description = row.DescKey or M.DescHandle(row.e) end)
     local icon = M.IconName(row)
     if icon then pcall(function() t.Icon = icon end) end
     return t
@@ -247,8 +326,10 @@ end
 -- WoW boots, entry 140, were in neither his nor the harness's used list). Such an item is removed (its
 -- entry now marked used) and the next reconcile makes it again from WoW's list, equipped if WoW wears it.
 M.Remade = 0
+local suffixed = {} -- uuid -> the suffix its name shows (reconcile)
 function M.Redress()
     local n, broken = 0, {}
+    suffixed = {}
     eachOurs(function(u, _, e)
         local entry = q(function() return e.Vars[ENTRY_VAR] end)
         local sid = q(function() return e.Data.StatsId end)
@@ -270,8 +351,8 @@ end
 
 M.Fresh = {}
 -- A new BG3 item for WoW entry `entry` (count for stacks) in `holder`'s inventory; tag = WowBg3Item.
-function M.Create(entry, holder, count, tag)
-    local row = assert(M.Item(entry), "no item " .. tostring(entry))
+function M.Create(entry, holder, count, tag, rand)
+    local row = M.Variant(assert(M.Item(entry), "no item " .. tostring(entry)), rand)
     M.MakeStats(row)
     M.MakeStrings(row)
     local rt = assert(rootOf(row), "no root template for " .. tostring(row.b))
@@ -290,8 +371,10 @@ function M.Create(entry, holder, count, tag)
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
     M.Suppress(u)
-    Osi.ToInventory(u, holder, 1, 0, 0)
+    -- The whole stack before it moves: BG3 sends camp supplies on to the Camp Supply Sack, and of a stack
+    -- raised after the move only the moved 1 went, a stray bare copy WoW's list does not know.
     if count and count > 1 then pcall(Osi.SetStackAmount, u, count) end
+    Osi.ToInventory(u, holder, count or 1, 0, 0)
     return u
 end
 
@@ -388,11 +471,89 @@ local function entryOf(u)
 end
 local stackWant = {}
 
-local function reconcileStacks(uuid, stacks, have)
+-- Food and drink spent in BG3 (switch `camp`): eaten, or taken by BG3 for a long rest. WoW is the truth,
+-- so without this the next reconcile put them back and every rest was free. A drop of a BG3 stack below
+-- what it last held goes to WoW as the bridge's `del` (WoW's stacks of that entry, bags before anything
+-- else); until WoW's list shows it, the stack stays at the lower amount (SPEND_WAIT ms, then WoW's word).
+local stackLast, stackSpent = {}, {} -- tag -> amount last held; {Total, N, At}
+local SPEND_WAIT = 15000
+local dropSeen, DROP_WAIT = {}, 150 -- tag -> tick a drop was first seen; ticks it must last (about 5 s)
+M.Spent = 0
+local function spend(uuid, entry, n, items)
+    local left = n
+    for _, it in ipairs(items or {}) do
+        if left <= 0 then break end
+        if it.Entry == entry then
+            local c = math.min(left, it.Count or 1)
+            M.Request({Op = "del", Member = uuid, Guid = tostring(it.Guid), Count = c})
+            left = left - c
+        end
+    end
+    M.Spent = M.Spent + (n - left)
+end
+-- How far the party's BG3 stacks of this entry together are below what they last held.
+local function partyDrop(entry)
+    local held, want = 0, 0
+    eachOurs(function(u)
+        local t = tagOf(u)
+        if entryOf(u) == entry and not (t and t:match("^[LV]")) then held = held + (q(Osi.GetStackAmount, u) or 0) end
+    end)
+    local prefix = "S" .. tostring(entry) .. "@"
+    for tag, n in pairs(stackLast) do
+        if tag:sub(1, #prefix) == prefix then want = want + n end
+    end
+    return want - held
+end
+local function spentCheck(tag, total)
+    local p = stackSpent[tag]
+    if not p then return total end
+    if total < p.Total or Ext.Utils.MonotonicTime() - p.At > SPEND_WAIT then
+        stackSpent[tag] = nil
+        return total
+    end
+    return math.max(0, total - p.N)
+end
+
+local function reconcileStacks(uuid, stacks, have, items)
+    -- An entry WoW no longer lists (sold, used up) starts over: a later purchase is no spending.
+    for tag in pairs(stackLast) do
+        local e, member = tag:match("^S(%d+)@(.+)$")
+        if member == uuid and not stacks[math.tointeger(tonumber(e))] then
+            stackLast[tag], stackSpent[tag] = nil, nil
+        end
+    end
     for entry, total in pairs(stacks) do
         local tag = stackTag(entry, uuid)
         stackWant[tag] = true
         local u = have[tag]
+        local supply = Camp.On() and (M.Item(entry) or {}).sv ~= nil
+        local waiting = false
+        if supply then
+            local wow = total
+            total = spentCheck(tag, wow)
+            -- Only from a stack seen before: right after a load the save and WoW's snapshot may differ by
+            -- anything, and the old rule below settles that without taking food from WoW.
+            local was = stackLast[tag] and math.min(stackLast[tag], total) or nil
+            local now = was and (u and q(Osi.GetStackAmount, u) or (not u and 0)) or nil
+            -- Only what left the party is spent: a part split off or moved to another member or a container
+            -- still counts (those the old rule below puts back; WoW's items are never destroyed for them).
+            local gone = (now and now < was and not (u and pendingItem[u])) and math.min(was - now, partyDrop(entry)) or 0
+            -- Spent only if it stays gone: a stack that vanished for one pass (seen once at a long rest's end,
+            -- cause not caught) must not cost WoW's food. Until then it is left as it is.
+            if gone > 0 and not (dropSeen[tag] and tick - dropSeen[tag] >= DROP_WAIT) then
+                dropSeen[tag] = dropSeen[tag] or tick
+                waiting = true
+                total = wow - gone
+            elseif gone > 0 then
+                dropSeen[tag] = nil
+                spend(uuid, entry, gone, items)
+                stackSpent[tag] = {Total = wow, N = gone, At = Ext.Utils.MonotonicTime()}
+                total = wow - gone
+            else
+                dropSeen[tag] = nil
+            end
+            stackLast[tag] = waiting and was or total
+        end
         if not u then
             -- A bought or looted item (vendor/loot tag) the player moved here: it becomes the stack.
             for t, x in pairs(have) do
@@ -405,11 +566,11 @@ local function reconcileStacks(uuid, stacks, have)
                 end
             end
         end
-        if not u then
+        if not u and total > 0 and not waiting then
             local ok, made = pcall(M.Create, entry, uuid, total, tag)
             if ok then u = made; have[tag] = u; state.Created = state.Created + 1 else note(made) end
         end
-        if u and not pendingItem[u] then
+        if u and not pendingItem[u] and not waiting then
             if holderOf(u) ~= uuid then M.Suppress(u); pcall(Osi.ToInventory, u, uuid, total, 0, 0) end
             local amount = q(Osi.GetStackAmount, u)
             if amount and amount ~= total then pcall(Osi.SetStackAmount, u, total) end
@@ -445,7 +606,7 @@ local function reconcileMember(uuid, m, have)
             row = nil -- handled as a stack below
         end
         if row and not u then
-            local ok, made = pcall(M.Create, it.Entry, uuid, it.Count, tag)
+            local ok, made = pcall(M.Create, it.Entry, uuid, it.Count, tag, it.Rand)
             if ok then
                 u = made
                 have[tag] = u
@@ -455,6 +616,10 @@ local function reconcileMember(uuid, m, have)
             end
         end
         if u and row and not pendingItem[u] then
+            if it.Rand and M.Props and M.Props[it.Rand] and suffixed[u] ~= it.Rand then
+                suffixed[u] = it.Rand -- a bought or looted item learns its suffix here; after a load too
+                pcall(M.Dress, u, M.Variant(row, it.Rand))
+            end
             if holderOf(u) ~= uuid and not equipped(u) then
                 M.Suppress(u)
                 pcall(Osi.ToInventory, u, uuid, it.Count or 1, 0, 0)
@@ -471,20 +636,35 @@ local function reconcileMember(uuid, m, have)
             if amount and it.Count and amount ~= it.Count then pcall(Osi.SetStackAmount, u, it.Count) end
         end
     end
-    reconcileStacks(uuid, stacks, have)
+    reconcileStacks(uuid, stacks, have, m.Items)
     -- WoW-only pieces the WoW character wears (no BG3 slot): their boosts on the member itself.
     local worn = {}
     for _, it in ipairs(m.Items) do
         local row = M.Item(it.Entry)
         if row and row.k == "worn" and it.Bag == 255 and it.Slot < 19 and row.bo then worn[#worn + 1] = row.bo end
     end
+    for _, b in ipairs(M.EffectBoosts(m.Items)) do worn[#worn + 1] = b end
     table.sort(worn)
     local want = table.concat(worn, ";")
     local e = Ext.Entity.Get(uuid)
     local had = q(function() return e.Vars[WORN_VAR] end) or ""
+    -- A load brings the variable back but not the boosts (harness): the first look goes by the member.
+    if not wornLooked[uuid] then
+        wornLooked[uuid] = true
+        if not hasWornBoost(e) then had = "" end
+    end
     if want ~= had then
-        if had ~= "" then pcall(Osi.RemoveBoosts, uuid, had, 0, "WowBg3Worn", uuid) end
-        if want ~= "" then pcall(Osi.AddBoosts, uuid, want, "WowBg3Worn", uuid) end
+        -- Only the boosts that changed: BG3 takes removals out later, so a boost removed and added
+        -- again in one tick is lost (a second item's boost cost the first its own).
+        local add = {}
+        for b in want:gmatch("[^;]+") do add[b] = (add[b] or 0) + 1 end
+        for b in had:gmatch("[^;]+") do
+            if (add[b] or 0) > 0 then add[b] = add[b] - 1
+            else pcall(Osi.RemoveBoosts, uuid, b, 0, "WowBg3Worn", uuid) end
+        end
+        for b, n in pairs(add) do
+            for _ = 1, n do pcall(Osi.AddBoosts, uuid, b, "WowBg3Worn", uuid) end
+        end
         pcall(function() e.Vars[WORN_VAR] = want end)
     end
     -- Gold: WoW's money, 1 BG3 gold per CopperPerGold copper (the member's own inventory).
@@ -501,9 +681,15 @@ end
 function M.Reconcile(inv)
     local have = ours()
     wowOwner, stackWant = {}, {}
-    for uuid, m in pairs(inv.Members or {}) do reconcileMember(uuid, m, have) end
+    local blind = false
+    for uuid, m in pairs(inv.Members or {}) do
+        reconcileMember(uuid, m, have)
+        if type(m) ~= "table" or type(m.Items) ~= "table" then blind = true end
+    end
     -- What WoW no longer has: plain WoW items (guid tags) not in any member's list, stacks it has none of.
-    for tag, u in pairs(have) do
+    -- Not while a member's list is missing (WoW offline, a far move): that says nothing about what it holds,
+    -- and a stack deleted here would next read as food spent.
+    for tag, u in pairs(blind and {} or have) do
         if ((tag:match("^%d+$") and not wowOwner[tag]) or (tag:match("^S") and not stackWant[tag])) and not pendingItem[u] then
             M.Suppress(u)
             pcall(Osi.RequestDelete, u)
@@ -582,7 +768,7 @@ local function askFor(u, tag, count, thief)
         local ware = nil
         for _, w in ipairs(((lastInv.Vendors or {})[guid]) or {}) do if tostring(w.Idx) == idx then ware = w end end
         if ware and thief then
-            M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = count or 1, Item = u})
+            M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = count or 1, Item = u, Npc = guid, Idx = ware.Idx})
             M.Stolen = (M.Stolen or 0) + 1
         elseif ware then M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = count or 1, Item = u}) end
     else
@@ -759,6 +945,9 @@ function M.Start(id)
     Ext.Events.StatsLoaded:Subscribe(function() pcall(M.MakeUsed) end)
     Ext.Events.SessionLoaded:Subscribe(function() M.MakeAll() end)
     if client then return end
+    -- Client and server share BG3's string table and both fill it at SessionLoaded; many strings are
+    -- lost there (harness: 3172 names and 47809 suffix names of 85386 empty), so once more on one side.
+    Ext.Osiris.RegisterListener("LevelGameplayStarted", 2, "after", function() M.MakeAll(true) end)
     Ext.Osiris.RegisterListener("Equipped", 2, "after", function(item, char) onEquipped(item, char, true) end)
     Ext.Osiris.RegisterListener("Unequipped", 2, "after", function(item, char) onEquipped(item, char, false) end)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)

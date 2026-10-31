@@ -20,8 +20,10 @@ Tested on AMD graphics (RADV) only so far.
 Everything else is in this download: the Linux Script Extender (bg3le, with
 WOW-BG3's patches), the local WoW server, the WoW engine (benilla) and the tools.
 
-Optional, not included: a level-cap mod, for BG3 levels past 12:
-Expansion Level 13-20 (Configurable) and 5e Spells, from mod.io or Nexus.
+Strongly recommended, not included: a level mod, because BG3 stops at level 12 without one. From Nexus
+Mods: UnlockLevelCurve or Expansion Level 13-20, then 5e Spells with its spell list patch, and Advanced
+Tabletop Spells for more level 7 to 9 spells. Not tested with WOW-BG3 yet. 5e Spells needs Script
+Extender, and whether it works on the Linux Script Extender in this download is unknown.
 
 ## Install
 
@@ -68,6 +70,26 @@ enabled says so in a message box (OK to close, the game goes on as plain BG3).
 
 Saving and loading work as in BG3. Loading an older save also takes the WoW
 character back to where it was in that save.
+
+## Levels
+
+WoW levels run to 60, the end goal. The level BG3 shows beside a character is that character's own BG3
+level, not your WoW level. WoW levels 2, 3 and 4 each open a party place; from WoW level 5 each level earns
+one BG3 level-up for one party member, and every 5th earns two. BG3's XP bar shows how far you are into your
+WoW level, and a notice at each new WoW level says the rest.
+
+| WoW level | Level-ups earned | A party of four at BG3 level |
+|---|---|---|
+| 5 | 2 | 1 to 2 |
+| 10 | 8 | 3 |
+| 20 | 20 | 6 |
+| 30 | 32 | 9 |
+| 40 | 44 | 12 |
+| 50 | 56 | 15 |
+| 57 | 64 | 17 |
+| 60 | 68 | 18 |
+
+BG3 stops at level 12 without a level mod (see "What you need").
 
 ## Where things are
 

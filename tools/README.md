@@ -23,7 +23,10 @@ header. The tools' own folder constants are development defaults that `relenv.py
 | `wowsave.py`, `wowchar.py`, `wowaccount.py`, `wowserver.py` | WoW character snapshots, BG3 to WoW character mapping, playthrough accounts, the server's console and database |
 | `world_bridge.py`, `wow_arena.py`, `wow_stand.py`, `wow_vmap.py`, `wow_mpq.py` | world mode's ground squares from the server's map data |
 | `inventory_bridge.py`, `wow_items.py`, `wow_icons.py` | the merged inventory, item data and the icon atlas |
+| `wow_abilities.py`, `wow_abilities_rules.json` | the BG3 abilities each WoW mob's stand-in gets (link/abilities.json) |
+| `test_camp.py` | camp trips and spent supplies under a fake game (needs the `lupa` module) |
 | `wowlevel.py` | the hero's WoW level for BG3's progression |
 | `wowbg3-chatcmd.py`, `wowbg3cmd.py` | `/wowbg3` commands typed in WoW's chat |
+| `wow_waypoints.py` | fast travel between WoW's flight points: the rules (`waypoints` in `settings.conf`); `test_wow_waypoints.py` checks them without a game |
 | `tavtex.py`, `bg3tex.py`, `bg3pak.py`, `bg3shade.py`, `bg3index.py` | textures for BG3's characters drawn inside WoW |
 | `wowcursor.py` | WoW's quest cursors for BG3 |

@@ -1,9 +1,8 @@
 -- Progression (server; the progression notes): BG3 levels the WoW way.
 --
--- The design (party-multiplayer-design.md "Progression"): cap 16 per BG3 character. The hero's
--- WoW levels 1 to 4 each open a party slot (level 1: the hero alone); every WoW level from 5 on earns
--- one level-up for one member. 4 members x BG3 level 16 = 64 BG3 levels = WoW 64 (4 starting levels and
--- 60 level-ups; BG3 itself stops at 12 without a level-cap mod, and the rest waits in the pool).
+-- The design: the hero's WoW levels 1 to 4 each open a party slot (level 1: the hero alone); every WoW level
+-- from 5 on earns one level-up for one member, every 5th two (M.CURVE): 4 members x BG3 level 18 at WoW 60.
+-- BG3 itself stops at 12 without a level-cap mod, and the rest waits in the pool.
 -- One command (a playtest request): the WoW level, the only one. While the pool holds a level-up,
 -- BG3's own Level Up button shows on every member who has room (M.Offer: its next level's XP); the
 -- player levels whichever one they want, BG3's LeveledUp spends the level-up on that one, and once the
@@ -36,8 +35,19 @@ pcall(Ext.Vars.RegisterUserVariable, VAR, {Server = true, Client = false, SyncTo
 
 M.SLOT_LEVELS = 4  -- WoW levels 1..4: one party slot each
 M.FIRST_EARN = 5   -- every WoW level from here on: one level-up
-M.CAP = 16         -- BG3 level cap per character
-M.GRANT_CAP = 16   -- the highest level the WoW levels give (WoW 64)
+
+-- The curve is this one table, a party of four at BG3 level Cap at WoW 60. One level-up per WoW level from 5 and a second at every Every-th, counted back
+-- from 60: 56 + 12 = 68 = 4 x 17 for 4x18, so all four can be 17 at WoW 57. 4x17 is this one change:
+-- Cap = 17, Every = 7 (64 = 4 x 16). BG3's own party limit follows the slots, and the popups below explain it all.
+M.WOW_MAX = 60
+M.CURVE = {Cap = 18, Every = 5}
+-- Companions at camp and the popups: settings.conf `companions = 1`, the launcher's wow-bg3/companions.json {On}.
+local camp = false
+function M.CampOn() return camp end
+local function readSwitch()
+    local ok, v = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/companions.json") or "")
+    camp = ok and type(v) == "table" and v.On == true
+end
 
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
@@ -102,7 +112,8 @@ function M.XpOff()
 end
 
 -- The pool (see the header).
-local pool = {Rev = 0, WowLevel = nil, Ups = {}}
+-- Seen, Queue: companions at camp only (the popups shown, the popups waiting).
+local pool = {Rev = 0, WowLevel = nil, Ups = {}, Seen = {}, Queue = {}}
 local function players()
     local out = {}
     for _, r in ipairs(q(function() return Osi.DB_Players:Get(nil) end) or {}) do
@@ -119,15 +130,18 @@ local function loadPool()
         if ok and type(v) == "table" and math.type(v.Rev) == "integer" and (not best or v.Rev > best.Rev) then best = v end
     end
     if best then
-        pool = {Rev = best.Rev, WowLevel = math.tointeger(best.WowLevel), Ups = type(best.Ups) == "table" and best.Ups or {}}
+        pool = {Rev = best.Rev, WowLevel = math.tointeger(best.WowLevel), Ups = type(best.Ups) == "table" and best.Ups or {},
+            Seen = type(best.Seen) == "table" and best.Seen or {},
+            Queue = type(best.Queue) == "table" and best.Queue or {}}
     else
-        pool = {Rev = 0, WowLevel = nil, Ups = {}}
+        pool = {Rev = 0, WowLevel = nil, Ups = {}, Seen = {}, Queue = {}}
     end
     return best ~= nil
 end
 local function savePool()
     pool.Rev = pool.Rev + 1
-    local s = Ext.Json.Stringify({Rev = pool.Rev, WowLevel = pool.WowLevel, Ups = pool.Ups})
+    local s = Ext.Json.Stringify({Rev = pool.Rev, WowLevel = pool.WowLevel, Ups = pool.Ups,
+        Seen = pool.Seen, Queue = pool.Queue})
     for _, u in ipairs(players()) do
         local e = q(Ext.Entity.Get, u)
         if e then pcall(function() e.Vars[VAR] = s end) end
@@ -151,6 +165,7 @@ function M.RefreshWowLevel()
     if v.Level < 1 then return false end
     if pool.WowLevel ~= v.Level then
         log(string.format("WoW level %s -> %d (%s)", tostring(pool.WowLevel), v.Level, tostring(v.Character)))
+        if pool.WowLevel and v.Level > pool.WowLevel then M.ding = true end
         pool.WowLevel = v.Level
         savePool()
     end
@@ -158,7 +173,21 @@ function M.RefreshWowLevel()
 end
 function M.WowLevel() return pool.WowLevel or 1 end
 function M.Slots() return math.max(1, math.min(M.WowLevel(), M.SLOT_LEVELS)) end
-function M.Earned() return math.max(0, M.WowLevel() - M.FIRST_EARN + 1) end
+-- Whether this WoW level gives a second level-up.
+local function isDouble(l)
+    return l >= M.FIRST_EARN and l <= M.WOW_MAX and (M.WOW_MAX - l) % M.CURVE.Every == 0
+end
+function M.Earned()
+    local top, n = math.min(M.WowLevel(), M.WOW_MAX), 0
+    for l = M.FIRST_EARN, top do if isDouble(l) then n = n + 1 end end
+    return math.max(0, top - M.FIRST_EARN + 1) + n
+end
+local function grantCap() return M.CURVE.Cap end
+-- Whether a member holding `ups` level-ups may take one more by the rules (not BG3's XP table).
+local function capRoom(ups) return 2 + ups <= grantCap() end
+local function capText(name, at)
+    return string.format("%s is at BG3 level %d, the highest the WoW levels give", name, at)
+end
 
 -- Level-ups a character holds. A party member the pool has not seen yet (an older save, a companion
 -- that joined with levels) keeps the levels it has: its levels above 1 count as spent. Only levels it
@@ -188,6 +217,7 @@ function M.AddRefusal(partySize)
     M.RefreshWowLevel()
     if partySize < M.Slots() then return nil end
     if M.Slots() >= M.SLOT_LEVELS then return nil end -- the 4th slot is BG3's own party limit's business
+    M.Popup("refused")
     return string.format("no party slot open: WoW level %d opens %d slot(s) (one per WoW level up to %d), the party has %d",
         M.WowLevel(), M.Slots(), M.SLOT_LEVELS, partySize)
 end
@@ -201,8 +231,9 @@ end
 function M.Status(party)
     local hero = Hero.Uuid()
     local out = {WowLevel = M.WowLevel(), WowPercent = progressPct, Slots = M.Slots(), Earned = M.Earned(),
-        MaxXpLevel = M.MaxXpLevel(), Cap = M.CAP, GrantCap = M.GRANT_CAP, XpOff = xpOffDone, Members = {},
-        Others = {}}
+        MaxXpLevel = M.MaxXpLevel(), Cap = grantCap(), GrantCap = grantCap(), XpOff = xpOffDone,
+        Members = {}, Others = {}, Camp = camp,
+        Popups = camp and pool.Queue or nil, WowMax = M.WOW_MAX}
     local inParty = {}
     for _, u in ipairs(party) do
         inParty[u] = true
@@ -316,7 +347,7 @@ end
 M.Offered = offered
 local function room(u, ups)
     local level = 2 + ups
-    return level <= M.GRANT_CAP and level <= M.MaxXpLevel() and M.XpFor(level) or nil
+    return capRoom(ups) and level <= M.MaxXpLevel() and M.XpFor(level) or nil
 end
 -- The member BG3's Level Up screen is open for (RenderScreen.lua's link/levelupfor.txt: its display-name
 -- handle), or nil. While it is open the offer is that member's alone: BG3 goes on from an accepted
@@ -382,8 +413,7 @@ function M.LevelUp(u, wait)
     need(M.Available() > 0, string.format("no level-up to give: WoW level %d earned %d (one per WoW level from %d), %d given",
         M.WowLevel(), M.Earned(), M.FIRST_EARN, M.Spent()))
     local level = 1 + ups + 1
-    need(level <= M.GRANT_CAP, string.format("%s is at BG3 level %d, the highest the WoW levels give (%d is post-60, later)",
-        name, level - 1, M.CAP))
+    need(capRoom(ups), capText(name, level - 1))
     need(level <= M.MaxXpLevel(), string.format("BG3 level %d needs a level-cap mod (BG3's XP table ends at %d)", level, M.MaxXpLevel()))
     local target = need(M.XpFor(level), "BG3's XP table has no Level" .. (level - 1))
     local before = xpOf(u) or {Total = 0}
@@ -426,9 +456,9 @@ function M.LevelUpMany(u, n, wait)
     need(have >= n, string.format("%d level-up(s) asked, the pool has %d (WoW level %d earned %d, %d given)",
         n, have, M.WowLevel(), M.Earned(), M.Spent()))
     local from = 1 + upsOf(u)
-    need(from + n <= M.GRANT_CAP, string.format(
-        "%s is at BG3 level %d: %d level-up(s) would pass level %d, the highest the WoW levels give (%d is post-60, "
-        .. "later); room for %d", name, from, n, M.GRANT_CAP, M.CAP, math.max(0, M.GRANT_CAP - from)))
+    need(from + n <= grantCap(), string.format(
+        "%s is at BG3 level %d: %d level-up(s) would pass level %d, the highest the WoW levels give; room for %d",
+        name, from, n, grantCap(), math.max(0, grantCap() - from)))
     need(from + n <= M.MaxXpLevel(), string.format(
         "BG3 level %d needs a level-cap mod (BG3's XP table ends at %d); room for %d", from + n, M.MaxXpLevel(),
         math.max(0, M.MaxXpLevel() - from)))
@@ -453,17 +483,17 @@ function M.Catchup(party, wait)
     need(type(party) == "table" and #party > 0, "no party member to give level-ups to")
     need(M.Available() > 0, string.format("no level-up to give: WoW level %d earned %d (one per WoW level from %d), %d given",
         M.WowLevel(), M.Earned(), M.FIRST_EARN, M.Spent()))
-    local room = math.min(M.GRANT_CAP, M.MaxXpLevel())
     local got, stopped, total = {}, nil, 0
     for _, u in ipairs(party) do got[u] = 0 end
     while M.Available() > 0 do
         local pick, fewest = nil, nil
         for _, u in ipairs(party) do
             local ups = upsOf(u)
-            if 1 + ups < room and (not pick or ups < fewest) then pick, fewest = u, ups end
+            if capRoom(ups) and 2 + ups <= M.MaxXpLevel() and (not pick or ups < fewest) then pick, fewest = u, ups end
         end
         if not pick then
-            stopped = string.format("everyone is at BG3 level %d, %d level-up(s) stay in the pool", room, M.Available())
+            stopped = string.format("nobody has room for another BG3 level (BG3's XP table ends at %d), %d level-up(s) stay in the pool",
+                M.MaxXpLevel(), M.Available())
             break
         end
         local ok, err = pcall(M.LevelUp, pick, wait)
@@ -497,7 +527,8 @@ function M.Reset(u)
 end
 local function respecDone(c)
     local u = uuidOf(c)
-    if not u or not respec[u] then return end
+    -- With companions at camp the player respecs at Withers' own dialog, which no M.Reset announced.
+    if not u or (not respec[u] and not camp) then return end
     local back = pool.Ups[u] or 0
     respec[u] = nil
     offered[u], granted[u] = nil, nil
@@ -511,6 +542,170 @@ local function respecCancelled(c)
     if u and respec[u] then respec[u] = nil; log(nameOf(u) .. ": respec cancelled, nothing changed") end
 end
 function M.InRespec(u) return respec[u] ~= nil end
+
+-- The popups (companions at camp; BG3's own message box): reaching WoW level 2 and 5 once each, the first
+-- member at BG3's own cap with level-ups waiting (no level mod) once, and every refused "join me". They
+-- wait in the pool, so a save keeps them, and only open out of every fight and
+-- dialog, with no Level Up or respec screen up, one at a time.
+-- Keep each under 210 characters: Accept on a box of 340 crashed BG3 every time (a worker thread, right after
+-- MessageBoxClosed), 209 did not.
+local POPUPS = {
+    recruit = string.format("You reached level 2 in WoW, which runs to level %d: you can recruit a companion. They all wait "
+        .. "at camp: go to camp and ask one to join you. WoW levels 3 and 4 each open one more place in your party.", M.WOW_MAX),
+    refused = "You don't have enough level for another companion. WoW levels 2, 3 and 4 each open one place in your party.",
+    levels = string.format("You reached level 5 in WoW. Each WoW level now levels ONE party member, and every %dth levels two, "
+        .. "with BG3's Level Up button. WoW levels run to %d, where a party of four is BG3 level %d.",
+        M.CURVE.Every, M.WOW_MAX, M.CURVE.Cap),
+    cap = "A party member reached level 12, BG3's own limit, with level-ups waiting. For more, add a level mod: "
+        .. "UnlockLevelCurve or Expansion, with 5e Spells and Advanced Tabletop Spells.",
+}
+M.POPUPS = POPUPS
+function M.Popup(id)
+    if not camp or not POPUPS[id] then return end
+    for _, q1 in ipairs(pool.Queue) do if q1 == id then return end end
+    pool.Queue[#pool.Queue + 1] = id
+    savePool()
+    log("popup waits: " .. id)
+end
+local function ups(n) return string.format("%d level-up%s", n, n == 1 and "" or "s") end
+-- What the next WoW level gives, for the notice below; nil at the top.
+local function nextLine()
+    local l = M.WowLevel()
+    if l >= M.WOW_MAX then return nil end
+    local at = math.max(l + 1, M.FIRST_EARN)
+    return string.format("Next: WoW level %d, %s.", at, ups(isDouble(at) and 2 or 1))
+end
+local dialogs, popupOpen, popupAt, calm = {}, nil, 0, 0
+local CALM = 3   -- checks in a row (30 ticks each) with nothing in the way before one opens
+local STUCK = 900 -- checks after which an open box without BG3's MessageBoxClosed counts as closed: the next opens over it
+local AFTER_LOAD = 45 -- checks after a load before one opens: Running comes before the loading screen goes
+local sinceLoad = 0
+local function popupDone(id)
+    for i, q1 in ipairs(pool.Queue) do
+        if q1 == id then table.remove(pool.Queue, i); break end
+    end
+    popupOpen = nil
+    savePool()
+end
+function M.PopupTick(party)
+    if not camp then return end
+    local lvl = M.WowLevel()
+    for _, t in ipairs({{2, "recruit"}, {5, "levels"}}) do
+        if lvl >= t[1] and not pool.Seen[t[2]] then
+            pool.Seen[t[2]] = true
+            M.Popup(t[2])
+            savePool()
+        end
+    end
+    if not pool.Seen.cap and M.MaxXpLevel() <= 12 and M.Available() > 0 then
+        for _, u in ipairs(party) do
+            local ups = pool.Ups[u]
+            if math.type(ups) == "integer" and 1 + ups >= 12 then
+                pool.Seen.cap = true
+                M.Popup("cap")
+                break
+            end
+        end
+    end
+    if popupOpen then
+        popupAt = popupAt + 1
+        if popupAt > STUCK then
+            log("popup " .. popupOpen .. ": no MessageBoxClosed, counted as closed")
+            popupDone(popupOpen)
+        end
+        return
+    end
+    local blocked = next(dialogs) ~= nil or levelUpFor(party) ~= nil
+    for _, u in ipairs(party) do
+        if q(Osi.IsInCombat, u) == 1 or M.InRespec(u) then blocked = true end
+    end
+    calm = blocked and 0 or calm + 1
+    sinceLoad = sinceLoad + 1
+    if sinceLoad < AFTER_LOAD then return end
+    local id = pool.Queue[1]
+    if calm < CALM then return end
+    local host = q(Osi.GetHostCharacter)
+    if not id then
+        -- A new WoW level, once nothing is in the way: BG3's small notice, no box to close.
+        if M.ding and host then
+            M.ding = false
+            local text = string.format("WoW level %d of %d: %s waiting. %s", M.WowLevel(), M.WOW_MAX,
+                ups(math.max(0, M.Available())), nextLine() or "")
+            log("notice: " .. text)
+            pcall(Osi.ShowNotification, host, text)
+        end
+        return
+    end
+    if not host or not POPUPS[id] then
+        if not POPUPS[id] then popupDone(id) end
+        return
+    end
+    local ok, err = pcall(Osi.OpenMessageBox, host, POPUPS[id])
+    if not ok then log("popup " .. id .. " failed: " .. tostring(err)); return end
+    popupOpen, popupAt, calm = id, 0, 0
+    log("popup shows: " .. id)
+end
+local function popupClosed(_, text)
+    if popupOpen and text == POPUPS[popupOpen] then
+        log("popup closed: " .. popupOpen)
+        popupDone(popupOpen)
+    end
+end
+-- One thing per save (Party.lua: a companion placed at camp once).
+function M.Once(key)
+    if not camp or pool.Seen[key] then return false end
+    pool.Seen[key] = true
+    savePool()
+    return true
+end
+-- BG3's own party limit follows the slots: its GEN_MaxPlayerCountReached flag is what BG3's "join me"
+-- dialogs and PROC_GLO_PartyMembers_CheckAdd read. Never below the party it already has.
+local appliedSlots, recheck = nil, false
+local function applySlots(party)
+    if not camp then return end
+    local want = math.max(M.Slots(), #party)
+    if appliedSlots == want then
+        -- The new limit only counts after this frame: the same call's check reads the old one, and left the
+        -- flag one step behind (a join through at WoW 1, BG3's "party full" at WoW 2 with nobody in it).
+        if recheck then
+            recheck = false
+            pcall(Osi.PROC_CheckPartyFull)
+        end
+        return
+    end
+    Osi.SetMaxPartySizeOverride(want)
+    appliedSlots, recheck = want, true
+    log(string.format("BG3's party limit is %d (WoW level %d)", want, M.WowLevel()))
+end
+-- A "join me" refused: BG3's recruit proc or its party-full swap dialog, while the WoW level is the limit.
+local SWAP_DIALOGS = {} -- filled from BG3's DB_GLO_CompanionSwapDialogue at session start
+-- A companion's own dialog, one not in the party: at the limit BG3 answers "join me" there with a line ("so many
+-- followers") and no add at all, so it counts as tried when it opens. Filled from DB_OriginInPartyDialog.
+local IN_PARTY = {}
+-- BG3's flag does not stop the dialog's own join when the party is at the limit: whoever came in over it goes
+-- back to camp once the dialog is over.
+local overJoin = {}
+local function joinTried(party, who)
+    if camp and M.Slots() < M.SLOT_LEVELS and #party >= M.Slots() then
+        M.Popup("refused")
+        if who then overJoin[uuidOf(who)] = true end
+    end
+end
+local function sendBack(party)
+    if not next(overJoin) or next(dialogs) then return end
+    for u in pairs(overJoin) do
+        overJoin[u] = nil
+        for _, m in ipairs(party) do
+            if m == u and #party > M.Slots() then
+                pcall(Osi.PROC_GLO_PartyMembers_Remove, u, q(Osi.GetHostCharacter), 1, 0)
+                pcall(Osi.PROC_DismissToCamp, u)
+                pcall(Osi.SetHasDialog, u, 1)
+                appliedSlots = nil
+                log("over the limit, back to camp: " .. tostring(u))
+            end
+        end
+    end
+end
 
 -- Harness research hook: wow-bg3/progression-research.lua (a chunk returning a function of M) runs
 -- when wow-bg3/progression-research-cmd.json {RunId, Sequence} changes; result in
@@ -539,6 +734,16 @@ function M.Start(runId)
     pcall(Ext.Osiris.RegisterListener, "RespecCompleted", 1, "after", function(c) pcall(respecDone, c) end)
     pcall(Ext.Osiris.RegisterListener, "RespecCancelled", 1, "after", function(c) pcall(respecCancelled, c) end)
     pcall(Ext.Osiris.RegisterListener, "LeveledUp", 1, "after", function(c) pcall(leveledUp, c) end)
+    pcall(Ext.Osiris.RegisterListener, "MessageBoxClosed", 2, "after", function(c, t) pcall(popupClosed, c, t) end)
+    pcall(Ext.Osiris.RegisterListener, "DialogStarted", 2, "after", function(d, id)
+        dialogs[id] = true
+        local who = IN_PARTY[uuidOf(d)]
+        if SWAP_DIALOGS[uuidOf(d)] or (who and not q(function() return Osi.DB_Players:Get(who)[1] end)) then
+            pcall(joinTried, players())
+        end
+    end)
+    pcall(Ext.Osiris.RegisterListener, "DialogEnded", 2, "after", function(_, id) dialogs[id] = nil end)
+    pcall(Ext.Osiris.RegisterListener, "PROC_GLO_PartyMembers_CheckAdd", 2, "before", function(who) pcall(joinTried, players(), who) end)
     Ext.Events.GameStateChanged:Subscribe(function(e)
         local to = tostring(e.ToState)
         if to ~= "Running" and to ~= "Save" and to ~= "Paused" and to ~= "GameMasterPause" then session = false end
@@ -549,6 +754,11 @@ function M.Start(runId)
         if not session then
             -- A session began (a load or a new game): the save's pool, BG3's own XP off.
             session = true
+            readSwitch()
+            dialogs, popupOpen, calm, appliedSlots, sinceLoad, overJoin = {}, nil, 0, nil, 0, {}
+            M.ding = false
+            for _, r in ipairs(q(function() return Osi.DB_GLO_CompanionSwapDialogue:Get(nil) end) or {}) do SWAP_DIALOGS[uuidOf(r[1])] = true end
+            for _, r in ipairs(q(function() return Osi.DB_OriginInPartyDialog:Get(nil, nil) end) or {}) do IN_PARTY[uuidOf(r[2])] = r[1] end
             local had = loadPool()
             for _, u in ipairs(players()) do pcall(upsOf, u) end -- every player counted (levels it has)
             local v = readLevelFile()
@@ -561,6 +771,13 @@ function M.Start(runId)
         if tick % 30 == 7 then pcall(M.RefreshWowLevel) end
         if tick % 30 == 17 then pcall(M.ShowWowProgress) end
         if tick % 90 == 47 then pcall(guard, players()) end
+        if tick % 30 == 22 then
+            local party = players()
+            pcall(sendBack, party)
+            pcall(applySlots, party)
+            local okP, errP = pcall(M.PopupTick, party)
+            if not okP and tick % 900 == 22 then log("popups: " .. tostring(errP)) end
+        end
         if tick % 30 == 27 then
             local okO, errO = pcall(M.Offer, players())
             if not okO and tick % 900 == 27 then log("offer: " .. tostring(errO)) end

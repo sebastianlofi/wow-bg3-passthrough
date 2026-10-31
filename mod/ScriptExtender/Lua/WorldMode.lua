@@ -44,6 +44,7 @@ local Probe = Ext.Require("ActionProbe.lua")
 local TavPlan = Ext.Require("TavPlan.lua")
 local Session = Ext.Require("Session.lua") -- held game states (a save): keep world mode (F5 fix)
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
+local Camp = Ext.Require("Camp.lua") -- the switch `camp` and a trip's numbers (the module runs on the server)
 local YD = 0.9144
 local MAX_SECONDS = 900
 
@@ -170,7 +171,10 @@ function M.Start(runId)
         return {C[1] + (w[2] - W[2]) * YD, C[2] + (w[3] - W[3]) * YD, C[3] - (w[1] - W[1]) * YD}
     end
     M.ToWow, M.ToBg3 = toWow, toBg3
-    M.IsActive = function() return state ~= nil and state.Started == true end
+    -- Whether the session runs at all (LinkLive.lua: a fight in it); IsActive is that and not at camp
+    -- (below): every module that treats BG3 as WoW's view stands aside for a trip, BG3's camp is BG3's.
+    M.Running = function() return state ~= nil and state.Started == true end
+    M.IsActive = function() return M.Running() and not M.InCamp() end
 
     local lastExtra = {}
     local function writeStatus(extra)
@@ -202,15 +206,59 @@ function M.Start(runId)
 
     -- Tav's position for benilla: "TAV1", seq, WoW xyz, BG3 xyz, yaw (BG3 radians), flags (1 Tav in a
     -- BG3 combat, 2 BG3's own sound muted: WoW's goes quiet with it, benilla 0030), seq2.
+    -- A trip to camp (Camp.lua, switch `camp`): tav.bin keeps the spot the hero left and says "muted"
+    -- (WoW's sound quiet, benilla 0030), so the WoW body stands still and the bridge holds its squares
+    -- with no change on either side. A big jump is held back until Camp.lua has said what it is: one
+    -- record of the camp's position through the mapping is what sent the WoW body 3.3 km away.
+    local camp = {Switch = Camp.On(), Seq = 0, In = false, Last = nil, Hold = nil}
+    local CAMP_JUMP, CAMP_HOLD = Camp.JUMP, Camp.PENDING + 30
+    M.InCamp = function() return camp.In end
+    M.CampState = camp
+    local function campRead()
+        local s = readJson("camp-state.json")
+        if not (s and s.RunId == runId and math.type(s.Seq) == "integer" and s.Seq ~= camp.Seq) then return end
+        camp.Seq = s.Seq
+        if s.InCamp == true and not camp.In then
+            camp.In, camp.Hold = true, nil
+            -- WoW's camera stays where it was; BG3's goes to camp alone.
+            -- The picking map back too: emptied, every cell reads 0, and at camp the player's region is not 0, so
+            -- BG3's cursor picked nobody there (no companion to talk to).
+            jobs[#jobs + 1] = {name = "camp", co = coroutine.create(function()
+                arena({Action = "Lead", On = false})
+                arena({Action = "PickRegionOff"}) end)}
+            Ext.Log.Print("WOW-BG3 world: at camp, WoW waits")
+        elseif s.InCamp ~= true and camp.In then
+            camp.In, camp.Hold = false, nil
+            local okp, p = pcall(Probe.HostPosition)
+            camp.Last = okp and p or camp.Last
+            jobs[#jobs + 1] = {name = "camp back", co = coroutine.create(function()
+                arena({Action = "PickRegion", Seconds = MAX_SECONDS})
+                arena({Action = "Lead", Wow = state.WowOrigin, Bg3 = state.Centre, Seconds = MAX_SECONDS}) end)}
+            Ext.Log.Print("WOW-BG3 world: back from camp")
+        end
+    end
     local function publishTav()
         local ok, p = pcall(Probe.HostPosition)
         if not ok or not state then return end
+        if camp.Switch then
+            if camp.In or camp.Hold or ticks % 15 == 0 then campRead() end
+            if camp.In then
+                p = camp.Last or p
+            elseif camp.Hold then
+                if ticks < camp.Hold then return end
+                camp.Hold = nil -- a long teleport, not a trip
+            elseif camp.Last and (p[1] - camp.Last[1]) ^ 2 + (p[3] - camp.Last[3]) ^ 2 > CAMP_JUMP * CAMP_JUMP then
+                camp.Hold = ticks + CAMP_HOLD
+                return
+            end
+            if not camp.In then camp.Last = p end
+        end
         local w = toWow(p)
         tavSeq = tavSeq + 1
         local flags = 0
         local okc, tb = pcall(function() return Hero.Entity().TurnBased end)
         if okc and tb and tb.IsInCombat_M then flags = flags | 1 end
-        if bg3Muted() then flags = flags | 2 end
+        if bg3Muted() or camp.In then flags = flags | 2 end
         local rec = string.pack("<c4I4fffffffI4I4", "TAV1", tavSeq, w[1], w[2], w[3], p[1], p[2], p[3], 0.0, flags, tavSeq)
         Ext.IO.SaveFile("wow-bg3/link/tav.bin", rec)
     end
@@ -291,7 +339,7 @@ function M.Start(runId)
         -- not fire for injected input, so tests call it with a fake event that records PreventAction).
         local function route(e)
                 M.InputEvents = (M.InputEvents or 0) + 1
-                if not (state and state.Started) then return end
+                if not (state and state.Started) or M.InCamp() then return end
                 local ev = e.Event or e -- SE passes the MouseButtonEvent itself (Button, Pressed)
                 -- SDL buttons: 1 left (select, move), 3 right (BG3's context menu; WoW's interact)
                 if ev.Button ~= 1 and ev.Button ~= 3 then return end
@@ -430,6 +478,7 @@ function M.Start(runId)
         assert(okFlag and flagOn == true, "world mode is off for this game (WorldFlag: "
             .. (okFlag and tostring(flagOn) or tostring(flagOn)) .. ")")
         state = {Centre = c.Centre, WowOrigin = c.WowOrigin, Layer = tonumber(c.Layer) or -15.262, At = ticks}
+        camp.Last, camp.Hold = nil, nil -- a new session's teleport is no trip
         -- Several out-of-bounds layers (plugin 0.2.9): Layers lists their heights.
         if type(c.Layers) == "table" and #c.Layers > 0 then state.Layers = c.Layers end
         -- The triangles of a 3 x 2 window of squares span 192 m: raise the plugin's span limit. Since plugin
@@ -589,16 +638,16 @@ function M.Start(runId)
         end
         if state and state.Started then
             if ticks % 3 == 0 then publishTav() end
-            if ticks % 3 == 1 then
+            if ticks % 3 == 1 and not M.InCamp() then
                 local ok, err = pcall(readErrand)
                 if not ok then lastExtra.ErrandError = tostring(err) end
             end
-            publishInput(false)
+            if not M.InCamp() then publishInput(false) end
             if ticks % 600 == 0 then writeStatus() end
             -- Tav's meshes and poses for WoW (TavPlan.lua), checked every TavPlan.Every ticks (since
             -- Every 10, was 30: a weapon drawn or an attachment of a cast reaches WoW
             -- sooner; a check costs TavPlan.LastMs, in world-status.json as TavMs).
-            if ticks % TavPlan.Every == 7 % TavPlan.Every then
+            if ticks % TavPlan.Every == 7 % TavPlan.Every and not M.InCamp() then
                 -- The hero and the companions near her (one figure each).
                 local ok, n = TavPlan.Publish(figures(), state.Centre, state.WowOrigin)
                 lastExtra.TavMeshes = ok and n or ("error: " .. tostring(n))
@@ -606,7 +655,7 @@ function M.Start(runId)
             end
             -- The characters BG3 keeps drawing with its map off (compose word "void"): those within
             -- 60 m of Tav (her, a fight's stand-ins).
-            if ticks % 30 == 22 then
+            if ticks % 30 == 22 and not M.InCamp() then
                 local okp, p = pcall(Probe.HostPosition)
                 if okp then
                     local ok, n = pcall(TavPlan.PublishKeep, p, 60, figures())

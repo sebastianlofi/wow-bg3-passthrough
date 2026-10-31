@@ -15,6 +15,8 @@ local M = {}
 M.Status = "TRAVELBLOCK_BLOCKEDZONE"
 M.Every = 60 -- ticks between checks (about 2 s)
 M.On = true  -- research knob
+-- With the switch `camp` on, Camp.lua's trip replaces all this; a save made under these blocks lifts them.
+local Camp = Ext.Require("Camp.lua")
 
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
@@ -42,6 +44,12 @@ end
 function M.Start(runId)
     local ticks, blocked, marked = 0, false, {}
     M.State = {Blocked = false, Applied = 0}
+    local lifted = false
+    local function liftSaved()
+        lifted = true
+        pcall(Osi.SetLongRestAvailable, 1)
+        for _, u in ipairs(players()) do pcall(Osi.RemoveStatus, u, M.Status) end
+    end
     local function lift()
         for u in pairs(marked) do pcall(Osi.RemoveStatus, u, M.Status) end
         marked = {}
@@ -54,6 +62,10 @@ function M.Start(runId)
         ticks = ticks + 1
         if ticks % M.Every ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
+            if Camp.On() then
+                if not lifted then liftSaved() end
+                return
+            end
             local want = M.On and worldActive()
             if not want then
                 if blocked then lift() end

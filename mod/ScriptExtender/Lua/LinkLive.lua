@@ -346,6 +346,7 @@ local function newBackend(actors, void, runId, session)
         -- Spiders (a showcase): BG3's spider web and the phase spider's teleport.
         local spells = sp.Kind == "spider" and {"Target_Web_Spider", "Target_EtherealJaunt"} or nil
         info.Boosts = standIn({Action = "Scale", Target = uuid, DamageBonus = bonus, MaxHp = maxHp, Spells = spells}).Boosts
+        pcall(Ext.Require("Abilities.lua").Grant, uuid, sp.Entry)
         info.MaxTook = waitUntil(function() return select(2, health(uuid)) == maxHp end, 90)
         if base ~= hp then
             standIn({Action = "Health", Target = uuid, Percent = percent})
@@ -541,7 +542,7 @@ local function newBackend(actors, void, runId, session)
         byUuid = {[Hero.Uuid()] = "hero"}
         origin, heroBridge = toWorld(hero.position), hero.position
         setup = coroutine.create(function(ad)
-            inWorld = World.IsActive and World.IsActive() or false
+            inWorld = World.Running and World.Running() or false
             if not inWorld then
                 local layer = tonumber(void.Layer) or -15.262
                 arena({Action = "Stamp", Void = true, MinX = void.MinCorner[1], MinZ = void.MinCorner[2],
@@ -1073,7 +1074,7 @@ local function newBackend(actors, void, runId, session)
         if not passing or ticks % 15 ~= 0 then return end
         -- World mode: the companions are BG3 party members and play their own turns
         -- with BG3's controls, as in BG3.
-        if World.IsActive and World.IsActive() then return end
+        if World.Running and World.Running() then return end
         local list = player().AssignedCharacters
         for i = 1, 16 do
             local c = list[i]

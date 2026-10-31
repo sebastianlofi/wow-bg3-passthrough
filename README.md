@@ -102,23 +102,45 @@ local server runs at normal WoW rates), and WoW levels turn into BG3 levels:
 |---|---|
 | 1 | Your character alone |
 | 2, 3, 4 | One more party slot each: a party of four at WoW level 4 |
-| 5 to 64 | One BG3 level-up each, 60 in all |
+| 5 to 60 | One BG3 level-up each, two at every 5th (5, 10 and on to 60): 68 in all |
 
-Each WoW level from 5 on puts one BG3 level-up into a **pool**. While the pool holds one, BG3's own
+Each WoW level from 5 on puts one BG3 level-up into a **pool**, every 5th WoW level two. While the pool holds one, BG3's own
 Level Up button shows on every party member who can take it; level whichever one you want (every
 class choice is yours), and the others' buttons go once the pool is empty. So members sit at different
-BG3 levels on purpose. 60 level-ups take a party of four from BG3 level 1 to 16, so **WoW 64 is a party
-of four at BG3 level 16**. Vanilla WoW stops at level 60 today, so the last four wait for a higher WoW
-cap.
+BG3 levels on purpose. 68 level-ups take a party of four from BG3 level 1 to 18, so **WoW 60 is a party
+of four at BG3 level 18**, and all four can be at 17 from WoW 57.
 
-BG3's XP bar on your character shows how far you are into your current WoW level.
+**WoW levels run to 60, the end goal.** The level BG3 shows beside a character is that character's own BG3
+level, not your WoW level:
 
-- BG3 itself stops at level 12. Levels 13 and up need a level-cap mod, which WOW-BG3 does not
-  bundle and has not tested (for example Expansion Level 13-20 (Configurable) and 5e Spells); without
-  one, level-ups past 12 stay in the pool.
+| WoW level | Level-ups earned | A party of four at BG3 level |
+|---|---|---|
+| 5 | 2 | 1 to 2 |
+| 10 | 8 | 3 |
+| 20 | 20 | 6 |
+| 30 | 32 | 9 |
+| 40 | 44 | 12 |
+| 50 | 56 | 15 |
+| 57 | 64 | 17 |
+| 60 | 68 | 18 |
+
+BG3's XP bar on your character shows how far you are into your current WoW level; its tooltip is still BG3's
+own. A small notice gives your WoW level, the level-ups waiting and what the next WoW level gives at each new
+WoW level, and `/wowbg3 pool` lists it all.
+
+- **We strongly recommend a level mod.** BG3 itself stops at level 12, and WOW-BG3 does not bundle levels
+  past it. Without a level mod, level-ups past 12 stay in the pool and a popup tells you which mods unlock
+  more. Install these yourself from Nexus Mods; WOW-BG3 still keeps its own cap of 18:
+  - A level mod, one of: [UnlockLevelCurve](https://www.nexusmods.com/baldursgate3/mods/377) or
+    [Expansion Level 13-20](https://www.nexusmods.com/baldursgate3/mods/279).
+  - [5e Spells](https://www.nexusmods.com/baldursgate3/mods/125) and its spell list patch, for real spells
+    of level 7 to 9, and [Advanced Tabletop Spells](https://www.nexusmods.com/baldursgate3/mods/14429) for
+    more of them.
+
+  None of these are tested with WOW-BG3 yet. 5e Spells needs Script Extender, and whether it works
+  on WOW-BG3's Linux Script Extender (bg3le) is unknown.
 - A dismissed companion keeps its BG3 levels and rejoins at them; the pool counts them as spent. Only
   Withers' respec (`/wowbg3 respec NAME`) gives level-ups back.
-- Planned: WoW levels 61 to 64 on the server, and new abilities for the classes past BG3's own.
 
 ## Commands
 
@@ -180,8 +202,10 @@ What works is listed above; this is what does not, or has not been tried:
 - **Most of the play so far was in Elwynn Forest.** Dungeons have not been tested at all, nor has a
   party spread across zones or continents; the other start zones and the Horde side have had little
   or no testing.
-- **Changing characters.** Recruiting, dismissing and swapping companions only works through the
-  commands (`add`, `remove`) for now.
+- **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
+  Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
+  says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and
+  `remove` still work. Not fully tested yet.
 - **Item mapping.** Every WoW item becomes a BG3 item by rule: a weapon keeps its BG3 base's damage
   die and gains +1 to +3 from its WoW damage per second, armour gets BG3-style AC from its WoW armour
   type and item level, and WoW stats become ability and resistance bonuses. WoW slots BG3 has none for
@@ -191,7 +215,8 @@ What works is listed above; this is what does not, or has not been tried:
 - **Health and ability mapping.** Your party is pure BG3: BG3 health, spells, saves and proficiency,
   with WoW gear adding AC and ability bonuses. A WoW mob fights as the nearest BG3 creature, with that
   creature's own BG3 health at the WoW mob's health fraction; only its damage is scaled to WoW's.
-- **The level cap**: BG3 stops at 12 without a level-cap mod (see [Levelling](#levelling)).
+- **The level cap**: BG3 stops at 12 without a level mod, which we strongly recommend (see
+  [Levelling](#levelling)).
 - **Indoors and big cities.** Walls, roofs and small props between the camera and your party fade out,
   and big pieces push the camera in. Cities have raised floors, but they are new: heading back across
   Orgrimmar's upper deck can jump, and rooms behind tall entrance steps cannot be reached on foot. Stairs
@@ -215,33 +240,41 @@ Each of these in detail, with the smaller ones: [docs/known-issues.md](docs/know
 
 ## Planned
 
-- **Withers in every graveyard**, for respecs and for raising fallen companions, and **the Guardian
-  as an NPC in the major cities and start zones**, to recruit, swap and change companions in game
-  (together with fixing what happens to the levels of a swapped companion).
 - **Equipment with more interesting effects** than stats: WoW's on-equip and on-use effects, and
   hand-made ones where a rule falls short.
 - **Hand-made content where rules are not enough**, dungeon bosses first.
-- **Waypoints**: BG3's fast-travel waypoints placed at WoW's flight points.
+- **Waypoints**: fast travel between the WoW flight points you have discovered is in: pins on the map
+  and `/wowbg3 waypoint` (`waypoints = 0` in `settings.conf` turns it off). Still to come: BG3's own
+  waypoint panel, and Ironforge and Undercity, which lie under their terrain.
 - **Proper balance and pacing** for the whole 1 to 60 journey.
-- **BG3 level 16** with new class abilities (see [Levelling](#levelling)).
 - **Multiplayer**, then **The Burning Crusade** and **Wrath of the Lich King** once vanilla is mostly
   complete.
 
-### Open question: resting
+### Resting
 
-BG3 refills spell slots and health with short and long rests at camp; WoW has no camp, only eating,
-drinking and resting at inns. Two ways to bring them together, and opinions are welcome (open an
-issue):
+BG3's camp is the rest in WOW-BG3, with WoW's food and drink as its supplies (`camp = 1` in `settings.conf`;
+with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
 
-1. **Camp and sleeping**, as in BG3: a long rest anywhere outside a fight takes the party to camp.
-   Withers and the Guardian would then live at camp instead of in graveyards and cities.
-2. **WoW's way**: drinking (mana potions, water) refills spell slots and eating heals, with no camp.
+- **Go to Camp and End the Day work as in BG3.** The party goes to BG3's camp and BG3 draws the picture;
+  the WoW character waits where it stood. Leaving camp puts the party back on the same spot.
+- **Long and short rests are BG3's own**, so spell slots, long-rest-only abilities and rest effects work
+  as BG3 has them. BG3's story nights do not play: no story runs here, so a night is just sleep.
+- **Food and drink are the supplies.** Anything your party carries counts, buying it at a WoW vendor or
+  pickpocketing it from a townsperson. A long rest costs BG3's 40 supplies, and WoW's food is worth more
+  than BG3's so you can rest more often:
 
-Until then, the `refill` test command does a long rest's work.
+  | WoW food or drink (item level) | Example | Supply | Needed for a long rest | Vendor cost of a rest |
+  |---|---|---|---|---|
+  | 5 | Tough Hunk of Bread, Refreshing Spring Water | 20 | 2 | 10 copper |
+  | 15 | Freshly Baked Bread, Ice Cold Milk | 20 | 2 | 50 copper |
+  | 25 | Moist Cornbread, Melon Juice | 20 | 2 | 2 silver |
+  | 35 | Mulgore Spice Bread, Sweet Nectar | 25 | 2 | 4 silver |
+  | 45 | Soft Banana Bread, Moonberry Juice | 30 | 2 | 8 silver |
+  | 55 | Homemade Cherry Pie, Morning Glory Dew | 40 | 1 | 8 silver |
 
-**Work in progress: camp is off for now.** Going to camp (and leaving it) breaks the WoW world for a
-while, so camp travel is turned off until the question above is settled. Use `/wowbg3 refill`
-instead of a long rest.
+  What is spent or eaten in BG3 is gone from the WoW character's bags too.
+- **Eating and drinking heal a little,** more for better food: 1d4 up to 4d4 HP, as BG3's own food does. Alcohol
+  makes the drinker Drunk, and counts for only 5 supply. Conjured food counts for 5 and sells for nothing.
 
 ## Good to know
 

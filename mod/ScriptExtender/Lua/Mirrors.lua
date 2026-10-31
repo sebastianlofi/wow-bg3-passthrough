@@ -108,6 +108,7 @@ local Hero = Ext.Require("Hero.lua") -- the hero: the character the player contr
 -- early (strike flag 16), and the fight is the party's BG3 combat: a stand-in that spots a companion
 -- starts it as one that spots the hero does. Party.lua's lists.
 local Party = Ext.Require("Party.lua")
+local Scaling = Ext.Require("Scaling.lua")
 local STRIKE_PARTY = 16
 local REGION = Ext.Require("Hero.lua").REGION -- host level (Hero.lua, host.json)
 local DIR = "wow-bg3/link/"
@@ -221,6 +222,7 @@ local HP_CURVE = 0.65
 -- giant spider template only bites and jumps; BG3's spider web (Target_Web_Spider) and the phase
 -- spider's teleport (Target_EtherealJaunt, a bonus action) added with Osiris AddSpell.
 local KIND_SPELLS = {spider = {"Target_Web_Spider", "Target_EtherealJaunt"}}
+local Abilities = Ext.Require("Abilities.lua") -- the switch `mob_abilities`
 local function standInMaxHp(wowMax) return math.max(1, math.floor(wowMax ^ HP_CURVE + 0.5)) end
 -- BG3's forward direction (x, z) of an entity, from its rotation quaternion: the rotated -z axis
 -- (M.FaceAxis), where a BG3 character looks and walks.
@@ -678,6 +680,7 @@ function M.Start(runId)
         if M.SelfHeal ~= true then pcall(Osi.PROC_SelfHealing_Disable, made) end
         if frac and frac < 1 then pcall(Osi.SetHitpointsPercentage, uuid, 100.0 * frac) end
         for _, s in ipairs(KIND_SPELLS[mob.Kind] or {}) do pcall(Osi.AddSpell, uuid, s, 0, 1) end
+        pcall(Abilities.Grant, uuid, mob.Entry)
         local plan = readJson("mirror.json") or {}
         local faction = mob.Hostile and plan.Hostile or plan.Neutral
         if type(faction) == "string" and uuidOf(faction) then Osi.SetFaction(uuid, faction) end
@@ -710,16 +713,45 @@ function M.Start(runId)
     -- under MIN_AVG_HIT: BG3's AI does not attack with an expected damage of about 0. Health: max HP
     -- standInMaxHp(WoW max HP) (IncreaseMaxHP; the "scaled" stage sets the WoW fraction after).
     local MIN_AVG_HIT = 1
+    -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves and the party. Boosts
+    -- under one cause, so a change of party or level can take them off and set new ones.
+    local function scaleByRules(m, info)
+        local sp = m.Want
+        local base = m.ScaleBase or hp(m.Uuid)
+        local wowMax, level = tonumber(sp.WowMaxHp) or 0, tonumber(sp.Level) or 0
+        if not base or base[2] <= 0 or wowMax <= 0 or level <= 0 then info.Skipped = "no numbers"; return end
+        m.ScaleBase = base
+        local party = Scaling.Party(ticks)
+        -- A hostile mob's camp, once: only the mobs near enough to be listed count, and they are, this close.
+        if not m.ScaleCamp then
+            local list = {}
+            if sp.Hostile then for _, v in pairs(M.WantNow or {}) do list[#list + 1] = v end end
+            m.ScaleCamp = sp.Hostile and math.min(Scaling.CampOf(sp, list), Scaling.PullCap(party.Members)) or 1
+        end
+        local n = Scaling.Compute({Level = level, WowMaxHp = wowMax, WowDamage = tonumber(sp.WowDamage), Map = world and world.Map,
+            Camp = m.ScaleCamp, Members = party.Members, WowLevel = party.WowLevel, PartyLevel = party.PartyLevel, Cap = party.Cap, Difficulty = party.Difficulty})
+        local okAc, ac = pcall(function() return Ext.Entity.Get(m.Uuid).Stats.ArmorClass end)
+        -- The stand-in's AC only before our boost is on it.
+        if m.ScaleAC == nil then m.ScaleAC = okAc and type(ac) == "number" and ac or false end
+        local boosts, bonus = Scaling.Boosts(n, sp.Kind, base[2], tonumber(sp.BaseDamage) or 0, m.ScaleAC or nil)
+        if m.ScaleBoosts then pcall(Osi.RemoveBoosts, m.Uuid, m.ScaleBoosts, 0, "WOWBG3_SCALE", m.Uuid) end
+        if boosts ~= "" then Osi.AddBoosts(m.Uuid, boosts, "WOWBG3_SCALE", m.Uuid) end
+        m.ScaleBoosts, m.ScaleKey = boosts, party.Key
+        info.MaxHp, info.DamageBonus, info.Base, info.Boosts, info.BaseAC = n.MaxHp, bonus, base, boosts, m.ScaleAC
+        info.Camp, info.Rules, info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = m.ScaleCamp, party.Key, n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
+        info.Health = "rules"
+    end
     local function scale(m, heroWowMax)
         local sp, info = m.Want, {}
         m.Scale = info
         -- Movement (a playtest request): every stand-in walks M.MovementPct of its template's base
         -- movement a turn (BG3's own multiplier, as Dash's 200).
-        if M.MovementPct and M.MovementPct ~= 100 then
+        if M.MovementPct and M.MovementPct ~= 100 and not m.ScaleKey then
             local b = string.format("ActionResourceMultiplier(Movement,%d,0)", M.MovementPct)
             local okm = pcall(Osi.AddBoosts, m.Uuid, b, "WOWBG3_MOVE", m.Uuid)
             info.Movement = okm and M.MovementPct or "failed"
         end
+        if Scaling.On() then return scaleByRules(m, info) end
         local tav = hp(Hero.Uuid())
         local wowMax = tonumber(sp.WowMaxHp) or 0
         if not (tav and heroWowMax and heroWowMax > 0 and wowMax > 0) then info.Skipped = "no numbers"; return end
@@ -1054,6 +1086,56 @@ function M.Start(runId)
                 want[mob.Guid] = mob
             end
         end
+        M.WantNow = want
+        -- The switch `scaling`: the usual fight is a pack. Hostile mobs chained within reach of a mob in the fight
+        -- join it (BG3's combat, so the bridge pulls them), up to the cap. At the cap the others can't join by
+        -- BG3's rules either: they walk on during a fight (TurnHold holds nothing in combat), and a fight that
+        -- grew would last longer and draw more. Patch 0015's pack mates within 15 yd still come.
+        -- Not a hard cap: BG3's ally join can bring a whole camp at the first turn, before this block (harness: 14).
+        if Scaling.On() and plan and plan.Active == true then
+            local inFight, chain = 0, {}
+            for g in pairs(fight) do
+                inFight = inFight + 1
+                if want[g] then chain[#chain + 1] = want[g] end
+            end
+            if inFight > 0 then
+                local cap = Scaling.PullCap(Scaling.Party(ticks).Members)
+                local r2, hero = Scaling.REACH_M ^ 2, Hero.Uuid()
+                local i = 1
+                while i <= #chain do
+                    local a = chain[i]
+                    for guid, mob in pairs(want) do
+                        local m = mirrors[guid]
+                        if m and mob.Hostile and not fight[guid] and not m.PackJoin and not m.PackBlocked and m.Stage ~= "spawned" and inFight < cap then
+                            local dx, dz = a.Pos[1] - mob.Pos[1], a.Pos[3] - mob.Pos[3]
+                            if dx * dx + dz * dz <= r2 and q(Osi.IsDead, m.Uuid) ~= 1 then
+                                m.PackJoin = ticks
+                                pcall(Osi.EnterCombat, m.Uuid, hero)
+                                inFight = inFight + 1
+                                chain[#chain + 1] = mob
+                            end
+                        end
+                    end
+                    i = i + 1
+                end
+                if inFight >= cap then
+                    for guid, m in pairs(mirrors) do
+                        if m.Hostile and not fight[guid] and not m.PackJoin and not m.PackBlocked then
+                            m.PackBlocked = true
+                            pcall(Osi.SetCanJoinCombat, m.Uuid, 0)
+                        end
+                    end
+                end
+            else
+                for _, m in pairs(mirrors) do
+                    m.PackJoin = nil
+                    if m.PackBlocked then
+                        m.PackBlocked = nil
+                        pcall(Osi.SetCanJoinCombat, m.Uuid, 1)
+                    end
+                end
+            end
+        end
         -- The party's BG3 combat: the hero's, else a companion's (a stand-in spotted a companion).
         local tavCombat = Party.Combat()
         -- Every party member's combat: a stand-in fighting a companion in
@@ -1122,6 +1204,11 @@ function M.Start(runId)
                     m.FriendlyReset = (m.FriendlyReset or 0) + 1
                 end
                 nameOf(m, mob)
+                -- The party or the WoW level changed: new numbers, on a stand-in out of every fight.
+                if m.ScaleKey and m.Stage ~= "spawned" and not inFight and not combat and not dead
+                    and Scaling.Party(ticks).Key ~= m.ScaleKey then
+                    m.Stage = "spawned"
+                end
                 if m.Stage == "spawned" and ticks - m.Born >= SCALE_AFTER then
                     local ok, err = pcall(scale, m, tonumber(plan.HeroWowMaxHp))
                     if not ok then note("scale " .. guid .. ": " .. tostring(err)) end

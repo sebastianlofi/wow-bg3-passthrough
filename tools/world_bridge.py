@@ -164,6 +164,31 @@ def tav_flags(since=0.0):
     return flags
 
 
+def camp_state(run):
+    """Camp.lua's record of a trip (wow-bg3/camp-state.json) for this BG3 run: at camp or not."""
+    try:
+        s = json.loads((IO / 'camp-state.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    return s.get('RunId') == run and s.get('InCamp') is True
+
+
+def camp_compose(at_camp):
+    """A trip to camp (Camp.lua): the compositor's file aside, so BG3's own picture shows, and back. The
+    layer looks for the file every frame; the coordinator writes it new at each world-mode start."""
+    d = os.environ.get('WOWBG3_CAPTURE_DIR')
+    cap = Path(d) if d else ROOT / 'bg3/private/logs/capture'
+    on, off = cap / 'compose', cap / 'compose.camp'
+    try:
+        if at_camp and on.exists():
+            on.replace(off)
+        elif not at_camp and off.exists():
+            off.replace(on)
+            os.utime(on)  # the layer reads the file when its time changes
+    except OSError as e:
+        print('camp: compose file:', e, flush=True)
+
+
 def move_request(run, done):
     """A new world-move.json for this BG3 run (seq above `done`), or None."""
     try:
@@ -839,6 +864,9 @@ class World:
         if tav_flags(self.started + 1.0) & 1:
             answer(False, 'not during a BG3 fight')
             return self
+        if camp_state(self.run):
+            answer(False, 'not from camp')
+            return self
         try:
             terrain = wow_arena.Terrain(Path(self.a.maps), target)
             h = terrain.height(x, y)
@@ -851,6 +879,12 @@ class World:
             except Exception as e:  # noqa: BLE001  the terrain still works outdoors
                 print('no floor from the movement map, the terrain instead:', e, flush=True)
                 z = h
+        elif m.get('Snap'):  # a waypoint's flight point: the floor nearest its height
+            try:
+                import wow_waypoints
+                z = wow_waypoints.stand_z(target, x, y, float(z), terrain)
+            except Exception as e:  # noqa: BLE001  its own height still works
+                print('no floor for the waypoint, its own height:', e, flush=True)
         z = float(z)
         print(time.strftime('%H:%M:%S'), 'move to', m.get('What') or '', 'WoW %.1f %.1f %.1f map %d' % (x, y, z, target), flush=True)
         self.publish(False)
@@ -1012,9 +1046,15 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
     w.start()
     moved = 0
+    at_camp = False
     while not stop['now']:
         time.sleep(0.5)
         try:
+            now_camp = camp_state(w.run)
+            if now_camp != at_camp:
+                at_camp = now_camp
+                print(time.strftime('%H:%M:%S'), 'at camp: WoW waits' if at_camp else 'back from camp', flush=True)
+                camp_compose(at_camp)
             m = move_request(w.run, moved)
             if m:
                 moved = m['Seq']
@@ -1023,6 +1063,8 @@ def main():
             w.follow()
         except Exception as e:  # keep following; the mod keeps the squares it has
             print('follow error:', e, flush=True)
+    if at_camp:
+        camp_compose(False)
     w.publish(False)
     if getattr(w, '_farsight', None):
         w.farsight(None)

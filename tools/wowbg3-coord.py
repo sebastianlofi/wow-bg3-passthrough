@@ -68,7 +68,7 @@ lifecycle.log = log  # the watcher's lines in the same log
 def settings():
     """WOW-BG3/settings.conf: `key = value` lines, # comments."""
     s = {'debug_commands': '1', 'host': 'BGO_Main_A', 'wow_sound': '1', 'view_distance': '',
-         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1'}
+         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '0', 'difficulty': 'balanced'}
     try:
         for line in (HOME / 'settings.conf').read_text().splitlines():
             line = line.split('#', 1)[0].strip()
@@ -385,6 +385,9 @@ class Release:
         src = HOME / 'benilla/AddOns'
         if src.is_dir():  # WoW's world-mode HUD (chat, minimap, tracker clear of BG3's HUD)
             subprocess.run(['cp', '-rT', str(src), str(addons)], check=False)
+            if S.get('waypoints') == '1':  # the map pins (wow_waypoints.py); the copy above is fresh each start
+                with open(addons / 'WowBg3Layout/Settings.lua', 'a') as fh:
+                    fh.write('\nWowBg3Layout_Waypoints = true\n')
         conf = DATA / 'benilla/config.toml'
         if not conf.exists():  # benilla picks the saved realm by itself (else it parks at the realm list)
             conf.write_text('# benilla local config (WOW-BG3 release: the local server\'s realm)\n[cvars]\nrealmName = "WOW-BG3"\n')
@@ -466,6 +469,7 @@ class Release:
         e.setdefault('WOW_BG3_WORLD_X', '-1400')
         e.setdefault('WOW_BG3_WORLD_Y', '120')
         e.setdefault('WOW_BG3_WORLD_Z', '-350')
+        e['WOWBG3_CAPTURE_DIR'] = str(CAPTURE)  # Camp: the compose file aside during a trip
         PROCS.start('world', py('world_bridge', '--maps', P['maps']), e)
         self.tav_pending = tav_ok()  # Tav's textures for benilla (tick() starts the baker once its index exists)
         self.fight_pending = time.time()  # started by tick() once BG3's client runs the level
@@ -475,7 +479,8 @@ class Release:
         chat = TOOLS / 'wowbg3-chatcmd.py'
         if chat.is_file():
             e2 = os.environ.copy()
-            e2.update({'WOW_CHAR': char, 'WOWBG3_DEBUG_COMMANDS': '1' if S.get('debug_commands') == '1' else '0'})
+            e2.update({'WOW_CHAR': char, 'WOWBG3_DEBUG_COMMANDS': '1' if S.get('debug_commands') == '1' else '0',
+                       'WOWBG3_WAYPOINTS': '1' if S.get('waypoints') == '1' else '0'})
             PROCS.start('chatcmd', [sys.executable, '-u', chat], e2)
         time.sleep(1.0)
         if not PROCS.alive('world'):
@@ -534,7 +539,7 @@ def db_env():
 
 
 def datagen_needed():
-    return not ((LINK / 'items.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
+    return not ((LINK / 'items.json').is_file() and (LINK / 'abilities.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
                 and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file())
 
 
@@ -548,6 +553,9 @@ def datagen():
     if not (LINK / 'items.json').is_file():
         steps.append(('items', py('wow_items', 'build', '--out', LINK / 'items.json', '--data', WOW / 'Data',
                                   '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
+    if not (LINK / 'abilities.json').is_file() and game_data():
+        steps.append(('abilities', py('wow_abilities', 'make', LINK / 'abilities.json', '--data', WOW / 'Data', '--bg3', game_data(),
+                                      '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
     if not (IO / 'gui/wow-icons.json').is_file() and game_data():
         steps.append(('icons', py('wow_icons', 'build', '--data', WOW / 'Data', '--bg3', game_data(), '--out', IO / 'gui',
                                   '--items', LINK / 'items.json')))
@@ -648,6 +656,10 @@ def main():
     for d in (LOGS, RUN, LINK, CAPTURE, SHM / 'tav'):
         d.mkdir(parents=True, exist_ok=True)
     host_json()
+    (IO / 'mob-abilities.json').write_text(json.dumps({'On': S.get('mob_abilities') == '1'}))
+    (IO / 'companions.json').write_text(json.dumps({'On': S.get('companions') == '1'}))
+    (IO / 'camp.json').write_text(json.dumps({'On': S.get('camp') == '1'}))
+    (IO / 'scaling.json').write_text(json.dumps({'On': S.get('scaling') == '1', 'Difficulty': S.get('difficulty')}))
     REL = Release()
     log('window %dx%d, settings %s' % (REL.size + (S,)))
     if not wait_server(stop):

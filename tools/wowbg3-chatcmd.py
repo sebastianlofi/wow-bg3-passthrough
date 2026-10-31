@@ -88,12 +88,12 @@ LOCKS = {k: threading.Lock() for k in ('party', 'tele', 'server', 'other')}
 def kind_of(text):
     """Which lock a command line takes, by its verb."""
     try:
-        verb, _ = W.verb_of(text.split())
+        verb, rest = W.verb_of(text.split())
     except Exception:  # noqa: BLE001  unknown word or a usage error: W.run reports it
         return 'other'
     if verb in W.PARTY_ACTIONS:
         return 'party'
-    if verb in ('tp', 'where', 'find'):
+    if verb in ('tp', 'where', 'find') or (verb == 'waypoint' and rest[:1] == ['go']):
         return 'tele'
     if verb in ('level', 'xprate'):
         return 'server'

@@ -6,7 +6,7 @@
 Carries BG3's inventory requests to the WoW server and the WoW characters' inventories back:
   BG3 (Inventory.lua) -> wow-bg3/link/inventory-req.json  {RunId, Reqs: [{Seq, Op, Member, ...}]}
   bridge -> BG3          wow-bg3/link/inventory.json      {Seq, Time, Members: {UUID: {Char, Money,
-                         Items: [{Guid, Entry, Count, Bag, Slot}]}}, Vendors: {GUID: [{Idx, Entry, Price,
+                         Items: [{Guid, Entry, Count, Bag, Slot, Rand}]}}, Vendors: {GUID: [{Idx, Entry, Price,
                          Stock}]}, Loot: {GUID: {Money, Items: [{Idx, Entry, Count}]}}, Replies: [...]}
 inventory.json's For is the RunId of the requests read: Inventory.lua takes only a file meant for it.
 Ops: list, equip, unequip, move, give, add, del, money, vendor (list wares), buy, sell, loot (list),
@@ -43,6 +43,8 @@ EQUIP = {1: [0], 2: [1], 3: [2], 4: [3], 5: [4], 20: [4], 6: [5], 7: [6], 8: [7]
          11: [10, 11], 12: [12, 13], 16: [14], 13: [15, 16], 17: [15], 21: [15], 14: [16], 22: [16], 23: [16],
          15: [17], 25: [17], 26: [17], 28: [17], 19: [18]}
 BACKPACK = list(range(23, 39))
+# Pockets (switch `camp`, Bridge.pocket): [below this NPC level, bread, water].
+POCKET_TIERS = [(10, 4540, 159), (20, 4541, 1179), (30, 4542, 1205), (40, 4544, 1708), (50, 4601, 1645), (10 ** 6, 8950, 8766)]
 
 
 def jload(p, default=None):
@@ -258,14 +260,22 @@ class Server:
         return False, 'no_reply', []
 
     def list(self, name):
-        money, items = 0, []
+        money, items, end = 0, [], None
         for w in self.call('inv', 'list', name):
             if len(w) >= 5 and w[1] == 'inv' and w[3] == 'begin':
                 money = int(w[4])
             elif len(w) >= 9 and w[1] == 'inv' and w[3] == 'item':
                 items.append({'Guid': w[6], 'Entry': int(w[7]), 'Count': int(w[8]), 'Bag': int(w[4]), 'Slot': int(w[5])})
+                if len(w) >= 12 and w[11] != '0':
+                    items[-1]['Rand'] = int(w[11])  # the random suffix: Durability, MaxDurability, Rand after Count
+            elif len(w) >= 5 and w[1] == 'inv' and w[3] == 'end':
+                end = int(w[4])
             elif 'refused' in w:
                 raise RuntimeError('list %s: %s' % (name, ' '.join(w)))
+        # The console is shared: a far move's teleport can read this list's lines as its own reply. A list
+        # with lines missing is no word on what WoW holds (Inventory.lua would delete the rest).
+        if end != len(items):
+            raise RuntimeError('list %s: %d item line(s), end says %s' % (name, len(items), end))
         return money, items
 
     def _after_ok(self, lines, key):
@@ -344,6 +354,8 @@ class Bridge:
         self.vendors, self.loot = {}, {}
         self.last_list = 0
         self.not_vendor = set()  # friendly NPCs a list was refused for (not vendors)
+        self.pockets = set()     # of those, the ones with food on them to steal (pocket())
+        self.camp_on = (jload(IO / 'camp.json', {}) or {}).get('On') is True
 
     def members(self):
         out = {}
@@ -371,6 +383,10 @@ class Bridge:
             to = members.get(req.get('To') or '')
             return be.give(name, str(req['Guid']), to) if to else (False, 'member', {})
         if op == 'add':
+            npc = str(req.get('Npc') or '')
+            if npc in self.pockets:  # stolen from a pocket (pocket()): gone from it
+                self.vendors[npc] = [r for r in self.vendors.get(npc, []) if r['Idx'] != req.get('Idx')]
+                self.urgent = True
             return be.add(name, int(req['Entry']), int(req.get('Count', 1)))
         if op == 'del':
             return be.delete(name, str(req['Guid']), req.get('Count'))
@@ -429,7 +445,26 @@ class Bridge:
                 self.vendors[g] = wares
                 return True
             self.not_vendor.add(g)
+            pocket = self.pocket(g, m)
+            if pocket:
+                self.vendors[g] = pocket
+                self.pockets.add(g)
+                return True
         return False
+
+    def pocket(self, guid, mob):
+        """Switch `camp`: what a friendly NPC that sells nothing has on it to steal, a little food and
+        drink (WoW's vendor bread and water tiers). The same for the same NPC; gone once taken."""
+        if not self.camp_on:
+            return []
+        # mirror.json carries no level for friendly NPCs: the hero's (wowlevel.py), what they can use anyway.
+        level = int((jload(IO / 'wow-level.json', {}) or {}).get('Level') or 1)
+        food, drink = next(t[1:] for t in POCKET_TIERS if level < t[0])
+        seed = int(guid, 16) if all(c in '0123456789abcdefABCDEF' for c in guid) else sum(map(ord, guid))
+        out = [{'Idx': 0, 'Entry': food, 'Price': 0, 'Stock': -1, 'Count': 1 + seed % 2}]
+        if seed % 3 == 0:
+            out.append({'Idx': 1, 'Entry': drink, 'Price': 0, 'Stock': -1, 'Count': 1})
+        return [r for r in out if r['Entry'] in self.be.items]
 
     def publish(self, run, out):
         self.seq += 1

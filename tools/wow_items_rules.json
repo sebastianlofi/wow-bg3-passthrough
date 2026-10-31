@@ -101,8 +101,106 @@
   "_food": "WoW consumables whose name contains one of these words use BG3's healing potion, food or drink (their BG3 use effect too). Other consumables are plain items in BG3 until WoW's own use is wired (see inventory.md).",
   "heal_words": ["healing potion", "healing draught"],
   "_categories": "WoW's own markers: a consumable whose first spell is in spell category 11 is food, 59 drink.",
+  "_camp_supply": "BG3's camp supply value of WoW's food and drink, by item level: [up to this item level, supply]. A long rest costs BG3's 40, so 4 of the first tier, 3 of the second, then 2 and 1. Tune here.",
+  "camp_supply": [[5, 20], [15, 20], [25, 20], [35, 25], [45, 30], [999, 40]],
+  "_conjured_supply": "Conjured food and drink is free to make, so it is worth a flat, small supply whatever its level. WoW sells it for 0.",
+  "conjured_supply": 5,
+  "_food_heal": "BG3 base by item level: its food heals when eaten, by size. [up to this item level, base]: bun 1d4, loaf 2d4, fish 3d4, dinner 4d4; water 1d4, soup 3d4, stew 4d4.",
+  "food_heal": [[5, "CONS_FOOD_Bread_Bun"], [15, "CONS_FOOD_Bread_Loaf"], [25, "CONS_FOOD_Fish"], [999, "CONS_FOOD_Dinner"]],
+  "drink_heal": [[15, "CONS_DRINK_Water"], [25, "CONS_FOOD_Soup"], [999, "CONS_FOOD_Stew"]],
+  "_alcohol": "WoW's own alcohol spells (weak, standard, strong, potent, lager). BG3's beer makes the drinker Drunk. Flat supply: a rest should not be paid in rum.",
+  "alcohol_spells": [11007, 11008, 11009, 11629, 5257],
+  "alcohol": "CONS_DRINK_Beer",
+  "alcohol_supply": 5,
   "food_category": 11,
   "drink_category": 59,
   "food_words": ["bread", "meat", "cheese", "apple", "fish", "steak", "pie", "cake", "jerky", "mushroom", "ribs", "sausage", "egg", "melon", "muffin", "biscuit", "roll", "venison", "chop", "kabob", "stew"],
-  "drink_words": ["water", "milk", "juice", "ale", "wine", "beer", "brew", "rum", "grog", "mead", "tea"]
+  "drink_words": ["water", "milk", "juice", "ale", "wine", "beer", "brew", "rum", "grog", "mead", "tea"],
+
+  "_effects": "The switch: on-equip effects, random suffixes, instant heals. On with 'enabled', wow_items.py --effects or WOW_BG3_ITEM_EFFECTS=1. A member's worn points add up by kind; every 'per' points is {n} in the boost 'b', at most 'cap' ({p} is 100 + n). Every number here is a balance call: docs/item-effects.md.",
+  "effects": {
+    "enabled": true,
+    "_stats": "WoW's aura stat index -> BG3 ability (per and cap: ability_per, ability_cap above).",
+    "stats": {"0": "Strength", "1": "Dexterity", "2": "Constitution", "3": "Intelligence", "4": "Wisdom"},
+    "_auras": "WoW aura -> kind. 'scale' turns its points into the kind's. school_mask: only when the aura's mask has one of these bits (126 every magic school, not physical).",
+    "auras": {
+      "99":  {"kind": "ap"},
+      "124": {"kind": "rap"},
+      "52":  {"kind": "crit"},
+      "71":  {"kind": "crit"},
+      "54":  {"kind": "hit"},
+      "55":  {"kind": "spellhit"},
+      "13":  {"kind": "sp", "school_mask": 126},
+      "49":  {"kind": "avoid"},
+      "47":  {"kind": "avoid"},
+      "51":  {"kind": "avoid"},
+      "31":  {"kind": "speed"}
+    },
+    "_skills": "WoW skill id of a +skill aura: 95 defense (scale: 25 defense count as 5% avoidance).",
+    "skills": {"95": {"kind": "avoid", "scale": 0.2}},
+    "_resist_bits": "School bit of a +resistance aura or enchantment: bit 1 armour (scale: 100 armour count as 5% avoidance), the others as 'resist' above.",
+    "resist_bits": {
+      "1":  {"kind": "avoid", "scale": 0.05},
+      "2":  {"kind": "res_radiant"},
+      "4":  {"kind": "res_fire"},
+      "8":  {"kind": "res_poison"},
+      "16": {"kind": "res_cold"},
+      "32": {"kind": "res_necrotic"},
+      "64": {"kind": "res_force"}
+    },
+    "kinds": {
+      "ap":       {"per": 32, "cap": 3, "b": "RollBonus(MeleeWeaponDamage,{n})"},
+      "rap":      {"per": 32, "cap": 3, "b": "RollBonus(RangedWeaponDamage,{n})"},
+      "crit":     {"per": 5,  "cap": 2, "b": "ReduceCriticalAttackThreshold({n})"},
+      "hit":      {"per": 5,  "cap": 2, "b": "RollBonus(MeleeWeaponAttack,{n});RollBonus(RangedWeaponAttack,{n})"},
+      "spellhit": {"per": 5,  "cap": 2, "b": "RollBonus(MeleeSpellAttack,{n});RollBonus(RangedSpellAttack,{n})"},
+      "sp":       {"per": 40, "cap": 2, "b": "SpellSaveDC({n})"},
+      "avoid":    {"per": 5,  "cap": 2, "b": "AC({n})"},
+      "speed":    {"per": 1,  "cap": 15, "b": "ActionResourceMultiplier(Movement,{p},0)"},
+      "res_radiant":  {"per": 30, "cap": 1, "b": "Resistance(Radiant,Resistant)"},
+      "res_fire":     {"per": 30, "cap": 1, "b": "Resistance(Fire,Resistant)"},
+      "res_poison":   {"per": 30, "cap": 1, "b": "Resistance(Poison,Resistant)"},
+      "res_cold":     {"per": 30, "cap": 1, "b": "Resistance(Cold,Resistant)"},
+      "res_necrotic": {"per": 30, "cap": 1, "b": "Resistance(Necrotic,Resistant)"},
+      "res_force":    {"per": 30, "cap": 1, "b": "Resistance(Force,Resistant)"}
+    },
+    "_heal_tiers": "A consumable with an instant WoW heal: [from WoW's amount, BG3 potion], the last one reached wins. Empty: a use in BG3 comes back at the next sync, so stronger potions would be free (docs/item-effects.md). To turn on: [[0, \"OBJ_Potion_Healing\"], [300, \"OBJ_Potion_Healing_Greater\"], [600, \"OBJ_Potion_Healing_Superior\"], [1000, \"OBJ_Potion_Healing_Supreme\"]].",
+    "heal_tiers": [],
+
+    "_table": "Words for wow_items.py effects; nothing else reads them.",
+    "table_rest_below": 40,
+    "table": {
+      "equip_names": {
+        "135": "+healing", "13": "+spell damage", "52": "+crit %", "85": "mana per 5 s", "124": "+ranged attack power",
+        "99": "+attack power", "30": "+skill (defense, weapon)", "71": "+spell crit %", "54": "+hit %", "49": "+dodge %",
+        "55": "+spell hit %", "22": "+resistance or armour", "31": "+run speed %", "42": "proc on an event", "107": "class spell tweak (flat)",
+        "102": "+attack power vs a creature type", "131": "+ranged attack power vs a creature type", "161": "health per 5 s", "123": "spell penetration",
+        "47": "+parry %", "51": "+block %", "141": "+ranged haste (quivers)", "158": "+block value", "108": "class spell tweak (%)", "15": "thorns (damage shield)"
+      },
+      "equip": {
+        "135": "not mapped: BG3 has no healing power (spells that also give spell damage count through +spell damage)",
+        "13": "single-school spell damage counts like any school (balance call)",
+        "30": "only defense; weapon skills not mapped",
+        "22": "armour into `avoid`, schools into `res_*`, from 30 points (fixed resistances keep their own 15)",
+        "71": "shares melee crit's pool",
+        "85": "not mapped: BG3 has spell slots, no mana",
+        "161": "not mapped: BG3 has no regeneration boost; needs a hand-made passive",
+        "42": "not mapped: hand-made", "107": "not mapped: WoW class spells", "108": "not mapped: WoW class spells",
+        "102": "not mapped: hand-made", "131": "not mapped: hand-made", "123": "not mapped", "141": "not mapped: BG3 has no attack speed",
+        "158": "not mapped: BG3 has no block", "15": "not mapped: hand-made"
+      },
+      "hit": "not mapped: hand-made; shown as WoW's text",
+      "use_names": {
+        "36:0": "teach a recipe or spell", "24:0": "create an item", "6:84": "food (health over time)", "53:0": "permanent item enchantment",
+        "6:32": "mount speed", "6:78": "mount", "6:29": "stat buff (scrolls, elixirs)", "59:0": "open a lock", "3:0": "script", "64:0": "trigger a spell",
+        "61:0": "script event", "6:23": "periodic trigger (well fed and others)", "97:0": "summon a pet", "6:77": "mechanic immunity", "86:0": "activate an object",
+        "10:0": "instant heal", "54:0": "temporary weapon enchantment", "2:0": "school damage", "30:0": "restore mana or rage", "41:0": "summon"
+      },
+      "use": {
+        "6:84": "already BG3 food by the existing rule (name, spell category)",
+        "10:0": "not mapped: `heal_tiers` is empty until a use in BG3 reaches WoW",
+        "30:0": "not mapped: BG3 has no mana"
+      }
+    }
+  }
 }

@@ -5,8 +5,8 @@ local inspect = Ext.Require("WorldInspect.lua")
 local Hero = Ext.Require("Hero.lua")
 function M.Start(runId)
     -- Server modules started from here: turn-based holds outside combat (TurnHold.lua) and
-    -- no stand-in outliving its session (Cleanup.lua), no camp in world mode (CampOff.lua).
-    for _, name in ipairs({"TurnHold.lua", "Cleanup.lua", "CampOff.lua"}) do
+    -- no stand-in outliving its session (Cleanup.lua), camp in world mode (CampOff.lua or, switch on, Camp.lua).
+    for _, name in ipairs({"TurnHold.lua", "Cleanup.lua", "CampOff.lua", "Camp.lua"}) do
         local ok, err = pcall(function() Ext.Require(name).Start(runId) end)
         if not ok then Ext.Log.Print("WOW-BG3 " .. name .. ": " .. tostring(err)) end
     end

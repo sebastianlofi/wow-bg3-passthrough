@@ -67,6 +67,7 @@ function Probe.Start(context)
         -- GUI overrides first: they must be in before BG3's GUI loads the files (WowUi.lua).
         local okUi, errUi = pcall(function() Ext.Require("WowUi.lua").Start(report.RunId) end)
         if not okUi then Ext.Log.Print("WOW-BG3 ui: " .. tostring(errUi)) end
+        pcall(function() Ext.Require("Abilities.lua").Start(report.RunId) end)
         local okInvC, errInvC = pcall(function() Ext.Require("InventoryClient.lua").Start(report.RunId) end)
         if not okInvC then Ext.Log.Print("WOW-BG3 inventory client: " .. tostring(errInvC)) end
         -- World mode only in games started with WOW-BG3.
@@ -132,6 +133,7 @@ function Probe.Start(context)
         -- WoW race names on stand-ins while BG3's examine or trade screen shows them.
         local okPr, errPr = pcall(function() Ext.Require("PreviewRaces.lua").Start(report.RunId) end)
         if not okPr then Ext.Log.Print("WOW-BG3 preview races: " .. tostring(errPr)) end
+        pcall(function() Ext.Require("Abilities.lua").Start(report.RunId) end)
         local okInv, errInv = pcall(function() Ext.Require("Inventory.lua").Start(report.RunId) end)
         if not okInv then Ext.Log.Print("WOW-BG3 inventory: " .. tostring(errInv)) end
         Ext.Require("Arena.lua").Start(report.RunId)

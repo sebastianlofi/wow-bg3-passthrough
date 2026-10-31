@@ -24,6 +24,7 @@
 --                                            leaving the level put every pool subgrid back)
 --   PickRegion {Seconds}                     client: BG3's cursor picks characters anywhere in the void
 --                                            (the level's region map emptied, plugin op 28); Restore
+--   PickRegionOff                            client: the map back, for BG3's own level (a trip to camp)
 --                                            puts it back
 --   SpatialGrid {Rebuild, Targets}          BG3's spatial grid on this side (square, flags, the AI grid
 --                                            bounds it would take); Rebuild asks the engine to rebuild
@@ -472,6 +473,10 @@ function M.Start(runId)
                     PoolFoundThem = out.F[4] == 1, MatchSubgrids = out.F[5] == 1}
             end
             if c.Action == "RaysOff" then return raysOff("command") or {Rays = false} end
+            if c.Action == "PickRegionOff" then
+                if not client then return {Side = "server", PickRegion = "client only"} end
+                return pickOff("command") or {PickRegion = false}
+            end
             if c.Action == "Extend" then
                 -- World mode keeps the arena for the whole session: push every time limit out.
                 local seconds = assert(tonumber(c.Seconds), "Seconds required")

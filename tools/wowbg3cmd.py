@@ -11,6 +11,7 @@ One verb each, no domain word in front:
   wowbg3cmd.py refill           HP, spell slots, rage... back to full (test helper)
   wowbg3cmd.py level N          the hero's WoW level (test helper, 1 to 60, also down)
   wowbg3cmd.py xprate [N]       the server's XP rate (kill, elite kill, quest, exploration); no N: show
+  wowbg3cmd.py waypoint [list] | waypoint go NAME   fast travel between known flight points (wow_waypoints.py)
   wowbg3cmd.py help
   --json on any party verb: the mod's whole answer
 
@@ -313,8 +314,9 @@ def party(ctx, args, as_json=False):
 
     def show_pool(p):
         pct = p.get('WowPercent')
-        say('WoW level %s%s: %s party slot%s (party of %s), level-ups earned %s, given %s, left %s' % (
-            p.get('WowLevel'), '' if pct is None else ' (%g%% into it)' % pct,
+        say('WoW level %s%s%s: %s party slot%s (party of %s), level-ups earned %s, given %s, left %s' % (
+            p.get('WowLevel'), ' of %s' % p['WowMax'] if p.get('WowMax') else '',
+            '' if pct is None else ' (%g%% into it)' % pct,
             p.get('Slots'), '' if p.get('Slots') == 1 else 's', p.get('PartySize'), p.get('Earned'),
             p.get('Spent'), p.get('Available')))
         for m in p.get('Members') or []:
@@ -326,7 +328,7 @@ def party(ctx, args, as_json=False):
         for m in p.get('Others') or []:
             say('  %s (not in the party): %s level-up%s given' % (m.get('Name'), m.get('LevelUps'),
                                                                  '' if m.get('LevelUps') == 1 else 's'))
-        say('  BG3 XP table ends at level %s; cap %s (WoW 64)%s' % (
+        say('  BG3 XP table ends at level %s; cap %s%s' % (
             p.get('MaxXpLevel'), p.get('GrantCap'),
             '' if p.get('XpOff') else '; BG3\'s own XP is NOT off yet'))
 
@@ -421,7 +423,18 @@ def map_of(zone):
     return None
 
 
-def tele(ctx, args):
+def at_camp(io):
+    """Camp.lua's record of a trip (wow-bg3/camp-state.json) says this BG3 run is at camp. World.move refuses
+    from there too: camp's teleport is BG3's own story, and a Stop there would lose the way back."""
+    try:
+        camp = json.load(open(io / 'camp-state.json'))
+        return camp.get('InCamp') is True and camp.get('RunId') == json.load(open(io / 'm3-client.json')).get('RunId')
+    except (OSError, ValueError):
+        return False
+
+
+def tele(ctx, args, at=None):
+    """`at` (x, y, z, map, what): a move decided elsewhere (a waypoint), its height to be snapped to a floor."""
     if not args:
         raise Usage(TELE_USAGE)
     link, io = ctx.link, ctx.io
@@ -495,7 +508,9 @@ def tele(ctx, args):
         return
 
     z = None
-    if len(args) == 1:
+    if at:
+        x, y, z, mapid, what = at
+    elif len(args) == 1:
         hits = places(args[0])
         if not hits:
             raise CmdError('tp: no named place like %r (find TEXT lists them)' % args[0])
@@ -525,7 +540,9 @@ def tele(ctx, args):
     else:
         raise Usage(TELE_USAGE)
 
-    # World mode must run, and not in a fight.
+    # World mode must run, and not in a fight or at camp (asked first: Camp.lua freezes tav.bin there).
+    if at_camp(io):
+        raise CmdError('tp: not from camp: leave camp first')
     try:
         run = json.load(open(io / 'm3-client.json'))['RunId']
         w = json.load(open(link / 'world.json'))
@@ -546,6 +563,8 @@ def tele(ctx, args):
         seq = 0
     seq += 1
     body = {'RunId': run, 'Seq': seq, 'Wow': [x, y, z], 'What': what, 'Map': mapid}
+    if at:
+        body['Snap'] = True
     cross = mapid != player_map()
     if cross:
         # The other continent: WoW's character goes first to the named place there nearest the point
@@ -585,6 +604,79 @@ def tele(ctx, args):
     px, py, _ = player()
     raise CmdError('tp: world mode moved, but WoW\'s character is still %.0f yd away (dead in WoW? a dead '
                    'character is not moved: revive it, then try again)' % (((px - x) ** 2 + (py - y) ** 2) ** 0.5))
+
+
+# ---------------------------------------------------------------- waypoints (wow_waypoints.py: the rules)
+
+WAYPOINT_USAGE = 'waypoint [list] | waypoint go NAME (a name or its number from the list)'
+
+
+def waypoints_on():
+    try:
+        import wow_waypoints
+    except ImportError:  # a build without it: the other commands must still work
+        return False
+    return wow_waypoints.enabled()
+
+
+def taxi_state(name):
+    """(known-taxi mask text, race, on a WoW flight now, dead), an online character written to the database first.
+    The columns by what they hold: the name differs between server versions."""
+    wow_level(name)
+    cols = [l.split('\t')[0] for l in sql("show columns from characters like '%taxi%';", 'characters').splitlines()]
+    mask = next((c for c in cols if 'mask' in c), None)
+    path = next((c for c in cols if 'path' in c), None)
+    if not mask:
+        raise CmdError('waypoint: this server keeps no flight points in its characters table')
+    row = sql("select race, health, `%s`, %s from characters where name = '%s';"
+              % (mask, '`%s`' % path if path else "''", name_ok(name)), 'characters').rstrip('\n').split('\t')
+    if len(row) != 4 or not row[0].isdigit():
+        raise CmdError('no WoW character %s' % name)
+    return row[2], int(row[0]), row[3].strip() not in ('', 'NULL'), row[1] == '0'
+
+
+def waypoint(ctx, args):
+    if not waypoints_on():
+        raise CmdError('waypoints are off (waypoints = 1 in WOW-BG3/settings.conf turns them on)')
+    import wow_waypoints
+    action = args[0].lower() if args else 'list'
+    if action not in ('list', 'go', 'pins') or (action == 'go') != (len(args) > 1):
+        raise Usage(WAYPOINT_USAGE)
+    mask, race, flying, dead = taxi_state(hero(ctx))
+    team = wow_waypoints.team_of(race)
+    if not team:
+        raise CmdError('waypoint: no team for race %d' % race)
+    every = wow_waypoints.nodes(dbc_dir())
+    points = wow_waypoints.waypoints(every, mask, team)
+    if action == 'pins':  # for the WoW layout addon, which keeps these lines out of the chat
+        rows = wow_waypoints.pins(points, wow_waypoints.map_rects(dbc_dir()))
+        for f, i, x, y, name in rows:
+            ctx.say('WBWP;pin;%s;%d;%.2f;%.2f;%s' % (f, i, x, y, name))
+        ctx.say('WBWP;end;%d' % len(rows))
+    elif action == 'list':
+        ctx.say('Waypoints you have discovered (%s; a flight master\'s window adds its own):' % team)
+        for p in points:
+            ctx.say('  %d %s (%s)' % (p['id'], p['name'], cont(p['map'])))
+        if not points:
+            ctx.say('  none yet')
+    else:
+        text = ' '.join(args[1:])
+        hits = wow_waypoints.choose(points, text)
+        if not hits and wow_waypoints.choose([n for n in every if n['id'] in wow_waypoints.NO_GROUND], text):
+            raise CmdError('waypoint: world mode has no ground inside Ironforge and Undercity yet')
+        if not hits:
+            raise CmdError('waypoint: you have discovered no flight point like %r ("waypoint" lists them)' % text)
+        if len(hits) > 1:
+            raise CmdError('waypoint: which one? ' + '; '.join(p['name'] for p in hits[:6]))
+        if flying:
+            raise CmdError('waypoint: not on a WoW flight')
+        if dead:
+            raise CmdError('waypoint: not while dead in WoW')
+        p = hits[0]
+        try:
+            tele(ctx, ['waypoint'], at=(p['x'], p['y'], p['z'], p['map'], p['name']))
+        except CmdError as e:
+            raise CmdError(re.sub(r'^tp: ', 'waypoint: ', str(e)))
 
 
 # ---------------------------------------------------------------- faction (the fight bridge's faction.txt)
@@ -713,7 +805,7 @@ def xp(ctx, args):
 # ---------------------------------------------------------------- chat dispatch
 
 # One verb each, no domain word in front and no second name for anything.
-VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'level', 'xprate')
+VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'level', 'xprate', 'waypoint')
 TEST_ONLY = ('tp', 'where', 'find', 'faction', 'refill', 'level', 'xprate')
 
 
@@ -739,6 +831,8 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
         tele(ctx, [verb] + args)
     elif verb == 'faction':
         faction(ctx, args)
+    elif verb == 'waypoint':
+        waypoint(ctx, args)
     elif verb == 'level':
         level(ctx, args, wow_bg3_only=wow_bg3_only)
     else:
@@ -748,6 +842,8 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
 def help_lines(debug):
     out = ['commands (type them in WoW\'s chat), one word each:']
     out += ['/wowbg3 ' + l for l in PARTY_HELP]
+    if waypoints_on():
+        out.append('/wowbg3 waypoint | waypoint go NAME - the flight points you have discovered; fast travel to one')
     out.append('/wowbg3 help - this list')
     if debug:
         out += ['test commands:',

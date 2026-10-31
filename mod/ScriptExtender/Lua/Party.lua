@@ -346,6 +346,12 @@ function M.Start(runId)
         pcall(Osi.DetachFromPartyGroup, u)
         cacheTick = -1
         wait(2)
+        if Prog.CampOn() then
+            -- Back to camp, as BG3's own dismiss does (Camp.lua's switch aside: nowhere else is home now).
+            pcall(Osi.PROC_DismissToCamp, u)
+            steps[#steps + 1] = "back to camp (PROC_DismissToCamp)"
+            return {Removed = nameOf(u), Uuid = u, Steps = steps, Party = M.Snapshot()}
+        end
         local home = homes()[u]
         local region = q(Osi.GetRegion, u)
         if home and type(home.Pos) == "table" and #home.Pos == 3 then
@@ -376,6 +382,50 @@ function M.Start(runId)
             steps[#steps + 1] = "no home recorded: off stage where it stands"
         end
         return {Removed = nameOf(u), Uuid = u, Steps = steps, Party = M.Snapshot()}
+    end
+
+    -- Companions at camp (settings.conf `companions`, needs `camp`): every companion not yet with the
+    -- party waits at camp once per save, the way BG3's own "fullcamp" does it (GLO_Camp): out of any
+    -- tutorial pod, PROC_ORI_SetupCamp (part of the team, on stage, to its camp spot, from another level
+    -- too) and PROC_DismissToCamp, with its in-party dialog, whose "join me" BG3 itself runs
+    -- (OriginAddToParty, PROC_GLO_PartyMembers_CheckAdd). Withers is BG3's own move to camp.
+    local function toCamp(k)
+        local u = uuidOf(k[2])
+        if not Ext.Entity.Get(u) or M.IsMember(u) or q(Osi.IsDead, u) == 1 then return end
+        if not Prog.Once("camp:" .. k[1]) then return end
+        if u == uuidOf(SH) then tutorialShadowheart(heroOrFail(), {}) end
+        pcall(Osi.PROC_ORI_SetupCamp, u, 1)
+        pcall(Osi.PROC_DismissToCamp, u)
+        -- Their faction of the story's moment (Minsc's Act 3 gang fights the hero on sight): their own instead.
+        for _, r in ipairs(rows("DB_GLO_PartyMembers_DefaultFaction", 2)) do
+            if uuidOf(r[1]) == u then pcall(Osi.SetFaction, u, r[2]) end
+        end
+        local dlg = q(function() return Osi.DB_OriginInPartyDialog:Get(k[2], nil) end)
+        if dlg and dlg[1] then
+            pcall(Osi.PROC_GLO_PartyMembers_SetInpartyDialog, u, dlg[1][2])
+            pcall(Osi.SetHasDialog, u, 1)
+        end
+        Ext.Utils.Print(string.format("WOW-BG3 party: %s waits at camp (%s)", nameOf(u), tostring(q(Osi.GetRegion, u))))
+    end
+    local campStarted = false
+    local function campStart()
+        if campStarted or not Prog.CampOn() or not Ext.Require("Camp.lua").On() then return end
+        local hero = Hero.Uuid()
+        local active = q(function() return Osi.DB_ActiveCamp:Get(nil) end)
+        if not hero or not active or not active[1] then return end -- the story has not set its camp yet
+        if q(Osi.IsInCombat, hero) == 1 or Ext.Require("Camp.lua").InTrip() then return end
+        campStarted = true
+        for _, k in ipairs(KNOWN) do
+            local ok, err = pcall(toCamp, k)
+            if not ok then Ext.Utils.Print("WOW-BG3 party: to camp failed: " .. tostring(err)) end
+        end
+        if Prog.Once("camp:withers") then
+            local ok, err = pcall(function()
+                Osi.PROC_GLO_Jergal_MoveToCamp()
+                Osi.PROC_GLO_Jergal_Appear()
+            end)
+            Ext.Utils.Print("WOW-BG3 party: Withers " .. (ok and "at camp" or ("to camp failed: " .. tostring(err))))
+        end
     end
 
     -- Every companion next to the hero (or c.Position) and chained (world mode's Start and Stop).
@@ -618,9 +668,13 @@ function M.Start(runId)
                 pcall(writeStatus, true)
             end
         end
-        if upkeep and tick % 30 == 11 and not jobs[1] then pcall(keepUp) end
+        -- A trip to camp (Camp.lua) is no fall: a member there stands about 110 m below the void.
+        if upkeep and tick % 30 == 11 and not jobs[1] then
+            if Ext.Require("Camp.lua").InTrip() then lastPos, steady = {}, {} else pcall(keepUp) end
+        end
         if upkeep and tick % 30 == 21 and not jobs[1] then pcall(helpUp) end
         if tick % 10 == 3 then pcall(writeStatus, false) end
+        if tick % 90 == 31 and not jobs[1] then pcall(campStart) end
         if tick % 10 ~= 0 then return end
         local raw = Ext.IO.LoadFile("wow-bg3/party-command.json")
         local okj, c = pcall(Ext.Json.Parse, raw or "")

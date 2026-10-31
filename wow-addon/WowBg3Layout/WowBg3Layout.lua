@@ -162,6 +162,96 @@ local function apply()
     end
 end
 
+-- Waypoints (`waypoints = 1` in settings.conf, which adds WowBg3Layout_Waypoints to Settings.lua; off, none of
+-- this runs): the flight points this character has discovered, as pins on WoW's map inside BG3's map page; a
+-- left click fast travels (the rules: tools/wow_waypoints.py). Each time the map opens the helper is asked
+-- for them ("waypoint pins"). Its answer can only come back through WoW's chat (benilla 0053), as
+-- `WBWP;pin;MapFile;id;x;y;name` lines and a `WBWP;end;n`, which are kept out of the chat here.
+local wpOpened, wpClosed = function() end, function() end
+if WowBg3Layout_Waypoints then
+    local pins, count, buttons, drawn, open, wait, hooked = {}, 0, {}, nil, false, 0, {}
+    local function button(i)
+        if buttons[i] then return buttons[i] end
+        local b = {frame = CreateFrame("Button", "WowBg3Waypoint" .. i, WorldMapButton)}
+        b.frame:SetWidth(18)
+        b.frame:SetHeight(18)
+        b.frame:EnableMouse(true) -- a frame made at run time takes no mouse without it
+        b.frame:SetFrameLevel(WorldMapButton:GetFrameLevel() + 2)
+        local t = b.frame:CreateTexture(nil, "ARTWORK")
+        t:SetAllPoints(b.frame)
+        t:SetTexture("Interface\\TaxiFrame\\UI-Taxi-Icon-Green")
+        b.frame:RegisterForClicks("LeftButtonUp")
+        b.frame:SetScript("OnClick", function()
+            if WowBg3_ChatCommand then WowBg3_ChatCommand("waypoint go " .. b.id) end
+        end)
+        b.frame:SetScript("OnEnter", function()
+            GameTooltip:SetOwner(b.frame, "ANCHOR_RIGHT")
+            GameTooltip:SetText(b.name)
+            GameTooltip:AddLine("Click to travel here", 1, 1, 1)
+            GameTooltip:Show()
+        end)
+        b.frame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        buttons[i] = b
+        return b
+    end
+    local function draw()
+        drawn = GetMapInfo() or ""
+        local n = 0
+        for i = 1, count do
+            local p = pins[i]
+            if p.file == drawn then
+                n = n + 1
+                local b = button(n)
+                b.id, b.name = p.id, p.name
+                b.frame:ClearAllPoints()
+                b.frame:SetPoint("CENTER", "WorldMapButton", "TOPLEFT", p.x / 100 * WorldMapButton:GetWidth(),
+                    -p.y / 100 * WorldMapButton:GetHeight())
+                b.frame:Show()
+            end
+        end
+        local i = n + 1
+        while buttons[i] do
+            buttons[i].frame:Hide()
+            i = i + 1
+        end
+    end
+    local function line(text)
+        local _, _, file, id, x, y, name = string.find(text, "^WBWP;pin;([^;]*);(%d+);([%d.-]+);([%d.-]+);(.*)$")
+        if file then
+            count = count + 1
+            pins[count] = {file = file, id = id, x = tonumber(x), y = tonumber(y), name = name}
+        elseif string.find(text, "^WBWP;end") then
+            draw()
+        end
+    end
+    local function hook(frame)
+        if not frame or hooked[frame] then return end
+        hooked[frame] = true
+        local add = frame.AddMessage
+        frame.AddMessage = function(self, text, r, g, b, a, id)
+            local at = type(text) == "string" and string.find(text, "WBWP;", 1, true)
+            if at then return line(string.sub(text, at)) end
+            return add(self, text, r, g, b, a, id)
+        end
+    end
+    local watch = CreateFrame("Frame", "WowBg3WaypointWatch")
+    watch:SetScript("OnUpdate", function()
+        wait = wait - arg1
+        if not open or wait > 0 then return end
+        wait = 0.2
+        if (GetMapInfo() or "") ~= drawn then draw() end -- the map moved to another zone or continent
+    end)
+    wpOpened = function()
+        if open then return end
+        open = true
+        hook(DEFAULT_CHAT_FRAME)
+        count = 0
+        draw()
+        if WowBg3_ChatCommand then WowBg3_ChatCommand("waypoint pins") end
+    end
+    wpClosed = function() open = false end
+end
+
 -- WoW's world map inside BG3's map frame. benilla calls this when BG3's
 -- map panel opens, moves or closes (link/bg3ui.bin, written by BG3's WowUi.lua): mode 0 closed,
 -- 1 inside the rect, 2 the whole screen; x, y, w, h are fractions of the screen from the top left.
@@ -197,6 +287,7 @@ end
 function WowBg3Layout_Map(mode, x, y, w, h)
     if not WorldMapFrame then return end
     if mode == 0 then
+        wpClosed()
         if WorldMapFrame:IsShown() then WorldMapFrame:Hide() end
         if mapBackdrop then mapBackdrop:Hide() end
         mapMeasure = 0
@@ -228,6 +319,7 @@ function WowBg3Layout_Map(mode, x, y, w, h)
     WorldMapFrame:SetPoint("BOTTOMRIGHT", mapBackdrop, "BOTTOMRIGHT", 0, 0)
     if not WorldMapFrame:IsShown() then WorldMapFrame:Show() end
     mapMeasure = 3
+    wpOpened()
 end
 
 -- WoW's panels clear of BG3's party portraits. Gossip, quests, the

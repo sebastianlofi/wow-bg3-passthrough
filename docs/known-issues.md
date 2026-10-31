@@ -32,6 +32,10 @@ This is the first public version. What we know is missing or rough:
 
 ## Game
 
+- Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
+  `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
+  music stays off there, and the WoW side shows nothing while you are at camp. Eating and drinking from the
+  bag, alcohol's Drunk, and a successful pickpocket of food have not been tried in the game yet.
 - Walls, roofs and small props between the camera and your party fade out, and big pieces push the camera in.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is
   ended where everyone stands (no WoW fight runs behind it any more).
@@ -48,19 +52,25 @@ This is the first public version. What we know is missing or rough:
   have been walked in only a few towns.
 - Fading: ribbons and point lights of a faded prop stay visible.
 
+- Camp: use Leave Camp to go back. Walking far off the camp area counts as leaving and can put your WoW
+  character in the wrong zone (`/wowbg3 tp` gets it back).
+- Camp food: a save from before camp can hold stray single copies of food, and a rest can then take the whole
+  stack.
+
 ## Levels and progression
 
-- Your WoW levels 1 to 4 each open a party slot; every WoW level from 5 on earns one BG3 level-up,
-  which BG3's own Level Up button offers on every party member with room: level whichever one you
+- Your WoW levels 1 to 4 each open a party slot; every WoW level from 5 on earns one BG3 level-up (two at
+  every 5th), which BG3's own Level Up button offers on every party member with room: level whichever one you
   want, so members sit at different BG3 levels on purpose. BG3's own XP is off; `pool` shows what
   your WoW levels earned and what is left.
 - Dismissing a companion does not return its level-ups to the pool. It keeps its BG3 levels and
   rejoins at them, and `pool` still counts those level-ups as given (a dismissed member is listed
   under "not in the party"). Only Withers' respec, `respec NAME`, puts them back.
 - BG3's own XP table ends at level 12, so no Level Up is offered past 12 without a level-cap mod.
-  WoW 64 is worth 64 BG3 levels (a party of four at level 16, the cap per character; vanilla WoW stops
-  at 60 today), so without such a mod the rest of the pool stays unspent. No level-cap mod is bundled
-  or tested; ours needs only a larger `MaxXPLevel` and the levels above 12 in BG3's XP table.
+  WoW 60 is worth 68 level-ups (a party of four at level 18, the cap per character), so without such a
+  mod the rest of the pool stays unspent, and a popup says which mods unlock more. No level-cap mod is bundled
+  or tested, and we strongly recommend one (README, Levelling); ours needs only a larger `MaxXPLevel` and
+  the levels above 12 in BG3's XP table. 5e Spells needs Script Extender; on bg3le that is unknown.
 - Companions earn no WoW XP of their own: the pool comes from your hero's WoW level alone.
 
 ## Items
@@ -75,7 +85,9 @@ This is the first public version. What we know is missing or rough:
   equipped on the WoW side.
 - Every item looks like its BG3 base item, not like the WoW item.
 - Not mapped yet: random suffixes ("of the Bear"), on-equip effects (attack power, crit), item
-  durability and repair, vendor buyback, and bags as BG3 containers.
+  durability and repair, vendor buyback, and bags as BG3 containers. A mapping for suffixes and part of
+  the on-equip and on-use effects exists behind a switch, on by default:
+  [item-effects.md](item-effects.md).
 - A WoW consumable uses BG3's own effect, so the use is not spent in WoW and the item can come back
   on the next sync. Dropping or destroying an item from BG3 has nowhere to go in WoW 1.12, which has
   no ground drop.
