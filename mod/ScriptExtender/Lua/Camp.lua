@@ -83,6 +83,7 @@ end
 function M.Start(runId)
     if not M.On() then return end
     local ticks, seq, pending, outFor = 0, 0, nil, 0
+    local own = nil -- where this module just sent the hero: its Teleported arrives ticks later, no one's travel
     M.State = {Trips = 0, Corrected = 0}
     local function publish(inCamp, extra)
         seq = seq + 1
@@ -102,7 +103,9 @@ function M.Start(runId)
         if uuidOf(who) ~= hero then return end
         local dx, dz = nx - ox, nz - oz
         if math.sqrt(dx * dx + dz * dz) < M.JUMP then return end
-        pending = {Hero = hero, From = {ox, oy, oz}, Until = ticks + M.PENDING}
+        local mine = own and ticks <= own.Until and math.sqrt((nx - own.X) ^ 2 + (nz - own.Z) ^ 2) < M.JUMP
+        own = nil
+        pending = {Hero = hero, From = {ox, oy, oz}, Until = ticks + M.PENDING, Own = mine}
     end
     pcall(Ext.Osiris.RegisterListener, "Teleported", 9, "before", onTeleported)
 
@@ -119,6 +122,8 @@ function M.Start(runId)
                     publish(true)
                     Ext.Utils.Print("WOW-BG3 camp: at camp, the WoW side waits at "
                         .. Ext.Json.Stringify(trip.From))
+                elseif ticks > pending.Until and pending.Own then
+                    pending = nil
                 elseif ticks > pending.Until then
                     -- A long teleport that is not to camp: BG3's own waypoint panel, no longer greyed with
                     -- CampOff's status gone. Its target is in the level, not on WoW's ground, and the next
@@ -126,6 +131,7 @@ function M.Start(runId)
                     -- are never this: they run with world.json Active false.
                     local f, pendingHero = pending.From, pending.Hero
                     pending = nil
+                    own = {X = f[1], Z = f[3], Until = ticks + M.PENDING}
                     Osi.TeleportToPosition(pendingHero, f[1], f[2], f[3], "", 1, 1, 1, 0, 1)
                     M.State.Refused = (M.State.Refused or 0) + 1
                     Ext.Utils.Print("WOW-BG3 camp: BG3's own travel in the level undone, the party back on WoW's ground")
@@ -137,6 +143,7 @@ function M.Start(runId)
                     local f = trip.From
                     local d = x and math.sqrt((x - f[1]) ^ 2 + (z - f[3]) ^ 2) or 1e9
                     if d > M.BACK_NEAR then
+                        own = {X = f[1], Z = f[3], Until = ticks + M.PENDING}
                         Osi.TeleportToPosition(trip.Hero, f[1], f[2], f[3], "", 0, 0, 0, 0, 1)
                         M.State.Corrected = M.State.Corrected + 1
                         Ext.Utils.Print(string.format("WOW-BG3 camp: the story left the hero %.1f m from the spot; put back", d))
