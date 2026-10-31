@@ -550,13 +550,13 @@ function M.InRespec(u) return respec[u] ~= nil end
 -- Keep each under 210 characters: Accept on a box of 340 crashed BG3 every time (a worker thread, right after
 -- MessageBoxClosed), 209 did not.
 local POPUPS = {
-    recruit = string.format("You reached level 2 in WoW, which runs to level %d: you can recruit a companion. They all wait "
-        .. "at camp: go to camp and ask one to join you. WoW levels 3 and 4 each open one more place in your party.", M.WOW_MAX),
-    refused = "You don't have enough level for another companion. WoW levels 2, 3 and 4 each open one place in your party.",
-    levels = string.format("You reached level 5 in WoW. Each WoW level now levels ONE party member, and every %dth levels two, "
-        .. "with BG3's Level Up button. WoW levels run to %d, where a party of four is BG3 level %d.",
+    recruit = "You reached level 2! You can recruit a new companion. Ask them in camp to join your party. "
+        .. "Levels 3 and 4 unlock an extra slot.",
+    refused = "You're not high enough level for another companion. Levels 2, 3 and 4 each unlock a slot.",
+    levels = string.format("You reached level 5! From now on, each level levels up one party member, and every %dth levels up two. "
+        .. "Use the Level Up button. At level %d, a party of four is BG3 level %d.",
         M.CURVE.Every, M.WOW_MAX, M.CURVE.Cap),
-    cap = "A party member reached level 12, BG3's own limit, with level-ups waiting. For more, add a level mod: "
+    cap = "A party member reached level 12, BG3's limit, and has level-ups waiting. To go higher, add a level mod: "
         .. "UnlockLevelCurve or Expansion, with 5e Spells and Advanced Tabletop Spells.",
 }
 M.POPUPS = POPUPS

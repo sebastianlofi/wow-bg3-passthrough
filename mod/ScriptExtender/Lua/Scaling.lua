@@ -4,10 +4,10 @@
 -- the launcher's wow-bg3/scaling.json {On, Difficulty}; off, Mirrors.lua keeps HP = WoW ^ 0.65.
 --
 -- Fights last what BG3's own do (about 3.5 rounds on average, all four members played), and the usual fight
--- is a pack: every hostile mob chained within 40 yd of a mob in the fight joins it (Mirrors.lua), up to a cap,
--- so it settles instead of snowballing while the party stands still in turn-based mode and others walk by. A
--- mob's stats know its camp, the mobs so chained, capped alike: a pack's mobs are each weaker, in HP, damage and
--- effective level. A lone mob is one strong mob, about 3 rounds.
+-- is a pack: every hostile stand-in chained within 40 yd of a mob in the fight joins it (Mirrors.lua; BG3's own
+-- ally join does the same, a Defias pull at Moonbrook grew from 2 to 14). Nothing limits a pull but the stand-ins
+-- there are. A mob's stats know its camp, the mobs so chained: a camp's mobs are each weaker, in HP, damage and
+-- effective level, so a camp of 14 or 30 is one fight. A lone mob is one strong mob, about 3 rounds.
 --
 -- The level table is Progression.lua's curve (M.CURVE, 4x18 at WoW 60): effective level of a WoW level W
 -- = 1 + (W - 4) x (Cap - 1) / 56. A party below that for its own WoW level (no level mod, level-ups not
@@ -17,7 +17,7 @@
 -- normal mob of its level (a rare is a normal; vmangos' rank is not in the mirror plan).
 --
 -- HP = party damage a member-turn at E x member-turns of the rank x (mob's WoW HP / its rank's usual) ^ 0.5
--- x the camp's and the party size's share.
+-- x the camp's and the party size's share. A smaller party's camp counts for more (CrowdOf).
 -- AC, to-hit, DC and saves: BG3's Combatant curve at E, plus the rank's. Damage: a share of a member's HP
 -- at E. One attack a turn: the boss's extra attacks and area ability of the research are in that one hit.
 -- All BG3 boosts, all applied by Mirrors.lua.
@@ -51,16 +51,25 @@ M.TURNS_CAP = 48
 -- By party members present, 1 to 4.
 M.SIZE_HP = {0.33, 0.58, 0.8, 1}
 M.SIZE_DAMAGE = {0.4, 0.65, 0.85, 1}
--- By the mob's camp, 1 to 8; past that the camp as a whole stops growing much. Levels: effective levels off AC,
--- to-hit, DC and saves per mob over one, at most CAMP_LEVELS.
+-- By the mob's camp, 1 to 8. Past 8 the mobs weaken fast enough that the whole camp stays one fight: a member kills
+-- at most about one a turn, and every mob left alive attacks. HP stops at about a hit's worth. Levels: effective
+-- levels off AC, to-hit, DC and saves per mob over one, at most CAMP_LEVELS.
 M.CAMP_HP = {1, 0.75, 0.62, 0.55, 0.5, 0.46, 0.43, 0.4}
 M.CAMP_DAMAGE = {1, 0.85, 0.72, 0.65, 0.6, 0.55, 0.5, 0.46}
 M.CAMP_LEVEL, M.CAMP_LEVELS = 0.6, 3
-function M.CampHp(k) return k <= 8 and M.CAMP_HP[math.max(1, k)] or (3.2 + 0.15 * (k - 8)) / k end
-function M.CampDamage(k) return k <= 8 and M.CAMP_DAMAGE[math.max(1, k)] or 3.7 / k end
--- The mod's reach: 40 yd chained, and the most mobs it brings. A smaller party brings fewer.
+local function between(t, k)
+    k = math.max(1, k)
+    local a = math.floor(k)
+    return a >= #t and t[#t] or t[a] + (t[a + 1] - t[a]) * (k - a)
+end
+function M.CampHp(k) return k <= 8 and between(M.CAMP_HP, k) or math.max(0.1, 0.4 * (8 / k) ^ 1.2) end
+function M.CampDamage(k) return k <= 8 and between(M.CAMP_DAMAGE, k) or 0.46 * (8 / k) ^ 1.1 end
+-- A smaller party meets the same camp with fewer to kill and to spread the attacks.
+function M.CrowdOf(camp, members) return camp * (4 / members) ^ 0.5 end
+-- BG3's AI needs an average hit of 1 (Boosts). Below that the shortfall comes off to-hit, about 9 points for all of it.
+M.MISS = 9
+-- The reach: 40 yd chained.
 M.REACH_M = 36.6
-function M.PullCap(members) return members < 4 and members + 1 or 6 end
 M.DIFFICULTY = {
     explorer = {HP = 0.7, Hit = -1, DC = -1, Damage = 0.8},
     balanced = {HP = 1, Hit = 0, DC = 0, Damage = 1},
@@ -115,9 +124,10 @@ function M.Compute(c)
     local rank = M.RankOf(rel, c.Map)
     local r = M.RANKS[rank]
     local turns = math.min(M.TURNS_CAP, r.Turns * (rel / r.Rel) ^ 0.5)
-    local hp = lerp(M.DPR, E) * turns * M.SIZE_HP[members] * M.CampHp(camp) * d.HP
+    local crowd = M.CrowdOf(camp, members)
+    local hp = lerp(M.DPR, E) * turns * M.SIZE_HP[members] * M.CampHp(crowd) * d.HP
     local share = math.max(r.Low, math.min(r.High, 0.30 * (1 - 0.035 * math.max(0, E - 8)) * math.max(reld, 0.01) ^ 0.35))
-    local damage = share * lerp(M.MEMBER_HP, E) * M.SIZE_DAMAGE[members] * M.CampDamage(camp) * d.Damage
+    local damage = share * lerp(M.MEMBER_HP, E) * M.SIZE_DAMAGE[members] * M.CampDamage(crowd) * d.Damage
     -- Level against the player: WoW's own gap, softened.
     local under = c.WowLevel - c.Level
     if under > 0 then
@@ -133,7 +143,7 @@ function M.Compute(c)
     local Es = math.max(1, E - math.min(M.CAMP_LEVELS, M.CAMP_LEVEL * (math.max(1, camp) - 1)))
     return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(1, round(hp)), Damage = damage,
         AC = math.max(12, round(10.7 + 0.5 * Es)) + r.AC + steps,
-        ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit + steps,
+        ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit + steps - round(M.MISS * math.max(0, 1 - damage)),
         DC = round(8.4 + 0.63 * Es) + r.DC + d.DC,
         Save = 1 + math.floor(Es * 0.4) + r.AC // 2}
 end

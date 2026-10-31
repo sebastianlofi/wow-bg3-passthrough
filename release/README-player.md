@@ -9,6 +9,11 @@ BG3 saves keep the WoW side too.
 Linux only, native BG3 from Steam (not the Windows version under Proton).
 Tested on AMD graphics (RADV) only so far.
 
+**Photosensitivity and epilepsy warning.** This is a work-in-progress mod. When the passthrough
+between WoW and BG3 glitches, the screen can flash suddenly, including bright white flashes. If
+you or anyone watching has photosensitive epilepsy or is sensitive to flashing lights, be careful
+playing it. Stop right away if you feel unwell.
+
 ## What you need
 
 - Baldur's Gate 3, native Linux build, from Steam.

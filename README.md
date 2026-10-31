@@ -16,6 +16,11 @@ The mod itself is called WOW-BG3: that is the name in BG3's mod manager, and in 
 > is untested, unbalanced or not built yet. [What is work in progress](#work-in-progress) lists it
 > honestly; read it before you start a long game.
 
+> **Photosensitivity and epilepsy warning.** This is a work-in-progress mod. When the passthrough
+> between WoW and BG3 glitches, the screen can flash suddenly, including bright white flashes. If
+> you or anyone watching has photosensitive epilepsy or is sensitive to flashing lights, be careful
+> playing it. Stop right away if you feel unwell.
+
 ![Gale exploring Elwynn Forest: BG3's character and interface on WoW's world](docs/screenshots/elwynn-forest.jpg)
 
 ![Gale and Shadowheart sneaking up on a Harvest Watcher in Westfall](docs/screenshots/westfall-sneaking.jpg)

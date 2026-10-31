@@ -713,6 +713,18 @@ function M.Start(runId)
     -- under MIN_AVG_HIT: BG3's AI does not attack with an expected damage of about 0. Health: max HP
     -- standInMaxHp(WoW max HP) (IncreaseMaxHP; the "scaled" stage sets the WoW fraction after).
     local MIN_AVG_HIT = 1
+    local function campOf(sp)
+        if not sp.Hostile then return 1 end
+        local list = {}
+        for _, v in pairs(M.WantNow or {}) do list[#list + 1] = v end
+        return Scaling.CampOf(sp, list)
+    end
+    -- More of its camp came into view: looked at once a second.
+    local function campGrew(m, sp, ticks)
+        if not (m.ScaleCamp and sp.Hostile) or ticks - (m.ScaleCampAt or 0) < 30 then return false end
+        m.ScaleCampAt = ticks
+        return campOf(sp) > m.ScaleCamp
+    end
     -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves and the party. Boosts
     -- under one cause, so a change of party or level can take them off and set new ones.
     local function scaleByRules(m, info)
@@ -722,12 +734,8 @@ function M.Start(runId)
         if not base or base[2] <= 0 or wowMax <= 0 or level <= 0 then info.Skipped = "no numbers"; return end
         m.ScaleBase = base
         local party = Scaling.Party(ticks)
-        -- A hostile mob's camp, once: only the mobs near enough to be listed count, and they are, this close.
-        if not m.ScaleCamp then
-            local list = {}
-            if sp.Hostile then for _, v in pairs(M.WantNow or {}) do list[#list + 1] = v end end
-            m.ScaleCamp = sp.Hostile and math.min(Scaling.CampOf(sp, list), Scaling.PullCap(party.Members)) or 1
-        end
+        -- A hostile mob's camp: only the mobs near enough to be listed count, so it can grow as the party comes closer.
+        m.ScaleCamp, m.ScaleCampAt = campOf(sp), ticks
         local n = Scaling.Compute({Level = level, WowMaxHp = wowMax, WowDamage = tonumber(sp.WowDamage), Map = world and world.Map,
             Camp = m.ScaleCamp, Members = party.Members, WowLevel = party.WowLevel, PartyLevel = party.PartyLevel, Cap = party.Cap, Difficulty = party.Difficulty})
         local okAc, ac = pcall(function() return Ext.Entity.Get(m.Uuid).Stats.ArmorClass end)
@@ -1087,53 +1095,34 @@ function M.Start(runId)
             end
         end
         M.WantNow = want
-        -- The switch `scaling`: the usual fight is a pack. Hostile mobs chained within reach of a mob in the fight
-        -- join it (BG3's combat, so the bridge pulls them), up to the cap. At the cap the others can't join by
-        -- BG3's rules either: they walk on during a fight (TurnHold holds nothing in combat), and a fight that
-        -- grew would last longer and draw more. Patch 0015's pack mates within 15 yd still come.
-        -- Not a hard cap: BG3's ally join can bring a whole camp at the first turn, before this block (harness: 14).
+        -- The switch `scaling`: the usual fight is a pack. Hostile stand-ins chained within reach of a mob in the
+        -- fight join it (BG3's combat, so the bridge pulls them), which BG3's ally join mostly does by itself. No limit
+        -- but the stand-ins there are: Scaling.lua's numbers carry a camp of any size.
         if Scaling.On() and plan and plan.Active == true then
-            local inFight, chain = 0, {}
+            local chain = {}
             for g in pairs(fight) do
-                inFight = inFight + 1
                 if want[g] then chain[#chain + 1] = want[g] end
             end
-            if inFight > 0 then
-                local cap = Scaling.PullCap(Scaling.Party(ticks).Members)
+            if next(fight) then
                 local r2, hero = Scaling.REACH_M ^ 2, Hero.Uuid()
                 local i = 1
                 while i <= #chain do
                     local a = chain[i]
                     for guid, mob in pairs(want) do
                         local m = mirrors[guid]
-                        if m and mob.Hostile and not fight[guid] and not m.PackJoin and not m.PackBlocked and m.Stage ~= "spawned" and inFight < cap then
+                        if m and mob.Hostile and not fight[guid] and not m.PackJoin and m.Stage ~= "spawned" then
                             local dx, dz = a.Pos[1] - mob.Pos[1], a.Pos[3] - mob.Pos[3]
                             if dx * dx + dz * dz <= r2 and q(Osi.IsDead, m.Uuid) ~= 1 then
                                 m.PackJoin = ticks
                                 pcall(Osi.EnterCombat, m.Uuid, hero)
-                                inFight = inFight + 1
                                 chain[#chain + 1] = mob
                             end
                         end
                     end
                     i = i + 1
                 end
-                if inFight >= cap then
-                    for guid, m in pairs(mirrors) do
-                        if m.Hostile and not fight[guid] and not m.PackJoin and not m.PackBlocked then
-                            m.PackBlocked = true
-                            pcall(Osi.SetCanJoinCombat, m.Uuid, 0)
-                        end
-                    end
-                end
             else
-                for _, m in pairs(mirrors) do
-                    m.PackJoin = nil
-                    if m.PackBlocked then
-                        m.PackBlocked = nil
-                        pcall(Osi.SetCanJoinCombat, m.Uuid, 1)
-                    end
-                end
+                for _, m in pairs(mirrors) do m.PackJoin = nil end
             end
         end
         -- The party's BG3 combat: the hero's, else a companion's (a stand-in spotted a companion).
@@ -1204,9 +1193,9 @@ function M.Start(runId)
                     m.FriendlyReset = (m.FriendlyReset or 0) + 1
                 end
                 nameOf(m, mob)
-                -- The party or the WoW level changed: new numbers, on a stand-in out of every fight.
+                -- The party, the WoW level or the camp changed: new numbers, on a stand-in out of every fight.
                 if m.ScaleKey and m.Stage ~= "spawned" and not inFight and not combat and not dead
-                    and Scaling.Party(ticks).Key ~= m.ScaleKey then
+                    and (Scaling.Party(ticks).Key ~= m.ScaleKey or campGrew(m, mob, ticks)) then
                     m.Stage = "spawned"
                 end
                 if m.Stage == "spawned" and ticks - m.Born >= SCALE_AFTER then

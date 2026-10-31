@@ -78,6 +78,31 @@ class Scaling(unittest.TestCase):
         neutral = lua.table_from({'Hostile': False, 'Pos': lua.table_from([1, 0, 0])})
         self.assertEqual(self.M.CampOf(me, lua.table_from([me, near, chained, far, neutral])), 3)
 
+    def test_camps_of_any_size(self):
+        self.assertIsNone(self.M.PullCap)
+        hp = [self.mob(40, 1865, 66.7, camp=k)['MaxHp'] for k in (1, 2, 3, 4, 6, 8, 10, 14, 18, 24, 30, 45)]
+        dmg = [self.mob(40, 1865, 66.7, camp=k)['Damage'] for k in (1, 2, 3, 4, 6, 8, 10, 14, 18, 24, 30, 45)]
+        self.assertEqual(hp, sorted(hp, reverse=True))
+        self.assertEqual(dmg, sorted(dmg, reverse=True))
+        self.assertAlmostEqual(self.M.CampHp(8), 0.4)
+        self.assertAlmostEqual(self.M.CampHp(8.001), 0.4, places=2)     # no step where the curves meet
+        self.assertAlmostEqual(self.M.CampDamage(8.001), 0.46, places=2)
+        self.assertAlmostEqual(self.M.CampHp(60), 0.1)
+        s, _ = self.M.Boosts(self.mob(40, 1865, 66.7, camp=45), 'human', 40, 8, None)
+        self.assertGreater(len(s), 0)
+
+    def test_smaller_party_counts_the_camp_for_more(self):
+        self.assertAlmostEqual(self.M.CrowdOf(6, 4), 6)
+        self.assertAlmostEqual(self.M.CrowdOf(6, 1), 12)
+        self.assertLess(self.mob(40, 1865, 66.7, n=2, camp=3)['Damage'] / 0.65, self.mob(40, 1865, 66.7, camp=3)['Damage'])
+
+    def test_a_hit_under_one_comes_off_to_hit(self):
+        lone, big = self.mob(1, 42, 2.1, n=1), self.mob(1, 42, 2.1, n=1, camp=14)
+        self.assertEqual(lone['ToHit'], 3)
+        self.assertLess(big['Damage'], 1)
+        self.assertEqual(big['ToHit'], 3 - round(9 * (1 - big['Damage'])))
+        self.assertEqual(self.mob(60, 4059, 120.9, camp=14)['ToHit'], 11)   # a real hit: nothing comes off
+
     def test_gray_mob_dies_to_a_hit(self):
         n = self.mob(25, 713, 37.5, w=40)
         self.assertLessEqual(n['MaxHp'], 0.6 * 24.5)

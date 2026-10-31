@@ -1,0 +1,29 @@
+WOW-BG3 vmangos patch 0020: a forced reaction opens a side's merchants.
+
+`.wowbg3 faction SIDE` forces the player's reactions, which already settles hostility, but
+CanInteractWithNPC also reads the saved reputation rank, so a Horde character counting as Alliance
+was still Hated in Stormwind and every human merchant refused it. A forced rank now wins there too.
+Saved reputation is unchanged.
+
+diff --git a/src/game/Objects/Player.cpp b/src/game/Objects/Player.cpp
+--- a/src/game/Objects/Player.cpp
++++ b/src/game/Objects/Player.cpp
+@@ -2520,12 +2520,16 @@
+     if (pCreature->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE))
+         return false;
+ 
+-    // not unfriendly
++    // not unfriendly (0020: a forced reaction counts, as it does for hostility, so `.wowbg3 faction`
++    // opens the side's merchants, trainers and quest givers while saved reputation stays as it is)
+     if (FactionTemplateEntry const* factionTemplate = sObjectMgr.GetFactionTemplateEntry(pCreature->GetFactionTemplateId()))
+         if (factionTemplate->faction)
+             if (FactionEntry const* faction = sObjectMgr.GetFactionEntry(factionTemplate->faction))
+-                if (faction->reputationListID >= 0 && GetReputationMgr().GetRank(faction) <= REP_UNFRIENDLY)
++            {
++                ReputationRank const* forced = GetReputationMgr().GetForcedRankIfAny(factionTemplate);
++                if (faction->reputationListID >= 0 && (forced ? *forced : GetReputationMgr().GetRank(faction)) <= REP_UNFRIENDLY)
+                     return false;
++            }
+ 
+     // not too far
+     if (!pCreature->IsWithinDistInMap(this, INTERACTION_DISTANCE))
