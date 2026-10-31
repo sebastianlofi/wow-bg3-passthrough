@@ -230,7 +230,8 @@ function M.Start(runId)
         elseif s.InCamp ~= true and camp.In then
             camp.In, camp.Hold = false, nil
             local okp, p = pcall(Probe.HostPosition)
-            camp.Last = okp and p or camp.Last
+            -- The spot left, not the hero now: after a walk off camp the put-back has not landed yet.
+            camp.Last = s.Back or (okp and p) or camp.Last
             jobs[#jobs + 1] = {name = "camp back", co = coroutine.create(function()
                 arena({Action = "PickRegion", Seconds = MAX_SECONDS})
                 arena({Action = "Lead", Wow = state.WowOrigin, Bg3 = state.Centre, Seconds = MAX_SECONDS}) end)}

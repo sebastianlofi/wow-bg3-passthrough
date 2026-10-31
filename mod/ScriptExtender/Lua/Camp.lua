@@ -84,6 +84,7 @@ function M.Start(runId)
     if not M.On() then return end
     local ticks, seq, pending, outFor = 0, 0, nil, 0
     local own = nil -- where this module just sent the hero: its Teleported arrives ticks later, no one's travel
+    local regroup = nil -- after a walk off camp: the hero's walking away undid the party's following
     M.State = {Trips = 0, Corrected = 0}
     local function publish(inCamp, extra)
         seq = seq + 1
@@ -114,6 +115,12 @@ function M.Start(runId)
         if ticks % 5 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
             if ticks % 30 == 0 then noNights() end
+            if regroup and ticks >= regroup.At then
+                for _, r in ipairs(q(function() return Osi.DB_Players:Get(nil) end) or {}) do
+                    if uuidOf(r[1]) ~= regroup.Hero then pcall(Osi.AttachToPartyGroup, r[1], regroup.Hero) end
+                end
+                regroup = nil
+            end
             if pending then
                 if inCampDb(pending.Hero) then
                     trip, pending = {Hero = pending.Hero, From = pending.From}, nil
@@ -145,6 +152,8 @@ function M.Start(runId)
                     if d > M.BACK_NEAR then
                         own = {X = f[1], Z = f[3], Until = ticks + M.PENDING}
                         Osi.TeleportToPosition(trip.Hero, f[1], f[2], f[3], "", 0, 0, 0, 0, 1)
+                        Osi.PROC_Camp_AllPlayersLeave() -- a walk off camp: the party still there comes along
+                        regroup = {Hero = trip.Hero, At = ticks + 60}
                         M.State.Corrected = M.State.Corrected + 1
                         Ext.Utils.Print(string.format("WOW-BG3 camp: the story left the hero %.1f m from the spot; put back", d))
                     end

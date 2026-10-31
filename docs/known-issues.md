@@ -52,8 +52,8 @@ This is the first public version. What we know is missing or rough:
   have been walked in only a few towns.
 - Fading: ribbons and point lights of a faded prop stay visible.
 
-- Camp: use Leave Camp to go back. Walking far off the camp area counts as leaving and can put your WoW
-  character in the wrong zone (`/wowbg3 tp` gets it back).
+- Camp: walking far off the camp area counts as leaving: the party goes back to where it left. Tested with
+  two party members.
 - Camp food: a save from before camp can hold stray single copies of food, and a rest can then take the whole
   stack.
 
