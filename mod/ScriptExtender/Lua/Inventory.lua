@@ -458,6 +458,8 @@ local function ours()
 end
 
 local function holderOf(u) return uuidOf(q(Osi.GetInventoryOwner, u)) end
+-- A plain WoW item's tag: its guid in hex as the bridge lists it ("6F"). Stacks, wares and loot start S, V, L.
+local function isWowGuid(tag) return tag:match("^%x+$") ~= nil end
 local function equipped(u) return q(Osi.IsEquipped, u) == 1 end
 
 -- ---- reconcile BG3 with inventory.json ----
@@ -786,7 +788,7 @@ function M.Reconcile(inv)
     -- Not while a member's list is missing (WoW offline, a far move): that says nothing about what it holds,
     -- and a stack deleted here would next read as food spent.
     for tag, u in pairs(blind and {} or have) do
-        if ((tag:match("^%d+$") and not wowOwner[tag]) or (tag:match("^S") and not stackWant[tag])) and not pendingItem[u] then
+        if ((isWowGuid(tag) and not wowOwner[tag]) or (tag:match("^S") and not stackWant[tag])) and not pendingItem[u] then
             M.Suppress(u)
             pcall(Osi.RequestDelete, u)
         end
@@ -1047,7 +1049,7 @@ local function onEquipped(item, char, on)
     local u, c = uuidOf(item), uuidOf(char)
     if not u or suppressed(u) then return end
     local tag = tagOf(u)
-    if not tag or not tag:match("^%d+$") then return end
+    if not tag or not isWowGuid(tag) then return end
     M.Request({Op = on and "equip" or "unequip", Member = c, Guid = tag, Item = u})
 end
 
@@ -1143,7 +1145,7 @@ local function onAddedTo(item, holder)
         return
     end
     if not tag then return end
-    if tag:match("^%d+$") then
+    if isWowGuid(tag) then
         local owner = wowOwner[tag]
         if members[h] and owner and owner ~= h then
             M.Request({Op = "give", Member = owner, To = h, Guid = tag, Item = u})
