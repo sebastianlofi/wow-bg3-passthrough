@@ -1,0 +1,34 @@
+WOW-BG3 benilla patch 0100: no BG3 effects are replayed at camp.
+
+Going to camp crashed benilla: a GPU page fault on a shader's data read, about the moment three new effect
+pipelines were built for BG3's frames there (log: "at camp: the interface alone", then the device lost). The fault
+is not traced to one draw, this takes the whole replay away while only the interface is drawn.
+
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -2073,7 +2073,8 @@
+     recv: Option<Res<FxReceivers>>,
+ ) {
+     let gpu = &mut *gpu;
+-    let set = ext.and_then(|e| e.set.clone());
++    // Patch 0100: at camp only the interface is wanted, and BG3's camp arrival replayed here took the GPU down.
++    let set = ext.and_then(|e| e.set.clone()).filter(|_| !crate::wowbg3_frames::at_camp());
+     let (Some(set), Ok((view, target))) = (set, views.single()) else {
+         gpu.ready = None;
+         gpu.last = None;
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -69,6 +69,11 @@
+     INTERFACE_ONLY.load(Ordering::Relaxed)
+ }
+ 
++/// Patch 0100: the party is at camp (`wowcamp.flag`).
++pub(crate) fn at_camp() -> bool {
++    INTERFACE_ONLY.load(Ordering::Relaxed)
++}
++
+ /// First in a frame, so the backdrop and the frame's tag agree. Every 6 frames: one `stat`.
+ fn watch_camp(mut frame: Local<u32>, mut flag: Local<Option<std::path::PathBuf>>) {
+     *frame = frame.wrapping_add(1);

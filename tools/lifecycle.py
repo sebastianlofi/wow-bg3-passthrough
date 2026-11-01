@@ -114,6 +114,17 @@ def set_side(side):
     log('side: %s' % side)
 
 
+def benilla_runs():
+    """A process named benilla, on this machine (or in this runtime's view of it)."""
+    for c in glob.glob('/proc/[0-9]*/comm'):
+        try:
+            if Path(c).read_text().strip() == 'benilla':
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def bg3_run():
     """The running BG3's run id (WOW_BG3_RUN_ID in its environment, as the mod's files carry it), or None.
     Files from an earlier BG3 (lifecycle.json, hero.json) carry another id and are ignored (harness
@@ -186,6 +197,9 @@ class Life:
     def __init__(self, a):
         self.a = a
         self.started = time.time()
+        self.benilla_seen = 0.0    # when benilla was last looked for
+        self.benilla_back = 0      # times it was started again this session
+        self.keep_chars = False    # the next bring_up is such a start: no restore, the WoW characters are current
         # `/wowbg3 time` is for one sitting: a new start of the game shows the time of this device.
         try:
             (IO / 'link').mkdir(parents=True, exist_ok=True)
@@ -387,6 +401,7 @@ class Life:
         log('session %s: %s in %s, save %s%s, party %s' % (session, hero.get('Name'), hero.get('Region'),
             lc_.get('SaveId') or '-', ' (new game)' if new_game else '',
             ', '.join('%s=%s' % (m.get('Name'), m.get('Char') or '?') for m in members)))
+        again_now = self.keep_chars
         self.down('a new session')
         self.why = None
         self.cur_session = session
@@ -395,7 +410,10 @@ class Life:
         known = [m['Char'] for m in members if m.get('Char')] + ([self.a.char] if self.a.char else [])
         self.wait_offline(known)
         sid = lc_.get('SaveId')
-        if sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
+        if self.keep_chars:
+            self.keep_chars = False
+            log('benilla again: WoW characters as they are')
+        elif sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
             secs = wowsave.sections(sid)
             if self.wait_offline(list(secs), 60):
                 try:
@@ -414,7 +432,8 @@ class Life:
             log('no snapshot %s (made before save sync, or pruned): WoW characters as they are' % sid)
         # `/wowbg3 faction` is the save's too: link/faction.txt outlives a load, and the bridge would send the
         # last session's side to this one. Done before benilla and the bridge start.
-        set_side(side_of_save(sid))
+        if not again_now:
+            set_side(side_of_save(sid))
         self.phase(session, 'characters')
         snap = wowsave.read_meta(sid).get('Members') if sid and wowsave.SID.fullmatch(sid) else None
         if not isinstance(snap, dict) and members and sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
@@ -669,6 +688,18 @@ class Life:
             self.snapshot(req)
         self.index_save()
         if self.session == session:
+            # benilla gone (a crash, 2026-11-01: the GPU lost at camp's door) and nothing brought it back: the
+            # world stayed gone until a reload. Back here, at the WoW side's state as it is; never at camp,
+            # where the world mode cannot start. Three times a session, then it stays down.
+            if self.up['benilla'] and time.time() - self.benilla_seen > 5.0:
+                self.benilla_seen = time.time()
+                at_camp = (read('camp-state.json') or {}).get('InCamp')
+                if not at_camp and self.benilla_back < 3 and not benilla_runs():
+                    self.benilla_back += 1
+                    log('benilla is gone: starting it again (%d of 3)' % self.benilla_back)
+                    self.keep_chars = True
+                    self.session = None
+                    return None
             self.death(session)
             self.joined(lc_)
             return None
