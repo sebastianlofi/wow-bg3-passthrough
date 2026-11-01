@@ -530,6 +530,7 @@ class ListGaps(unittest.TestCase):
           swept = {}
           function sweepStrays() end
           listedAt, LISTED_WAIT, tick = {}, 900, 0
+          stackLast, stackSpent, dropSeen = {}, {}, {}
           function goldOf() return 0 end
           function reconcileMember(uuid, m) if m.Items then wowOwner["123"] = uuid; wowOwner["6F"] = uuid; stackWant["S117@hero"] = true end end
           M.Suppress = function() end
