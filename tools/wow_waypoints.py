@@ -5,8 +5,7 @@ The rules, one place:
   Which points  TaxiNodes.dbc on the two continents world mode has ground for (0 and 1), less what no
                 flight master stands at: nodes no TaxiPath.dbc path uses, the "Generic" flight target, the
                 capture towers (NO_MASTER). A node with no mount for either side (ferries, ships) is never one.
-                Nor are Ironforge and Undercity (NO_GROUND): they lie under their terrain, and world mode's
-                ground holds only floors on or above it, so the party would land on the mountain or the ruins.
+                Ironforge and Undercity lie under their terrain: world_bridge.py cuts those sessions with --under.
   Discovered    WoW's own: the character's known-taxi mask in the characters table, bit (node - 1). WoW sets
                 it when the character opens a flight master's window, and a new character starts with its
                 race's capital. Nothing here writes it, so WoW's window and these waypoints always agree.
@@ -18,6 +17,7 @@ The rules, one place:
                 continent (a far one by the same server teleport as `tp`). Never in a BG3 fight, on a WoW
                 flight, or dead in WoW.
   Cost          Free, as BG3's waypoints; WoW's flight prices are not charged.
+  BG3's panel   The discovered points in BG3's own waypoint panel (panel(), Waypoints.lua); a click is `waypoint go`.
   The move      The party goes as for `tp`: wow-bg3/world-move.json (wowbg3cmd.py tele, World.move in
                 world_bridge.py). A flight point's height is a little off the ground, and the terrain is
                 wrong under a city, so Snap asks the bridge for the walkable floor nearest it (stand_z).
@@ -38,7 +38,6 @@ RACE_TEAM = {1: ALLIANCE, 3: ALLIANCE, 4: ALLIANCE, 7: ALLIANCE, 2: HORDE, 5: HO
 # Nodes with a mount and no flight master (checked against TaxiNodes.dbc and TaxiPath.dbc of 5875): no path
 # uses 1, 3, 9, 15 and 57; 36 is a "Generic" flight target; 84 to 87 are the capture towers' own flights.
 NO_MASTER = frozenset((1, 3, 9, 15, 36, 57, 84, 85, 86, 87))
-NO_GROUND = frozenset((6, 11))  # Ironforge 267 yd, Undercity 105 yd under their terrain (tried: on top of it)
 FLOOR_REACH = 15.0  # yards: a floor farther than this from a flight point's height is another storey
 
 
@@ -101,7 +100,7 @@ def known_ids(mask_text):
 
 
 def can_be_waypoint(node, team):
-    return node['map'] in CONTINENTS and node['id'] not in NO_MASTER | NO_GROUND and node[team] != 0
+    return node['map'] in CONTINENTS and node['id'] not in NO_MASTER and node[team] != 0
 
 
 def waypoints(all_nodes, mask_text, team):
@@ -134,6 +133,15 @@ def pins(points, rects):
                 out.append((r['file'], p['id'], (p['y'] - r['left']) * 100.0 / (r['right'] - r['left']),
                             (p['x'] - r['top']) * 100.0 / (r['bottom'] - r['top']), p['name']))
     return out
+
+
+def panel(all_nodes, mask_text, team):
+    """BG3's own waypoint panel: every point of the team with its slot by node id, so a point keeps its slot as more
+    are discovered (Waypoints.lua gives each slot a trigger of the host level), and whether it is discovered: a save
+    keeps the panel's entries, also those of a character that does not know them."""
+    known = known_ids(mask_text)
+    every = sorted((n for n in all_nodes if can_be_waypoint(n, team)), key=lambda n: n['id'])
+    return [{'Slot': i, 'Id': n['id'], 'Name': n['name'], 'Known': n['id'] in known} for i, n in enumerate(every)]
 
 
 def nearest_floor(z, floors, reach=FLOOR_REACH):

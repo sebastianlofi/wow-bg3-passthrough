@@ -667,8 +667,6 @@ def waypoint(ctx, args):
     else:
         text = ' '.join(args[1:])
         hits = wow_waypoints.choose(points, text)
-        if not hits and wow_waypoints.choose([n for n in every if n['id'] in wow_waypoints.NO_GROUND], text):
-            raise CmdError('waypoint: world mode has no ground inside Ironforge and Undercity yet')
         if not hits:
             raise CmdError('waypoint: you have discovered no flight point like %r ("waypoint" lists them)' % text)
         if len(hits) > 1:
@@ -682,6 +680,18 @@ def waypoint(ctx, args):
             tele(ctx, ['waypoint'], at=(p['x'], p['y'], p['z'], p['map'], p['name']))
         except CmdError as e:
             raise CmdError(re.sub(r'^tp: ', 'waypoint: ', str(e)))
+
+
+def waypoint_panel(ctx):
+    """waypoint-panel.json for BG3's own panel (Waypoints.lua). Nothing written when waypoints are off."""
+    if not waypoints_on():
+        return
+    import wow_waypoints
+    mask, race, _, _ = taxi_state(hero(ctx))
+    team = wow_waypoints.team_of(race)
+    if team:
+        rows = wow_waypoints.panel(wow_waypoints.nodes(dbc_dir()), mask, team)
+        atomic_write(ctx.link / 'waypoint-panel.json', json.dumps({'Points': rows}))
 
 
 # ---------------------------------------------------------------- faction (the fight bridge's faction.txt)

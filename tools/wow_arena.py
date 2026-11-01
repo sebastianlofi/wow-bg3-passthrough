@@ -4,7 +4,7 @@
 wow_arena.py OUT_DIR --wow X Y [--size 40] --bg3 X Y Z [--mirror 1|0] [--islands largest|border]
              [--maps DIR] [--mmaps DIR] [--models [all|wmo]] [--walls auto|all|none] [--vmaps DIR]
              [--margin 0.5] [--max-triangles 60000] [--map 0|1]
-             [--slope-limit 50] [--steep-polys keep|drop] [--storeys 1|0]
+             [--slope-limit 50] [--steep-polys keep|drop] [--storeys 1|0] [--under X Y Z]
 
 Reads the test server's published movement maps (Detour tiles) and terrain heights for map MAP
 (0 Eastern Kingdoms, the default; 1 Kalimdor)
@@ -111,6 +111,10 @@ STOREY_JOIN_M = 0.5
 STOREY_OFFSETS = ((1, 0), (1, 1), (0, 1), (-1, 0), (0, -1), (-1, -1), (1, -1), (-1, 1))
 # An upper level over the first with fewer tiles is left out.
 STOREY_MIN_LEVEL = 8
+# A session whose origin lies this far (yd) under the terrain runs its cuts with --under: the models go down to
+# its floors (normally 30 yd under the terrain, and every square would carry them) and its storeys start from the
+# origin's own polygons, since Undercity's reach the rest of the world by lift, which the movement map has not.
+UNDER_CLEAR = 30.0
 
 # An M2 at least this thick (yards, the smallest side of its collision model in its own axes, times its
 # scale, so how it is turned does not matter) is big: the camera
@@ -140,8 +144,9 @@ def detour_polys(path):
         polys.append(Poly(pts, flags))
     return polys
 
-def main_polys(polys):
-    """The polygons (their id()) in the largest set the movement map joins by shared edges."""
+def main_polys(polys, at=None):
+    """The polygons (their id()) in the largest set the movement map joins by shared edges; with `at`
+    (x, y, z), in the set of the polygon nearest that point instead (empty if none lies over it)."""
     par = list(range(len(polys)))
     def find(a):
         while par[a] != a:
@@ -160,6 +165,9 @@ def main_polys(polys):
     for i in range(len(polys)):
         size[find(i)] = size.get(find(i), 0) + 1
     big = max(size, key=size.get) if size else None
+    if at:
+        over = [(abs(poly_height(at[0], at[1], p) - at[2]), i) for i, p in enumerate(polys) if inside(at[0], at[1], p)]
+        big = find(min(over)[1]) if over else None
     return {id(p) for i, p in enumerate(polys) if find(i) == big}
 
 class Poly(list):
@@ -431,6 +439,8 @@ def main():
     # Upper storeys (storey.bin, see STOREY_CLEAR). 0 writes exactly what was written before them.
     p.add_argument('--storeys', type=int, choices=[0, 1], default=int(os.environ.get('WOW_BG3_STOREYS') or 1))
     p.add_argument('--storey-levels', type=int, default=int(os.environ.get('WOW_BG3_STOREY_LEVELS') or 4))
+    # A session under the terrain (Undercity, Ironforge): WoW point X Y Z of its origin. See UNDER_CLEAR.
+    p.add_argument('--under', type=float, nargs=3, metavar=('X', 'Y', 'Z'))
     a = p.parse_args()
     assert 2 <= a.size <= 120
     sx = 1.0 if a.mirror else -1.0  # BG3 x = sx * WoW y
@@ -477,6 +487,8 @@ def main():
     ring = [(r, c) for r in range(-1, n + 1) for c in range(-1, n + 1)]   # rows BG3 +Z, columns +X
     col, terr, mesh, water, steep_poly = {}, {}, {}, {}, {}
     poly_hs = {}    # every polygon height in the tile's middle column but deep water's (storeys)
+    # Under the terrain the storeys are the origin's own set of polygons: the ruins or the mountain over it are not.
+    under_set = main_polys(polys, a.under) if a.under else None
     for r, c in ring:
         x, y = to_wow(-half + (c + 0.5) * TILE, -half + (r + 0.5) * TILE)
         th = terrain.height(x, y)
@@ -487,10 +499,10 @@ def main():
                 h = poly_height(x, y, pts)
                 if best is None or abs(h - th) < abs(best - th):
                     best, wet, stp = h, pts.water, pts.steep
-                if not pts.water:
+                if not pts.water and (under_set is None or id(pts) in under_set):
                     hs.append(h)
             # Around the middle too, for the storey: a narrow door's polygon can miss a tile's middle.
-            elif a.storeys and not pts.water:
+            elif a.storeys and not pts.water and (under_set is None or id(pts) in under_set):
                 for ox, oy in ((0.3, 0.0), (-0.3, 0.0), (0.0, 0.3), (0.0, -0.3)):
                     if inside(x + ox, y + oy, pts):
                         hs.append(poly_height(x + ox, y + oy, pts))
@@ -506,6 +518,9 @@ def main():
         import wow_vmap
         reach_yd = (half + a.margin) / YD
         zlo, zhi = min(terr.values()) - 30, max(terr.values()) + 100
+        if a.under:
+            zlo = min([zlo] + [h - 5.0 for hs in poly_hs.values() for h in hs])
+            zhi = min(zhi, zlo + 390.0 / YD)
         wt, sizes = wow_vmap.VMap(a.vmaps, a.map).triangles(wx - reach_yd, wx + reach_yd, wy - reach_yd, wy + reach_yd,
                                                         zlo, zhi, m2=a.models == 'all', thickness=thick)
         surfaces = Surfaces(wt)
@@ -683,7 +698,7 @@ def main():
             if not any(rc not in seen and rc in col for rc in cand):
                 return seen
             if not main:
-                main.append(main_polys(polys))
+                main.append(under_set if under_set is not None else main_polys(polys))
             start = []
             for rc in cand:
                 if rc not in seen and rc in col:

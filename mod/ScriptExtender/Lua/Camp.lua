@@ -29,6 +29,7 @@
 -- with them. Supplies are WoW food and drink (Inventory.lua, wow_items.py `sv`).
 local M = {}
 local Hero = Ext.Require("Hero.lua")
+local Waypoints = Ext.Require("Waypoints.lua")
 
 M.JUMP = 150.0        -- metres in one teleport: a trip's start, never a walk
 M.PENDING = 180       -- ticks a teleported hero may take to count as in camp
@@ -101,7 +102,7 @@ function M.Start(runId)
     -- Fires before the frame's client tick reads the state (server and client share the process, and the
     -- client holds its publish over a jump until it hears: WorldMode.lua).
     local function onTeleported(who, _, ox, oy, oz, nx, ny, nz, reason)
-        if trip or reason == "RegionSwap" then return end
+        if trip or reason == "RegionSwap" or Waypoints.Hopping() then return end
         local w = worldActive()
         if not w then return end
         local hero = Hero.Uuid()
@@ -140,10 +141,10 @@ function M.Start(runId)
                 elseif ticks > pending.Until and pending.Own then
                     pending = nil
                 elseif ticks > pending.Until then
-                    -- A long teleport that is not to camp: BG3's own waypoint panel, no longer greyed with
-                    -- CampOff's status gone. Its target is in the level, not on WoW's ground, and the next
-                    -- record would move the WoW body there, so the party goes back. Moves on the WoW map
-                    -- are never this: they run with world.json Active false.
+                    -- A long teleport that is not to camp (the panel's own clicks are Waypoints.lua's): its
+                    -- target is in the level, not on WoW's ground, and the next record would move the WoW body
+                    -- there, so the party goes back. Moves on the WoW map are never this: they run with
+                    -- world.json Active false.
                     local f, pendingHero = pending.From, pending.Hero
                     pending = nil
                     own = {X = f[1], Z = f[3], Until = ticks + M.PENDING}

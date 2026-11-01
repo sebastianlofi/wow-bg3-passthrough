@@ -319,12 +319,20 @@ class Verb(unittest.TestCase):
             self.run_cmd('waypoint go stormwind')
         self.assertFalse((self.io / 'world-move.json').exists())
 
-    def test_underground_capital_says_why(self):
+    def test_a_point_keeps_its_panel_slot_as_more_are_discovered(self):
+        every = [{'id': i, 'name': 'P%d' % i, 'map': 0, 'x': 0, 'y': 0, 'z': 0, 'horde': 1, 'alliance': 1} for i in (5, 7, 12)]
+        first = W.panel(every, str(1 << 6), 'horde')
+        later = W.panel(every, str(1 << 6 | 1 << 4), 'horde')
+        self.assertEqual([(p['Slot'], p['Id'], p['Known']) for p in first], [(0, 5, False), (1, 7, True), (2, 12, False)])
+        self.assertEqual([(p['Slot'], p['Id'], p['Known']) for p in later], [(0, 5, True), (1, 7, True), (2, 12, False)])
+
+    def test_capital_under_its_terrain_is_a_waypoint(self):
         self.mask = mask_of(2, 6)
-        with self.assertRaisesRegex(C.CmdError, 'no ground inside'):
-            self.run_cmd('waypoint go ironforge')
         self.run_cmd('waypoint')
-        self.assertNotIn('Ironforge', '\n'.join(self.lines))
+        self.assertIn('Ironforge', '\n'.join(self.lines))
+        self.bridge((-4821.0, -1155.0, 0))
+        self.run_cmd('waypoint go ironforge')
+        self.assertEqual(self.request['Wow'][2], 502)
 
     def test_null_path_is_not_a_flight(self):
         self.flight = 'NULL'
@@ -369,11 +377,11 @@ class RealData(unittest.TestCase):
             for i in ids:
                 self.assertTrue(W.can_be_waypoint(self.by_id[i], team), i)
 
-    def test_the_underground_capitals_are_not_waypoints(self):
+    def test_the_capitals_under_their_terrain_are_waypoints(self):
         self.assertEqual(self.by_id[6]['name'].split(',')[0], 'Ironforge')
         self.assertEqual(self.by_id[11]['name'].split(',')[0], 'Undercity')
-        self.assertFalse(W.can_be_waypoint(self.by_id[6], W.ALLIANCE))
-        self.assertFalse(W.can_be_waypoint(self.by_id[11], W.HORDE))
+        self.assertTrue(W.can_be_waypoint(self.by_id[6], W.ALLIANCE))
+        self.assertTrue(W.can_be_waypoint(self.by_id[11], W.HORDE))
 
 
 if __name__ == '__main__':

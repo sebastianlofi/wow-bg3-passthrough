@@ -393,6 +393,9 @@ class World:
                '--bg3', str(cx), str(by), str(cz), '--size', str(CELL), '--islands', 'border',
                '--map', str(self.map), '--storeys', '1' if STOREYS else '0',
                '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
+        ox, oy, oz = self.origin
+        if STOREYS and oz < self.terrain.height(ox, oy) - wow_arena.UNDER_CLEAR:
+            cmd += ['--under', str(ox), str(oy), str(oz)]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         tiles = (out / 'tiles.bin').read_bytes()
         tris = (out / 'triangles.bin').read_bytes()
@@ -765,10 +768,13 @@ class World:
             x, z = bx + dc * 0.5, bz + dr * 0.5
             i, j = int(math.floor((x - self.centre[0]) / CELL)), int(math.floor((z - self.centre[2]) / CELL))
             found = []
-            for st in (self.cells.get((i, j)) or {}).get('storeys') or ():
-                c0, r0 = int((x - st['min'][0]) // 0.5), int((z - st['min'][1]) // 0.5)
-                if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
-                    found.append(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0])
+            # A level lies a tile off its square, so a tile on a square's low edge is in the neighbour's level:
+            # a Start's point is on that edge, and Undercity's flight point fell to the storey under its own.
+            for ij in ((i, j), (i - 1, j), (i, j - 1), (i - 1, j - 1)):
+                for st in (self.cells.get(ij) or {}).get('storeys') or ():
+                    c0, r0 = int((x - st['min'][0]) // 0.5), int((z - st['min'][1]) // 0.5)
+                    if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
+                        found.append(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0])
             if found:
                 return min(found, key=lambda v: abs(v - self.centre[1]))
         return None
@@ -1087,6 +1093,8 @@ def main():
     a.floor = max(2, min(6, a.floor))
     wait_hero(a.wait_hero)
     w = World(a)
+    # A bridge that was killed left Active true: Camp.lua would take the coming Start's jump to the void for BG3's own travel.
+    w.publish(False)
     stop = {'now': False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))

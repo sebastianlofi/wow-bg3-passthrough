@@ -65,6 +65,9 @@ version is mostly complete.
   are exact. A merchant shows 4,000,000 gold during a trade, since WoW's vendors never run out. Inside an opened bag,
   such as the Camp Supply Sack, BG3's tooltip shows the item's plain value, not the trade price; the sale still pays
   the right price. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
+- **Waypoints.** The WoW flight points you have discovered are BG3's waypoints: click one in BG3's waypoint panel or
+  its pin on the map, or `/wowbg3 waypoint go NAME`. Free, no flight master needed, on either continent; Ironforge
+  and Undercity too. Not in a fight, on a flight, dead, or at camp. `waypoints = 0` in `settings.conf` turns it off.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
@@ -165,6 +168,7 @@ Type them in WoW's chat, one word each: `/wowbg3 help` lists them.
 | `/wowbg3 remove NAME` | Dismiss a companion (it keeps its BG3 levels) |
 | `/wowbg3 pool` | Your WoW level, party slots and BG3 level-ups left |
 | `/wowbg3 respec NAME` | Withers' respec: back to BG3 level 1, its level-ups back to the pool |
+| `/wowbg3 waypoint`, `waypoint go NAME` | The flight points you have discovered; travel to one |
 | `/wowbg3 chat on`, `off` | Show or hide WoW's chat |
 
 Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.conf`; 0 turns them off):
@@ -259,9 +263,6 @@ Each of these in detail, with the smaller ones: [docs/known-issues.md](docs/know
 - **Equipment with more interesting effects** than stats: WoW's on-equip and on-use effects, and
   hand-made ones where a rule falls short.
 - **Hand-made content where rules are not enough**, dungeon bosses first.
-- **Waypoints**: fast travel between the WoW flight points you have discovered is in: pins on the map
-  and `/wowbg3 waypoint` (`waypoints = 0` in `settings.conf` turns it off). Still to come: BG3's own
-  waypoint panel, and Ironforge and Undercity, which lie under their terrain.
 - **Proper balance and pacing** for the whole 1 to 60 journey.
 - **Multiplayer**, then **The Burning Crusade** and **Wrath of the Lich King** once vanilla is mostly
   complete.

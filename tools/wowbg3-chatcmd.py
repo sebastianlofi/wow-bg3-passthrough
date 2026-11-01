@@ -16,6 +16,7 @@ Files (one line each, tab separated):
   reply    `<seq> <kind> <text>`, kind + a line, ! an error line, . the answer is complete   (ours)
 Requests older than 30 s when the helper starts, or already answered in the reply file, are not run. SIGTERM: a clean exit.
 """
+import json
 import os
 import signal
 import sys
@@ -29,6 +30,7 @@ import wowbg3cmd as W  # noqa: E402
 
 KEEP_LINES = 400
 STALE = 30
+PANEL_EVERY = 60  # s
 
 
 def log(*a):
@@ -100,7 +102,7 @@ def kind_of(text):
     return 'other'
 
 
-def handle(replies, seq, who, text):
+def handle(replies, seq, who, text, refused=None):
     first = [True]
 
     def out(line, error=False):
@@ -117,6 +119,8 @@ def handle(replies, seq, who, text):
     except W.CmdError as e:
         out(str(e) or 'failed', True)
         result = 'refused: %s' % str(e).splitlines()[0] if str(e) else 'refused'
+        if refused:
+            refused(str(e))
     except Exception as e:  # noqa: BLE001
         out('the command failed: %s' % e, True)
         result = 'error'
@@ -124,6 +128,26 @@ def handle(replies, seq, who, text):
     finally:
         replies.add(seq, '.', '')
     log('#%d %r from %s: %s in %.1f s' % (seq, text, who or '?', result, time.time() - t0))
+
+
+def panel_loop():
+    """What BG3's own waypoint panel lists (a discovery only reaches the table when the server saves)."""
+    ctx = W.Ctx(debug=False, out=lambda *_: None, chat=True)
+    while True:
+        try:
+            with LOCKS['server']:
+                W.waypoint_panel(ctx)
+            time.sleep(PANEL_EVERY)
+        except Exception:  # noqa: BLE001  WoW's character not online yet
+            time.sleep(5)
+
+
+def stamp_of(path):
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
 
 
 def main():
@@ -141,13 +165,24 @@ def main():
     done = set((s, t) for s, t, _, _ in read_requests(req) if t < start - STALE or s in answered)
     log('watching %s (test commands %s; server %s)' % (req, 'on' if debug_commands() else 'off',
                                                         os.environ.get('WOW_BG3_SERVER') or 'Docker test server'))
+    threading.Thread(target=panel_loop, daemon=True).start()
+    click = link / 'waypoint-click.json'  # a click in BG3's own panel (Waypoints.lua)
+    last_click = stamp_of(click)
     last = None
     while True:
-        try:
-            st = req.stat()
-            stamp = (st.st_mtime_ns, st.st_size)
-        except OSError:
-            stamp = None
+        stamp = stamp_of(click)
+        if stamp and stamp != last_click:
+            last_click = stamp
+            try:
+                text = 'waypoint go %d' % json.loads(click.read_text())['Id']
+                seq = int(time.time() * 10)
+                log('#%d %r from the panel' % (seq, text))
+                # WoW's chat prints only answers to its own requests: a refusal goes back to the panel's side.
+                said = lambda why, s=seq: W.atomic_write(link / 'waypoint-refused.json', json.dumps({'Seq': s, 'Text': why}))
+                threading.Thread(target=handle, args=(replies, seq, None, text, said), daemon=True).start()
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                log('panel click: %s' % e)
+        stamp = stamp_of(req)
         if stamp and stamp != last:
             last = stamp
             for s, t, who, text in read_requests(req):

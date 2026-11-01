@@ -84,7 +84,7 @@ class Trip(unittest.TestCase):
           files["wow-bg3/camp.json"] = '{"On": true}'
           files["wow-bg3/link/world.json"] = '{"Active": true}'
           package.loaded = package.loaded or {}
-          Ext.Require = function(n) return {Uuid = function() return "%s" end} end
+          Ext.Require = function(n) return {Uuid = function() return "%s" end, Hopping = function() return false end} end
         ''' % HERO_ID)
         self.camp = L.execute((LUA / 'Camp.lua').read_text().replace('local M = {}', 'local M = {}; Camp = M', 1))
         L.execute('Camp.Start("run")')
@@ -114,6 +114,14 @@ class Trip(unittest.TestCase):
         self.assertEqual(s['Off'], 0)
         self.assertEqual(len(L.globals().teleports), 0)
         self.assertFalse(L.eval('Camp.InTrip()'))
+
+    def test_world_modes_start_is_no_travel(self):
+        L = self.L
+        L.globals().files['wow-bg3/link/world.json'] = '{"Active": true, "Centre": [-2600.0, 120.0, -1000.0]}'
+        self.teleport([-46.6, 2.8, -402.8], [-2600.0, 121.0, -1000.0])
+        L.eval('tick(200)')
+        self.assertEqual(len(L.globals().teleports), 0)
+        self.assertFalse(self.state()['InCamp'])
 
     def test_wrong_return_is_put_right(self):
         L, frm = self.L, [-2600.0, 120.0, -1000.0]
