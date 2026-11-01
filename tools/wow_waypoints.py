@@ -152,10 +152,14 @@ def pins(points, rects):
 def panel(all_nodes, mask_text, team):
     """BG3's own waypoint panel: every point of the team with its slot by node id, so a point keeps its slot as more
     are discovered (Waypoints.lua gives each slot a trigger of the host level), and whether it is discovered: a save
-    keeps the panel's entries, also those of a character that does not know them."""
+    keeps the panel's entries, also those of a character that does not know them. The other team's points come
+    with Slot -1, never known: a save from before a faction change holds them too, and they have to go."""
     known = known_ids(mask_text)
     every = sorted((n for n in all_nodes if can_be_waypoint(n, team)), key=lambda n: n['id'])
-    return [{'Slot': i, 'Id': n['id'], 'Name': n['name'], 'Known': n['id'] in known} for i, n in enumerate(every)]
+    out = [{'Slot': i, 'Id': n['id'], 'Name': n['name'], 'Known': n['id'] in known} for i, n in enumerate(every)]
+    ours = {n['id'] for n in every}
+    return out + [{'Slot': -1, 'Id': n['id'], 'Name': n['name'], 'Known': False} for n in sorted(all_nodes, key=lambda n: n['id'])
+                  if n['id'] not in ours and n['map'] in CONTINENTS and n['id'] not in NO_MASTER]
 
 
 def nearest_floor(z, floors, reach=FLOOR_REACH):

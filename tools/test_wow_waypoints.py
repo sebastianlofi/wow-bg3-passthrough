@@ -334,6 +334,11 @@ class Verb(unittest.TestCase):
         self.assertEqual([(p['Slot'], p['Id'], p['Known']) for p in first], [(0, 5, False), (1, 7, True), (2, 12, False)])
         self.assertEqual([(p['Slot'], p['Id'], p['Known']) for p in later], [(0, 5, True), (1, 7, True), (2, 12, False)])
 
+    def test_the_other_teams_points_leave_the_panel(self):
+        every = [{'id': i, 'name': 'P%d' % i, 'map': 0, 'x': 0, 'y': 0, 'z': 0, 'horde': h, 'alliance': 1} for i, h in ((5, 1), (7, 0))]
+        rows = W.panel(every, str(1 << 4 | 1 << 6), 'horde')
+        self.assertEqual([(p['Slot'], p['Id'], p['Known']) for p in rows], [(0, 5, True), (-1, 7, False)])
+
     def test_capital_under_its_terrain_is_a_waypoint(self):
         self.mask = mask_of(2, 6)
         self.run_cmd('waypoint')

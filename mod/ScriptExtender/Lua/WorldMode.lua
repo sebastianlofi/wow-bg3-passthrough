@@ -465,6 +465,20 @@ function M.Start(runId)
         sendErrand({Go = true, Guid = guid, Position = dest, Target = t, Distance = d})
     end
 
+    -- Stop sends the party home for a moment, into BG3's own level: BG3 greets it with its place banner
+    -- ("Campsite", 5 s), which playtesters saw as a popup too quick to read at each tp and waypoint.
+    local function placeBanner(vis)
+        local function walk(n, d)
+            if not n or d > 6 then return end
+            if n.Type == "ls.UIWidget" then
+                if tostring(n.Name) == "NotificationWidget" then n:SetProperty("Visibility", vis) end
+                return
+            end
+            for i = 1, math.min(n.VisualChildrenCount or 0, 256) do walk(n:VisualChild(i), d + 1) end
+        end
+        local ok, err = pcall(walk, Ext.UI.GetRoot(), 0)
+        if not ok then Ext.Log.Print("WOW-BG3 world: place banner left as is: " .. tostring(err)) end
+    end
     local function start(c)
         local function vec(t, n)
             if type(t) ~= "table" or #t ~= n then return false end
@@ -537,6 +551,7 @@ function M.Start(runId)
         arena({Action = "Lead", Wow = c.WowOrigin, Bg3 = c.Centre, Seconds = MAX_SECONDS})
         state.Started = true
         hookInput()
+        placeBanner("Visible")
         Ext.Log.Print("WOW-BG3 world: started at " .. Ext.Json.Stringify(c.Centre))
     end
     local function stream(c)
@@ -572,6 +587,7 @@ function M.Start(runId)
         -- Stop publishing first: Tav is sent back to her BG3 position below, and benilla would
         -- otherwise walk the WoW character toward that spot's mapping while Stop runs.
         state.Started = false
+        placeBanner("Collapsed")
         local problems = {}
         for _, step in ipairs({
             function() arena({Action = "Lead", On = false}) end,
