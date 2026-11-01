@@ -222,8 +222,11 @@ What works is listed above; this is what does not, or has not been tried:
   creature's own BG3 health at the WoW mob's health fraction; only its damage is scaled to WoW's.
 - **The level cap**: BG3 stops at 12 without a level mod, which we strongly recommend (see
   [Levelling](#levelling)).
-- **Indoors and big cities.** Walls, roofs and small props between the camera and your party fade out,
-  and big pieces push the camera in. Cities have raised floors, but they are new: heading back across
+- **The camera.** It ignores all collision for now, so it can pass through anything. Indoors it keeps
+  to the selected character's height. Walls, roofs, tent cloth, trees and thick posts in its way open
+  in a see-through circle, and so does the ground; small things like fences and lamps do not. The rules are
+  new and rough, so expect odd views, mostly in caves.
+- **Indoors and big cities.** Cities have raised floors, but they are new: heading back across
   Orgrimmar's upper deck can jump, and rooms behind tall entrance steps cannot be reached on foot. Stairs
   have been walked in only a few towns.
 - **Cloth and models.** BG3's cloth simulation is not carried onto WoW's picture, so a robe or heavy

@@ -1507,7 +1507,7 @@ PickFilter pick_filter(int context) {
     if (context != 1) return f;
     f.Top = g_pick_top.load(std::memory_order_relaxed);
     f.Terrain = g_pick_terrain.load(std::memory_order_relaxed);
-    f.Cut = g_indoors.load(std::memory_order_relaxed);
+    f.Cut = true;  // benilla 0097: the see-through runs indoors and out
     f.On = f.Cut || std::isfinite(f.Top);
     for (int i = 0; i < 3; ++i) {
         f.Eye[i] = g_pick_eye[i].load(std::memory_order_relaxed);
@@ -1532,7 +1532,7 @@ bool in_see_cut(PickFilter const& f, glm::vec3 const& p) {
 }
 
 bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind) {
-    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && in_see_cut(f, p);  // benilla 0096: indoors terrain is cut too
+    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && in_see_cut(f, p);  // benilla 0097: terrain is cut too
     return p.y > f.Top || (f.Cut && in_see_cut(f, p));
 }
 
@@ -2916,7 +2916,10 @@ constexpr float kCeilingMarginM = 0.45f;
 //         chest and stays under the ceiling over her. It never sits in a wall, but indoors it is
 //         pinned: measured in the Lion's Pride Inn, the served eye stopped at z 62.55 whatever the
 //         zoom while BG3's own eye wanted 6.51 m more.
-//   free  the default, the design rule of 2026-10-31: the see-through is for indoors, and indoors the
+//   free  the default: no collision at all since 2026-10-31 (clear_eye), the see-through takes what is in
+//         the way everywhere (benilla 0097) and pin_height keeps the eye at the selected character's
+//         height indoors. The rest of this note is the rule before that, the code still there for now:
+//         the see-through is for indoors, and indoors the
 //         camera is not bumped up or down, that is what the see-through is for ("whats the point of the
 //         seethrough wall if they are gonna bump your camera in anyways"). So with a ceiling over her
 //         (g_indoors, her chest's own rays) the eye stays BG3's whatever it meets: it rises through the
@@ -2957,6 +2960,8 @@ struct CamClear {
     bool On = true;
     std::atomic<float> TavX{0.0f}, TavY{0.0f}, TavZ{0.0f};
     std::atomic<std::uint32_t> TavGen{0};  // 0: no position yet
+    std::atomic<float> SelX{0.0f}, SelY{0.0f}, SelZ{0.0f};  // link/selected.bin: who BG3 has selected
+    std::atomic<bool> SelHave{false};
     std::uint32_t TavSeq = 0;
     struct Entry {
         void const* Controller = nullptr;
@@ -2996,6 +3001,10 @@ struct CamClear {
     glm::vec3 EaseAnchor[2]{};
     double EaseAt[2]{0.0, 0.0};
     bool EaseHave[2]{false, false};
+    // pin_height per controller (under Lock): the eye's height while it is pinned.
+    float PinY[2]{0.0f, 0.0f};
+    double PinAt[2]{0.0, 0.0};
+    bool PinOn[2]{false, false};
     std::atomic<std::uint64_t> Frame{0};
 };
 CamClear g_clear;
@@ -3149,6 +3158,26 @@ void clear_read_tav() {
     g_clear.TavX.store(p[0], std::memory_order_relaxed);
     g_clear.TavY.store(p[1], std::memory_order_relaxed);
     g_clear.TavZ.store(p[2], std::memory_order_relaxed);
+    // The selected character (WorldMode.lua): "SEL1", tav.bin's seq, BG3 xyz. Its seq says it is this run's.
+    bool sel = false;
+    const std::string selPath = io_dir() + "link/selected.bin";
+    if (const int sf = ::open(selPath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW); sf >= 0) {
+        unsigned char srec[20];
+        std::uint32_t sseq = 0;
+        float sp[3];
+        if (::pread(sf, srec, sizeof(srec), 0) == (ssize_t)sizeof(srec) && std::memcmp(srec, "SEL1", 4) == 0) {
+            std::memcpy(&sseq, srec + 4, 4);
+            std::memcpy(sp, srec + 8, 12);
+            if (seq - sseq <= 60u && std::isfinite(sp[0]) && std::isfinite(sp[1]) && std::isfinite(sp[2])) {
+                g_clear.SelX.store(sp[0], std::memory_order_relaxed);
+                g_clear.SelY.store(sp[1], std::memory_order_relaxed);
+                g_clear.SelZ.store(sp[2], std::memory_order_relaxed);
+                sel = true;
+            }
+        }
+        ::close(sf);
+    }
+    g_clear.SelHave.store(sel, std::memory_order_relaxed);
     g_clear.TavGen.fetch_add(1, std::memory_order_release);
 }
 
@@ -3241,11 +3270,12 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     // start teleports her 1.2 km): left alone.
     if (!(len > 0.5f) || len > 60.0f) return false;
     *tested = true;
+    // `free`: nothing bumps the eye (playtest feedback, 2026-10-31: "ignore all collisions altogether"); what
+    // stands in the way is the see-through's. `hold` below is the old rule.
+    if (g_indoor == IndoorMode::Free) return true;
     float f = 1.0f, t = 2.0f;
     glm::vec3 n{};
     const bool free = g_indoor == IndoorMode::Free;
-    // `free`, indoors: never bumped (see IndoorMode). What it was pulled in by outside eases off.
-    if (free && g_indoors.load(std::memory_order_relaxed)) return true;
     // What the eye bumps into on the line from her chest: terrain and buildings in `hold`, and
     // big doodads too in `free` (see IndoorMode).
     const std::uint32_t lineKinds = free ? kBumpKinds : kCameraKinds;
@@ -3334,6 +3364,44 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     return true;
 }
 
+// Indoors the eye keeps to the selected character's height, whatever BG3 thinks the ground is. BG3 puts its
+// camera over the ground under its target, and in a cave that is the hill on top (Burning Blade Coven: the
+// eye 39 m over her and her off the picture, jumping with every tile of the hill). The height is the one
+// that puts BG3's own forward line on her, so the zoom and the angle stay BG3's. A camera not on her (panned,
+// on someone else's turn) keeps its height. Eased both ways. True while it sets `eye`.
+constexpr float kOrbitTargetM = 0.82f;  // what BG3's camera looks at, over her feet (measured outdoors)
+constexpr float kPinOffM = 4.0f;        // the line passes further than this from her: the camera is not on her
+constexpr float kPinEaseS = 0.12f;
+bool pin_height(int slot, glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& who, double now, glm::vec3& eye) {
+    ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
+    const bool on = r != nullptr && !r->Tris.empty() && inside_square(*r, eye0) && g_indoors.load(std::memory_order_relaxed);
+    if (!g_clear.PinOn[slot]) {
+        if (!on) return false;
+        g_clear.PinOn[slot] = true;
+        g_clear.PinY[slot] = eye0.y;
+        g_clear.PinAt[slot] = now;
+    }
+    float want = on ? g_clear.PinY[slot] : eye0.y;
+    const glm::vec2 flat(fwd.x, fwd.z);
+    const float fl = glm::length(flat);
+    if (on && fwd.y < -0.15f && fl > 1e-3f) {
+        const glm::vec2 dir = flat / fl, to(who.x - eye0.x, who.z - eye0.z);
+        const float along = glm::dot(to, dir);
+        if (along > 0.0f && glm::length(to - dir * along) <= kPinOffM) {
+            want = who.y + kOrbitTargetM + along * -fwd.y / fl;
+        }
+    }
+    const double dt = std::clamp(now - g_clear.PinAt[slot], 0.0, 0.1);
+    g_clear.PinAt[slot] = now;
+    g_clear.PinY[slot] += (want - g_clear.PinY[slot]) * (1.0f - std::exp(-(float)dt / kPinEaseS));
+    if (!on && std::abs(g_clear.PinY[slot] - eye0.y) < 0.02f) {
+        g_clear.PinOn[slot] = false;
+        return false;
+    }
+    eye.y = g_clear.PinY[slot];
+    return true;
+}
+
 CamPose const* clear_pose(void const* self, bool* tested) {
     if (tested != nullptr) *tested = false;
     if (!g_clear.On || !g_lead.On || self == nullptr) return nullptr;
@@ -3362,6 +3430,10 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     if (cached(i)) return found(i);
     const glm::vec3 tav{g_clear.TavX.load(std::memory_order_relaxed), g_clear.TavY.load(std::memory_order_relaxed),
                         g_clear.TavZ.load(std::memory_order_relaxed)};
+    const glm::vec3 who = g_clear.SelHave.load(std::memory_order_relaxed)
+        ? glm::vec3{g_clear.SelX.load(std::memory_order_relaxed), g_clear.SelY.load(std::memory_order_relaxed),
+                    g_clear.SelZ.load(std::memory_order_relaxed)}
+        : tav;
     // BG3's forward (the third column of the camera-to-world rotation, as lead_frame reads it).
     float raw[4];
     std::memcpy(raw, &x->RotationQuat, sizeof(raw));
@@ -3372,8 +3444,8 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     const glm::vec3 fwd = glm::normalize(rot[2]);
     bool wasTested = false;
     float target = 1.0f;
-    glm::vec3 chest = tav + glm::vec3(0.0f, kChestM, 0.0f);
-    clear_eye(eye0, fwd, tav, &target, &wasTested, &chest);
+    glm::vec3 chest = who + glm::vec3(0.0f, kChestM, 0.0f);
+    clear_eye(eye0, fwd, who, &target, &wasTested, &chest);
     // The ease out: pulled in at once, the pull-in shrinks at most kEyeEaseOutMps.
     const float len = glm::length(eye0 - chest);
     float served = target;
@@ -3400,8 +3472,10 @@ CamPose const* clear_pose(void const* self, bool* tested) {
         g_clear.EaseHave[slot] = true;
         served = 1.0f - in / len;
     }
-    const bool moved = wasTested && served < 0.999f;
-    const glm::vec3 eye = chest + (eye0 - chest) * served;
+    glm::vec3 eye = chest + (eye0 - chest) * served;
+    const bool pinned = pin_height(slot, eye0, fwd, who, now, eye);
+    if (pinned) easing = true;  // computed again next frame
+    const bool moved = (wasTested && served < 0.999f) || pinned;
     if (slot == 0) {  // the see-through's ends, for the cursor
         for (int k = 0; k < 3; ++k) {
             g_pick_eye[k].store(eye[k], std::memory_order_relaxed);
@@ -3486,7 +3560,8 @@ void lead_frame() {
     // Flags at 52 (was padding): 1 = the eye clearance tested this eye against WoW's ground (benilla
     // then leaves it alone: its own clearance is only for eyes the plugin could not test); 2 = she is
     // indoors, which is when benilla's see-through runs (patch 0095).
-    const std::uint32_t flags = (tested ? 1u : 0u) | (g_indoors.load(std::memory_order_relaxed) ? 2u : 0u);
+    (void)tested;  // always 1 now: nothing bumps the eye, benilla's own clearance neither
+    const std::uint32_t flags = 1u | (g_indoors.load(std::memory_order_relaxed) ? 2u : 0u);
     std::memcpy(rec + 52, &flags, 4);
     const double now = mono_seconds();
     std::memcpy(rec + 56, &now, 8);
@@ -5790,7 +5865,7 @@ extern "C" BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3
     if (char const* v = std::getenv("WOWBG3_CAM_UNROOF"); v != nullptr && *v != 0) g_unroof = std::strcmp(v, "0") != 0;
     logf("camera: unroof walk %s", g_unroof ? "on" : "off");
     logf("camera: %s", g_indoor == IndoorMode::Free
-                           ? "free (indoors never bumped; outdoors bumps terrain, buildings and big doodads)"
+                           ? "free (no collision; indoors at the selected character's height)"
                            : "hold (bumps terrain and buildings, held under the ceiling)");
     int rc = 0;
     rc |= host->add_setting(self, "channel", BG3LE_SETTING_INT, &g_set_channel, 0, 0);

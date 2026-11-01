@@ -1,0 +1,112 @@
+WOW-BG3 benilla patch 0097: the camera bumps into nothing, the see-through takes what is in its way.
+
+Playtest feedback: "have the camera ignore all collisions altogether and implement the see through thing on walls,
+ceilings, roofs and thick items like thick posts and trees and cloth ceilings in tents; little fences and
+meats and decor and lamp posts dont need to become see through." The plugin stopped moving the eye, so the
+capsule now runs outdoors too and cuts terrain (the floor rule of 0095 stays: nothing under 0.35 yd over her
+feet), and record bit 20 means a little piece (`phase_out::is_little`) that is never cut.
+
+diff --git a/crates/benilla-world/src/terrain_stream/spawn/mod.rs b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
+--- a/crates/benilla-world/src/terrain_stream/spawn/mod.rs
++++ b/crates/benilla-world/src/terrain_stream/spawn/mod.rs
+@@ -236,10 +236,7 @@
+                             .insert(crate::exterior_cull::ExteriorScene);
+                     }
+                     // WOW-BG3 patch 0092: small or big, on this placement's collision hull.
+-                    let phase_key = crate::phase_out::phases(crate::phase_out::placement_thickness(
+-                        m.collision.as_ref(),
+-                        &p.transform,
+-                    ))
++                    let phase_key = crate::phase_out::is_little(m.collision.as_ref(), &p.transform)
+                     .then(|| crate::phase_out::piece_key(&p.transform));
+                     if let Some(key) = phase_key {
+                         if let Some(gx) = staticgx.as_deref_mut() {
+@@ -714,10 +711,7 @@
+             // skipped, as at the ADT site.
+             let anim_root = host.as_ref().map(|h| h.root);
+             // WOW-BG3 patch 0092: small or big, on this prop's collision hull.
+-            let phase_key = crate::phase_out::phases(crate::phase_out::placement_thickness(
+-                m.collision.as_ref(),
+-                &d.transform,
+-            ))
++            let phase_key = crate::phase_out::is_little(m.collision.as_ref(), &d.transform)
+             .then(|| crate::phase_out::piece_key(&d.transform));
+             if let Some(key) = phase_key {
+                 if let Some(gx) = staticgx.as_deref_mut() {
+diff --git a/crates/benilla-world/src/phase_out.rs b/crates/benilla-world/src/phase_out.rs
+--- a/crates/benilla-world/src/phase_out.rs
++++ b/crates/benilla-world/src/phase_out.rs
+@@ -79,6 +79,28 @@
+     thick < SMALL_YD
+ }
+ 
++/// WOW-BG3 patch 0097: under this tall (yd) a piece is seen over, and stays whole: a fence, a crate, a meat rack.
++pub const LITTLE_TALL_YD: f32 = 3.0;
++/// And one no wider than this (yd) stays whole however tall: a lamp post, a pole. A thick post is wider.
++pub const LITTLE_WIDE_YD: f32 = 0.75;
++
++/// Patch 0097: does the see-through leave this placement whole? Playtest feedback: walls, ceilings, roofs and thick
++/// things (thick posts, trees, a tent's cloth) go; little fences, meat, decor and lamp posts do not. On its
++/// collision hull in the model's own axes (raw M2 space, Z up), times its scale; no hull is little.
++pub fn is_little(hull: Option<&benilla_formats::CollisionMesh>, transform: &Transform) -> bool {
++    let Some(hull) = hull.filter(|h| !h.is_empty() && !h.positions.is_empty()) else {
++        return true;
++    };
++    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
++    for p in &hull.positions {
++        let v = Vec3::from_array(*p);
++        lo = lo.min(v);
++        hi = hi.max(v);
++    }
++    let size = (hi - lo) * transform.scale.abs().max_element();
++    size.z < LITTLE_TALL_YD || size.x.max(size.y) < LITTLE_WIDE_YD
++}
++
+ /// A placement's identity for the fade: its translation's bits. Every batch of a placement shares
+ /// its transform, and the `uniqueId` will not do: a WMO's props all carry their building's.
+ pub type PieceKey = [u32; 3];
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -338,7 +338,8 @@
+     // (record bit 20; with that fade off, row 25's z, it is cut with the rest). A wall takes it, and so does a big tree's canopy: WoW's collision has the trunk
+     // alone, so the camera bumps the trunk and ends up under leaves; BG3 marks 163 of its 345 trees
+     // `SeeThrough` for the same picture.
+-    if (((recs[in.word & 0xffffu].w & 1048576u) == 0u || wow_light.cut_clip.z < 0.5)
++    // Patch 0097: record bit 20 is now a little piece (`phase_out::is_little`), never cut.
++    if ((recs[in.word & 0xffffu].w & 1048576u) == 0u
+         && wow_cut(in.world_position.xyz, in.uv)) {
+         discard;
+     }
+diff --git a/crates/benilla-app/src/wowbg3_see.rs b/crates/benilla-app/src/wowbg3_see.rs
+--- a/crates/benilla-app/src/wowbg3_see.rs
++++ b/crates/benilla-app/src/wowbg3_see.rs
+@@ -79,7 +79,8 @@
+             on: true,
+             radius: 4.4,
+             screen: 0.45,
+-            terrain: false,
++            // Patch 0097: no collision any more, so a hill in the way opens like a wall.
++            terrain: true,
+             // Her body's depth: a wall she stands against lies within it and must never count as
+             // in front of her (0.15 left a torn patch on the wall at her shoulder, 2026-10-29).
+             near: 0.6,
+@@ -87,7 +88,8 @@
+             scale: 2.0,
+             look: false,
+             look_apart: 2.5,
+-            outdoors: false,
++            // Patch 0097: indoors and out, the camera bumps into nothing.
++            outdoors: true,
+             phase: false,
+         }
+     }
+@@ -227,7 +229,7 @@
+         near: s.near.max(0.0),
+         noise_amp: s.amp.max(0.0),
+         noise_scale: s.scale,
+-        terrain: s.terrain || crate::wowbg3_lead::she_is_indoors(),
++        terrain: s.terrain,
+         phase: s.phase,
+         ..SeeThrough::default()
+     };

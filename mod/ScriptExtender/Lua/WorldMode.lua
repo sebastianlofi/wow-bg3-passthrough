@@ -262,6 +262,11 @@ function M.Start(runId)
         if bg3Muted() or camp.In then flags = flags | 2 end
         local rec = string.pack("<c4I4fffffffI4I4", "TAV1", tavSeq, w[1], w[2], w[3], p[1], p[2], p[3], 0.0, flags, tavSeq)
         Ext.IO.SaveFile("wow-bg3/link/tav.bin", rec)
+        -- The character BG3 has selected, whom the camera's height follows (the plugin's pin_height).
+        local oks, x, y, z = pcall(function() return Osi.GetPosition(Osi.GetHostCharacter()) end)
+        if oks and x and y and z then
+            Ext.IO.SaveFile("wow-bg3/link/selected.bin", string.pack("<c4I4fff", "SEL1", tavSeq, x, y, z))
+        end
     end
 
     local function cursor()

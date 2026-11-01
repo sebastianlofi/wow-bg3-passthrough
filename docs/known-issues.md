@@ -36,7 +36,8 @@ This is the first public version. What we know is missing or rough:
   `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
   music stays off there, and the WoW side shows nothing while you are at camp. Eating and drinking from the
   bag, alcohol's Drunk, and a successful pickpocket of food have not been tried in the game yet.
-- Walls, roofs and small props between the camera and your party fade out, and big pieces push the camera in.
+- The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
+  in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is
   ended where everyone stands (no WoW fight runs behind it any more).
 - Horde start zones, Teldrassil and Mulgore have had less testing than Northshire and Shadowglen.
