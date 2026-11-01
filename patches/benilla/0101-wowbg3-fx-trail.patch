@@ -1,0 +1,66 @@
+WOW-BG3 benilla patch 0101: a crash says which effects were being replayed.
+
+The GPU fault at camp's door logged when and what kind, not which draw. BG3's shaders run through passthrough,
+without wgpu's checks, so they are the suspects. The last 240 frames' draws go to Diagnostics/fx-trail.txt from
+the panic hook. Each line is built once per BG3 frame.
+
+diff --git a/crates/benilla-app/src/wowbg3_fx_render.rs b/crates/benilla-app/src/wowbg3_fx_render.rs
+--- a/crates/benilla-app/src/wowbg3_fx_render.rs
++++ b/crates/benilla-app/src/wowbg3_fx_render.rs
+@@ -1901,6 +1901,7 @@
+             }
+         }
+         self.last_counts = (draws.len(), skipped);
++        note_trail(set, skipped);
+         let luts = self.luts(dev, queue, set);
+         if luts.is_some() {
+             self.held_luts = luts.clone();
+@@ -2669,6 +2670,36 @@
+     })
+ }
+ 
++/// Patch 0101: what the last frames replayed, for the crash report: BG3's shaders run here without
++/// the checks wgpu puts on its own, so a bad read in one loses the device with nothing else to say which.
++const TRAIL_FRAMES: usize = 240;
++static TRAIL: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
++
++fn note_trail(set: &FxFrameSet, skipped: usize) {
++    use std::fmt::Write as _;
++    let frame = &set.frame;
++    let mut line = format!("frame {} blob {} bytes, {} draws, {skipped} skipped:", frame.frame, frame.blob.len(), frame.draws.len());
++    for d in &frame.draws {
++        let _ = write!(line, " [pipe {:016x} count {} inst {} first {} vo {} fi {} idx {}+{} vbs {} sets {}]", d.pipe, d.count, d.instances,
++            d.first, d.vertex_offset, d.first_instance, d.index_blob, d.index_size, d.vbs.len(), d.sets.len());
++    }
++    if let Ok(mut t) = TRAIL.try_lock() {
++        if t.len() == TRAIL_FRAMES {
++            t.pop_front();
++        }
++        t.push_back(line);
++    }
++}
++
++/// Patch 0101: the trail, newest last. Never waits: a panic can hold anything.
++pub(crate) fn trail_text() -> String {
++    let at_camp = crate::wowbg3_frames::at_camp();
++    match TRAIL.try_lock() {
++        Ok(t) => format!("at camp: {at_camp}\n{}\n", t.iter().cloned().collect::<Vec<_>>().join("\n")),
++        Err(_) => format!("at camp: {at_camp}\ntrail busy\n"),
++    }
++}
++
+ /// Draws `draws` (the over-white pass takes a scene reader's over-white groups, patch 0023).
+ fn replay(pass: &mut wgpu::RenderPass, r: &Ready, draws: &[PreparedDraw], white: bool) {
+     for d in draws {
+diff --git a/crates/benilla-app/src/crash.rs b/crates/benilla-app/src/crash.rs
+--- a/crates/benilla-app/src/crash.rs
++++ b/crates/benilla-app/src/crash.rs
+@@ -42,6 +42,8 @@
+     let Some(dir) = crate::local_state::diagnostics_dir() else {
+         return;
+     };
++    // WOW-BG3 patch 0101: which of BG3's effects were being replayed.
++    let _ = std::fs::write(dir.join("fx-trail.txt"), crate::wowbg3_fx_render::trail_text());
+     let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+         (*s).to_owned()
+     } else if let Some(s) = info.payload().downcast_ref::<String>() {

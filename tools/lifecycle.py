@@ -28,7 +28,7 @@ Hero.lua, wowsave-request.json, death.json) and drives the WoW side through the 
 --char NAME: the hero's WoW character for a save that names none (older saves).
 Log: one line per step on stdout (the launcher's unit sends it to tmp/m4-slice/lifecycle-TAG.log).
 """
-import argparse, glob, json, os, re, signal, subprocess, sys, time
+import argparse, glob, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
@@ -127,6 +127,37 @@ def benilla_runs():
     return False
 
 
+def keep_crash():
+    """Everything a benilla crash leaves, in logs/crash-TIME under the player's data folder, before a restart
+    overwrites it or the kernel drops its GPU dump (about five minutes). What cannot be read is noted in it."""
+    data = os.environ.get('WOWBG3_DATA')
+    if not data:
+        return None
+    out = Path(data) / 'logs' / time.strftime('crash-%Y%m%d-%H%M%S')
+    out.mkdir(parents=True, exist_ok=True)
+    notes = []
+    def take(src, name=None):
+        try:
+            shutil.copyfile(src, out / (name or Path(src).name))
+        except OSError as e:
+            notes.append('%s: %s' % (src, e))
+    for name in ('benilla.log', 'world.log', 'coord.log', 'fight.log', 'inventory.log'):
+        take(Path(data) / 'logs' / name)
+    take(Path(data) / 'capture' / 'layer.log')
+    diag = sorted(glob.glob(str(Path(data) / 'benilla/Diagnostics/*')), key=os.path.getmtime)
+    for d in diag[-3:]:
+        take(d)
+    for i, d in enumerate(glob.glob('/sys/class/drm/card*/device/devcoredump/data')):
+        take(d, 'gpu-coredump-%d.txt' % i)
+    try:
+        r = subprocess.run(['dmesg', '-T'], capture_output=True, text=True, timeout=10)
+        (out / 'dmesg.txt').write_text('\n'.join(r.stdout.splitlines()[-400:]) + '\n' + r.stderr)
+    except (OSError, subprocess.SubprocessError) as e:
+        notes.append('dmesg: %s' % e)
+    (out / 'not-kept.txt').write_text('\n'.join(notes) + '\n')
+    return out
+
+
 def bg3_run():
     """The running BG3's run id (WOW_BG3_RUN_ID in its environment, as the mod's files carry it), or None.
     Files from an earlier BG3 (lifecycle.json, hero.json) carry another id and are ignored (harness
@@ -202,6 +233,7 @@ class Life:
         self.benilla_seen = 0.0    # when benilla was last looked for
         self.benilla_back = 0      # times it was started again this session
         self.keep_chars = False    # the next bring_up is such a start: no restore, the WoW characters are current
+        self.crash_kept = False    # its crash is in logs/crash-TIME
         # `/wowbg3 time` is for one sitting: a new start of the game shows the time of this device.
         try:
             (IO / 'link').mkdir(parents=True, exist_ok=True)
@@ -696,7 +728,12 @@ class Life:
             if self.up['benilla'] and time.time() - self.benilla_seen > 5.0:
                 self.benilla_seen = time.time()
                 at_camp = (read('camp-state.json') or {}).get('InCamp')
-                if not at_camp and self.benilla_back < 3 and not benilla_runs():
+                gone = not benilla_runs()
+                if gone and not self.crash_kept:
+                    self.crash_kept = True
+                    log('benilla is gone: crash kept in %s' % keep_crash())
+                if gone and not at_camp and self.benilla_back < 3:
+                    self.crash_kept = False
                     self.benilla_back += 1
                     log('benilla is gone: starting it again (%d of 3)' % self.benilla_back)
                     self.keep_chars = True
