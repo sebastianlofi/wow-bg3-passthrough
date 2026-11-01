@@ -538,8 +538,18 @@ def db_env():
     return e
 
 
+def items_current():
+    """items.json is there and of this version's schema (its first key)."""
+    try:
+        with open(LINK / 'items.json') as f:
+            m = re.match(r'\{"Schema":\s*(\d+)', f.read(40))
+    except OSError:
+        return False
+    return bool(m) and int(m.group(1)) >= 2
+
+
 def datagen_needed():
-    return not ((LINK / 'items.json').is_file() and (LINK / 'abilities.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
+    return not (items_current() and (LINK / 'abilities.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
                 and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file())
 
 
@@ -550,7 +560,7 @@ def datagen():
     when it starts, so the icons show from the next start on; benilla picks the noise up while it runs."""
     rc = 0
     steps = []
-    if not (LINK / 'items.json').is_file():
+    if not items_current():
         steps.append(('items', py('wow_items', 'build', '--out', LINK / 'items.json', '--data', WOW / 'Data',
                                   '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
     if not (LINK / 'abilities.json').is_file() and game_data():

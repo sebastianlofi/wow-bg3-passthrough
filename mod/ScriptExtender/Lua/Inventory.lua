@@ -770,7 +770,12 @@ local function askFor(u, tag, count, thief)
         if ware and thief then
             M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = count or 1, Item = u, Npc = guid, Idx = ware.Idx})
             M.Stolen = (M.Stolen or 0) + 1
-        elseif ware then M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = count or 1, Item = u}) end
+        elseif ware then
+            -- WoW sells a food stack as one purchase: Count is purchases, shown as a stack of bc (fillHolder).
+            local row = M.Item(ware.Entry)
+            local lots = math.ceil((count or 1) / (row and row.bc or 1))
+            M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = lots, Item = u})
+        end
     else
         M.Request({Op = "take", Member = member, Npc = guid, Idx = tonumber(idx), Item = u})
     end
@@ -790,8 +795,9 @@ local function fillHolder(standin, prefix, list)
             askFor(old, tag, sideCount[tag])
         end
         if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) then
-            local ok, made = pcall(M.Create, w.Entry, standin, w.Count or 1, tag)
-            if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = w.Count or 1 else note(made) end
+            local n = w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1
+            local ok, made = pcall(M.Create, w.Entry, standin, n, tag)
+            if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = n else note(made) end
         end
     end
     for tag, u in pairs(have) do

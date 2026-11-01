@@ -17,7 +17,7 @@ player's own server and client already have.
 Row (JSON, keys short because the BG3 side loads all ~17,700 at once):
   {"e": entry, "n": name, "q": quality, "k": kind (weapon|armor|worn|object), "b": BG3 stats
    entry used as base, "t": WoW inventory type, "s": WoW slot name, "i": icon name, "st": stack size,
-   "bp": buy price (copper), "sp": sell price, "il": item level, "rl": required level,
+   "bp": buy price of one (copper; WoW's price is for buy_count), "bc": how many one WoW purchase gives, when not 1, "sp": sell price, "il": item level, "rl": required level,
    "r": BG3 rarity, "mg": armour magic bonus (+AC), "d": damage die, "dt": damage type, "en": weapon +N, "x": extra damage,
    "ac": armour class, "bo": BG3 boosts (Ability, Resistance, AC), "w": weight kg,
    "wd": WoW text for the description (damage, armour, stats as WoW shows them)}
@@ -37,11 +37,12 @@ IO = ROOT / "bg3/private/home/.local/share/Larian Studios/Baldur's Gate 3/Script
 DATA = ROOT / 'client/SoloCraft 1.12.1/Data'
 DB_CMD = ['sudo', '-n', 'docker', 'exec', '-i', 'wow-bg3-database-1', 'sh', '-c',
           'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos']
-COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 'buy_price', 'sell_price',
+COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 'buy_price', 'buy_count', 'sell_price',
         'inventory_type', 'item_level', 'required_level', 'stackable', 'container_slots', 'delay',
         'dmg_min1', 'dmg_max1', 'dmg_type1', 'dmg_min2', 'dmg_max2', 'dmg_type2', 'armor', 'block',
         'holy_res', 'fire_res', 'nature_res', 'frost_res', 'shadow_res', 'arcane_res', 'spellcategory_1', 'spellid_1'] + \
        ['stat_type%d' % i for i in range(1, 11)] + ['stat_value%d' % i for i in range(1, 11)]
+ITEMS_SCHEMA = 2  # 2: bp is the price of one, bc added. wowbg3-coord.py makes an older table again.
 STAT_NAMES = {0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina'}
 DIES = [(4, 2.5), (6, 3.5), (8, 4.5), (10, 5.5), (12, 6.5)]
 SPELL_COLS = ['random_property'] + ['%s_%d' % (c, i) for i in range(1, 6) for c in ('spellid', 'spelltrigger')]
@@ -169,8 +170,10 @@ def map_item(rules, it, icons):
     cls, sub, inv = it['class'], it['subclass'], it['inventory_type']
     ilvl, q = it['item_level'], it['quality']
     row = {'e': it['entry'], 'n': it['name'], 'q': q, 't': inv, 'i': icons.get(it['display_id'], ''),
-           'st': max(1, it['stackable']), 'bp': it['buy_price'], 'sp': it['sell_price'], 'il': ilvl,
+           'st': max(1, it['stackable']), 'bp': math.ceil(it['buy_price'] / max(1, it['buy_count'])), 'sp': it['sell_price'], 'il': ilvl,
            'rl': it['required_level'], 'r': rules['rarity_by_quality'].get(str(q), 'Common')}
+    if it['buy_count'] > 1:
+        row['bc'] = it['buy_count']
     boosts = []
     if cls == 2 and str(sub) in rules['weapons']:
         w = rules['weapons'][str(sub)]
@@ -474,7 +477,7 @@ def build(args):
     items = load_items(args.db, COLS + SPELL_COLS if effects else COLS)
     icons = load_icons(args.data)
     rows = [map_item(rules, it, icons) for _, it in sorted(items.items())]
-    out = {'Schema': 1, 'Rules': os.path.basename(args.rules), 'CopperPerGold': rules['copper_per_bg3_gold'],
+    out = {'Schema': ITEMS_SCHEMA, 'Rules': os.path.basename(args.rules), 'CopperPerGold': rules['copper_per_bg3_gold'],
            'Count': len(rows), 'Items': rows}
     if effects:
         spells = load_spells(args.db)

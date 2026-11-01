@@ -389,6 +389,21 @@ class Supply(unittest.TestCase):
         it['class'] = 0
         return wow_items.map_item(rules, it, {})
 
+    def test_a_price_is_for_one_not_for_what_one_purchase_gives(self):
+        import collections
+        import wow_items
+        rules = json.loads((HERE / 'wow_items_rules.json').read_text())
+        it = collections.defaultdict(int, entry=8950, name='Homemade Cherry Pie', buy_price=4000, buy_count=5, sell_price=200, stackable=20)
+        it['class'] = 0
+        r = wow_items.map_item(rules, it, {})
+        self.assertEqual((r['bp'], r['bc'], r['sp']), (800, 5, 200))
+        it.update(buy_price=10, buy_count=200)  # an arrow is not free
+        self.assertEqual(wow_items.map_item(rules, it, {})['bp'], 1)
+        it.update(buy_price=500, buy_count=1)
+        r = wow_items.map_item(rules, it, {})
+        self.assertEqual(r['bp'], 500)
+        self.assertNotIn('bc', r)
+
     def test_food_heals_by_level_and_counts(self):
         self.assertEqual((self.row('Tough Hunk of Bread', 5, 11)['b'], self.row('Tough Hunk of Bread', 5, 11)['sv']), ('CONS_FOOD_Bread_Bun', 20))
         self.assertEqual(self.row('Homemade Cherry Pie', 55, 11)['b'], 'CONS_FOOD_Dinner')
