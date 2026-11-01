@@ -1,0 +1,37 @@
+WOW-BG3 benilla patch 0099: `/wowbg3 time` holds the world's light.
+
+A request while recording previews: a command to make it day, and one to bring it back to the device's time. WoW's
+sky follows the login packet's clock, so the light holds at the minute in link/daytime.txt. The server's clock,
+and anything running on it, stays as it is.
+
+diff --git a/crates/benilla-app/src/net.rs b/crates/benilla-app/src/net.rs
+--- a/crates/benilla-app/src/net.rs
++++ b/crates/benilla-app/src/net.rs
+@@ -631,6 +631,7 @@
+ pub(crate) fn publish_world_time(
+     server: Res<ServerTime>,
+     mut world_time: ResMut<benilla_world::lighting::WorldTime>,
++    mut held: Local<(Option<Instant>, Option<u32>)>,
+ ) {
+     *world_time = match server.0 {
+         Some(gt) => benilla_world::lighting::WorldTime {
+@@ -641,6 +642,19 @@
+         },
+         None => benilla_world::lighting::WorldTime::default(),
+     };
++    // WOW-BG3 patch 0099: `/wowbg3 time` holds the light at a minute of the day (link/daytime.txt, read
++    // twice a second); anything but a minute there is the session clock.
++    if held.0.is_none_or(|at| at.elapsed().as_secs_f32() > 0.5) {
++        held.0 = Some(Instant::now());
++        held.1 = std::env::var_os("WOW_BG3_LINK_DIR")
++            .and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join("daytime.txt")).ok())
++            .and_then(|t| t.trim().parse::<u32>().ok())
++            .filter(|m| *m < 1440);
++    }
++    if let Some(m) = held.1 {
++        world_time.minute = m;
++        world_time.minute_f = m as f32;
++    }
+ }
+ 
+ /// The server's unix wall clock (`SMSG_QUERY_TIME_RESPONSE`), advanced monotonically. Descriptor

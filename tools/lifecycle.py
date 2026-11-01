@@ -186,6 +186,12 @@ class Life:
     def __init__(self, a):
         self.a = a
         self.started = time.time()
+        # `/wowbg3 time` is for one sitting: a new start of the game shows the time of this device.
+        try:
+            (IO / 'link').mkdir(parents=True, exist_ok=True)
+            (IO / 'link/daytime.txt').write_text('now\n')
+        except OSError as e:
+            log('daytime.txt: %s' % e)
         self.session = None        # the BG3 session (Hero.SESSION) the WoW side is up for
         self.down_for = None       # the session the WoW side was last taken down for
         self.up = {'benilla': None, 'world': False, 'bots': []}

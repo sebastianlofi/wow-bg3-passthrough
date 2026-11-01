@@ -726,6 +726,37 @@ def faction(ctx, args):
     ctx.say('saved (%s): the bridge sends it when world mode runs' % side)
 
 
+# ---------------------------------------------------------------- time (for recording)
+
+DAYTIMES = {'day': 720, 'noon': 720, 'dawn': 360, 'dusk': 1140, 'night': 0, 'midnight': 0}
+
+
+def daytime(ctx, args):
+    """link/daytime.txt: benilla's world light holds at this minute of the day (patch 0099); `now` lets go."""
+    f = ctx.link / 'daytime.txt'
+    if not args:
+        try:
+            m = int(f.read_text().strip())
+            ctx.say('held at %02d:%02d' % (m // 60, m % 60))
+        except (OSError, ValueError):
+            ctx.say('now: the time of this device')
+        return
+    word = args[0].lower()
+    hhmm = re.fullmatch(r'(\d{1,2})(?::(\d\d))?', word)
+    if word == 'now':
+        text = 'now'
+    elif word in DAYTIMES:
+        text = str(DAYTIMES[word])
+    elif hhmm and int(hhmm.group(1)) < 24 and int(hhmm.group(2) or 0) < 60:
+        text = str(int(hhmm.group(1)) * 60 + int(hhmm.group(2) or 0))
+    else:
+        raise Usage('time day | night | dawn | dusk | HH:MM | now (now: back to the time of this device); time: what is set')
+    ctx.link.mkdir(parents=True, exist_ok=True)
+    atomic_write(f, text + '\n')
+    ctx.say('back to the time of this device' if text == 'now'
+            else 'the world holds at %02d:%02d, for you only' % (int(text) // 60, int(text) % 60))
+
+
 # ---------------------------------------------------------------- level (test helper)
 
 def level(ctx, args, wow_bg3_only=False):
@@ -805,8 +836,8 @@ def xp(ctx, args):
 # ---------------------------------------------------------------- chat dispatch
 
 # One verb each, no domain word in front and no second name for anything.
-VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'level', 'xprate', 'waypoint')
-TEST_ONLY = ('tp', 'where', 'find', 'faction', 'refill', 'level', 'xprate')
+VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate', 'waypoint')
+TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate')
 
 
 def verb_of(words):
@@ -831,6 +862,8 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
         tele(ctx, [verb] + args)
     elif verb == 'faction':
         faction(ctx, args)
+    elif verb == 'time':
+        daytime(ctx, args)
     elif verb == 'waypoint':
         waypoint(ctx, args)
     elif verb == 'level':
@@ -851,10 +884,11 @@ def help_lines(debug):
                 '/wowbg3 tp PLACE | tp ZONE X Y | tp X Y - move on the WoW map (X Y from 0 to 100)',
                 '/wowbg3 where | find TEXT - where you are; search places',
                 '/wowbg3 faction horde | alliance | own - your WoW side (faction: what is set)',
+                '/wowbg3 time day | night | dawn | dusk | HH:MM | now - hold the light, for recording (now: this device\'s time)',
                 '/wowbg3 level N - set your WoW level, 1 to 60 (WoW, not BG3: it fills the pool)',
                 '/wowbg3 xprate N - the server\'s XP rate (1 normal); xprate: show']
     else:
-        out.append('test commands (tp, where, find, faction, refill, level, xprate) are off: %s turns '
+        out.append('test commands (tp, where, find, faction, time, refill, level, xprate) are off: %s turns '
                    'them on' % SETTINGS_HINT)
     out.append(LEVEL_HINT)
     return out

@@ -169,6 +169,7 @@ Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.c
 | `/wowbg3 tp PLACE`, `tp ZONE X Y`, `tp X Y` | Move on the WoW map (X and Y from 0 to 100, as on WoW's map) |
 | `/wowbg3 where`, `find TEXT` | Where you are; search zones and named places |
 | `/wowbg3 faction horde`, `alliance`, `own` | Your WoW side, kept in each save |
+| `/wowbg3 time day`, `night`, `dawn`, `dusk`, `HH:MM`, `now` | Hold the world's light at that time, for recording, until `now` or the next start of the game. The server's clock does not change |
 | `/wowbg3 level N` | Set your WoW level, 1 to 60 (it fills the pool: BG3's Level Up shows on the party) |
 | `/wowbg3 xprate N` | The server's XP rate (1 is normal) |
 

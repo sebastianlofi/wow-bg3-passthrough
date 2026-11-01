@@ -1819,7 +1819,7 @@ bool hook_all(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hit
     }
     float t;
     glm::vec3 n;
-    if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex)
+    if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex) && !camera_sweep(a, b, context)
         && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context))
         && allocator_ready()) {
         phx_hit wh{};
@@ -1850,7 +1850,7 @@ bool hook_any(void const* scene, glm::vec3 const& a, glm::vec3 const& b, bg3se::
     note_query(*s, kRayAnySlot, type, in, ex, context, a, b);
     float t;
     glm::vec3 n;
-    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n)) {
+    if (wants_wow(*r, type, in, ex) && !camera_sweep(a, b, context) && wow_closest(*r, a, b, t, n)) {
         s->Stats.Wow[2].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -1945,7 +1945,7 @@ bool sweep_closest_common(int slot, void const* scene, SweepShape sh, glm::vec3 
     }
     float t;
     glm::vec3 nrm;
-    if (wants_wow(*r, type, in, ex) && wow_sweep(*r, sh, a, b, t, nrm) && (!got || t < hit.Distance)) {
+    if (wants_wow(*r, type, in, ex) && !camera_sweep(a, b, context) && wow_sweep(*r, sh, a, b, t, nrm) && (!got || t < hit.Distance)) {
         fill_wow_hit(*r, a, b, t, nrm, hit);
         s->SweepWow[slot].fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -2017,7 +2017,7 @@ bool sweep_all_common(int slot, void const* scene, SweepShape sh, glm::vec3 cons
     }
     float t;
     glm::vec3 nrm;
-    if (wants_wow(*r, type, in, ex) && wow_sweep(*r, sh, a, b, t, nrm) && allocator_ready()) {
+    if (wants_wow(*r, type, in, ex) && !camera_sweep(a, b, context) && wow_sweep(*r, sh, a, b, t, nrm) && allocator_ready()) {
         phx_hit wh{};
         fill_wow_hit(*r, a, b, t, nrm, wh);
         hits.Normals.push_back(wh.Normal);
