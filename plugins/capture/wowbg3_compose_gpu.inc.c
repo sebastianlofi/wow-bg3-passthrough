@@ -579,6 +579,51 @@ static int gc_dark_frame(DeviceData* d, WowSlot* w) {
     return 1;
 }
 
+// During a move (g_move_cover): the frame cleared to black, no WoW frame or HUD. 1: the present must wait on *sem;
+// 0: frame left untouched.
+static int cover_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info, VkSemaphore* sem) {
+    DeviceData* d = q->dev;
+    if (g_gc.failed || !d->CmdClearColorImage || !gc_init(d, q->family)) return 0;
+    if (g_gc.queue && g_gc.queue != q->queue) gc_wait_all();
+    g_gc.queue = q->queue;
+    const uint32_t k = g_gc.k;
+    if (d->WaitForFences(d->device, 1, &g_gc.fence[k], VK_TRUE, 2000000000ull) != VK_SUCCESS) return 0;
+    memset(g_gc.cnt[k].map, 0, 16);
+    gc_completed();
+    VkCommandBuffer cmd = g_gc.cmd[k];
+    d->ResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    d->BeginCommandBuffer(cmd, &cbi);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    d->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (g_gc.qp) {
+        d->CmdResetQueryPool(cmd, g_gc.qp, 2 * k, 2);
+        d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_gc.qp, 2 * k);
+    }
+    VkImage img = c->images[index];
+    VkClearColorValue black = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    d->CmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (g_gc.qp) d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_gc.qp, 2 * k + 1);
+    d->EndCommandBuffer(cmd);
+    VkPipelineStageFlags stages[16];
+    uint32_t waits = info->waitSemaphoreCount > 16 ? 16 : info->waitSemaphoreCount;
+    for (uint32_t i = 0; i < waits; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, waits, info->pWaitSemaphores, stages, 1, &cmd, 1, &g_gc.done[k]};
+    d->ResetFences(d->device, 1, &g_gc.fence[k]);
+    if (d->QueueSubmit(q->queue, 1, &si, g_gc.fence[k]) != VK_SUCCESS) {
+        g_gc.failed = 1;
+        logf_("compose: move cover: submit failed; CPU path from now on");
+        return 0;
+    }
+    g_gc.serial[k] = ++g_gc.next_serial;
+    g_gc.k = (k + 1) % GC_SLOTS;
+    *sem = g_gc.done[k];
+    return 1;
+}
+
 #define GSKIP(r) { g_cc.skipped++; g_cc.why[(r) & 7]++; \
     if (g_cc.skipped < 200 || g_cc.skipped % 300 == 1) logf_("compose: skipping (reason %d; %llu skipped, %llu frames; depth %llx l%d ui %llx l%d ext %ux%u)", (r), \
         (unsigned long long)g_cc.skipped, (unsigned long long)g_cc.frames, (unsigned long long)g_role.depth, g_role.dlayout, \

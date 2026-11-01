@@ -1062,6 +1062,7 @@ typedef struct {
     uint64_t frames, skipped, why[8];
 } ComposeCfg;
 static ComposeCfg g_cc;
+static volatile int g_move_cover;
 
 // OUT_DIR/compose present = on. Optional words: "noui" (keep BG3's final picture where WoW shows
 // instead of rebuilding it from the UI target), "light" (add BG3's picture over WoW: effects in
@@ -1112,6 +1113,13 @@ static int has_word(const char* line, const char* w) {
 }
 static void compose_config(void) {
     struct stat st;
+    // OUT_DIR/compose.move, written by world_bridge.py for a move: every present black (cover_gpu), for the moments
+    // the party stands in BG3's own level. Old after 120 s: a bridge killed mid-move does not leave the screen black.
+    {
+        const int cover = stat(outp("/compose.move"), &st) == 0 && time(NULL) - st.st_mtim.tv_sec < 120;
+        if (cover != g_move_cover) logf_("compose: move cover %s", cover ? "on" : "off");
+        g_move_cover = cover;
+    }
     if (stat(outp("/compose"), &st) != 0) { if (g_cc.on) logf_("compose off"); g_cc.on = 0; return; }
     if (st.st_mtim.tv_sec == g_cc.seen.tv_sec && st.st_mtim.tv_nsec == g_cc.seen.tv_nsec) return;
     g_cc.seen = st.st_mtim;
@@ -1492,6 +1500,11 @@ static float hdr_sum(VkFormat f, const uint8_t* p) {
 
 // Returns a semaphore the present must wait on, or null (frame untouched).
 static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info) {
+    if (g_move_cover) {
+        VkSemaphore s = VK_NULL_HANDLE;
+        cover_gpu(q, c, index, info, &s);
+        return s;
+    }
     {  // the GPU compositor, unless it does not apply (wowbg3_compose_gpu.inc.c)
         VkSemaphore s = VK_NULL_HANDLE;
         if (compose_gpu(q, c, index, info, &s) >= 0) return s;
@@ -3619,11 +3632,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
             // the dark backdrop ("screenvoid"), but without WoW's frame, so the pacing stays out.
             const int scr_dark = g_screen && g_cc.screenvoid;
             if (c && info->pImageIndices[0] < c->count && !g_cc.raw && (!g_screen || scr_dark || g_screen_dialog)) {
-                if (!scr_dark) pace_before_compose();  // which WoW frame, and a bounded wait for it (no trace lock held)
+                const int paced = !scr_dark && !g_move_cover;
+                if (paced) pace_before_compose();  // which WoW frame, and a bounded wait for it (no trace lock held)
                 pthread_mutex_lock(&g_trace_lock);
                 VkSemaphore w = compose_frame(q, c, info->pImageIndices[0], info);
                 pthread_mutex_unlock(&g_trace_lock);
-                if (!scr_dark) pace_after_compose(t_in);
+                if (paced) pace_after_compose(t_in);
                 if (w != VK_NULL_HANDLE) {
                     wait = w;
                     copy.waitSemaphoreCount = 1;

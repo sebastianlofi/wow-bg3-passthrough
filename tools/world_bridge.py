@@ -179,6 +179,20 @@ def camp_state(run):
 CAMP_WORDS = 'camp bg3tav'
 
 
+def move_cover(on):
+    """A move: the screen stays black (the compositor's compose.move) while the party stands in BG3's own level."""
+    d = os.environ.get('WOWBG3_CAPTURE_DIR')
+    f = (Path(d) if d else ROOT / 'bg3/private/logs/capture') / 'compose.move'
+    try:
+        if on:
+            f.touch()
+            time.sleep(0.5)  # the compositor looks every 15 presents
+        else:
+            f.unlink(missing_ok=True)
+    except OSError as e:
+        print('move: cover file:', e, flush=True)
+
+
 def camp_compose(at_camp):
     """A trip to camp (Camp.lua): BG3's own picture with WoW's interface over it, and back. benilla draws
     its interface without the world while link/wowcamp.flag exists; the compositor takes the words at once
@@ -939,6 +953,7 @@ class World:
                 print('no floor for the waypoint, its own height:', e, flush=True)
         z = float(z)
         print(time.strftime('%H:%M:%S'), 'move to', m.get('What') or '', 'WoW %.1f %.1f %.1f map %d' % (x, y, z, target), flush=True)
+        move_cover(True)
         self.publish(False)
         seq = self.command('Stop')
         ok, err = self.wait_done(seq, 60)
@@ -1117,7 +1132,10 @@ def main():
             m = move_request(w.run, moved)
             if m:
                 moved = m['Seq']
-                w = w.move(m)
+                try:
+                    w = w.move(m)
+                finally:
+                    move_cover(False)
                 continue
             w.follow()
         except Exception as e:  # keep following; the mod keeps the squares it has
