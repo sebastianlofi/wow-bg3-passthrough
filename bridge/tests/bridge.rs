@@ -533,21 +533,21 @@ fn big_pulls_go_out_as_begin_and_join_lines_that_fit_wow_chat() {
         mobs: mobs.clone(),
     }
     .commands();
-    assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(lines[0].starts_with(".wowbg3 begin pull-1 "));
-    assert!(
-        lines[1].starts_with(".wowbg3 join pull-1 ")
-            && lines[2].starts_with(".wowbg3 join pull-1 ")
-    );
+    assert!(lines[1..].iter().all(|l| l.starts_with(".wowbg3 join pull-1 ") && !l.contains(',')), "{lines:?}");
     assert!(lines.iter().all(|l| l.len() < 255), "{lines:?}");
     let all: Vec<&str> = lines
         .iter()
         .flat_map(|l| l.rsplit(' ').next().unwrap().split(','))
         .collect();
     assert_eq!(all, mobs.iter().map(String::as_str).collect::<Vec<_>>());
+    // One mob a line: a mob the server has already refuses only itself.
     let small = Handoff::Join {
         encounter: "pull-1".into(),
         mobs: mobs[..2].to_vec(),
     };
-    assert_eq!(small.commands(), vec![small.command().unwrap()]);
+    assert_eq!(
+        small.commands(),
+        vec![format!(".wowbg3 join pull-1 {}", mobs[0]), format!(".wowbg3 join pull-1 {}", mobs[1])]
+    );
 }

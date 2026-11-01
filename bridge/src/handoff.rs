@@ -119,22 +119,19 @@ impl Handoff {
     /// line holds goes out as `begin` with the first [`GUIDS_PER_LINE`] and `join` lines for the
     /// rest (encounters take up to 50 mobs).
     pub fn commands(&self) -> Vec<String> {
-        let chunked = |verb: &str, encounter: &str, mobs: &[String]| -> Vec<String> {
-            mobs.chunks(GUIDS_PER_LINE)
-                .enumerate()
-                .map(|(i, part)| {
-                    let v = if i == 0 { verb } else { "join" };
-                    format!(".wowbg3 {v} {encounter} {}", part.join(","))
-                })
-                .collect()
+        // A join line goes for one mob each: the server refuses a whole line if one of its mobs is in the fight
+        // already (a pack mate it took by itself, 0015), and the others then stay free in WoW.
+        let joins = |encounter: &str, mobs: &[String]| -> Vec<String> {
+            mobs.iter().map(|m| format!(".wowbg3 join {encounter} {m}")).collect()
         };
         match self {
             Self::Begin { encounter, mobs } if mobs.len() > GUIDS_PER_LINE => {
-                chunked("begin", encounter, mobs)
+                let (first, rest) = mobs.split_at(GUIDS_PER_LINE);
+                let mut lines = vec![format!(".wowbg3 begin {encounter} {}", first.join(","))];
+                lines.extend(joins(encounter, rest));
+                lines
             }
-            Self::Join { encounter, mobs } if mobs.len() > GUIDS_PER_LINE => {
-                chunked("join", encounter, mobs)
-            }
+            Self::Join { encounter, mobs } => joins(encounter, mobs),
             _ => self.command().into_iter().collect(),
         }
     }
