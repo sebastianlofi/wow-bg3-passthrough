@@ -61,6 +61,7 @@ VERBS = {
 # invalid, profane, reserved... The lifecycle then tries the next free name (wowchar.free_name).
 NAME_REFUSED = {0x31} | set(range(0x45, 0x51))
 CREATE_TRIES = 4
+SIDES = ('horde', 'alliance', 'own')
 
 
 def log(*a):
@@ -79,6 +80,38 @@ def write(name, body):
     tmp = p.with_name(p.name + '.tmp')
     tmp.write_text(json.dumps(body))
     tmp.replace(p)
+
+
+def side_now():
+    """The side link/faction.txt names (`SEQ SIDE`, wowbg3cmd.py faction); own without one."""
+    try:
+        side = (IO / 'link/faction.txt').read_text().split()[1]
+    except (OSError, IndexError):
+        return 'own'
+    return side if side in SIDES else 'own'
+
+
+def side_of_save(sid):
+    """The side a save was made on (ID.json Side). A new game, or a save from before the side was kept: own."""
+    side = wowsave.read_meta(sid).get('Side') if sid and wowsave.SID.fullmatch(sid) else None
+    return side if side in SIDES else 'own'
+
+
+def set_side(side):
+    """link/faction.txt names SIDE; the fight bridge sends it at its start and benilla reads it (a new SEQ
+    only when the side changes)."""
+    if side == side_now():
+        return
+    f = IO / 'link/faction.txt'
+    try:
+        seq = int(f.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        seq = 0
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f.name + '.tmp')
+    tmp.write_text('%d %s\n' % (seq + 1, side))
+    tmp.replace(f)
+    log('side: %s' % side)
 
 
 def bg3_run():
@@ -373,6 +406,9 @@ class Life:
                     log('restore %s FAILED: %s' % (sid, e))
         elif sid:
             log('no snapshot %s (made before save sync, or pruned): WoW characters as they are' % sid)
+        # `/wowbg3 faction` is the save's too: link/faction.txt outlives a load, and the bridge would send the
+        # last session's side to this one. Done before benilla and the bridge start.
+        set_side(side_of_save(sid))
         self.phase(session, 'characters')
         snap = wowsave.read_meta(sid).get('Members') if sid and wowsave.SID.fullmatch(sid) else None
         if not isinstance(snap, dict) and members and sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
@@ -497,6 +533,7 @@ class Life:
             return
         meta = wowsave.read_meta(req['Id'])
         meta['Members'] = by_member  # which member had which character (resolve(), a save naming none)
+        meta['Side'] = side_now()  # `/wowbg3 faction` at this save (bring_up puts it back)
         wowsave.write_meta(req['Id'], meta)
         log('save %s: snapshot of %s in %.1f s' % (req['Id'], ', '.join(names), time.time() - t0))
         # The save folder is the newest one written since the request (BG3's start-of-game autosave is
