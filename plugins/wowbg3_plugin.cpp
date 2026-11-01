@@ -1532,7 +1532,7 @@ bool in_see_cut(PickFilter const& f, glm::vec3 const& p) {
 }
 
 bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind) {
-    if (kind == 0) return f.Terrain && p.y > f.Top;
+    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && in_see_cut(f, p);  // benilla 0096: indoors terrain is cut too
     return p.y > f.Top || (f.Cut && in_see_cut(f, p));
 }
 

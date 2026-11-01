@@ -1,0 +1,19 @@
+WOW-BG3 benilla patch 0096: indoors, the see-through takes the terrain too.
+
+In a cave the camera is not bumped (0095), so it often sits behind the hill the cave lies in, and terrain
+was never cut: the character stood behind a piece of mountain and a click on the floor landed on it. While
+she is indoors the capsule now cuts terrain as it does everything else, with the same floor rule (nothing
+under 0.35 yd over her feet). Outdoors nothing changes. The plugin's cursor goes through the same terrain.
+
+diff --git a/crates/benilla-app/src/wowbg3_see.rs b/crates/benilla-app/src/wowbg3_see.rs
+--- a/crates/benilla-app/src/wowbg3_see.rs
++++ b/crates/benilla-app/src/wowbg3_see.rs
+@@ -227,7 +227,7 @@
+         near: s.near.max(0.0),
+         noise_amp: s.amp.max(0.0),
+         noise_scale: s.scale,
+-        terrain: s.terrain,
++        terrain: s.terrain || crate::wowbg3_lead::she_is_indoors(),
+         phase: s.phase,
+         ..SeeThrough::default()
+     };

@@ -97,6 +97,7 @@ SLOPE_FLAG_M = 0.25
 # square of ground needs), and the pool asks for STOREY_SPARE more than --pool for them. A storey
 # with fewer than STOREY_MIN walkable tiles is left out.
 STOREYS = os.environ.get('WOW_BG3_STOREYS', '1') != '0'
+GUARD_FEET_M, GUARD_HEAD_M = 3.0, 1.5  # fall guard: how far under and over a walker's feet a face counts as its floor
 STOREY_SPARE = 2
 STOREY_MIN = 8
 # The flags a seam tile (where a storey meets the ground) gets in both sections: 4 SubgridEdge, 8
@@ -276,6 +277,26 @@ def camera_wow():
     return eye if all(math.isfinite(v) for v in eye) else None
 
 
+def face_under(tris, x, y, z):
+    """The height of a WoW face within reach of a walker's feet at BG3 (x, y, z), or None. A square's tiles
+    hold one floor, so in a cave they can name the hill over it; what the walker stands on is still a face."""
+    for ax, ay, az, bx, by, bz, cx, cy, cz in struct.iter_unpack('<9f', tris):
+        if (x < ax and x < bx and x < cx) or (x > ax and x > bx and x > cx) \
+                or (z < az and z < bz and z < cz) or (z > az and z > bz and z > cz):
+            continue
+        d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz)
+        if abs(d) < 1e-6:
+            continue
+        u = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d
+        v = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d
+        if u < 0.0 or v < 0.0 or u + v > 1.0:
+            continue
+        h = u * ay + v * by + (1.0 - u - v) * cy
+        if y - GUARD_FEET_M < h < y + GUARD_HEAD_M:
+            return h
+    return None
+
+
 class Walker:
     """One party member's window on the lattice (its own node, look-ahead axis and fall guard)."""
     def __init__(self, uuid, name):
@@ -284,6 +305,7 @@ class Walker:
         self.ahead_axis = None
         self.last_good = None
         self.rescued = 0.0
+        self.faces_read = 0.0
         self.seen = 0.0
 
 
@@ -763,8 +785,8 @@ class World:
         return bool(walk), y
 
     def guard(self, w, bx, by, bz, is_hero):
-        """Fall guard, per member: one more than 8 m below the WoW floor under it (a gap in the
-        ground, a fight knocking it off) goes back to where it last stood on it: the hero through
+        """Fall guard, per member: one more than 8 m below the WoW floor under it and with no WoW face
+        at its feet (a gap in the ground, a fight knocking it off) goes back to where it last stood on it: the hero through
         StandIns Teleport (as WorldMode does), a companion through StandIns Rescue. At most once
         every 10 s per member."""
         f = self.floor_at(bx, bz)
@@ -775,6 +797,15 @@ class World:
             w.last_good = (bx, floor, bz)
             return
         if by > floor - 8.0 or not w.last_good or time.time() - w.rescued < 10.0:
+            return
+        # Under the tile's floor, on a face all the same: a cave under a hill, not a fall.
+        if time.time() - w.faces_read < 0.5:
+            return
+        w.faces_read = time.time()
+        ij = (int(math.floor((bx - self.centre[0]) / CELL)), int(math.floor((bz - self.centre[2]) / CELL)))
+        h = face_under(self.cells[ij]['tris'], bx, by, bz)
+        if h is not None:
+            w.last_good = (bx, h, bz)
             return
         w.rescued = time.time()
         x, y, z = w.last_good
