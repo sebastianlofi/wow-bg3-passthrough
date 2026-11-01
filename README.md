@@ -139,8 +139,8 @@ level, not your WoW level:
 | 57 | 64 | 17 |
 | 60 | 68 | 18 |
 
-BG3's XP bar on your character shows how far you are into your current WoW level; its tooltip is still BG3's
-own. A small notice gives your WoW level, the level-ups waiting and what the next WoW level gives at each new
+BG3's XP bar on your character shows how far you are into your current WoW level, and its tooltip says how the
+levels work. A small notice gives your WoW level, the level-ups waiting and what the next WoW level gives at each new
 WoW level, and `/wowbg3 pool` lists it all.
 
 - **We strongly recommend a level mod.** BG3 itself stops at level 12, and WOW-BG3 does not bundle levels
@@ -152,8 +152,8 @@ WoW level, and `/wowbg3 pool` lists it all.
     of level 7 to 9, and [Advanced Tabletop Spells](https://www.nexusmods.com/baldursgate3/mods/14429) for
     more of them.
 
-  None of these are tested with WOW-BG3 yet. 5e Spells needs Script Extender, and whether it works
-  on WOW-BG3's Linux Script Extender (bg3le) is unknown.
+  Only UnlockLevelCurve has been tried with WOW-BG3, up to BG3 level 14 on a Wizard; the rest are untested.
+  5e Spells needs Script Extender, and whether it works on WOW-BG3's Linux Script Extender (bg3le) is unknown.
 - A dismissed companion keeps its BG3 levels and rejoins at them; the pool counts them as spent. Only
   Withers' respec (`/wowbg3 respec NAME`) gives level-ups back.
 
@@ -285,7 +285,8 @@ Turn it off and they are gone at the next load; a Frost Armor already on lasts t
 BG3's camp is the rest in WOW-BG3, with WoW's food and drink as its supplies (`camp = 1` in `settings.conf`;
 with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
 
-- **Go to Camp and End the Day work as in BG3.** The party goes to BG3's camp and BG3 draws the picture;
+- **Go to Camp and End the Day work as in BG3.** End the Day only brings on the night; press Long Rest again,
+  or click your bedroll, to open the rest panel. The party goes to BG3's camp and BG3 draws the picture;
   the WoW character waits where it stood. Leaving camp puts the party back on the same spot.
 - **Long and short rests are BG3's own**, so spell slots, long-rest-only abilities and rest effects work
   as BG3 has them. BG3's story nights do not play: no story runs here, so a night is just sleep.

@@ -679,9 +679,10 @@ local function applySlots(party)
 end
 -- A "join me" refused: BG3's recruit proc or its party-full swap dialog, while the WoW level is the limit.
 local SWAP_DIALOGS = {} -- filled from BG3's DB_GLO_CompanionSwapDialogue at session start
--- A companion's own dialog, one not in the party: at the limit BG3 answers "join me" there with a line ("so many
--- followers") and no add at all, so it counts as tried when it opens. Filled from DB_OriginInPartyDialog.
-local IN_PARTY = {}
+-- A companion's own dialog: at the limit BG3 answers "join me" there with a line ("so many followers") and no add
+-- at all. That line sets this global flag for BG3's full party tutorial, which clears it again, so it fires at each
+-- refusal; only that, opening the dialog to talk does not. Jaheira's and Minsc's lines set no flag, and Lae'zel's dialog has no such line: no popup for them.
+local FULL_PARTY_REJECTION = "94a40e88-0e15-33f5-0beb-0332de542341"
 -- BG3's flag does not stop the dialog's own join when the party is at the limit: whoever came in over it goes
 -- back to camp once the dialog is over.
 local overJoin = {}
@@ -737,10 +738,10 @@ function M.Start(runId)
     pcall(Ext.Osiris.RegisterListener, "MessageBoxClosed", 2, "after", function(c, t) pcall(popupClosed, c, t) end)
     pcall(Ext.Osiris.RegisterListener, "DialogStarted", 2, "after", function(d, id)
         dialogs[id] = true
-        local who = IN_PARTY[uuidOf(d)]
-        if SWAP_DIALOGS[uuidOf(d)] or (who and not q(function() return Osi.DB_Players:Get(who)[1] end)) then
-            pcall(joinTried, players())
-        end
+        if SWAP_DIALOGS[uuidOf(d)] then pcall(joinTried, players()) end
+    end)
+    pcall(Ext.Osiris.RegisterListener, "FlagSet", 3, "after", function(flag)
+        if uuidOf(flag) == FULL_PARTY_REJECTION then pcall(joinTried, players()) end
     end)
     pcall(Ext.Osiris.RegisterListener, "DialogEnded", 2, "after", function(_, id) dialogs[id] = nil end)
     pcall(Ext.Osiris.RegisterListener, "PROC_GLO_PartyMembers_CheckAdd", 2, "before", function(who) pcall(joinTried, players(), who) end)
@@ -758,7 +759,6 @@ function M.Start(runId)
             dialogs, popupOpen, calm, appliedSlots, sinceLoad, overJoin = {}, nil, 0, nil, 0, {}
             M.ding = false
             for _, r in ipairs(q(function() return Osi.DB_GLO_CompanionSwapDialogue:Get(nil) end) or {}) do SWAP_DIALOGS[uuidOf(r[1])] = true end
-            for _, r in ipairs(q(function() return Osi.DB_OriginInPartyDialog:Get(nil, nil) end) or {}) do IN_PARTY[uuidOf(r[2])] = r[1] end
             local had = loadPool()
             for _, u in ipairs(players()) do pcall(upsOf, u) end -- every player counted (levels it has)
             local v = readLevelFile()

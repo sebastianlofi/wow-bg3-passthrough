@@ -81,6 +81,21 @@ local function override(root, se, gamePath, name, text)
     return {Game = gamePath, Override = Ext.IO.GetPathOverride(gamePath), Bytes = #text}
 end
 
+-- BG3's XP bar on the character sheet: its tooltip speaks of BG3's XP, while the bar shows the way to the next WoW
+-- level (Progression.lua, ShowWowProgress). BG3's description goes, these words come in its place. The UI keeps its
+-- own copy of the string, so Ext.Loca does not reach the tooltip.
+local SHEET = "Public/Game/GUI/Library/CharacterSheetTemplates.xaml"
+local function xpTooltip(xaml, text)
+    local src = xaml:find("Stats.Level.Description", 1, true)
+    if not src then return nil, "the XP bar's description not found in " .. SHEET end
+    local open = xaml:sub(1, src):match(".*()<b:Interaction.Behaviors>")
+    local _, close = xaml:find("</b:Interaction.Behaviors>", src, true)
+    local tag = open and xaml:sub(1, open):match(".*()<TextBlock ")
+    if not tag or not close then return nil, "the XP bar's text not found" end
+    -- As an attribute: text between the tags came out as an empty tooltip.
+    return xaml:sub(1, tag - 1) .. "<TextBlock Text=\"" .. text .. "\" " .. xaml:sub(tag + 11, open - 1) .. xaml:sub(close + 1)
+end
+
 -- BG3's map page: the JournalMap widget under the UI root (ContentRoot's children), or nil.
 local function journalMap()
     local function name(n) local ok, v = pcall(function() return n.Name end); return ok and v or nil end
@@ -465,6 +480,18 @@ function M.Start(runId)
         local okmm, errmm = pcall(startMinimap, runId, s)
         if not okmm then s.MinimapError = tostring(errmm) end
     end
+    local okx, errx = pcall(function()
+        local root = assert(dataRoot(), "no Data root (path overrides off?)")
+        local se = assert(seRoot(), "no Script Extender directory")
+        local xaml = assert(Ext.IO.LoadFile(SHEET, "data"), "cannot read " .. SHEET)
+        local P = Ext.Require("Progression.lua")
+        local changed, why = xpTooltip(xaml, string.format("This bar fills toward your next WoW level. WoW levels run to %d. "
+            .. "From level %d, each WoW level levels up one party member, and every %dth levels up two. "
+            .. "At level %d, a party of four is BG3 level %d.", P.WOW_MAX, P.FIRST_EARN, P.CURVE.Every, P.WOW_MAX, P.CURVE.Cap))
+        s.XpTooltip = override(root, se, SHEET, "CharacterSheetTemplates.xaml", assert(changed, why))
+    end)
+    if not okx then s.XpTooltipError = tostring(errx) end
+    Ext.Log.Print("WOW-BG3 ui: XP bar tooltip " .. (okx and "in" or ("failed: " .. tostring(errx))))
     Ext.IO.SaveFile("wow-bg3/wowui-status.json", Ext.Json.Stringify(s))
     Ext.Log.Print("WOW-BG3 ui: " .. (s.TurnOrderProbe and ("turn-order probe " .. (ok and "in" or ("failed: " .. tostring(err)))) or "map link on"))
     Ext.Log.Print("WOW-BG3 ui: minimap layer " .. (s.MinimapOff and "off" or (s.MinimapLayer and "in" or ("failed: " .. tostring(s.MinimapLayerError)))))

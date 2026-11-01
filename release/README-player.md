@@ -27,7 +27,7 @@ WOW-BG3's patches), the local WoW server, the WoW engine (benilla) and the tools
 
 Strongly recommended, not included: a level mod, because BG3 stops at level 12 without one. From Nexus
 Mods: UnlockLevelCurve or Expansion Level 13-20, then 5e Spells with its spell list patch, and Advanced
-Tabletop Spells for more level 7 to 9 spells. Not tested with WOW-BG3 yet. 5e Spells needs Script
+Tabletop Spells for more level 7 to 9 spells. Only UnlockLevelCurve has been tried with WOW-BG3, to level 14. 5e Spells needs Script
 Extender, and whether it works on the Linux Script Extender in this download is unknown.
 
 ## Install
