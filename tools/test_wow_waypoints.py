@@ -130,11 +130,19 @@ class Rules(unittest.TestCase):
         points = W.waypoints(self.nodes, mask_of(2, 23), W.ALLIANCE) + W.waypoints(self.nodes, mask_of(23), W.HORDE)
         rows = W.pins(points, W.map_rects(self.dir))
         self.assertEqual(sorted((f, i) for f, i, *_ in rows),
-                         [('Azeroth', 2), ('Durotar', 23), ('Elwynn', 2), ('Kalimdor', 23)])
+                         [('Durotar', 23), ('Elwynn', 2)])
         f, _, x, y, _ = next(r for r in rows if r[0] == 'Elwynn')
         m = {'left': 1066.0, 'right': -2133.0, 'top': -7466.0, 'bottom': -9600.0}
         self.assertAlmostEqual(x, C.to_map(m, -8840.0, 489.0)[0], places=2)
         self.assertAlmostEqual(y, C.to_map(m, -8840.0, 489.0)[1], places=2)
+
+    def test_pins_on_own_map_only(self):
+        rects = W.map_rects(self.dir) + [
+            {'map': 1, 'area': 17, 'file': 'Barrens', 'left': -1000.0, 'right': -7000.0, 'top': 2000.0, 'bottom': -5000.0},
+            {'map': 1, 'area': 1637, 'file': 'Ogrimmar', 'left': -3700.0, 'right': -5000.0, 'top': 2200.0, 'bottom': 1200.0}]
+        points = W.waypoints(self.nodes, mask_of(23, 80), W.HORDE)
+        self.assertEqual(sorted((f, i) for f, i, *_ in W.pins(points, rects)),
+                         [('Barrens', 80), ('Durotar', 23), ('Ogrimmar', 23)])
 
     def test_nearest_floor(self):
         self.assertEqual(W.nearest_floor(100.0, [97.0, 130.0]), 97.0)
@@ -255,9 +263,9 @@ class Verb(unittest.TestCase):
 
     def test_pins_lines(self):
         self.run_cmd('waypoint pins')
-        self.assertEqual(self.lines[-1], 'WBWP;end;3')
+        self.assertEqual(self.lines[-1], 'WBWP;end;1')
         self.assertTrue(all(l.startswith('WBWP;') for l in self.lines))
-        self.assertEqual(self.lines[0].split(';')[:4], ['WBWP', 'pin', 'Azeroth', '2'])
+        self.assertEqual(self.lines[0].split(';')[:4], ['WBWP', 'pin', 'Elwynn', '2'])
 
     def test_same_continent_move(self):
         self.camera(-9429.0, -2231.0, 0)

@@ -658,6 +658,9 @@ def waypoint(ctx, args):
         for f, i, x, y, name in rows:
             ctx.say('WBWP;pin;%s;%d;%.2f;%.2f;%s' % (f, i, x, y, name))
         ctx.say('WBWP;end;%d' % len(rows))
+        # The map just opened: BG3's own panel beside it lists what WoW knows right now.
+        atomic_write(ctx.link / 'waypoint-panel.json',
+                     json.dumps({'Points': wow_waypoints.panel(every, mask, team)}))
     elif action == 'list':
         ctx.say('Waypoints you have discovered (%s; a flight master\'s window adds its own):' % team)
         for p in points:

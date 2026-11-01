@@ -80,8 +80,8 @@ def nodes(dbc_dir):
 
 
 def map_rects(dbc_dir):
-    """WorldMapArea.dbc (1.12), continents too: map, the art's name (WoW's GetMapInfo()), edges in world yards."""
-    return [{'map': i[1], 'file': t(i[3]), 'left': f[4], 'right': f[5], 'top': f[6], 'bottom': f[7]}
+    """WorldMapArea.dbc (1.12), continents too (area 0): map, the art's name (WoW's GetMapInfo()), edges in world yards."""
+    return [{'map': i[1], 'area': i[2], 'file': t(i[3]), 'left': f[4], 'right': f[5], 'top': f[6], 'bottom': f[7]}
             for i, f, t in read_dbc(Path(dbc_dir) / 'WorldMapArea.dbc')]
 
 
@@ -124,12 +124,26 @@ def choose(points, text):
     return []
 
 
+# TaxiNodes' place names against WorldMapArea's art names, where they differ more than by spaces and case.
+MAP_OF_PLACE = {'orgrimmar': 'ogrimmar', 'hillsbrad': 'hilsbrad', 'dustwallowmarsh': 'dustwallow',
+                'silverpineforest': 'silverpine', 'azshara': 'aszhara', 'thebarrens': 'barrens',
+                'thehinterlands': 'hinterlands'}
+
+
+def map_key(place):
+    k = ''.join(c for c in place.lower() if c.isalnum())
+    return MAP_OF_PLACE.get(k, k)
+
+
 def pins(points, rects):
-    """(map file, id, x, y, name) of each point on every WoW map whose art holds it, x and y from 0 to 100."""
+    """(map file, id, x, y, name) of each point on its own zone's map and its city's, x and y from 0 to 100. Not on
+    a continent's map; not on a neighbour's, whose art's edges also hold it. The node's name says where it is:
+    "Crossroads, The Barrens", "Orgrimmar, Durotar", "Moonglade"."""
     out = []
     for p in points:
+        own = {map_key(part) for part in p['name'].split(',')}
         for r in rects:
-            if r['map'] == p['map'] and r['right'] <= p['y'] <= r['left'] and r['bottom'] <= p['x'] <= r['top']:
+            if r['area'] and map_key(r['file']) in own and r['map'] == p['map']:
                 out.append((r['file'], p['id'], (p['y'] - r['left']) * 100.0 / (r['right'] - r['left']),
                             (p['x'] - r['top']) * 100.0 / (r['bottom'] - r['top']), p['name']))
     return out
