@@ -30,7 +30,7 @@ Backends:
              one console line on stdin and prints the reply lines; default server/tools/world-console.py
              wowbg3 ARGS).
 """
-import argparse, json, os, shlex, subprocess, sys, time
+import argparse, json, math, os, shlex, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -196,17 +196,21 @@ class Fake:
         c['money'] -= cost
         return True, '', {'Guid': g, 'Money': c['money']}
 
-    def sell(self, name, npc, guid):
+    def sell(self, name, npc, guid, count=0):
         c = self.char(name)
         it = c['items'].get(guid)
         if not it:
             return False, 'gone', {}
         if it['bag'] == 255 and it['slot'] < 19:
             return False, 'equipped', {}
-        price = self.items.get(it['entry'], {}).get('sp', 0) * it['count']
+        n = count if 0 < count < it['count'] else it['count']
+        price = self.items.get(it['entry'], {}).get('sp', 0) * n
         if price <= 0:
             return False, 'no_price', {}
-        del c['items'][guid]
+        if n < it['count']:
+            it['count'] -= n
+        else:
+            del c['items'][guid]
         c['money'] += price
         return True, '', {'Money': c['money']}
 
@@ -323,8 +327,8 @@ class Server:
             extra = {'Guid': w[i + 1] if len(w) > i + 1 else None, 'Money': int(w[i + 2]) if len(w) > i + 2 else None}
         return ok, why, extra
 
-    def sell(self, name, npc, guid):
-        return self._after_ok(self.call('vendor', 'sell', name, npc, guid, 0), 'Money')
+    def sell(self, name, npc, guid, count=0):
+        return self._after_ok(self.call('vendor', 'sell', name, npc, guid, count), 'Money')
 
     def loot(self, npc, name=None):
         out = {'Money': 0, 'Items': []}
@@ -399,8 +403,21 @@ class Bridge:
             return True, '', {'Npc': npc}
         if op == 'buy':
             return be.buy(name, str(req['Npc']), int(req['Entry']), int(req.get('Count', 1)))
+        if op == 'buypart':
+            # Part of a stack WoW only sells whole (buy_count): that many at the price of one. The money
+            # first, so a purchase never comes free; a full bag gives it back.
+            count = int(req['Count'])
+            price = math.ceil(int(req['Price']) / max(1, int(req.get('Lot', 1)))) * count
+            ok, why, _ = be.money(name, -price)
+            if not ok:
+                return False, why or 'nomoney', {}
+            ok, why, extra = be.add(name, int(req['Entry']), count)
+            if not ok:
+                be.money(name, price)
+                return False, why or 'full', {}
+            return True, '', extra
         if op == 'sell':
-            return be.sell(name, str(req['Npc']), str(req['Guid']))
+            return be.sell(name, str(req['Npc']), str(req['Guid']), int(req.get('Count', 0)))
         if op == 'loot':
             npc = str(req['Npc'])
             self.loot[npc] = be.loot(npc) if isinstance(be, Fake) else be.loot(npc, name)

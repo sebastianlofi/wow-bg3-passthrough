@@ -738,7 +738,8 @@ local function onReplies(inv)
                 if e then pcall(function() e.Vars[VAR] = tostring(rep.Guid) end) end
             end
             if not rep.Ok then
-                if r.Item and (r.Op == "buy" or r.Op == "take") then M.Refused[r.Item] = true end
+                if r.Item and (r.Op == "buy" or r.Op == "buypart" or r.Op == "take") then M.Refused[r.Item] = true end
+                if r.Op == "buypart" and r.Tag then M.PartRefused(r) end
                 pcall(tellRefused, r, rep)
                 note(string.format("%s refused: %s", tostring(r.Op), tostring(rep.Why)))
             end
@@ -771,10 +772,16 @@ local function askFor(u, tag, count, thief)
             M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = count or 1, Item = u, Npc = guid, Idx = ware.Idx})
             M.Stolen = (M.Stolen or 0) + 1
         elseif ware then
-            -- WoW sells a food stack as one purchase: Count is purchases, shown as a stack of bc (fillHolder).
-            local row = M.Item(ware.Entry)
-            local lots = math.ceil((count or 1) / (row and row.bc or 1))
-            M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = lots, Item = u})
+            -- WoW sells a food stack as one purchase (shown as a stack of bc, fillHolder): whole purchases
+            -- go as WoW's own buy, the rest of a stack split earlier at the price of one.
+            local bc = (M.Item(ware.Entry) or {}).bc or 1
+            local n = count or 1
+            if n % bc == 0 then
+                M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = n // bc, Item = u})
+            else
+                M.Request({Op = "buypart", Member = member, Npc = guid, Entry = ware.Entry, Count = n, Price = ware.Price,
+                    Lot = bc, Item = u})
+            end
         end
     else
         M.Request({Op = "take", Member = member, Npc = guid, Idx = tonumber(idx), Item = u})
@@ -782,12 +789,38 @@ local function askFor(u, tag, count, thief)
 end
 M.AskFor = askFor
 
+-- A ware's stack that got smaller where it stands: the player split some off. Those are bought at the
+-- price of one, and the amount left is what the next look compares with. Asked again on every look, so it
+-- does not matter whether BG3 says so with an event, or which of the two stacks it calls the moved one.
+local function settleWare(standin, guid, tag, w)
+    local u = sideUuid[tag]
+    if not u or asked[u] or deleted[u] or holderOf(u) ~= standin then return end
+    local left, had = q(Osi.GetStackAmount, u), sideCount[tag]
+    if not left or not had or left <= 0 or left >= had then return end
+    sideCount[tag] = left
+    local pick = picking[standin]
+    if pick and pick.Until >= tick then
+        M.Request({Op = "add", Member = pick.Thief, Entry = w.Entry, Count = had - left, Npc = guid, Idx = w.Idx})
+    else
+        M.Request({Op = "buypart", Member = Hero.Uuid(), Npc = guid, Entry = w.Entry, Count = had - left, Price = w.Price,
+            Lot = (M.Item(w.Entry) or {}).bc or 1, Tag = tag})
+    end
+end
+-- WoW said no to a part (money, bags full): back on the stand-in's stack.
+function M.PartRefused(r)
+    local u = sideUuid[r.Tag]
+    if not u or not q(Ext.Entity.Get, u) then return end
+    sideCount[r.Tag] = (sideCount[r.Tag] or 0) + r.Count
+    pcall(Osi.SetStackAmount, u, sideCount[r.Tag])
+end
+
 local function fillHolder(standin, prefix, list)
     local have = ours()
     local want = {}
     for _, w in ipairs(list or {}) do
         local tag = prefix .. tostring(w.Idx)
         want[tag] = true
+        if prefix:sub(1, 1) == "V" then settleWare(standin, prefix:match("^V(%x+):"), tag, w) end
         -- Gone without a trace: the player took it and BG3 merged it into a stack of theirs (no
         -- RemovedFrom for a merge, harness).
         local old = sideUuid[tag]
@@ -882,12 +915,29 @@ local function onEquipped(item, char, on)
     M.Request({Op = on and "equip" or "unequip", Member = c, Guid = tag, Item = u})
 end
 
+-- What the player split off a WoW stack, on its way somewhere: not one of ours. The stack itself says what
+-- happens (settleWare, the sale below) and the next reconcile shows it, so this copy goes, before `ours`
+-- sees two items with one tag and deletes either of them.
+local function dropPiece(u)
+    local e = q(Ext.Entity.Get, u)
+    if e then
+        pcall(function() e.Vars[VAR] = nil end)
+    end
+    M.Suppress(u)
+    pcall(Osi.RequestDelete, u)
+end
+
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
     if not u or not h or suppressed(u) then return end
     local tag = tagOf(u)
-    if not tag then return end
     local members = memberSet(lastInv)
+    if members[h] and ((tag and tag:match("^V%x+:%d+$") and sideUuid[tag] and sideUuid[tag] ~= u and not M.SideTag[u])
+        or (not tag and entryOf(u) and not M.SideTag[u])) then
+        dropPiece(u)
+        return
+    end
+    if not tag then return end
     if tag:match("^%d+$") then
         local owner = wowOwner[tag]
         if members[h] and owner and owner ~= h then
@@ -899,6 +949,24 @@ local function onAddedTo(item, holder)
     end
     local entry, owner = tag:match("^S(%d+)@(.+)$")
     if entry and owner ~= h and (members[h] or vendorOf[h]) then
+        -- Part of a stack to a vendor: only that many, out of WoW's stacks of that entry.
+        local amount, total = q(Osi.GetStackAmount, u), 0
+        local list = (((lastInv.Members or {})[owner]) or {}).Items or {}
+        for _, it in ipairs(list) do
+            if tostring(it.Entry) == entry then total = total + (it.Count or 1) end
+        end
+        if vendorOf[h] and amount and amount < total then
+            local left = amount
+            for _, it in ipairs(list) do
+                if left > 0 and tostring(it.Entry) == entry then
+                    local n = math.min(left, it.Count or 1)
+                    M.Request({Op = "sell", Member = owner, Npc = vendorOf[h], Guid = tostring(it.Guid), Count = n})
+                    left = left - n
+                end
+            end
+            dropPiece(u)
+            return
+        end
         -- A whole stack to another member (give) or to a vendor (sell): every WoW item of that entry.
         local first = true
         for _, it in ipairs((((lastInv.Members or {})[owner]) or {}).Items or {}) do
