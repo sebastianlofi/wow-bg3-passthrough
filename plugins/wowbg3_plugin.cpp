@@ -2958,6 +2958,8 @@ constexpr float kLookNearM = 4.0f;       // a look point farther than this from 
 constexpr float kSkyM = 300.0f;          // how far up the underground test looks for WoW's terrain
 constexpr float kAnchorJumpM = 4.0f;     // a look point this far from the last: a new target, no ease
 
+std::atomic<bool> g_tav_away{false};  // tav.bin's flag 2: at camp, or BG3 muted (a load, a menu)
+
 struct CamClear {
     bool On = true;
     std::atomic<float> TavX{0.0f}, TavY{0.0f}, TavZ{0.0f};
@@ -3147,6 +3149,9 @@ void clear_read_tav() {
     std::memcpy(&seq, rec + 4, 4);
     std::memcpy(&seq2, rec + 40, 4);
     std::memcpy(p, rec + 20, 12);
+    std::uint32_t tavFlags = 0;
+    std::memcpy(&tavFlags, rec + 36, 4);
+    g_tav_away.store((tavFlags & 2u) != 0, std::memory_order_relaxed);
     if (seq == 0 || seq != seq2 || seq == g_clear.TavSeq || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
         return;
     }
@@ -3367,12 +3372,12 @@ void read_wish(double now) {
     const std::string path = io_dir() + "link/campose.bin";
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return;
-    unsigned char rec[52];
+    unsigned char rec[48];
     const ssize_t got = ::pread(fd, rec, sizeof(rec), 0);
     ::close(fd);
     if (got != (ssize_t)sizeof(rec) || std::memcmp(rec, "CAM1", 4) != 0) return;
     std::uint32_t seq = 0, flags = 0;
-    float v[10];
+    float v[9];
     std::memcpy(&seq, rec + 4, 4);
     std::memcpy(&flags, rec + 8, 4);
     std::memcpy(v, rec + 12, sizeof(v));
@@ -3387,16 +3392,21 @@ void read_wish(double now) {
     g_wish.Pitch = v[1];
     g_wish.Direction = {v[2], v[3], v[4]};
     g_wish.Look = {v[5], v[6], v[7]};
-    g_wish.Height = v[9];
+    g_wish.Height = v[8];
     g_wish.At = now;
 }
 
 // Sets `eye` and `rot` (BG3's camera-to-world: s, u, f) from the wish. False: BG3's own camera stays (no word from
 // the client, tactical view, off WoW's ground: camp, a load).
-bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, double now, glm::vec3& eye, glm::mat3& rot) {
+bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& tav, double now, glm::vec3& eye, glm::mat3& rot) {
     read_wish(now);
     ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
-    const glm::vec3 look(g_wish.Look.x, g_wish.Height + kRigidLiftM, g_wish.Look.z);
+    glm::vec3 look(g_wish.Look.x, g_wish.Height + kRigidLiftM, g_wish.Look.z);
+    // Just after a load BG3's camera still looks at where the hero stood in BG3's own level, thousands of metres off,
+    // until the first step: the picture was BG3's own world. Not at camp, where tav.bin keeps the spot left behind.
+    if (r != nullptr && !r->Tris.empty() && !inside_square(*r, look) && !g_tav_away.load(std::memory_order_relaxed)) {
+        look = tav + glm::vec3(0.0f, kRigidLiftM, 0.0f);
+    }
     const glm::vec2 across(g_wish.Direction.x, g_wish.Direction.z);
     if (!g_wish.Have || now - g_wish.At > kWishStaleS || g_wish.Tactical || !(g_wish.Distance > 0.5f) || glm::length(across) < 1e-3f
         || r == nullptr || r->Tris.empty() || !inside_square(*r, look)) {
@@ -3424,8 +3434,8 @@ bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, double now, glm::v
     rot = glm::mat3(side, up, f);
     eye = glm::vec3(look.x, g_pin_y, look.z) - f * g_wish.Distance;
     if (++g_wish.Served % 600 == 1) {
-        logf("camera: rigid, distance %.2f pitch %.1f (BG3's forward y %.2f) look %.1f %.1f height %.2f; BG3's own eye %.1f over the height, ours %.1f",
-             g_wish.Distance, g_wish.Pitch, rot0[2].y, g_wish.Look.x, g_wish.Look.z, g_wish.Height, eye0.y - look.y, eye.y - look.y);
+        logf("camera: rigid, distance %.2f pitch %.1f (BG3's forward y %.2f) look %.1f %.1f height %.2f (tav %.2f); BG3's own eye %.1f over the height, ours %.1f",
+             g_wish.Distance, g_wish.Pitch, rot0[2].y, g_wish.Look.x, g_wish.Look.z, g_wish.Height, tav.y, eye0.y - look.y, eye.y - look.y);
     }
     return true;
 }
@@ -3499,7 +3509,7 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     glm::vec3 eye = chest + (eye0 - chest) * served;
     // Only the game camera: a cast's action camera (slot 1) is BG3's picture.
     glm::mat3 rigidRot = rot;
-    const bool rigid = slot == 0 && g_indoor == IndoorMode::Free && rigid_pose(eye0, rot, now, eye, rigidRot);
+    const bool rigid = slot == 0 && g_indoor == IndoorMode::Free && rigid_pose(eye0, rot, tav, now, eye, rigidRot);
     if (rigid) easing = true;  // computed again next frame
     const bool moved = (wasTested && served < 0.999f) || rigid;
     if (slot == 0) {  // the see-through's ends, for the cursor
