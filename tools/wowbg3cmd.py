@@ -836,7 +836,7 @@ def xp(ctx, args):
 # ---------------------------------------------------------------- chat dispatch
 
 # One verb each, no domain word in front and no second name for anything.
-VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate', 'waypoint')
+VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate', 'waypoint', 'report')
 TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate')
 
 
@@ -864,6 +864,9 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
         faction(ctx, args)
     elif verb == 'time':
         daytime(ctx, args)
+    elif verb == 'report':
+        import crashreport
+        ctx.say('Send this one file: %s' % str(crashreport.make(' '.join(args) or 'asked')).replace(str(Path.home()), '~'))
     elif verb == 'waypoint':
         waypoint(ctx, args)
     elif verb == 'level':
@@ -884,6 +887,7 @@ def help_lines(debug):
                 '/wowbg3 tp PLACE | tp ZONE X Y | tp X Y - move on the WoW map (X Y from 0 to 100)',
                 '/wowbg3 where | find TEXT - where you are; search places',
                 '/wowbg3 faction horde | alliance | own - your WoW side (faction: what is set)',
+                '/wowbg3 report - one file with the logs, to send when something is wrong',
                 '/wowbg3 time day | night | dawn | dusk | HH:MM | now - hold the light, for recording (now: this device\'s time)',
                 '/wowbg3 level N - set your WoW level, 1 to 60 (WoW, not BG3: it fills the pool)',
                 '/wowbg3 xprate N - the server\'s XP rate (1 normal); xprate: show']

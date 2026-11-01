@@ -299,6 +299,19 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   `~/.local/share/bg3le/logs/` (BG3's side). Please attach both to a bug report, with what you did
   just before.
 
+## If it crashes
+
+If the WoW side crashes, WOW-BG3 starts it again and a popup names one file. To send a report yourself at any
+time, for a crash or anything that looks wrong, type `/wowbg3 report` in chat.
+
+1. Find the newest `WOW-BG3-report-<time>.zip` in `~/.local/share/wow-bg3/reports/`.
+2. Open an [issue](https://github.com/sebastianlofi/wow-bg3-passthrough/issues), say what you were doing, and
+   attach that one file.
+
+It holds the mod's logs, crash reports, your GPU's crash data and what your machine is. Your home folder and user
+name are masked, and lines naming a password or token are blanked. Your saves and game files are not in it. The
+logs do show your character's name and where it went, and the GPU data is raw, so open the zip first if you prefer.
+
 ## Credits
 
 WOW-BG3 stands on [vmangos](https://github.com/vmangos/core) (the WoW server),

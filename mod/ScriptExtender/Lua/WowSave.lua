@@ -147,6 +147,7 @@ function M.Start(runId)
         status()
     end)
     local ticks = 0
+    local crashTold = nil
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
         if ticks % 30 ~= 0 then return end
@@ -174,6 +175,17 @@ function M.Start(runId)
                             Ext.Log.Print("WOW-BG3 wowsave: " .. tostring(nameOf(u)) .. " is WoW character " .. name)
                         end
                     end
+                end
+            end
+        end
+        -- The WoW side crashed: lifecycle.py made a report, the player is told the one file to send.
+        if state == "Running" and ticks % 300 == 0 then
+            local c = readJson("wow-bg3/crash-notice.json")
+            if c and c.RunId == runId and type(c.Path) == "string" and c.Path ~= crashTold then
+                crashTold = c.Path
+                local host = q(Osi.GetHostCharacter)
+                if host then
+                    pcall(Osi.OpenMessageBox, host, "WOW-BG3's WoW side crashed. To help fix it, send this one file on GitHub:\n" .. c.Path)
                 end
             end
         end

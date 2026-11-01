@@ -51,7 +51,7 @@ FOLDER = "WOWBG3"          # the release module's folder (and ModTable)
 LAUNCHER = "wowbg3-launcher.so"
 PLUGIN = "wowbg3.so"
 # The tools the coordinator runs (tools/relenv.py points them at the player's folders).
-TOOLS = ["lifecycle.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_bridge.py", "wow_arena.py", "wow_stand.py", "wow_waypoints.py",
+TOOLS = ["lifecycle.py", "crashreport.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_bridge.py", "wow_arena.py", "wow_stand.py", "wow_waypoints.py",
          "wow_vmap.py", "wow_mpq.py", "inventory_bridge.py", "wowlevel.py", "wow_items.py", "wow_items_rules.json"]
 TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthrough accounts, chat commands
                "tavtex.py", "bg3tex.py", "bg3pak.py", "bg3shade.py", "bg3index.py",  # Tav's textures (with --python)
