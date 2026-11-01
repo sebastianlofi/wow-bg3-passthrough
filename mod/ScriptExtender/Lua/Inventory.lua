@@ -487,6 +487,7 @@ local function setGold(u, want)
     if want > 0 then return pcall(Osi.AddGold, u, want) end
 end
 local function addGold(u, delta) return setGold(u, goldOf(u) + delta) end
+local goldOwed, goldTried = {}, {} -- member -> gold BG3 is short of WoW's money, not yet given back; the last try at it
 M.AddGold, M.SetGold = addGold, setGold
 
 -- Stackable things (row kind "object": potions, food, cloth, quest items...) are one BG3 stack per
@@ -736,25 +737,39 @@ local function reconcileMember(uuid, m, have)
             M.Barter[uuid], b = nil, nil
         end
         if b then
-            b.Target = b.Target or have_g
             local busy = false
             for _, r in pairs(pending) do
                 if r.Member == uuid and BARTER_OPS[r.Op] then busy = true end
             end
             if not busy then
-                local delta = math.floor(b.Target * (M.CopperPerGold or 1)) - m.Money
+                -- What BG3 still owes from before (below) is no part of this barter's price.
+                local delta = math.floor((have_g + (goldOwed[uuid] or 0)) * (M.CopperPerGold or 1)) - m.Money
                 if delta == 0 then
                     M.Barter[uuid], b = nil, nil
-                elseif not b.Asked then
-                    b.Asked = true
+                elseif b.Asked ~= delta then
+                    b.Asked = delta
                     M.Request({Op = "money", Member = uuid, Delta = delta})
                 end
             end
             if b then want = have_g end
+        else
+            goldOwed[uuid] = want - have_g
         end
         if want ~= have_g then
             M.SuppressGold = tick + 20
-            setGold(uuid, want)
+            -- BG3 holds a trader's gold stack while a trade is open, so setting it does nothing until the trade
+            -- ends (harness: GetGold also lags a tick, so that shows only at the next look). AddGold still
+            -- works, upward: a refused buy's price comes back at once.
+            local t = goldTried[uuid]
+            if t and t.Want == want and t.Have == have_g and want > have_g and not t.Added then
+                t.Added = true
+                pcall(Osi.AddGold, uuid, want - have_g)
+            else
+                if not (t and t.Want == want and t.Have == have_g) then goldTried[uuid] = {Want = want, Have = have_g} end
+                setGold(uuid, want)
+            end
+        else
+            goldTried[uuid] = nil
         end
     end
 end
@@ -831,6 +846,13 @@ end
 -- ---- vendors and corpses: their WoW wares or loot in the stand-in's BG3 inventory ----
 local sideUuid, sideCount, deleted = {}, {}, {} -- tag -> the stand-in item made for it; its count; ours deleted
 local asked = {} -- uuid -> true once a buy or take went out for it
+-- Vendor stand-in -> the tick from which a ware leaving it is a buy: its trade screen is open and has settled.
+-- Nothing else is one. A world move takes a stand-in apart and opening a trade clears its stock, and every ware
+-- "left" it (harness: all of Farley's bought in WoW, then refunded by the barter, each time).
+local trading = {}
+local TRADE_SETTLE = 45
+local function buying(standin) return trading[standin] ~= nil and tick >= trading[standin] end
+
 
 -- Pickpocketing a stand-in (BG3's RequestPickpocket / StartPickpocket): stand-in uuid -> {Thief, Until}.
 -- A ware taken from it then is stolen, not bought: WoW gives the thief the item (the bridge's `add`), and
@@ -870,18 +892,54 @@ local function askFor(u, tag, count, thief)
     end
 end
 M.AskFor = askFor
+-- Part of a ware bought (split in the drag): BG3 makes the part and moves it in one go, into the buyer's stack if
+-- there is one, with no event to see (harness). What shows is the ware's own stack getting smaller, so that is the buy;
+-- the part itself goes (notePieces) and WoW's list brings it. A ware BG3 won't stack (arrows) just never gets smaller.
+local wareSeen, partBought = {}, {} -- tag -> its stack as last seen in this trade; entry -> tick part of it was bought
+local function settleWares()
+    local have
+    for standin, at in pairs(trading) do
+        local guid = vendorOf[standin]
+        if guid and tick >= at then
+            have = have or ours()
+            for _, w in ipairs(((lastInv or {}).Vendors or {})[guid] or {}) do
+                local tag = "V" .. guid .. ":" .. tostring(w.Idx)
+                local u = have[tag]
+                local n = u and not asked[u] and holderOf(u) == standin and q(Osi.GetStackAmount, u)
+                if n then
+                    local was = wareSeen[tag]
+                    if was and n < was and (w.Price or 0) > 0 then
+                        local member, bc, part = Hero.Uuid(), (M.Item(w.Entry) or {}).bc or 1, was - n
+                        M.Barter[member] = M.Barter[member] or {At = tick}
+                        partBought[w.Entry] = tick
+                        if part % bc == 0 then
+                            M.Request({Op = "buy", Member = member, Npc = guid, Entry = w.Entry, Count = part // bc})
+                        else
+                            M.Request({Op = "buypart", Member = member, Npc = guid, Entry = w.Entry, Count = part,
+                                Price = w.Price, Lot = bc})
+                        end
+                    end
+                    wareSeen[tag] = n
+                end
+            end
+        end
+    end
+end
+M.SettleWares = settleWares
+
 
 local function fillHolder(standin, prefix, list)
     local have = ours()
-    local want = {}
+    local want, size = {}, {}
     for _, w in ipairs(list or {}) do
         local tag = prefix .. tostring(w.Idx)
         want[tag] = true
+        if prefix:sub(1, 1) == "V" then size[tag] = w.Count or (M.Item(w.Entry) or {}).bc or 1 end
         -- Gone without a trace: the player took it and BG3 merged it into a stack of theirs (no
         -- RemovedFrom for a merge, harness).
         local old = sideUuid[tag]
         if not have[tag] and old and not deleted[old] and not q(Ext.Entity.Get, old) then
-            askFor(old, tag, sideCount[tag])
+            if buying(standin) then askFor(old, tag, sideCount[tag]) else deleted[old] = true end
         end
         if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) then
             local n = w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1
@@ -902,11 +960,26 @@ local function fillHolder(standin, prefix, list)
                 -- Held by nobody: its stand-in was made again (it moved off the ground and back); into
                 -- the one there now.
                 M.Suppress(u); pcall(Osi.ToInventory, u, standin, 1, 0, 0)
+            elseif size[tag] and not buying(standin) and not asked[u] and q(Osi.GetStackAmount, u) ~= size[tag] then
+                -- A ware is a full lot until its trade is under way (notePieces took the bare copies, which can
+                -- hold part of it); one BG3 won't stack just stays as it is.
+                pcall(Osi.SetStackAmount, u, size[tag])
             end
         end
     end
 end
 local corpseGold = {} -- corpse stand-in -> the gold we put there
+-- BG3 won't let a trader buy what it has no gold for ("Insufficient Gold") and WoW's vendors never run out, so a
+-- merchant holds enough for WoW's dearest item at BG3's best price (sp 1,224,473, value times 2.5) while its trade
+-- is open, and nothing after: gold in a stand-in's pockets could be stolen and would become WoW's money.
+local MERCHANT_GOLD = 4000000
+local funded = {} -- stand-in -> tick funded: GetGold lags, so it is not asked again at once
+local function fundMerchant(standin)
+    if tick - (funded[standin] or -1000) < 60 or goldOf(standin) >= MERCHANT_GOLD / 2 then return end
+    funded[standin] = tick
+    setGold(standin, MERCHANT_GOLD)
+end
+
 
 local function fillVendors(inv)
     -- Every vendor's stand-in whose wares the bridge listed ahead (it lists every friendly NPC with a
@@ -916,6 +989,10 @@ local function fillVendors(inv)
     end
     for standin in pairs(vendorOf) do
         if not Ext.Entity.Get(standin) then vendorOf[standin] = nil end -- its stand-in is gone
+    end
+    for standin in pairs(vendorOf) do
+        if trading[standin] then fundMerchant(standin)
+        elseif not corpseOf[standin] and goldOf(standin) > 0 then setGold(standin, 0) end
     end
     for standin, guid in pairs(vendorOf) do
         local wares = (inv.Vendors or {})[guid]
@@ -946,6 +1023,9 @@ end
 function M.OpenVendor(standin, wowGuid, member)
     standin = uuidOf(standin) or standin
     vendorOf[standin] = tostring(wowGuid)
+    pcall(M.NotePieces) -- before the trade counts as open: its strays go
+    trading[standin] = tick + TRADE_SETTLE
+    fundMerchant(standin)
     pcall(Osi.ClearTradeGeneratedItems, standin)
     M.Request({Op = "vendor", Npc = tostring(wowGuid), Member = member})
 end
@@ -991,17 +1071,30 @@ local function eachHeld(u, fn)
         if it then fn(it) end
     end
 end
+-- A piece that has been dealt with: the next reconcile shows the stack as WoW has it.
+local function dropPiece(u)
+    M.Suppress(u)
+    pcall(Osi.RequestDelete, u)
+end
+local function wareTag(guid, entry)
+    for _, w in ipairs(((lastInv or {}).Vendors or {})[guid] or {}) do
+        if w.Entry == entry then return "V" .. guid .. ":" .. tostring(w.Idx) end
+    end
+end
 local function notePieces()
     for standin, guid in pairs(vendorOf) do
         eachHeld(standin, function(it)
             local entry = not tagOf(it) and entryOf(it)
             local row = entry and M.Item(entry)
-            if row then
+            if row and not trading[standin] and not pieceOwner[it] then
+                -- No trade, so no part being split off: a bare copy (a load brings them, and BG3 adds it to the
+                -- ware's stack on screen: Farley's food showed 10 for 5).
+                M.Suppress(it)
+                pcall(Osi.RequestDelete, it)
+            elseif row then
                 notePiece(it, row)
                 priceItem(it, standin)
-                for _, w in ipairs(((lastInv or {}).Vendors or {})[guid] or {}) do
-                    if w.Entry == entry then M.SideTag[it] = "V" .. guid .. ":" .. tostring(w.Idx) end
-                end
+                M.SideTag[it] = wareTag(guid, entry)
             end
         end)
     end
@@ -1009,7 +1102,11 @@ local function notePieces()
         local function look(it)
             local entry = not tagOf(it) and entryOf(it)
             local row = entry and M.Item(entry)
-            if row then notePiece(it, row); priceItem(it, uuid); pieceOwner[it] = uuid end
+            -- A merchant's piece bought: its buy is on the way, WoW's list brings the stack (a look is what
+            -- catches one BG3 put straight in the Camp Supply Sack).
+            if row and ((M.SideTag[it] and asked[it]) or (not pieceOwner[it] and tick - (partBought[entry] or -1000) < 90)) then
+                dropPiece(it)
+            elseif row then notePiece(it, row); priceItem(it, uuid); pieceOwner[it] = uuid end
         end
         eachHeld(uuid, function(it)
             look(it)
@@ -1018,11 +1115,6 @@ local function notePieces()
     end
 end
 M.NotePieces = notePieces
--- A piece that has been dealt with: the next reconcile shows the stack as WoW has it.
-local function dropPiece(u)
-    M.Suppress(u)
-    pcall(Osi.RequestDelete, u)
-end
 
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
@@ -1034,14 +1126,15 @@ local function onAddedTo(item, holder)
     if not tag and entryOf(u) then
         if members[h] then
             dropPiece(u)
-        elseif vendorOf[h] and pieceOwner[u] then
-            -- Part of a stack sold: that many, out of WoW's stacks of that entry.
+        elseif vendorOf[h] and (pieceOwner[u] or buying(h)) then
+            -- Part of a stack sold: that many, out of WoW's stacks of that entry. Split in the drag, no look has seen it.
+            local seller = pieceOwner[u] or Hero.Uuid()
             local left = q(Osi.GetStackAmount, u) or 1
-            for _, it in ipairs((((lastInv.Members or {})[pieceOwner[u]]) or {}).Items or {}) do
+            for _, it in ipairs((((lastInv.Members or {})[seller]) or {}).Items or {}) do
                 if left > 0 and it.Entry == entryOf(u) then
                     local n = math.min(left, it.Count or 1)
-                    M.Barter[pieceOwner[u]] = M.Barter[pieceOwner[u]] or {At = tick}
-                    M.Request({Op = "sell", Member = pieceOwner[u], Npc = vendorOf[h], Guid = tostring(it.Guid), Count = n})
+                    M.Barter[seller] = M.Barter[seller] or {At = tick}
+                    M.Request({Op = "sell", Member = seller, Npc = vendorOf[h], Guid = tostring(it.Guid), Count = n})
                     left = left - n
                 end
             end
@@ -1086,7 +1179,7 @@ local function onRemovedFrom(item, holder)
     local pick = picking[h]
     if kind == "V" and pick and pick.Until >= tick then
         askFor(u, tag, q(Osi.GetStackAmount, u), pick.Thief)
-    elseif (kind == "V" and vendorOf[h]) or (kind == "L" and corpseOf[h]) then
+    elseif (kind == "V" and vendorOf[h] and buying(h)) or (kind == "L" and corpseOf[h]) then
         askFor(u, tag, q(Osi.GetStackAmount, u))
     end
 end
@@ -1173,6 +1266,11 @@ function M.Start(id)
             M.Request({Op = "money", Member = t, Delta = math.floor(tonumber(amount) * (M.CopperPerGold or 1))})
         end
     end)
+    pcall(Ext.Osiris.RegisterListener, "TradeEnds", 2, "after", function(a, b)
+        for _, x in ipairs({uuidOf(a) or "", uuidOf(b) or ""}) do
+            if trading[x] then trading[x] = nil; wareSeen = {} end
+        end
+    end)
     -- BG3's trade with a WoW vendor's stand-in, however it was opened (interaction's click, the
     -- context menu, dialog): fill it with the WoW vendor's wares.
     for _, ev in ipairs({{"RequestTrade", 4}, {"RequestTrade", 3}}) do
@@ -1193,6 +1291,7 @@ function M.Start(id)
         tick = tick + 1
         if tick % 10 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         if not made then M.MakeAll() end
+        pcall(settleWares)
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
         for u, f in pairs(M.Fresh) do

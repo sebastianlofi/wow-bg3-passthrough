@@ -205,5 +205,225 @@ class Items(unittest.TestCase):
         self.assertNotIn('TRADE_MARKUP', text)
 
 
+GOLD = r"""
+tick, pending, reqs, sets, adds = 100, {}, {}, 0, 0
+gold, blocked = 1000, false
+M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
+BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
+function goldOf() return gold end
+function setGold(_, want) sets = sets + 1; if not blocked then gold = want end end
+Osi = {AddGold = function(_, n) adds = adds + n; gold = gold + n end}
+"""
+
+
+class Gold(unittest.TestCase):
+    """Inventory.lua: BG3's gold and WoW's money after a barter, a refusal, an open trade."""
+
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        L.execute(GOLD)
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute('function look(uuid, m)\n' + section(text, "    -- Gold: WoW's money", 'function M.Reconcile(inv)'))
+
+    def look(self, money):
+        self.L.execute('look("hero", {Money = %d})' % money)
+
+    def test_a_barter_pays_the_screen_s_price(self):
+        self.L.execute('gold = 928; M.Barter.hero = {At = 100}')
+        self.look(900)  # WoW charged its 100, the screen said 72
+        self.assertEqual(self.L.eval('reqs[1].Delta'), 28)
+        self.look(900)  # the reply is not in yet: not asked twice
+        self.assertEqual(self.L.eval('#reqs'), 1)
+        self.look(928)
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+
+    def test_two_buys_in_one_barter_both_count(self):
+        self.L.execute('gold = 928; M.Barter.hero = {At = 100}')
+        self.look(900)
+        self.L.execute('gold = 856')  # the second buy, before the first's money came back
+        self.look(828)  # WoW: 100 more, the first's 28 not yet: still 28 short, so nothing more to ask
+        self.assertEqual(self.L.eval('#reqs'), 1)
+        self.look(856)  # the 28 arrives
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+        self.L.execute('gold = 784; M.Barter.hero = {At = 100}')  # a third, on its own
+        self.look(756)
+        self.assertEqual(self.L.eval('reqs[2].Delta'), 28)
+        self.look(784)
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+
+    def test_a_refused_buy_comes_back_in_an_open_trade(self):
+        self.L.execute('blocked = true; gold = 928')  # refused: WoW's money stays 1000
+        self.look(1000)
+        self.assertEqual((self.L.eval('sets'), self.L.eval('adds')), (1, 0))  # GetGold lags: the set may have worked
+        self.look(1000)
+        self.assertEqual((self.L.eval('gold'), self.L.eval('adds')), (1000, 72))
+        self.look(1000)
+        self.assertEqual(self.L.eval('adds'), 72)
+
+    def test_a_set_that_works_gets_no_add_on_top(self):
+        self.L.execute('gold = 928')
+        self.look(1000)
+        self.look(1000)
+        self.assertEqual((self.L.eval('gold'), self.L.eval('adds')), (1000, 0))
+
+    def test_what_is_owed_stays_out_of_the_next_barter(self):
+        self.L.execute('blocked = true; gold = 928; Osi.AddGold = function() end')  # not even AddGold gets through
+        self.look(1000)
+        self.look(1000)
+        self.L.execute('gold = 856; M.Barter.hero = {At = 100}')  # the next buy, 72 on the screen; WoW takes 100
+        self.look(900)
+        self.assertEqual(self.L.eval('reqs[1].Delta'), 28)  # 928, not 856
+        self.look(928)
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+        self.L.execute('blocked = false')  # the trade is over
+        self.look(928)
+        self.look(928)
+        self.assertEqual(self.L.eval('gold'), 928)
+
+    def test_gold_above_wow_s_money_waits_for_the_end_of_the_trade(self):
+        self.L.execute('blocked = true; gold = 1100')
+        for _ in range(3):
+            self.look(1000)
+        self.assertEqual((self.L.eval('gold'), self.L.eval('adds')), (1100, 0))
+        self.L.execute('blocked = false')
+        self.look(1000)
+        self.assertEqual(self.L.eval('gold'), 1000)
+
+
+class Buying(unittest.TestCase):
+    """Inventory.lua: what counts as a buy."""
+
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute("""
+          bought, tags, stacks, entries = {}, {}, {}, {}
+          function uuidOf(s) return s end
+          function suppressed() return false end
+          function tagOf(u) return tags[u] end
+          function entryOf(u) return entries[u] end
+          function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
+          function askFor(u, tag, n) bought[#bought + 1] = {u, tag, n} end
+          Osi = {GetStackAmount = function(u) return stacks[u] end}
+          M = {SideTag = {}}
+          lastInv = {Vendors = {f1 = {{Idx = 4, Entry = 414}}}}
+          picking, pieceOwner, vendorOf, corpseOf, trading = {}, {}, {f = "f1", s = "f1"}, {}, {f = 50}
+          tick = 100
+          function buying(u) return trading[u] ~= nil and tick >= trading[u] end
+        """ + section(text, 'local function wareTag', 'local function notePieces').replace('local function', 'function')
+                  + section(text, 'local function onRemovedFrom', 'local function research').replace('local function', 'function'))
+
+    def test_a_ware_leaving_an_open_trade_is_a_buy(self):
+        self.L.execute('tags.w = "Vf1:4"; stacks.w = 5; onRemovedFrom("w", "f")')
+        self.assertEqual(self.L.eval('bought[1][3]'), 5)
+
+    def test_a_ware_leaving_a_stand_in_with_no_trade_is_not(self):
+        self.L.execute('tags.w = "Vf1:4"; stacks.w = 5; onRemovedFrom("w", "s")')
+        self.assertEqual(self.L.eval('#bought'), 0)
+
+    def test_a_trade_still_opening_clears_its_stock_and_buys_nothing(self):
+        self.L.execute('trading.f = 145; tags.w = "Vf1:4"; stacks.w = 5; onRemovedFrom("w", "f")')
+        self.assertEqual(self.L.eval('#bought'), 0)
+
+    def test_the_settle_rule_is_the_one_tested(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.assertIn('local function buying(standin) return trading[standin] ~= nil and tick >= trading[standin] end', text)
+        self.assertIn('trading[standin] = tick + TRADE_SETTLE', text)
+
+    def test_a_part_with_no_tag_leaving_is_no_buy_of_its_own(self):
+        self.L.execute('entries.p = 414; stacks.p = 2; onRemovedFrom("p", "f")')
+        self.assertEqual(self.L.eval('#bought'), 0)  # settleWares counts it
+
+
+class Parts(unittest.TestCase):
+    """Inventory.lua settleWares: part of a ware bought shows as its stack getting smaller."""
+
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute("""
+          reqs, stacks, asked, trading, vendorOf = {}, {w = 5, a = 1}, {}, {f = 50}, {f = "f1"}
+          tick = 100
+          lastInv = {Vendors = {f1 = {{Idx = 0, Entry = 414, Price = 125}, {Idx = 1, Entry = 2512, Price = 10}}}}
+          function ours() return {["Vf1:0"] = "w", ["Vf1:1"] = "a"} end
+          function holderOf() return "f" end
+          function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
+          Osi = {GetStackAmount = function(u) return stacks[u] end}
+          Hero = {Uuid = function() return "hero" end}
+          M = {Barter = {}, Request = function(r) reqs[#reqs + 1] = r end,
+               Item = function(e) if e == 414 then return {bc = 5} end return {bc = 200} end}
+        """ + section(text, 'local wareSeen, partBought', 'M.SettleWares = settleWares').replace('local function', 'function'))
+
+    def test_a_first_look_buys_nothing(self):
+        self.L.execute('settleWares(); settleWares()')
+        self.assertEqual(self.L.eval('#reqs'), 0)
+
+    def test_part_of_a_stack(self):
+        self.L.execute('settleWares(); stacks.w = 3; settleWares(); settleWares()')
+        self.assertEqual(self.L.eval('#reqs'), 1)
+        self.assertEqual((self.L.eval('reqs[1].Op'), self.L.eval('reqs[1].Count'), self.L.eval('reqs[1].Lot')), ('buypart', 2, 5))
+        self.assertEqual(self.L.eval('M.Barter.hero.At'), 100)
+
+    def test_a_ware_bg3_will_not_stack_is_not_bought_for_being_short(self):
+        self.L.execute('settleWares(); settleWares(); settleWares()')  # arrows: 1 where WoW's lot is 200
+        self.assertEqual(self.L.eval('#reqs'), 0)
+
+    def test_not_before_the_trade_has_settled(self):
+        self.L.execute('trading.f = 200; settleWares(); stacks.w = 3; settleWares()')
+        self.assertEqual(self.L.eval('#reqs'), 0)
+
+
+class Merchant(unittest.TestCase):
+    """Inventory.lua: a merchant can pay, while its trade is open and no longer."""
+
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute("""
+          sold, tick = {}, 0
+          function goldOf(u) return sold[u] or 0 end
+          function setGold(u, n) sold[u] = n end
+          function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
+          Ext = {Entity = {Get = function(u) return u end}}
+          vendorOf, corpseOf = {}, {}
+          M = {Request = function() end, Item = function() end}
+          Osi = {}
+        """ + section(text, '-- BG3 won\'t let a trader buy', 'local function fillVendors').replace('local ', '') + """
+          trading = {}
+          function open(u) trading[u] = true; fundMerchant(u) end
+          function pass()
+            for standin in pairs(vendorOf) do
+              if trading[standin] then fundMerchant(standin)
+              elseif not corpseOf[standin] and goldOf(standin) > 0 then setGold(standin, 0) end
+            end
+          end
+        """)
+
+    def test_it_can_pay_for_the_dearest_item_at_bg3_s_best_price(self):
+        self.assertGreaterEqual(self.L.eval('MERCHANT_GOLD'), 1224473 * 2.5)
+
+    def test_open_funded_closed_emptied(self):
+        L = self.L
+        L.execute('vendorOf.farley = "f1"; pass()')
+        self.assertEqual(L.eval('goldOf("farley")'), 0)
+        L.execute('open("farley")')
+        self.assertEqual(L.eval('goldOf("farley")'), L.eval('MERCHANT_GOLD'))
+        L.execute('sold.farley = 0; pass()')  # GetGold lags: not funded twice at once
+        self.assertEqual(L.eval('goldOf("farley")'), 0)
+        L.execute('tick = 100; sold.farley = 1000; pass()')  # paid out a lot
+        self.assertEqual(L.eval('goldOf("farley")'), L.eval('MERCHANT_GOLD'))
+        L.execute('trading.farley = nil; pass()')
+        self.assertEqual(L.eval('goldOf("farley")'), 0)
+
+    def test_a_corpse_keeps_its_loot_money(self):
+        self.L.execute('vendorOf.dead = "f2"; corpseOf.dead = "f2"; sold.dead = 37; pass()')
+        self.assertEqual(self.L.eval('goldOf("dead")'), 37)
+
+    def test_the_real_pass_is_the_one_tested(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.assertIn("""        if trading[standin] then fundMerchant(standin)
+        elseif not corpseOf[standin] and goldOf(standin) > 0 then setGold(standin, 0) end""", text)
+
+
 if __name__ == '__main__':
     unittest.main()

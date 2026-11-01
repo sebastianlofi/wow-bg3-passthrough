@@ -62,7 +62,9 @@ version is mostly complete.
   buy price and pays WoW's sell price, on every difficulty. BG3's attitude and Persuasion move both from
   there, and the price the screen shows is the price you pay: WoW's money follows. BG3's item values are whole
   numbers, so a buy price can show up to 1 copper off WoW's (a 1 copper item shows 3 on Balanced); sell prices
-  are exact. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
+  are exact. A merchant shows 4,000,000 gold during a trade, since WoW's vendors never run out. Inside an opened bag,
+  such as the Camp Supply Sack, BG3's tooltip shows the item's plain value, not the trade price; the sale still pays
+  the right price. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
