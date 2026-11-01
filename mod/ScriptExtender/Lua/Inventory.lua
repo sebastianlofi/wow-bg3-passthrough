@@ -391,6 +391,10 @@ local reqs, reqSeq, runId = {}, 0, nil
 local pending = {} -- Seq -> {Op, Item, Member, ...}
 -- BG3 items with a request on the way: the reconcile leaves them alone until the reply (or 30 s).
 local pendingItem = {} -- uuid -> tick asked
+-- A barter that went through: member -> {At, Target = its BG3 gold after it} until WoW's money is that (reconcile).
+M.Barter = {}
+local BARTER_OPS = {buy = true, buypart = true, sell = true}
+local BARTER_WAIT = 600
 function M.Request(r)
     reqSeq = reqSeq + 1
     r.Seq = reqSeq
@@ -674,6 +678,30 @@ local function reconcileMember(uuid, m, have)
     if type(m.Money) == "number" then
         local want = math.floor(m.Money / (M.CopperPerGold or 1))
         local have_g = goldOf(uuid)
+        -- After a barter the price seen is the price paid: BG3's gold, with its attitude and Persuasion, is the
+        -- truth. WoW's buys and sells run first (its stock and refusals), then WoW's money is made BG3's.
+        -- A refusal drops this (onReplies), and WoW's word stands.
+        local b = M.Barter[uuid]
+        if b and tick - b.At > BARTER_WAIT then
+            M.Barter[uuid], b = nil, nil
+        end
+        if b then
+            b.Target = b.Target or have_g
+            local busy = false
+            for _, r in pairs(pending) do
+                if r.Member == uuid and BARTER_OPS[r.Op] then busy = true end
+            end
+            if not busy then
+                local delta = math.floor(b.Target * (M.CopperPerGold or 1)) - m.Money
+                if delta == 0 then
+                    M.Barter[uuid], b = nil, nil
+                elseif not b.Asked then
+                    b.Asked = true
+                    M.Request({Op = "money", Member = uuid, Delta = delta})
+                end
+            end
+            if b then want = have_g end
+        end
         if want ~= have_g then
             M.SuppressGold = tick + 20
             setGold(uuid, want)
@@ -742,6 +770,7 @@ local function onReplies(inv)
             end
             if not rep.Ok then
                 if r.Item and (r.Op == "buy" or r.Op == "buypart" or r.Op == "take") then M.Refused[r.Item] = true end
+                if BARTER_OPS[r.Op] and r.Member then M.Barter[r.Member] = nil end
                 pcall(tellRefused, r, rep)
                 note(string.format("%s refused: %s", tostring(r.Op), tostring(rep.Why)))
             end
@@ -778,6 +807,7 @@ local function askFor(u, tag, count, thief)
             -- go as WoW's own buy, the rest of a stack split earlier at the price of one.
             local bc = (M.Item(ware.Entry) or {}).bc or 1
             local n = count or 1
+            if (ware.Price or 0) > 0 then M.Barter[member] = M.Barter[member] or {At = tick} end
             if n % bc == 0 or (ware.Price or 0) <= 0 then -- price 0: a pocket's food, no vendor's (the bridge refuses it)
                 M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = n // bc, Item = u})
             else
@@ -957,6 +987,7 @@ local function onAddedTo(item, holder)
             for _, it in ipairs((((lastInv.Members or {})[pieceOwner[u]]) or {}).Items or {}) do
                 if left > 0 and it.Entry == entryOf(u) then
                     local n = math.min(left, it.Count or 1)
+                    M.Barter[pieceOwner[u]] = M.Barter[pieceOwner[u]] or {At = tick}
                     M.Request({Op = "sell", Member = pieceOwner[u], Npc = vendorOf[h], Guid = tostring(it.Guid), Count = n})
                     left = left - n
                 end
@@ -971,6 +1002,7 @@ local function onAddedTo(item, holder)
         if members[h] and owner and owner ~= h then
             M.Request({Op = "give", Member = owner, To = h, Guid = tag, Item = u})
         elseif vendorOf[h] and owner then
+            M.Barter[owner] = M.Barter[owner] or {At = tick}
             M.Request({Op = "sell", Member = owner, Npc = vendorOf[h], Guid = tag, Item = u})
         end
         return
@@ -983,6 +1015,7 @@ local function onAddedTo(item, holder)
             if tostring(it.Entry) == entry then
                 local r = members[h] and {Op = "give", Member = owner, To = h, Guid = tostring(it.Guid)}
                     or {Op = "sell", Member = owner, Npc = vendorOf[h], Guid = tostring(it.Guid)}
+                if not members[h] then M.Barter[owner] = M.Barter[owner] or {At = tick} end
                 if first then r.Item = u; first = false end
                 M.Request(r)
             end
