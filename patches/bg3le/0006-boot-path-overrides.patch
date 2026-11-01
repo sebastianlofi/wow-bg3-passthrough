@@ -1,0 +1,81 @@
+--- a/src/game_state.cpp
++++ b/src/game_state.cpp
+@@ -346,6 +346,8 @@
+     plugins_dispatch_frame();
+     return result;
+ }
++
++extern "C" void bg3le_path_overrides_boot();
+ 
+ using StatsLoadProc = std::uint64_t (*)(void*, void*, void*, void*);
+ StatsLoadProc g_stats_load = nullptr;
+@@ -354,6 +356,7 @@
+ std::uint64_t stats_load_hook(void* paths, void* a, void* b, void* c) {
+     logf("stats: RPGStats::Load starts");
+     lua_module_load_started();
++    bg3le_path_overrides_boot();  // after the reset above clears them; no mod's Lua runs before this load
+     bg3le_stats_loading(true);
+     const std::uint64_t result = g_stats_load(paths, a, b, c);
+     logf("stats: RPGStats::Load done");
+--- a/src/vendor/path_override.cpp
++++ b/src/vendor/path_override.cpp
+@@ -12,11 +12,16 @@
+ #include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
++#include <ctime>
++#include <fstream>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <string>
+ #include <unordered_map>
+ 
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include "../hook.h"
+ #include "../log.h"
+ #include "../resolve.h"
+@@ -164,6 +169,42 @@
+     return true;
+ }
+ 
++namespace {
++const std::time_t g_process_start = std::time(nullptr);
++}
++
++// WOW-BG3: overrides for the files RPGStats::Load reads, which Lua cannot give: the client's mods load after it.
++// <Script Extender folder>/boot-path-overrides.txt, one "game path<TAB>absolute file" a line, the game path as
++// Ext.IO.AddPathOverride takes it. Under WOW-BG3's launcher (WOWBG3_SHM) its coordinator writes the file at every
++// start, moments after BG3 starts: wait a little for this start's. Without it, or when late, whatever is there.
++extern "C" void bg3le_path_overrides_boot() {
++    if (g_real == nullptr) return;
++    char const* xdg = std::getenv("XDG_DATA_HOME");
++    char const* home = std::getenv("HOME");
++    if ((xdg == nullptr || *xdg == 0) && home == nullptr) return;
++    const std::string file = ((xdg != nullptr && *xdg != 0) ? std::string(xdg) : std::string(home) + "/.local/share")
++                             + "/Larian Studios/Baldur's Gate 3/Script Extender/boot-path-overrides.txt";
++    if (std::getenv("WOWBG3_SHM") != nullptr) {
++        struct stat st{};
++        for (int i = 0; i < 150 && !(::stat(file.c_str(), &st) == 0 && st.st_mtime >= g_process_start); i++) {
++            ::usleep(100000);
++        }
++    }
++    std::ifstream in(file);
++    std::string line;
++    int count = 0;
++    while (std::getline(in, line)) {
++        const std::size_t tab = line.find('\t');
++        if (tab == std::string::npos) continue;
++        std::string from = absolute(line.substr(0, tab).c_str());
++        std::unique_lock<std::shared_mutex> held(g_lock);
++        g_overrides[std::move(from)] = line.substr(tab + 1);
++        g_any.store(true, std::memory_order_relaxed);
++        count++;
++    }
++    bg3le::logf("io: %d path override(s) from %s", count, file.c_str());
++}
++
+ // Upstream's GetPathOverride: the absolute override, or null.
+ extern "C" char const* bg3le_path_override_get(char const* path) {
+     static thread_local std::string out;

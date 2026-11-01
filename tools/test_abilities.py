@@ -49,6 +49,14 @@ def test_level_one_is_gentle():
     assert w.recharge(1000, 'nuke', True, 4, None) == 'fight'
 
 
+def test_stats_text():
+    copies = {'abc': {'B': 'Projectile_FireBolt', 'Dc': 11, 'St': 'Projectile', 'F': {'SpellRoll': 'SavingThrow(Ability.Dexterity, @DC@)', 'DisplayName': 'WowBg3_Aabc;1'}}}
+    s = w.stats_text(copies, 'new entry "Wall"\r\n')
+    assert s.startswith('new entry "Wall"\r\n\r\nnew entry "WOWBG3_AB_abc"\r\ntype "SpellData"\r\ndata "SpellType" "Projectile"\r\nusing "Projectile_FireBolt"\r\n')
+    assert 'SavingThrow(Ability.Dexterity, 11)' in s and 'data "DisplayName" "WowBg3_Aabc;1"' in s
+    assert 'SavingThrow(Ability.Dexterity, SourceSpellDC())' in w.stats_text(copies, '', 'SourceSpellDC()')
+
+
 if __name__ == '__main__':
     for name, fn in list(globals().items()):
         if name.startswith('test_'):

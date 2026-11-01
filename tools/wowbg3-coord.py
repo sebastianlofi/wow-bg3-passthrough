@@ -548,8 +548,38 @@ def items_current():
     return bool(m) and int(m.group(1)) >= 5
 
 
+ABILITIES_CARRIER = 'Public/GustavX/Stats/Generated/Data/Spell_Wall.txt'  # wow_abilities.py CARRIER
+
+
+def abilities_current():
+    """The mobs' abilities are there and of this version's schema (wow_abilities.py SCHEMA)."""
+    try:
+        with open(LINK / 'abilities.json') as f:
+            m = re.match(r'\{"Schema":\s*(\d+)', f.read(40))
+    except OSError:
+        return False
+    return bool(m) and int(m.group(1)) >= 3 and (LINK / 'abilities-stats.txt').is_file()
+
+
+def abilities_first():
+    """The table from the release's seed, needing no server, as soon as BG3 starts, and the override that has BG3's
+    own loader read the copies from a stats file in place of a small game file whose text they start with."""
+    on = S.get('mob_abilities') == '1'
+    if on and not abilities_current():
+        seed, rc, t0 = TOOLS / 'abilities-seed.json.gz', 1, time.time()
+        if seed.is_file() and game_data():
+            rc = subprocess.run(py('wow_abilities', 'make', LINK / 'abilities.json', '--seed', seed, '--bg3', game_data()),
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        log('abilities: table from the seed, exit %d in %.1f s' % (rc, time.time() - t0))
+    # bg3le patch 0006 reads this as BG3 starts on its stats. Every start: it waits for this start's.
+    stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
+    tmp = IO.parent / 'boot-path-overrides.tmp'
+    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_current() else '')
+    os.replace(tmp, IO.parent / 'boot-path-overrides.txt')
+
+
 def datagen_needed():
-    return not (items_current() and (LINK / 'abilities.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
+    return not (items_current() and abilities_current() and (IO / 'gui/wow-icons.json').is_file()
                 and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file() and (LINK / 'spells.json').is_file())
 
 
@@ -563,7 +593,7 @@ def datagen():
     if not items_current():
         steps.append(('items', py('wow_items', 'build', '--out', LINK / 'items.json', '--data', WOW / 'Data',
                                   '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
-    if not (LINK / 'abilities.json').is_file() and game_data():
+    if not abilities_current() and game_data():
         steps.append(('abilities', py('wow_abilities', 'make', LINK / 'abilities.json', '--data', WOW / 'Data', '--bg3', game_data(),
                                       '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
     if not (LINK / 'spells.json').is_file():
@@ -673,6 +703,7 @@ def main():
     (IO / 'camp.json').write_text(json.dumps({'On': S.get('camp') == '1'}))
     (IO / 'wow-spells.json').write_text(json.dumps({'On': S.get('wow_spells') == '1'}))
     (IO / 'scaling.json').write_text(json.dumps({'On': S.get('scaling') == '1', 'Difficulty': S.get('difficulty')}))
+    abilities_first()
     REL = Release()
     log('window %dx%d, settings %s' % (REL.size + (S,)))
     if not wait_server(stop):

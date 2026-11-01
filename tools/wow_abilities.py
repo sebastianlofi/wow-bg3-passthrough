@@ -3,7 +3,9 @@
 
   wow_abilities.py export OUT.json [--db CMD]    read the server's database (read-only selects) and the
                                                  client's DBCs into one world file
-  wow_abilities.py make OUT.json --data D --bg3 D [--db CMD]    export and build, for the first run
+  wow_abilities.py seed WORLD.json OUT.json.gz   the part of a world file the table needs, for the release
+  wow_abilities.py make OUT.json --bg3 D --seed F   build from a seed, no database: what a first start runs
+  wow_abilities.py make OUT.json --data D --bg3 D [--db CMD]    export and build, when no seed shipped
   wow_abilities.py build WORLD.json --out FILE --bg3 D|STATS.json [--rules FILE]
                                                  the table the mod reads (link/abilities.json)
   wow_abilities.py show WORLD.json NAME|ENTRY    one mob's rows, for tuning the rules
@@ -19,8 +21,13 @@ Power is decided here, not in BG3's data: see ladder floors, dc(), recharge() an
 
 Sources: creature_template, creature_spells, creature_ai_events and creature_ai_scripts (spell lists and
 EventAI), spell_template, and the player's own DBCs. The world file and the table hold names and numbers from
-the player's own server and client; both are generated on the player's machine, neither is ever committed."""
-import argparse, hashlib, json, math, os, re, struct, subprocess, sys
+the player's own server and client; both are generated on the player's machine, neither is ever committed.
+The seed holds the same server's numbers and spell names, goes in the release beside the server's own SQL, and
+is not committed either.
+
+The copies themselves go in stats files (abilities-stats.txt, -scaled.txt with SourceSpellDC()): BG3's own loader
+reads them through Ext.IO.AddPathOverride on a small file of its own, whose text they start with. Abilities.lua."""
+import argparse, gzip, hashlib, json, math, os, re, struct, subprocess, sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -634,7 +641,11 @@ BG3_PAKS = (('Shared.pak', ('Shared', 'SharedDev')), ('Gustav.pak', ('Gustav', '
             ('GustavX.pak', ('GustavX', 'HonourX')))
 MAIN_COSTS = ('ActionPoint', 'BonusActionPoint', 'ReactionActionPoint')
 WEAPON_DAMAGE = re.compile(r'(Main|Offhand)\w*Weapon')
-DC_TOKEN = '@DC@'  # Abilities.lua: the fixed DC, or SourceSpellDC() when the stand-in carries Scaling's boost
+DC_TOKEN = '@DC@'  # the fixed DC, or SourceSpellDC() in the stats file for `scaling`, whose stand-ins carry the boost
+PREFIX = 'WOWBG3_AB_'
+# The game's file the copies travel in: small, in the last module loaded (Abilities.lua overrides it).
+CARRIER_PAK, CARRIER = 'GustavX.pak', 'Public/GustavX/Stats/Generated/Data/Spell_Wall.txt'
+SCHEMA = 3  # wowbg3-coord.py makes the table again below this
 
 
 def load_bg3(path):
@@ -797,7 +808,7 @@ def table(world, rules, bg3):
     """The mod's table: Spells, the copies by a short stable name, with their stats text; Mobs, per creature entry,
     the copies it gets. Only what the mod needs; no zones, no texts but the WoW spell's name for the log."""
     spells = {int(k): v for k, v in world['spells'].items()}
-    copies, mobs, missing = {}, {}, Counter()
+    copies, mobs, names, missing = {}, {}, {}, Counter()
     for e, m in world['mobs'].items():
         if not m['spawns']:
             continue
@@ -809,30 +820,82 @@ def table(world, rules, bg3):
                 missing[r['b']] += 1
                 continue
             fields = copy_fields(base, r)
-            # The DC names a copy only if its text uses it: fewer copies, each costs load time.
+            # BG3's text under WoW's name: a string of ours per name.
+            name = re.sub(r'\s+Proc$', '', r['wn'])
+            handle = 'WowBg3_A' + hashlib.sha1(name.encode()).hexdigest()[:12]
+            names[handle] = name
+            fields['DisplayName'] = handle + ';1'
+            # The DC names a copy only if its text uses it.
             dc_used = r['dc'] if DC_TOKEN in json.dumps(fields) else None
             key = hashlib.sha1(json.dumps([r['b'], dc_used, fields], sort_keys=True).encode()).hexdigest()[:12]
-            copies.setdefault(key, {'B': r['b'], 'Dc': r['dc'], 'Wn': r['wn'], 'F': fields})
+            copies.setdefault(key, {'B': r['b'], 'Dc': r['dc'], 'Wn': r['wn'], 'St': base.get('SpellType') or '', 'F': fields})
             got.append(key)
         if got:
             mobs[e] = got
     for b, n in missing.most_common():
         print('not in BG3 data: %s (%d mobs)' % (b, n), file=sys.stderr)
-    return {'Schema': 2, 'Spells': copies, 'Mobs': mobs}
+    return {'Schema': SCHEMA, 'Spells': copies, 'Mobs': mobs, 'Names': names}
 
 
-def write_table(world, rules, bg3, out):
+def stats_text(copies, carrier, dc=None):
+    """The carrier file's own text, then every copy as BG3's loader reads it. dc None: each copy's fixed DC."""
+    out = [carrier.rstrip('\r\n') + '\r\n\r\n'] if carrier else []
+    for key, c in sorted(copies.items()):
+        out.append('new entry "%s%s"\r\ntype "SpellData"\r\ndata "SpellType" "%s"\r\nusing "%s"\r\n' % (PREFIX, key, c['St'], c['B']))
+        for k, v in sorted(c['F'].items()):
+            out.append('data "%s" "%s"\r\n' % (k, v.replace(DC_TOKEN, dc or str(c['Dc']))))
+        out.append('\r\n')
+    return ''.join(out)
+
+
+def carrier_text(bg3_path):
+    if str(bg3_path).endswith('.json'):
+        return ''  # a test, on an extract
+    sys.path.insert(0, str(HERE))
+    from bg3pak import Pak
+    return Pak(str(Path(bg3_path) / CARRIER_PAK)).read(CARRIER).decode(errors='replace')
+
+
+def write_table(world, rules, bg3, out, carrier=''):
+    """abilities.json last: it says the stats files beside it are there."""
     t = table(world, rules, bg3)
+    d = Path(out).parent
+    for name, dc in (('abilities-stats.txt', None), ('abilities-stats-scaled.txt', 'SourceSpellDC()')):
+        (d / (name + '.tmp')).write_bytes(stats_text(t['Spells'], carrier, dc).encode())
+        os.replace(d / (name + '.tmp'), d / name)
+    t['Spells'] = {k: {'B': c['B'], 'Wn': c['Wn']} for k, c in t['Spells'].items()}
     tmp = str(out) + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(t, f, separators=(',', ':'))
     os.replace(tmp, out)
-    print('%d mobs with abilities, %d spell copies -> %s' % (len(t['Mobs']), len(t['Spells']), out))
+    print('%d mobs with abilities, %d spell copies, %d names -> %s' % (len(t['Mobs']), len(t['Spells']), len(t['Names']), out))
+
+
+def seed(world, out):
+    """What table() reads of a world file: fightable mobs with something to cast and the spells they can reach."""
+    sp = world['spells']
+    mobs = {e: {k: v for k, v in m.items() if k not in ('places', 'subname')} for e, m in world['mobs'].items()
+            if m['spawns'] and (m['list'] or m['events'] or m['auras'] or m['spawn_spell_id'])}
+    todo = []
+    for m in mobs.values():
+        todo += [x['spellId'] for x in m['list']] + [x['spell'] for x in m['events']] + [m['spawn_spell_id']]
+        todo += re.findall(r'\d+', str(m['auras'] or ''))
+    seen = set()
+    while todo:
+        s = str(todo.pop())
+        if s in seen or s not in sp:
+            continue
+        seen.add(s)
+        todo += [sp[s].get('effectTriggerSpell%d' % i) or 0 for i in (1, 2, 3)]
+    body = {'mobs': mobs, 'spells': {s: {k: v for k, v in sp[s].items() if k not in ('description', 'nameSubtext')} for s in seen}}
+    with gzip.open(out, 'wt') as f:
+        json.dump(body, f, separators=(',', ':'))
+    print('%d mobs, %d spells -> %s' % (len(mobs), len(seen), out))
 
 
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    a.add_argument('cmd', choices=('make', 'export', 'build', 'show', 'stats'))
+    a.add_argument('cmd', choices=('make', 'export', 'seed', 'build', 'show', 'stats'))
     a.add_argument('world')
     a.add_argument('mob', nargs='?')
     a.add_argument('--db', help='database command reading SQL on stdin (default: the server wowserver.py finds)')
@@ -840,26 +903,33 @@ def main():
     a.add_argument('--out', help='where build writes')
     a.add_argument('--rules', default=str(HERE / 'wow_abilities_rules.json'))
     a.add_argument('--bg3', help="BG3's Data folder, or a JSON of its spells (build, make)")
+    a.add_argument('--seed', help='a seed from `seed` (make: no database needed)')
     args = a.parse_args()
     db = ['sh', '-c', args.db] if args.db else None
     if args.cmd == 'make':
-        # wow_abilities.py make OUT.json --data D --bg3 D: first run, the world file next to the table.
-        if not (args.data and args.bg3):
-            sys.exit('make needs --data and --bg3')
-        world_file = str(args.world) + '.world'
-        export(world_file, db, args.data)
-        return write_table(json.load(open(world_file)), json.load(open(args.rules)), load_bg3(args.bg3), args.world)
+        # First run: from the release's seed, or from the database with the world file next to the table.
+        if not (args.bg3 and (args.seed or args.data)):
+            sys.exit('make needs --bg3 and --seed or --data')
+        if args.seed:
+            world = json.load(gzip.open(args.seed, 'rt'))
+        else:
+            world_file = str(args.world) + '.world'
+            export(world_file, db, args.data)
+            world = json.load(open(world_file))
+        return write_table(world, json.load(open(args.rules)), load_bg3(args.bg3), args.world, carrier_text(args.bg3))
     if args.cmd == 'export':
         if not args.data:
             sys.exit('export needs --data')
         return export(args.world, db, args.data)
     world = json.load(open(args.world))
+    if args.cmd == 'seed':
+        return seed(world, args.mob)
     rules = json.load(open(args.rules))
     spells = {int(k): v for k, v in world['spells'].items()}
     if args.cmd == 'build':
         if not (args.out and args.bg3):
             sys.exit('build needs --out and --bg3')
-        write_table(world, rules, load_bg3(args.bg3), args.out)
+        write_table(world, rules, load_bg3(args.bg3), args.out, carrier_text(args.bg3))
     elif args.cmd == 'show':
         for e, m in world['mobs'].items():
             if args.mob in (e, m['name']):

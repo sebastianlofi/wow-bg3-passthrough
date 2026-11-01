@@ -130,6 +130,8 @@ def main():
                     help="the bg3le build with WOW-BG3's patches (its sha256 should be patches/bg3le/build.lock.json's)")
     ap.add_argument("--python", help="a portable python with numpy, Pillow, lz4, zstandard (release/python/pack.sh): WOW-BG3/python")
     ap.add_argument("--fastlz", help="libfastlz.so built for sniper (Tav's textures)")
+    ap.add_argument("--abilities-seed", default=str(BUILD / "abilities-seed.json.gz"),
+                    help="wow_abilities.py seed from the server's database; without it a new install has no mob abilities until its second start")
     ap.add_argument("--allow-missing", action="store_true")
     ap.add_argument("--source", action="append", default=[], help="NAME=DIR for the sources archive")
     ap.add_argument("--sources", help="upstream sources of the GPL/LGPL/MPL parts, made by release/licences/collect.py "
@@ -204,6 +206,10 @@ def main():
             missing.append(f"tool tools/{f}")
         else:
             print(f"note: tools/{f} not there yet (left out)")
+    if Path(a.abilities_seed).is_file():
+        shutil.copy2(a.abilities_seed, tools / "link/tools/abilities-seed.json.gz")
+    else:
+        print(f"note: no {a.abilities_seed}: a new install has no mob abilities until its second start")
     # bg3le, WOW-BG3's build (the release ships everything a player needs):
     # our installer (release/bg3le-install.py) with bg3le's own install.py and launch wrapper, unchanged.
     b3 = folder / "bg3le"
