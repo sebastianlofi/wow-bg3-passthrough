@@ -37,6 +37,16 @@ class BuyPart(unittest.TestCase):
         self.assertTrue(ask(be)[0])
         self.assertEqual((be.m, be.items), (5000 - 1600, [(8950, 2)]))
 
+    def test_no_price_gives_nothing(self):
+        be = Be(5000)
+        self.assertFalse(ask(be, price=0)[0])
+        self.assertEqual((be.m, be.items), (5000, []))
+
+    def test_a_whole_purchase_is_no_part(self):
+        be = Be(5000)
+        self.assertFalse(ask(be, count=5)[0])
+        self.assertEqual((be.m, be.items), (5000, []))
+
     def test_not_enough_money_buys_nothing(self):
         be = Be(100)
         self.assertFalse(ask(be)[0])

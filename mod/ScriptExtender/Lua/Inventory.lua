@@ -776,7 +776,7 @@ local function askFor(u, tag, count, thief)
             -- go as WoW's own buy, the rest of a stack split earlier at the price of one.
             local bc = (M.Item(ware.Entry) or {}).bc or 1
             local n = count or 1
-            if n % bc == 0 then
+            if n % bc == 0 or (ware.Price or 0) <= 0 then -- price 0: a pocket's food, no vendor's (the bridge refuses it)
                 M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = n // bc, Item = u})
             else
                 M.Request({Op = "buypart", Member = member, Npc = guid, Entry = ware.Entry, Count = n, Price = ware.Price,
@@ -792,11 +792,18 @@ M.AskFor = askFor
 -- A ware's stack that got smaller where it stands: the player split some off. Those are bought at the
 -- price of one, and the amount left is what the next look compares with. Asked again on every look, so it
 -- does not matter whether BG3 says so with an event, or which of the two stacks it calls the moved one.
+local sideSeen = {} -- tag -> the stack it was seen at: what BG3 made of it, some items do not stack (arrows)
 local function settleWare(standin, guid, tag, w)
     local u = sideUuid[tag]
-    if not u or asked[u] or deleted[u] or holderOf(u) ~= standin then return end
-    local left, had = q(Osi.GetStackAmount, u), sideCount[tag]
-    if not left or not had or left <= 0 or left >= had then return end
+    if not u or asked[u] or deleted[u] or holderOf(u) ~= standin or (w.Price or 0) <= 0 then return end
+    local left = q(Osi.GetStackAmount, u)
+    if not left or left <= 0 then return end
+    if sideSeen[tag] ~= u then
+        sideSeen[tag], sideCount[tag] = u, left
+        return
+    end
+    local had = sideCount[tag]
+    if not had or left >= had then return end
     sideCount[tag] = left
     local pick = picking[standin]
     if pick and pick.Until >= tick then
@@ -806,12 +813,13 @@ local function settleWare(standin, guid, tag, w)
             Lot = (M.Item(w.Entry) or {}).bc or 1, Tag = tag})
     end
 end
--- WoW said no to a part (money, bags full): back on the stand-in's stack.
+function M.PartBack(tag) sideSeen[tag] = nil end
+-- WoW said no to a part (money, bags full): back on the stand-in's stack, seen again from there.
 function M.PartRefused(r)
     local u = sideUuid[r.Tag]
     if not u or not q(Ext.Entity.Get, u) then return end
-    sideCount[r.Tag] = (sideCount[r.Tag] or 0) + r.Count
-    pcall(Osi.SetStackAmount, u, sideCount[r.Tag])
+    pcall(Osi.SetStackAmount, u, (sideCount[r.Tag] or 0) + r.Count)
+    M.PartBack(r.Tag)
 end
 
 local function fillHolder(standin, prefix, list)

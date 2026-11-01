@@ -407,7 +407,10 @@ class Bridge:
             # Part of a stack WoW only sells whole (buy_count): that many at the price of one. The money
             # first, so a purchase never comes free; a full bag gives it back.
             count = int(req['Count'])
-            price = math.ceil(int(req['Price']) / max(1, int(req.get('Lot', 1)))) * count
+            lot = max(1, int(req.get('Lot', 1)))
+            price = math.ceil(int(req['Price']) / lot) * count
+            if price <= 0 or not 0 < count < lot:  # a pocket's food has no price; more than a purchase is no part
+                return False, 'notvendor', {}
             ok, why, _ = be.money(name, -price)
             if not ok:
                 return False, why or 'nomoney', {}
