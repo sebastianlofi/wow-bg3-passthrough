@@ -1609,28 +1609,30 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
     return best <= 1.0f;
 }
 
-// BG3's own camera collision: a sweep along the camera's axis from its look point out toward the eye (or
-// back). Playtest feedback, 2026-10-31: "ignore all collisions altogether", and the plugin's own clearance moved 0
-// of 33416 eyes while posts and trees still bumped the camera, so the bump is taken to be this (not seen
-// directly: the log's "camera: sweep" lines say whether it is). WoW's triangles are left out of such a
-// query. Not the cursor's (context 1), whose ray starts at the eye too.
-std::atomic<float> g_axis[3]{};            // BG3's forward
+// BG3's own camera collision. Playtest feedback, 2026-10-31: "ignore all collisions altogether", and the plugin's
+// own clearance moved 0 of 33416 eyes while posts and trees still pushed the camera. Under a tree its eye stood
+// 14 yd over her and 3 yd back, at 69 degrees, where it is 10 and 10 at 41: the same distance, swung up over the
+// tree. So BG3 tries lines from where it looks to where the eye wants to be, up and away, and it is those
+// lines that lose WoW's triangles (their shape is inferred: the log's "camera: sweep" lines show what is caught).
+// Not the cursor's (context 1), and not while she is in a fight, where such a line can be a spell's or a
+// bow's line of sight up a hill and WoW's ground has to stop it.
 std::atomic<float> g_axis_from[3]{};       // who it looks at, the selected character
 std::atomic<bool> g_axis_on{false};
+std::atomic<bool> g_in_fight{false};       // tav.bin's flag 1
 std::atomic<std::uint64_t> g_axis_sweeps{0};
-constexpr float kSweepNearM = 6.0f;        // one end this near her
-constexpr float kSweepLineup = 0.97f;      // and along the axis, this closely
+constexpr float kSweepNearM = 6.0f;        // the low end this near her
+constexpr float kSweepRise = 0.35f;        // climbing at least this much per metre across (about 20 degrees)
+constexpr float kSweepMinM = 2.0f, kSweepMaxM = 40.0f;  // and no plumb line down to the ground, no long shot
 bool camera_sweep(glm::vec3 const& a, glm::vec3 const& b, int context) {
-    if (context == 1 || !g_axis_on.load(std::memory_order_relaxed)) return false;
-    const glm::vec3 d = b - a;
-    const float len = glm::length(d);
-    if (!(len > 0.5f)) return false;
-    const glm::vec3 axis{g_axis[0].load(std::memory_order_relaxed), g_axis[1].load(std::memory_order_relaxed),
-                         g_axis[2].load(std::memory_order_relaxed)};
-    if (std::abs(glm::dot(d / len, axis)) < kSweepLineup) return false;
+    if (context == 1 || !g_axis_on.load(std::memory_order_relaxed) || g_in_fight.load(std::memory_order_relaxed)) return false;
+    glm::vec3 const& low = a.y < b.y ? a : b;
+    glm::vec3 const& high = a.y < b.y ? b : a;
+    const float across = glm::length(glm::vec2(high.x - low.x, high.z - low.z));
+    const float len = glm::length(high - low);
+    if (across < kSweepMinM || len > kSweepMaxM || high.y - low.y < kSweepRise * across) return false;
     const glm::vec3 her{g_axis_from[0].load(std::memory_order_relaxed), g_axis_from[1].load(std::memory_order_relaxed),
                         g_axis_from[2].load(std::memory_order_relaxed)};
-    if (glm::length(a - her) > kSweepNearM && glm::length(b - her) > kSweepNearM) return false;
+    if (glm::length(low - her) > kSweepNearM) return false;
     if (g_axis_sweeps.fetch_add(1, std::memory_order_relaxed) < 8) {
         logf("camera: sweep context %d (%.1f %.1f %.1f) to (%.1f %.1f %.1f) gets no WoW triangles", context, a.x, a.y, a.z, b.x, b.y, b.z);
     }
@@ -3181,6 +3183,9 @@ void clear_read_tav() {
     std::memcpy(&seq, rec + 4, 4);
     std::memcpy(&seq2, rec + 40, 4);
     std::memcpy(p, rec + 20, 12);
+    std::uint32_t tavFlags = 0;
+    std::memcpy(&tavFlags, rec + 36, 4);
+    g_in_fight.store((tavFlags & 1u) != 0, std::memory_order_relaxed);
     if (seq == 0 || seq != seq2 || seq == g_clear.TavSeq || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
         return;
     }
@@ -3472,10 +3477,7 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     glm::mat3 rot = glm::mat3_cast(q);
     if (order >= 2) rot = glm::transpose(rot);
     const glm::vec3 fwd = glm::normalize(rot[2]);
-    for (int k = 0; k < 3; ++k) {
-        g_axis[k].store(fwd[k], std::memory_order_relaxed);
-        g_axis_from[k].store(who[k], std::memory_order_relaxed);
-    }
+    for (int k = 0; k < 3; ++k) g_axis_from[k].store(who[k], std::memory_order_relaxed);
     g_axis_on.store(g_indoor == IndoorMode::Free, std::memory_order_relaxed);
     bool wasTested = false;
     float target = 1.0f;
