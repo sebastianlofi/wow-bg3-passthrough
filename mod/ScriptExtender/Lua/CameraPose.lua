@@ -3,7 +3,7 @@
 -- in; in WoW's world those come from a hill over a cave and from trees. Playtest feedback: the camera stays at the
 -- character's height, zooms and turns, and bumps into nothing. So the plugin takes only the zoom, the angle
 -- and where it looks across from here, and the height from whoever the camera follows.
---   link/campose.bin  "CAM1", seq, flags (1 tactical), distance, pitch degrees, direction xyz, look xyz, target y
+--   link/campose.bin  "CAM1", seq, flags (1 tactical, 2 height from a character), distance, pitch degrees, direction xyz, look xyz, target y
 local M = {}
 
 local function behavior()
@@ -14,7 +14,7 @@ local function behavior()
 end
 
 function M.Start()
-    local seq, ticks = 0, 0
+    local seq, ticks, lastY = 0, 0, nil
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
         if ticks % 2 ~= 0 then return end
@@ -22,13 +22,31 @@ function M.Start()
             local b = behavior()
             if not b then return nil end
             local d, t = b.Direction, b.TargetCurrent
-            -- Whoever it follows: its own height, never the ground BG3 found under it.
-            local y = t[2]
-            local okY, ty = pcall(function() return b.Target.Transform.Transform.Translate[2] end)
-            if okY and type(ty) == "number" then y = ty end
-            local flags = b.TacticalMode == true and 1 or 0
+            -- Whoever it follows: its own height, never the ground BG3 found under it. The nearest of the
+            -- camera's targets and the character the player controls to where it looks.
+            local best, y = 36.0, nil
+            local function try(e)
+                local okP, pos = pcall(function() return e.Transform.Transform.Translate end)
+                if okP and pos then
+                    local dx, dz = pos[1] - t[1], pos[3] - t[3]
+                    local far = dx * dx + dz * dz
+                    if far < best then best, y = far, pos[2] end
+                end
+            end
+            for _, k in ipairs({"Target", "FollowTarget", "TrackTarget"}) do
+                local okE, e = pcall(function() return b[k] end)
+                if okE and e then try(e) end
+            end
+            for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("ClientControl")) do try(e) end
+            -- A camera panned off them all keeps the last height.
+            lastY = y or lastY
+            local own = y ~= nil
+            y = lastY or t[2]
+            -- DistanceCurrent is the zoom. Distance is that pulled in by BG3's arm collision, measured 6.07 against 12
+            -- on a ledge, 2.33 after camp, and held there until the next step.
+            local flags = (b.TacticalMode == true and 1 or 0) | (own and 2 or 0)
             seq = seq + 1
-            return string.pack("<c4I4I4fffffffff", "CAM1", seq, flags, b.Distance, b.PitchDegrees, d[1], d[2], d[3], t[1], t[2], t[3], y)
+            return string.pack("<c4I4I4fffffffff", "CAM1", seq, flags, b.DistanceCurrent, b.PitchDegrees, d[1], d[2], d[3], t[1], t[2], t[3], y)
         end)
         if ok and rec then Ext.IO.SaveFile("wow-bg3/link/campose.bin", rec) end
     end)
