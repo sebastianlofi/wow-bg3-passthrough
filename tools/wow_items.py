@@ -4,6 +4,7 @@
   wow_items.py build [--out FILE] [--rules FILE] [--data WOW_DATA] [--db CMD] [--effects]
       writes the item table (default: the harness IO dir's link/items.json)
   wow_items.py effects                 the rule table with its counts, as markdown (docs/item-effects.md)
+  wow_items.py consumables             what each consumable rule catches, as markdown (docs/item-effects.md)
   wow_items.py show ENTRY [ENTRY...]   one item's row, for tuning the rules
   wow_items.py stats                   how many items map to each BG3 base
 
@@ -20,7 +21,8 @@ Row (JSON, keys short because the BG3 side loads all ~17,700 at once):
    "bp": buy price of one (copper; WoW's price is for buy_count), "bc": how many one WoW purchase gives, when not 1, "sp": sell price, "il": item level, "rl": required level,
    "r": BG3 rarity, "mg": armour magic bonus (+AC), "d": damage die, "dt": damage type, "en": weapon +N, "x": extra damage,
    "ac": armour class, "bo": BG3 boosts (Ability, Resistance, AC), "w": weight kg,
-   "wd": WoW text for the description (damage, armour, stats as WoW shows them)}
+   "wd": WoW text for the description (damage, armour, stats as WoW shows them),
+   "us": 1 on a consumable BG3 can use up that is no camp supply: a use should be spent in WoW too}
 
 The effects switch (--effects, WOW_BG3_ITEM_EFFECTS=1 or "enabled" in the rules' "effects", on by default;
 off, the table is what it was without it): rows gain "ef" (on-equip points by kind) and "rp" (random
@@ -42,13 +44,13 @@ COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 
         'dmg_min1', 'dmg_max1', 'dmg_type1', 'dmg_min2', 'dmg_max2', 'dmg_type2', 'armor', 'block',
         'holy_res', 'fire_res', 'nature_res', 'frost_res', 'shadow_res', 'arcane_res', 'spellcategory_1', 'spellid_1'] + \
        ['stat_type%d' % i for i in range(1, 11)] + ['stat_value%d' % i for i in range(1, 11)]
-ITEMS_SCHEMA = 3  # 2: bp is the price of one, bc added. 3: supply by price, water is water. wowbg3-coord.py makes an older table again.
+ITEMS_SCHEMA = 4  # 2: bp is the price of one, bc added. 3: supply by price, water is water. 4: consumables by their spell, us added. wowbg3-coord.py makes an older table again.
 STAT_NAMES = {0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina'}
 DIES = [(4, 2.5), (6, 3.5), (8, 4.5), (10, 5.5), (12, 6.5)]
 SPELL_COLS = ['random_property'] + ['%s_%d' % (c, i) for i in range(1, 6) for c in ('spellid', 'spelltrigger')]
 SPELL_TEMPLATE = ['entry', 'build', 'name', 'description'] + \
     ['%s%d' % (c, i) for i in (1, 2, 3) for c in ('effect', 'effectApplyAuraName', 'effectBasePoints',
-                                                  'effectDieSides', 'effectMiscValue')]
+                                                  'effectDieSides', 'effectMiscValue', 'effectTriggerSpell')]
 TRIGGER_USE, TRIGGER_EQUIP, TRIGGER_HIT = 0, 1, 2
 TRIGGER_TEXT = {TRIGGER_USE: 'Use', TRIGGER_EQUIP: 'Equip', TRIGGER_HIT: 'Chance on hit'}
 EFFECT_APPLY_AURA, EFFECT_HEAL = 6, 10
@@ -368,10 +370,90 @@ def effect_rules(rules):
     return kinds
 
 
+def use_effects(spells, sp, seen=None):
+    """A spell's effects with those of the spells it triggers (Well Fed hangs behind Food's periodic trigger):
+    (effect, aura, misc, points)."""
+    seen = set() if seen is None else seen
+    if sp['entry'] in seen:
+        return []
+    seen.add(sp['entry'])
+    out = []
+    for n in (1, 2, 3):
+        if sp['effect%d' % n]:
+            out.append((sp['effect%d' % n], sp['effectApplyAuraName%d' % n], sp['effectMiscValue%d' % n], spell_points(sp, n)))
+            t = spells.get(sp.get('effectTriggerSpell%d' % n))
+            if t:
+                out += use_effects(spells, t, seen)
+    return out
+
+
+def rule_points(rule, fx):
+    """The largest points among effects a consumable rule matches; None when it matches none."""
+    best = None
+    for effect, aura, misc, points in fx:
+        if points < 0 or effect != rule.get('effect', EFFECT_APPLY_AURA):
+            continue
+        if 'auras' in rule and aura not in rule['auras']:
+            continue
+        if 'misc' in rule and misc not in rule['misc']:
+            continue
+        if 'mask' in rule and not misc & rule['mask']:
+            continue
+        if 'min_bits' in rule and bin(misc).count('1') < rule['min_bits']:
+            continue
+        if 'with_aura' in rule and not any(f[0] == EFFECT_APPLY_AURA and f[1] == rule['with_aura'] for f in fx):
+            continue
+        if 'with_effect' in rule and not any(f[0] == rule['with_effect'] for f in fx):
+            continue
+        best = points if best is None else max(best, points)
+    return best
+
+
+def pick_tier(tiers, amount):
+    base = tiers[0][1]
+    for at, name in tiers:
+        if amount >= at:
+            base = name
+    return base
+
+
+def consumable_rule(rules, row, it, spells):
+    """The first consumable rule an item's use spells match, with its BG3 base: (rule, base), or None. What
+    WoW makes for free stays at the lowest tier; a camp supply only follows a rule that names food_from."""
+    c = rules['effects']['consumables']
+    fx = []
+    for i in range(1, 6):
+        sp = spells.get(it['spellid_%d' % i])
+        if sp and it['spelltrigger_%d' % i] == TRIGGER_USE:
+            fx += use_effects(spells, sp)
+    if not fx or any(f[0] in c['skip_effects'] for f in fx):
+        return None
+    for rule in c['rules']:
+        points = rule_points(rule, fx)
+        if points is None or ('sv' in row and points < rule.get('food_from', math.inf)):
+            continue
+        low = it['name'].lower()
+        free = any(w in low for w in c['conjured_words'])
+        return rule, rule['tiers'][0][1] if free else pick_tier(rule['tiers'], points)
+    return None
+
+
+def map_consumable(rules, row, it, spells):
+    """A consumable's BG3 base by what its spell does. WoW's water and alcohol keep their own rules."""
+    if it['class'] != 0 or row['k'] != 'object' or row['b'] == rules['alcohol']:
+        return
+    if 'sv' in row and row['b'] == rules['water']:
+        return
+    found = consumable_rule(rules, row, it, spells)
+    if found:
+        row['b'] = found[1]
+
+
 def add_effects(rules, row, it, spells):
     """The switch's additions to a row made by map_item."""
     fx = rules['effects']
     pts, lines = {}, []
+    map_consumable(rules, row, it, spells)
     for i in range(1, 6):
         sp, trigger = spells.get(it['spellid_%d' % i]), it['spelltrigger_%d' % i]
         if not sp or trigger not in TRIGGER_TEXT:
@@ -383,9 +465,12 @@ def add_effects(rules, row, it, spells):
         if trigger == TRIGGER_USE and it['class'] == 0 and row['b'] in (rules['objects']['0']['base'], rules['objects']['0']['heal']):
             for n in (1, 2, 3):
                 if sp['effect%d' % n] == EFFECT_HEAL:
-                    for at, base in fx['heal_tiers']:
+                    free = any(w in it['name'].lower() for w in fx['consumables']['conjured_words'])
+                    for at, base in fx['heal_tiers'][:1] if free else fx['heal_tiers']:
                         if spell_points(sp, n) >= at:
                             row['b'] = base
+    if it['class'] == 0 and 'sv' not in row and row['b'] != rules['objects']['0']['base']:
+        row['us'] = 1
     if pts:
         row['ef'] = pts
     if it['random_property']:
@@ -472,6 +557,33 @@ def effects_table(rules, items, spells, props, pools):
     return '\n'.join(out)
 
 
+def consumables_table(rules, items, spells):
+    """What each consumable rule catches, counted from the data: markdown for docs/item-effects.md."""
+    groups, left = {}, {}
+    for it in items.values():
+        if it['class'] != 0:
+            continue
+        row = map_item(rules, it, {})
+        found = None
+        if not (row['b'] == rules['alcohol'] or ('sv' in row and row['b'] == rules['water'])):
+            found = consumable_rule(rules, row, it, spells)
+        if found:
+            g = groups.setdefault(found[0]['name'], {})
+            g.setdefault(found[1], []).append(it['name'])
+        else:
+            left[it['entry']] = it['name']
+    out = ['| WoW effect | Items | Examples | BG3 base by WoW amount |', '|---|---:|---|---|']
+    for rule in rules['effects']['consumables']['rules']:
+        g = groups.get(rule['name'])
+        if not g:
+            continue
+        names = sorted({n for v in g.values() for n in v})
+        tiers = ', '.join('%s from %s' % (name, at) if len(rule['tiers']) > 1 else name for at, name in rule['tiers'])
+        out.append('| %s | %d | %s | %s |' % (rule['name'], sum(len(v) for v in g.values()), ', '.join(names[:3]), tiers))
+    out.append('\nNo rule: %d of %d consumables.' % (len(left), sum(1 for it in items.values() if it['class'] == 0)))
+    return '\n'.join(out)
+
+
 def effects_on(args, rules):
     return bool(args.effects or os.environ.get('WOW_BG3_ITEM_EFFECTS') == '1' or rules['effects'].get('enabled'))
 
@@ -501,7 +613,7 @@ def build(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['build', 'show', 'stats', 'effects'])
+    ap.add_argument('cmd', choices=['build', 'show', 'stats', 'effects', 'consumables'])
     ap.add_argument('entries', nargs='*', type=int)
     ap.add_argument('--out', default=str(IO / 'link/items.json'))
     ap.add_argument('--rules', default=str(HERE / 'wow_items_rules.json'))
@@ -514,6 +626,9 @@ def main():
         build(args)
         return
     rules = json.loads(Path(args.rules).read_text())
+    if args.cmd == 'consumables':
+        print(consumables_table(rules, load_items(args.db, COLS + SPELL_COLS), load_spells(args.db)))
+        return
     if args.cmd == 'effects':
         spells = load_spells(args.db)
         props, pools = load_props(rules, args.db, args.data, spells)

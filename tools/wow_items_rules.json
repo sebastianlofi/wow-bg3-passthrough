@@ -169,8 +169,48 @@
       "res_necrotic": {"per": 30, "cap": 1, "b": "Resistance(Necrotic,Resistant)"},
       "res_force":    {"per": 30, "cap": 1, "b": "Resistance(Force,Resistant)"}
     },
-    "_heal_tiers": "A consumable with an instant WoW heal: [from WoW's amount, BG3 potion], the last one reached wins. Empty: a use in BG3 comes back at the next sync, so stronger potions would be free (docs/item-effects.md). To turn on: [[0, \"OBJ_Potion_Healing\"], [300, \"OBJ_Potion_Healing_Greater\"], [600, \"OBJ_Potion_Healing_Superior\"], [1000, \"OBJ_Potion_Healing_Supreme\"]].",
-    "heal_tiers": [],
+    "_heal_tiers": "A consumable with an instant WoW heal: [from WoW's amount, BG3 potion], the last one reached wins.",
+    "heal_tiers": [[0, "OBJ_Potion_Healing"], [300, "OBJ_Potion_Healing_Greater"], [600, "OBJ_Potion_Healing_Superior"], [1000, "OBJ_Potion_Healing_Supreme"]],
+
+    "_consumables": "A consumable's BG3 base by what its use spell and the spells it triggers do: the first rule that matches wins. 'effect': WoW spell effect (default 6, apply aura); 'auras', 'misc' (any of), 'mask' (school bits), 'min_bits'; 'with_aura' and 'with_effect' must also be in the chain. tiers: [from WoW's points, BG3 base], the last one reached wins. Food and drink with a camp supply follow a rule only with 'food_from', from those points; below it they stay BG3 food. skip_effects: 24 makes an item, 86 activates an object, 100 alcohol keeps its own rule. conjured_words: what WoW makes for free stays at the first tier. Every choice is a balance call: docs/item-effects.md.",
+    "consumables": {
+      "skip_effects": [24, 86, 100],
+      "conjured_words": ["healthstone", "mana agate", "mana jade", "mana citrine", "mana ruby"],
+      "rules": [
+        {"name": "restore mana", "effect": 30, "misc": [0], "tiers": [[0, "ALCH_Solution_Elixir_Meditation"], [500, "ALCH_Solution_Elixir_Meditation_Greater"], [1000, "ALCH_Solution_Elixir_Meditation_Superior"], [1500, "ALCH_Solution_Elixir_Meditation_Supreme"]]},
+        {"name": "restore rage", "effect": 30, "misc": [1], "tiers": [[0, "ALCH_Solution_Elixir_Bloodlust"]]},
+        {"name": "restore energy", "effect": 30, "misc": [3], "tiers": [[0, "ALCH_Solution_Elixir_Alertness"]]},
+        {"name": "immunity", "auras": [39], "tiers": [[0, "OBJ_Potion_Of_Invulnerability"]]},
+        {"name": "dreamless sleep", "auras": [8], "with_aura": 12, "tiers": [[0, "ALCH_Solution_Potion_Rest_Lesser"], [500, "ALCH_Solution_Potion_Rest_Greater"]]},
+        {"name": "+armour", "auras": [22], "misc": [1], "tiers": [[0, "ALCH_Solution_Elixir_Barkskin"]]},
+        {"name": "+defense", "auras": [30], "misc": [95], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Barkskin"]]},
+        {"name": "resist all magic", "auras": [22, 69, 143], "min_bits": 3, "tiers": [[0, "OBJ_Potion_Of_Force_Resistance"], [50, "OBJ_Potion_Of_Invulnerability"]]},
+        {"name": "resist or absorb holy", "auras": [22, 69, 143], "mask": 2, "tiers": [[0, "OBJ_Potion_Of_Radiant_Resistance"]]},
+        {"name": "resist or absorb fire", "auras": [22, 69, 143], "mask": 4, "tiers": [[0, "OBJ_Potion_Of_Fire_Resistance"]]},
+        {"name": "resist or absorb nature", "auras": [22, 69, 143], "mask": 8, "tiers": [[0, "OBJ_Potion_Of_Poison_Resistance"]]},
+        {"name": "resist or absorb frost", "auras": [22, 69, 143], "mask": 16, "tiers": [[0, "OBJ_Potion_Of_Cold_Resistance"]]},
+        {"name": "resist or absorb shadow", "auras": [22, 69, 143], "mask": 32, "tiers": [[0, "OBJ_Potion_Of_Necrotic_Resistance"]]},
+        {"name": "resist or absorb arcane", "auras": [22, 69, 143], "mask": 64, "tiers": [[0, "OBJ_Potion_Of_Force_Resistance"]]},
+        {"name": "free action", "auras": [77], "misc": [7, 11, 12], "tiers": [[0, "ALCH_Solution_Elixir_Freedom"]]},
+        {"name": "invisibility", "auras": [18], "tiers": [[0, "OBJ_Potion_Of_Invisibility"]]},
+        {"name": "+strength", "auras": [29], "misc": [0], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Alertness"], [8, "ALCH_Solution_Elixir_Enlarge"], [25, "OBJ_Potion_Of_Hill_Giant_Strength"]]},
+        {"name": "+stamina or max health", "auras": [29, 34], "misc": [0, 2], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Alertness"], [8, "OBJ_Potion_Of_Heroism"]]},
+        {"name": "+agility", "auras": [29], "misc": [1], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Alertness"], [8, "ALCH_Solution_Elixir_Criticals"]]},
+        {"name": "+intellect", "auras": [29], "misc": [3], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Alertness"], [8, "ALCH_Solution_Elixir_ArcaneAcuity"]]},
+        {"name": "+spirit", "auras": [29], "misc": [4], "food_from": 8, "tiers": [[0, "ALCH_Solution_Elixir_Alertness"], [8, "ALCH_Solution_Elixir_Concentration"]]},
+        {"name": "+crit %", "auras": [52], "tiers": [[0, "ALCH_Solution_Elixir_Criticals"]]},
+        {"name": "+spell damage", "auras": [13], "mask": 126, "tiers": [[0, "ALCH_Solution_Elixir_ArcaneAcuity"]]},
+        {"name": "+attack power", "auras": [99, 102], "tiers": [[0, "ALCH_Solution_Elixir_Bloodlust"]]},
+        {"name": "+run or attack speed", "auras": [31, 138], "tiers": [[0, "OBJ_Potion_Of_Speed"]]},
+        {"name": "+swim speed", "auras": [58], "tiers": [[0, "ALCH_Solution_Potion_Jump"]]},
+        {"name": "water breathing", "auras": [82], "tiers": [[0, "ALCH_Solution_Elixir_Darkvision"]]},
+        {"name": "detect", "auras": [17, 19, 44], "tiers": [[0, "ALCH_Solution_Elixir_SeeInvisible"]]},
+        {"name": "dispel", "effect": 38, "tiers": [[0, "ALCH_Solution_Potion_Remedy"]]},
+        {"name": "fire proc", "auras": [42], "with_effect": 2, "food_from": 0, "tiers": [[0, "OBJ_Potion_Of_Fire_Breath"]]},
+        {"name": "heal over time (bandages, Troll's Blood)", "auras": [8, 161], "tiers": [[0, "OBJ_Potion_Healing"]]},
+        {"name": "mana over time", "auras": [24, 85], "tiers": [[0, "ALCH_Solution_Elixir_Meditation"]]}
+      ]
+    },
 
     "_table": "Words for wow_items.py effects; nothing else reads them.",
     "table_rest_below": 40,
@@ -203,8 +243,10 @@
       },
       "use": {
         "6:84": "already BG3 food by the existing rule (name, spell category)",
-        "10:0": "not mapped: `heal_tiers` is empty until a use in BG3 reaches WoW",
-        "30:0": "not mapped: BG3 has no mana"
+        "6:29": "consumables only: see Consumables",
+        "6:23": "consumables only, through what it triggers: see Consumables",
+        "10:0": "`heal_tiers`, see Consumables",
+        "30:0": "see Consumables: mana gives spell slots"
       }
     }
   }

@@ -26,8 +26,7 @@ by hand. Off again: rebuild without it; a member's added boosts leave at the nex
   rolls it then: a vendor ware or corpse item shows the plain name until it is bought or taken. The tooltip
   does not show its numbers (see "Not proven").
 - Every Equip, Use and Chance on hit line, mapped or not, is added to the item's text as WoW words it.
-- A consumable with an instant WoW heal can pick its BG3 potion by WoW's amount (`heal_tiers`). Empty for
-  now, see call 10.
+- A consumable takes a BG3 potion, elixir or food as its base by what its WoW spell does: see "Consumables".
 
 ## Rule table
 
@@ -82,19 +81,19 @@ server's `item_template` (17,707 items, highest patch row) and `spell_template`,
 | permanent item enchantment | 134 | 134 | not mapped |
 | mount speed | 129 | 129 | not mapped |
 | mount | 125 | 125 | not mapped |
-| stat buff (scrolls, elixirs) | 104 | 93 | not mapped |
+| stat buff (scrolls, elixirs) | 104 | 93 | consumables only: see Consumables |
 | open a lock | 104 | 104 | not mapped |
 | script | 99 | 98 | not mapped |
 | trigger a spell | 84 | 61 | not mapped |
 | script event | 79 | 79 | not mapped |
-| periodic trigger (well fed and others) | 75 | 75 | not mapped |
+| periodic trigger (well fed and others) | 75 | 75 | consumables only, through what it triggers: see Consumables |
 | summon a pet | 70 | 70 | not mapped |
 | mechanic immunity | 57 | 21 | not mapped |
 | activate an object | 56 | 52 | not mapped |
-| instant heal | 53 | 53 | not mapped: `heal_tiers` is empty until a use in BG3 reaches WoW |
+| instant heal | 53 | 53 | `heal_tiers`, see Consumables |
 | temporary weapon enchantment | 52 | 52 | not mapped |
 | school damage | 47 | 45 | not mapped |
-| restore mana or rage | 45 | 45 | not mapped: BG3 has no mana |
+| restore mana or rage | 45 | 45 | see Consumables: mana gives spell slots |
 | summon | 41 | 40 | not mapped |
 | everything else | 761 | 635 | not mapped |
 
@@ -153,6 +152,60 @@ In numbers the table merges:
   Those fixed stats keep their own per-item rule; they do not add to the suffix's points.
 - Of 2,012 properties in the client, 1,315 are reachable on this server. Alone, 669 of those reach no step, 105 of them because they have no mapped kind at all.
 
+## Consumables
+
+Generated: `wow_items.py consumables`, rules in `wow_items_rules.json` (`effects.consumables`). The first rule that
+matches wins, on the item's use spell and the spells it triggers (Well Fed hangs behind Food's trigger). 221 of 994
+consumables match, deprecated and test items counted. The rest have no BG3 equivalent or need WoW itself: they stay
+plain items with WoW's text: weapon oils and poisons, enchantments, recipes, fireworks, grenades, costumes, soulstones,
+reflection, +healing.
+
+| WoW effect | Items | Examples | BG3 base (from WoW's points) |
+|---|---:|---|---|
+| restore mana (with health too) | 21 | Mana Potion, Major Rejuvenation Potion | Elixir of Arcane Cultivation: `ALCH_Solution_Elixir_Meditation` level 1 slot, `_Greater` level 2 from 500, `_Superior` level 3 from 1000, `_Supreme` level 4 from 1500 |
+| restore rage | 3 | Rage Potion, Mighty Rage Potion | `ALCH_Solution_Elixir_Bloodlust` |
+| restore energy | 1 | Thistle Tea | `ALCH_Solution_Elixir_Alertness` |
+| immunity | 4 | Light of Elune, Flask of Petrification | `OBJ_Potion_Of_Invulnerability` |
+| dreamless sleep | 2 | Dreamless Sleep Potion | `ALCH_Solution_Potion_Rest_Lesser`, `_Greater` from 500 |
+| +armour | 13 | Elixir of Defense, Greater Stoneshield Potion | `ALCH_Solution_Elixir_Barkskin` |
+| +defense | 2 | Buttermilk Delight | `ALCH_Solution_Elixir_Barkskin` |
+| resist all magic | 5 | Magic Resistance Potion, Flask of Chromatic Resistance | `OBJ_Potion_Of_Force_Resistance`, `OBJ_Potion_Of_Invulnerability` from 50 |
+| resist or absorb one school | 13 | Greater Fire Protection Potion | `OBJ_Potion_Of_*_Resistance`: holy Radiant, fire Fire, nature Poison, frost Cold, shadow Necrotic, arcane Force |
+| free action | 2 | Free Action Potion | `ALCH_Solution_Elixir_Freedom` |
+| invisibility | 2 | Lesser Invisibility Potion | `OBJ_Potion_Of_Invisibility` |
+| +strength | 15 | Elixir of Giants, Smoked Desert Dumplings | `ALCH_Solution_Elixir_Alertness`, `ALCH_Solution_Elixir_Enlarge` from 8, `OBJ_Potion_Of_Hill_Giant_Strength` from 25 |
+| +stamina or max health | 37 | Elixir of Fortitude, Monster Omelet | `ALCH_Solution_Elixir_Alertness`, `OBJ_Potion_Of_Heroism` from 8 |
+| +agility | 13 | Elixir of Agility, Grilled Squid | `ALCH_Solution_Elixir_Alertness`, `ALCH_Solution_Elixir_Criticals` from 8 |
+| +intellect | 10 | Elixir of Greater Intellect | `ALCH_Solution_Elixir_Alertness`, `ALCH_Solution_Elixir_ArcaneAcuity` from 8 |
+| +spirit | 8 | Gizzard Gum, Hot Smoked Bass | `ALCH_Solution_Elixir_Alertness`, `ALCH_Solution_Elixir_Concentration` from 8 |
+| +spell damage | 9 | Arcane Elixir, Flask of Supreme Power | `ALCH_Solution_Elixir_ArcaneAcuity` |
+| +attack power | 2 | Winterfall Firewater | `ALCH_Solution_Elixir_Bloodlust` |
+| +run or attack speed | 7 | Swiftness Potion, Fishliver Oil | `OBJ_Potion_Of_Speed` |
+| +swim speed | 1 | Swim Speed Potion | `ALCH_Solution_Potion_Jump` |
+| water breathing | 2 | Elixir of Water Breathing | `ALCH_Solution_Elixir_Darkvision` |
+| detect | 4 | Catseye Elixir | `ALCH_Solution_Elixir_SeeInvisible` |
+| dispel | 10 | Jungle Remedy, Purification Potion | `ALCH_Solution_Potion_Remedy` |
+| fire proc | 1 | Dragonbreath Chili | `OBJ_Potion_Of_Fire_Breath` |
+| heal over time | 30 | Linen Bandage, Troll's Blood | `OBJ_Potion_Healing` |
+| mana over time | 4 | Mageblood Potion | `ALCH_Solution_Elixir_Meditation` |
+| instant heal (`heal_tiers`, not a rule) | | Healing Potion, Whipper Root Tuber | `OBJ_Potion_Healing`, `_Greater` from 300, `_Superior` from 600, `_Supreme` from 1000 |
+
+How it behaves:
+
+- **Mana is BG3's own potion.** Its status `ALCH_ELIXIR_MEDITATION*` is `ActionResource(SpellSlot,1,N)`, and its template
+  applies it with duration -1, so the slot lasts until long rest. Read from BG3's stats and root templates.
+- **One elixir at a time.** Most of these share BG3's stack `ALCH_ELIXIR`, Heroism and Hill Giant Strength too: a new one
+  replaces the old, also a spent mana slot's status. WoW stacks a food buff with elixirs; BG3 does not.
+- **Food and drink with a camp supply** keep their supply and price, and follow a rule only with `food_from`, so from 8
+  points of a stat (one step of `ability_per`), and the chili. Below that, and for food that regenerates health or mana,
+  they stay BG3 food. A buffed food does not heal when eaten: its base is the potion.
+- **Water and alcohol keep their rules**, a drink that makes WoW drunk too (Rumsey Rum). An elixir named for water is no
+  water.
+- **What WoW makes for free stays at the first tier**: healthstones and mana gems, so a mage's gem is never a level 4 slot.
+- A stat elixir below 8 points is `Alertness` (+5 initiative): too small for a stat, still something.
+- **Spending:** every usable consumable that is no camp supply has `"us": 1` on its row, for `Inventory.lua` to spend a
+  use in WoW as it does a camp supply. See "Not proven".
+
 ## Balance calls still open
 
 Every number below is a proposal in `wow_items_rules.json` (`effects`), and the game runs on them until
@@ -170,7 +223,12 @@ boosts work in the game; whether the numbers feel right has not been played.
 | 7 | Run speed | WoW's % as a movement multiplier, cap 15. **Conservative** | Direct, no scale. Only BG3's turn movement. WoW's own sum could be used up to 30. |
 | 8 | Resistance from gear in total | 30 points = Resistant, once per school. **Conservative** | Resistant halves a whole school, so the sum takes twice the 15 a single item needs under the fixed-stat rule. |
 | 9 | Suffix abilities | 8 points per +1, cap +2 per ability over **all** worn gear | Existing rule and numbers. The cap is the question: a full set "of the Bear" gets the same +2 as one level 60 piece (+29). It comes on top of the fixed stats' +2 per item. |
-| 10 | Potion tiers by WoW's heal | Off: `"heal_tiers": []`. **Conservative** | **Stronger potions would be free:** a use in BG3 comes back at the next sync until an `inv use` verb exists. The tiers to turn on (under 300 Healing, 300 Greater, 600 Superior, 1000 Supreme; 32 items change base) are written beside the setting. |
+| 10 | Potion tiers by WoW's heal | On: under 300 Healing, 300 Greater, 600 Superior, 1000 Supreme | Bases read from BG3's stats. **A use stays free until `Inventory.lua` reads `us`**, see "Not proven". |
+| 11 | Mana per spell slot level | 0 level 1, 500 level 2, 1000 level 3, 1500 level 4 | Puts Minor and Lesser at 1, Mana and Greater at 2, Superior at 3, Major at 4. A low level character has no use for a slot above its own. Rejuvenation counts as mana; its health is lost. |
+| 12 | Well Fed | From 8 points a stat elixir's effect, below that plain food | **Heroism on food may be strong**: 21 foods, 10 temporary HP and 1d4 on attacks and saves for the price of a meal. The other answer is raising `food_from`. |
+| 13 | Rage, energy | Bloodlust (a kill gives temporary HP and an action), Alertness. **Conservative for energy** | BG3 has no potion for a class's resource. Haste would fit energy better, and is too much for a 15th level recipe. |
+| 14 | Swiftness | `OBJ_Potion_Of_Speed` (Haste) | **Strong for its price**: WoW's +50% run speed at item level 15 becomes BG3's Haste, because nothing else in BG3's potions is speed. |
+| 15 | Giant Strength | From 25 points | Strength 21 outright, so it means much at low level. Elixir of Giants, R.O.I.D.S. |
 
 ## Not mapped, on purpose
 
@@ -179,7 +237,8 @@ boosts work in the game; whether the numbers feel right has not been played.
   regeneration, bonus against a creature type, on-use effects of equipment (trinkets).
 - WoW's own systems: class spell tweaks, recipes, enchantments, mounts, pets, keys. These need WoW to run
   them, so the same `inv use` verb.
-- Consumable buffs (elixirs, scrolls): BG3's elixirs do different things, so a rule would misdescribe them.
+- Consumables without a BG3 equivalent: see "Consumables". A chosen elixir does what BG3's elixir does, not what WoW's
+  text says: the item's text still shows WoW's words.
 
 ## Proven
 
@@ -199,12 +258,15 @@ at the start of play makes them).
 
 ## Not proven
 
+- **Consumables: nothing has run in the game.** Unit tests (`tools/test_consumables.py`) and the rules run over the
+  server's real table; every base exists in BG3's stats. Not seen: drinking any of them, the slot appearing and leaving at
+  a long rest, the tooltip, a buffed food offered and spent at camp on a potion base (camp proved food and water bases).
+- **A use comes back until `Inventory.lua` reads `us`:** `reconcileStacks` spends only rows with `sv`. Until that line is
+  changed, a mana potion drunk in BG3 returns at the next sync, so slots are free, as healing potions already were.
 - In a fight: nothing here has been rolled on, so a raised crit range or DC is only proven to be on the sheet.
 - Run speed, hit, attack power and resistances from worn gear: their strings are proven, their items were not
   worn (the test character cannot wear plate or those weapons).
 - A companion's worn gear, and a suffix item bought or looted rather than added.
-- `OBJ_Potion_Healing_Greater`, `_Superior`, `_Supreme`, if call 10 is turned on, are from memory of BG3's
-  data. A missing base makes that item fail to appear in BG3.
 - An item that exists when the switch goes on keeps its old BG3 base and text until it is made again.
 
 ## Known limits
