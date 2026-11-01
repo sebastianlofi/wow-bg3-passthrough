@@ -115,10 +115,12 @@ def set_side(side):
 
 
 def benilla_runs():
-    """A process named benilla, on this machine (or in this runtime's view of it)."""
-    for c in glob.glob('/proc/[0-9]*/comm'):
+    """A live process named benilla, on this machine (or in this runtime's view of it). One that crashed stays
+    in the list as a zombie until the coordinator waits for it (seen 2026-11-01), and counts as gone."""
+    for c in glob.glob('/proc/[0-9]*/stat'):
         try:
-            if Path(c).read_text().strip() == 'benilla':
+            head, _, rest = Path(c).read_text().rpartition(')')
+            if head.partition('(')[2] == 'benilla' and rest.split()[0] != 'Z':
                 return True
         except OSError:
             pass
