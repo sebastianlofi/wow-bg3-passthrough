@@ -543,14 +543,19 @@ def tele(ctx, args, at=None):
     # World mode must run, and not in a fight or at camp (asked first: Camp.lua freezes tav.bin there).
     if at_camp(io):
         raise CmdError('tp: not from camp: leave camp first')
-    try:
-        run = json.load(open(io / 'm3-client.json'))['RunId']
-        w = json.load(open(link / 'world.json'))
-        active = w.get('Active') and time.time() - os.stat(link / 'tav.bin').st_mtime < 5
-    except (OSError, ValueError, KeyError):
-        active = False
-    if not active:
-        raise CmdError('tp: world mode is not running')
+    # Right after a load world mode is still coming up: wait for it (bridge start and WoW login).
+    for wait in range(61):
+        try:
+            run = json.load(open(io / 'm3-client.json'))['RunId']
+            w = json.load(open(link / 'world.json'))
+            active = w.get('Active') and time.time() - os.stat(link / 'tav.bin').st_mtime < 5
+        except (OSError, ValueError, KeyError):
+            active = False
+        if active:
+            break
+        if wait == 60:
+            raise CmdError('tp: world mode is not running')
+        time.sleep(1)
     raw = open(link / 'tav.bin', 'rb').read()
     if len(raw) >= 44 and struct.unpack_from('<I', raw, 36)[0] & 1:
         raise CmdError('tp: not during a BG3 fight')
