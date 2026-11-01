@@ -34,8 +34,8 @@ This is the first public version. What we know is missing or rough:
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
-  music stays off there, and the WoW side shows nothing while you are at camp. Eating and drinking from the
-  bag, alcohol's Drunk, and a successful pickpocket of food have not been tried in the game yet.
+  music stays off there, and the WoW side shows nothing while you are at camp. Water from the bag, alcohol's
+  Drunk, and a successful pickpocket of food have not been tried in the game yet.
 - The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
   in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is
@@ -89,9 +89,11 @@ This is the first public version. What we know is missing or rough:
   durability and repair, vendor buyback, and bags as BG3 containers. A mapping for suffixes and part of
   the on-equip and on-use effects exists behind a switch, on by default:
   [item-effects.md](item-effects.md).
-- A WoW consumable uses BG3's own effect, so the use is not spent in WoW and the item can come back
-  on the next sync. Dropping or destroying an item from BG3 has nowhere to go in WoW 1.12, which has
-  no ground drop.
+- A WoW consumable uses BG3's own effect, not WoW's spell. One elixir at a time, as in BG3: eating a Well
+  Fed food can replace a mana potion's elixir and take its spell slot. Dropping or destroying an item from
+  BG3 has nowhere to go in WoW 1.12, which has no ground drop.
+- Rarely, at the end of a long rest, all of one member's food stacks vanish, from WoW too (2 of 9 rests; cause
+  not caught). Potions and elixirs in the same bag come back: [item-effects.md](item-effects.md).
 
 ## Fights and numbers
 

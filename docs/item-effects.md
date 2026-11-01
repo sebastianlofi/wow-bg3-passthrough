@@ -204,7 +204,8 @@ How it behaves:
 - **What WoW makes for free stays at the first tier**: healthstones and mana gems, so a mage's gem is never a level 4 slot.
 - A stat elixir below 8 points is `Alertness` (+5 initiative): too small for a stat, still something.
 - **Spending:** every usable consumable that is no camp supply has `"us": 1` on its row, and `Inventory.lua` spends a use
-  in WoW as it does a camp supply.
+  in WoW as it does a camp supply. During a long rest and 30 s after it, such a stack's drop is no spending: it is put back
+  from WoW's list (see "Known limits").
 
 ## Balance calls
 
@@ -278,11 +279,31 @@ Three bugs came out of this, all fixed: a boost removed and added in one tick wa
 while their variable stayed, and strings made by client and server at the same moment were lost (a second pass
 at the start of play makes them).
 
+Consumables, on a level 1 Wizard with 2 level 1 slots, each used from BG3 and read back from BG3 and from WoW's list:
+
+| Item | BG3 got | BG3 stack | WoW's count |
+|---|---|---|---|
+| Minor Mana Potion | `ALCH_ELIXIR_MEDITATION`, level 1 slots 2 to 3 | 2 to 1 | 2 to 1 |
+| Mana Potion | `_GREATER`, level 2 slots 0 to 1 | 2 to 1 | 2 to 1 |
+| Major Mana Potion | `_SUPREME`, level 4 slots 0 to 1 | 2 to 1 | 2 to 1 |
+| Monster Omelet (Well Fed) | `POTION_OF_HEROISM` and its temporary hit points | 2 to 1 | 2 to 1 |
+| Grilled Squid (Well Fed) | `ALCH_ELIXIR_CRITICALS` | 2 to 1 | 2 to 1 |
+| Elixir of Giants | `POTION_OF_STRENGTH_HILL_GIANT` | 2 to 1 | 2 to 1 |
+| Elixir of Greater Agility | `ALCH_ELIXIR_CRITICALS` | 2 to 1 | 2 to 1 |
+| Greater Fire Protection Potion | `POTION_OF_RESISTANCE_FIRE` | 2 to 1 | 2 to 1 |
+| Rage Potion | `ALCH_ELIXIR_BLOODLUST` | 2 to 1 | 2 to 1 |
+| Thistle Tea | `ALCH_ELIXIR_ALERTNESS` | 2 to 1 | 2 to 1 |
+
+- A long rest ends the mana slot: level 2 slots 1 to 0, the status gone. It stays through the trip to camp until then.
+- A real click on the hotbar's Major Mana Potion, then on the portrait, did the same as a use by script: slot, stack, WoW.
+- A new elixir replaces the old and takes its slot with it: level 4 slots 1 to 0 on eating the Omelet.
+- Rests spend food only, also buffed food: one Omelet of two, 2 Squid and 2 bread.
+- The guard: with all 9 potion stacks of a member deleted as the rest finished, all were back within 3 s, WoW's counts
+  unchanged, no `del` sent. A drink before the rest and one 90 s after it were spent as usual.
+
 ## Not proven
 
-- **Consumables: nothing has run in the game.** Unit tests (`tools/test_consumables.py`) and the rules run over the
-  server's real table; every base exists in BG3's stats. Not seen: drinking any of them, the slot appearing and leaving at
-  a long rest, the tooltip, a buffed food offered and spent at camp on a potion base (camp proved food and water bases).
+- Consumables: the tooltip; a consumable in a fight; the other rules of the table (only the kinds above ran).
 - In a fight only weapon damage was measured. Hit, crit range, DC, AC and resistance from gear are on the character, not
   measured on a roll.
 - Attack power on a ranged weapon: the test character has none. BG3's own Sharpshooter uses the same boost.
@@ -290,6 +311,11 @@ at the start of play makes them).
 - An item that exists when the switch goes on keeps its old BG3 base and text until it is made again.
 
 ## Known limits
+
+- **A member's stacks can vanish at the end of a long rest.** Seen in 2 of 9 rests, about 2 s after `LongRestFinished`: all of one
+  member's food and potion stacks at once, another member's kept, and with them WoW's copies. Cause not caught: no rest with the
+  call log on showed it, and no setup brings it on at will. Potions and elixirs now come back (`restGuard`, `Inventory.lua`).
+  **Food in such a stack is still lost**, since a rest spends food and the two look alike.
 
 - The tooltip shows the BG3 base item's text (a bone for "Worn in WoW" pieces), not WoW's text, so a suffix's
   numbers show nowhere in BG3. The code that sets the description is older than this mapping.

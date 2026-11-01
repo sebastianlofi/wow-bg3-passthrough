@@ -543,6 +543,10 @@ end
 local stackLast, stackSpent = {}, {} -- tag -> amount last held; {Total, N, At}
 local SPEND_WAIT = 15000
 local dropSeen, DROP_WAIT = {}, 150 -- tag -> tick a drop was first seen; ticks it must last (about 5 s)
+-- Nobody drinks during a long rest, yet at its end all of one member's stacks went at once, twice in nine rests
+-- (harness, cause not caught; it lasted past DROP_WAIT and cost WoW every potion). Until this tick a potion's
+-- drop is no spending, so the old rule below puts it back. Started to Finished is about 8 s.
+local restGuard, REST_START, REST_AFTER = 0, 1800, 900
 M.Spent = 0
 local function spend(uuid, entry, n, items)
     local left = n
@@ -605,6 +609,7 @@ local function reconcileStacks(uuid, stacks, have, items)
             -- Only what left the party is spent: a part split off or moved to another member or a container
             -- still counts (those the old rule below puts back; WoW's items are never destroyed for them).
             local gone = (now and now < was and not (u and pendingItem[u])) and math.min(was - now, partyDrop(entry)) or 0
+            if row.us ~= nil and tick < restGuard then gone = 0 end
             -- Spent only if it stays gone: a stack that vanished for one pass (seen once at a long rest's end,
             -- cause not caught) must not cost WoW's food. Until then it is left as it is.
             if gone > 0 and not (dropSeen[tag] and tick - dropSeen[tag] >= DROP_WAIT) then
@@ -1224,6 +1229,8 @@ function M.Start(id)
     Ext.Osiris.RegisterListener("Unequipped", 2, "after", function(item, char) onEquipped(item, char, false) end)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)
     Ext.Osiris.RegisterListener("RemovedFrom", 2, "after", function(item, holder) onRemovedFrom(item, holder) end)
+    pcall(Ext.Osiris.RegisterListener, "LongRestStarted", 0, "after", function() restGuard = tick + REST_START end)
+    pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER end)
     -- A WoW mob's stand-in dying in BG3: its WoW loot goes on the BG3 corpse. The server makes the
     -- WoW corpse lootable a moment after the kill reaches it, so it is asked from 15 ticks on and every
     -- 30 ticks until WoW's answer has the loot (CORPSE_ASKS at most). It was asked at 30 and 120 ticks:
