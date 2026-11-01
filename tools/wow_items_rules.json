@@ -110,7 +110,7 @@
   "camp_supply": [[5, 20], [15, 20], [25, 20], [35, 25], [45, 30], [999, 40]],
   "_conjured_supply": "Conjured food and drink is free to make, so it is worth a flat, small supply whatever its level. WoW sells it for 0.",
   "conjured_supply": 5,
-  "_food_heal": "BG3 base by item level: its food heals when eaten, by size. [up to this item level, base]: bun 1d4, loaf 2d4, fish 3d4, dinner 4d4; water 1d4, soup 3d4, stew 4d4.",
+  "_food_heal": "BG3 base by item level, for its look and size: BG3's food has no use from the bag (only alcohol has). [up to this item level, base].",
   "food_heal": [[5, "CONS_FOOD_Bread_Bun"], [15, "CONS_FOOD_Bread_Loaf"], [25, "CONS_FOOD_Fish"], [999, "CONS_FOOD_Dinner"]],
   "drink_heal": [[15, "CONS_DRINK_Water"], [25, "CONS_FOOD_Soup"], [999, "CONS_FOOD_Stew"]],
   "_alcohol": "WoW's own alcohol spells (weak, standard, strong, potent, lager). BG3's beer makes the drinker Drunk. Flat supply: a rest should not be paid in rum.",

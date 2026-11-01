@@ -40,6 +40,7 @@ BY_PLAYER = ['corpse']                       # column player_guid
 BY_PET = ['pet_aura', 'pet_spell', 'pet_spell_cooldown']  # column guid = character_pet.id
 NAME = re.compile(r'[A-Za-z]{2,12}')
 SID = re.compile(r'[A-Za-z0-9_-]{1,64}')
+GUARD_MARGIN = 1000
 
 
 def sh(cmd, stdin=None):
@@ -129,6 +130,7 @@ def snapshot(sid, names):
     tmp = out.with_suffix('.sql.tmp')
     tmp.write_text('\n'.join(parts) + '\n')
     tmp.replace(out)
+    guard_item_guids()
     m = read_meta(sid)
     m.update(Id=sid, Time=time.time(), Chars=chars, Rows=rows)
     write_meta(sid, m)
@@ -152,6 +154,17 @@ def sections(sid):
 
 ITEM_GUID = re.compile(r"^INSERT INTO `item_instance` VALUES \((\d+),")
 INSERT_TABLE = re.compile(r"^INSERT INTO `([a-z_]+)` VALUES ")
+
+
+def guard_item_guids():
+    """The server takes its next item guid from the highest in item_instance when it starts. A restore can put back
+    items above that (a load of a later snapshot after a restart that followed a load of an earlier one), and a new
+    item would get the guid of a restored one. A row of nobody's (owner 0, no item) keeps the number above everything
+    a snapshot can hold; the margin is for the new items of a session that never reach a snapshot. The server's reuse
+    of gaps is off for the same reason (wowbg3-server.sh)."""
+    sql('delete from item_instance where owner_guid = 0 and item_id = 0;\n'
+        "insert into item_instance (guid, item_id, owner_guid, enchantments) "
+        "select ifnull(max(guid), 0) + %d, 0, 0, '' from item_instance;\n" % GUARD_MARGIN)
 
 
 def apply(secs, names):
@@ -190,6 +203,7 @@ def restore(sid, names=None):
     except RuntimeError as e:
         apply(before, names)
         raise RuntimeError('restore %s failed, the characters were put back as they were: %s' % (sid, e))
+    guard_item_guids()
     print('restored %s: %s' % (sid, ', '.join('%s (guid %d, %d rows)' % (n, secs[n][0], len(secs[n][1])) for n in names)))
 
 

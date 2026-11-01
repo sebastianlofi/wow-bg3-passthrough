@@ -302,8 +302,12 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   | 8 silver | Homemade Cherry Pie, Morning Glory Dew | 80 | 1 | 8 silver |
 
   What is spent or eaten in BG3 is gone from the WoW character's bags too.
-- **Eating and drinking heal a little,** more for better food: 1d4 up to 4d4 HP, as BG3's own food does. Alcohol
-  makes the drinker Drunk, and counts for only 5 supply. WoW's water and alcohol use BG3's water bottle and beer, so they should throw as those do (not tried yet). Conjured food counts for 5 and sells for nothing.
+- **Food is eaten at camp.** As in BG3, food has no use from the bag: a long rest is what heals. Food with a WoW buff is
+  also drunk from the bag for that buff, and it replaces an elixir, a mana potion's too. Alcohol is the
+  exception: Consume gives BG3's Alcohol condition (disadvantage on Dexterity and Charisma checks) and counts for only
+  5 supply. Thrown water and alcohol break where they land and leave their surface, and one is gone from WoW too.
+  Conjured food counts for 5 and sells for nothing.
+- **Pickpocketing takes Sneak** and gets a friendly NPC's pocket food for free, or its wares if it is a vendor.
 
 ## Good to know
 

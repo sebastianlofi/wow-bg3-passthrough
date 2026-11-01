@@ -541,6 +541,7 @@ end
 -- what it last held goes to WoW as the bridge's `del` (WoW's stacks of that entry, bags before anything
 -- else); until WoW's list shows it, the stack stays at the lower amount (SPEND_WAIT ms, then WoW's word).
 local stackLast, stackSpent = {}, {} -- tag -> amount last held; {Total, N, At}
+local pieceOwner = {} -- a part split off a stack (notePieces) -> the member whose stack it came from
 local SPEND_WAIT = 15000
 local dropSeen, DROP_WAIT = {}, 150 -- tag -> tick a drop was first seen; ticks it must last (about 5 s)
 -- Nobody drinks during a long rest, yet at its end all of one member's stacks went at once, twice in nine rests
@@ -560,9 +561,18 @@ local function spend(uuid, entry, n, items)
     end
     M.Spent = M.Spent + (n - left)
 end
+-- What is split off an entry's stacks right now: in the barter columns, or on its way out of a hand.
+local function piecesOf(entry)
+    local n = 0
+    for it in pairs(pieceOwner) do
+        if not q(Ext.Entity.Get, it) then pieceOwner[it] = nil
+        elseif entryOf(it) == entry then n = n + (q(Osi.GetStackAmount, it) or 0) end
+    end
+    return n
+end
 -- How far the party's BG3 stacks of this entry together are below what they last held.
 local function partyDrop(entry)
-    local held, want = 0, 0
+    local held, want = piecesOf(entry), 0
     eachOurs(function(u)
         local t = tagOf(u)
         if entryOf(u) == entry and not (t and t:match("^[LV]")) then held = held + (q(Osi.GetStackAmount, u) or 0) end
@@ -623,6 +633,8 @@ local function reconcileStacks(uuid, stacks, have, items)
                 total = wow - gone
             else
                 dropSeen[tag] = nil
+                -- All of the drop is a piece still out: neither spent nor put back until it is settled.
+                waiting = now ~= nil and was ~= nil and now < was and not (u and pendingItem[u]) and piecesOf(entry) > 0
             end
             stackLast[tag] = waiting and was or total
         end
@@ -788,7 +800,43 @@ local function reconcileMember(uuid, m, have)
     end
 end
 
+local function eachHeld(u, fn)
+    local e = q(Ext.Entity.Get, u)
+    local okI, list = pcall(function() return e.InventoryOwner.PrimaryInventory.InventoryContainer.Items end)
+    for _, v in pairs(okI and list or {}) do
+        local it = q(function() return v.Item.Uuid.EntityUuid end)
+        if it then fn(it) end
+    end
+end
+-- What builds before the stack fix (M.Create) left in a save: bare copies of a stack's food, no tag, WoW's list
+-- does not know them. Right after a load nothing can be a live piece yet, so an untagged item of ours is one of
+-- those (BG3's rest took it and the stack with it). A copy comes back from a save with no stats entry at all and
+-- BG3's name for the food base ("Butter Bun", harness); no BG3 food has no stats. WoW's count stands, nothing is spent.
+local swept = {}
+local function sweepStrays(uuid)
+    local function bare(it)
+        local e = q(Ext.Entity.Get, it)
+        return q(function() return e.Data.StatsId end) == "" and tostring(q(Osi.GetTemplate, it)):find("^CONS_") ~= nil
+    end
+    local function look(it)
+        if not tagOf(it) and (entryOf(it) or bare(it)) then
+            M.Suppress(it)
+            if pcall(Osi.RequestDelete, it) then M.Strays = (M.Strays or 0) + 1 end
+        end
+    end
+    eachHeld(uuid, function(it)
+        look(it)
+        eachHeld(it, look) -- the Camp Supply Sack holds the food
+    end)
+end
+
 function M.Reconcile(inv)
+    for uuid, m in pairs(inv.Members or {}) do
+        if not swept[uuid] and type(m) == "table" and type(m.Items) == "table" then
+            swept[uuid] = true
+            pcall(sweepStrays, uuid)
+        end
+    end
     local have = ours()
     wowOwner, stackWant = {}, {}
     local blind = false
@@ -1069,7 +1117,6 @@ end
 -- our stats, none of our variables, BG3's name and icon. notePieces, on every look, dresses it and says
 -- what it came from. It stays a piece until the barter goes through, and only then is it bought or sold
 -- (onRemovedFrom, onAddedTo); back on the stack it never happened.
-local pieceOwner = {} -- piece -> the member whose stack it came from
 local pieceDressed = {}
 local function notePiece(it, row)
     if not pieceDressed[it] then
@@ -1077,16 +1124,9 @@ local function notePiece(it, row)
         pcall(M.Dress, it, row)
     end
 end
-local function eachHeld(u, fn)
-    local e = q(Ext.Entity.Get, u)
-    local okI, list = pcall(function() return e.InventoryOwner.PrimaryInventory.InventoryContainer.Items end)
-    for _, v in pairs(okI and list or {}) do
-        local it = q(function() return v.Item.Uuid.EntityUuid end)
-        if it then fn(it) end
-    end
-end
 -- A piece that has been dealt with: the next reconcile shows the stack as WoW has it.
 local function dropPiece(u)
+    pieceOwner[u] = nil
     M.Suppress(u)
     pcall(Osi.RequestDelete, u)
 end
@@ -1129,6 +1169,14 @@ local function notePieces()
     end
 end
 M.NotePieces = notePieces
+-- A piece moved to another member goes back on its stack: read as gone, it would cost WoW's food.
+local function returnPiece(u, h)
+    local owner, entry = pieceOwner[u] or h, entryOf(u)
+    local stack = ours()[stackTag(entry, owner)]
+    local amount = stack and q(Osi.GetStackAmount, stack)
+    if amount then pcall(Osi.SetStackAmount, stack, amount + (q(Osi.GetStackAmount, u) or 0)) end
+    dropPiece(u)
+end
 
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
@@ -1139,7 +1187,13 @@ local function onAddedTo(item, holder)
     local members = memberSet(lastInv)
     if not tag and entryOf(u) then
         if members[h] then
-            dropPiece(u)
+            -- A merchant's piece comes from the buy. One of the party's stays as it is: it may be offered in the
+            -- barter columns (BG3 keeps it in the bag until the deal), or be BG3's Throw, which splits one off just
+            -- like this and breaks it where it lands (water, alcohol's surface), or a split the player wanted.
+            -- When it is gone it reads as spent; a load sweeps what is left (sweepStrays), WoW's count stands.
+            if M.SideTag[u] then dropPiece(u)
+            elseif pieceOwner[u] and pieceOwner[u] ~= h then returnPiece(u, pieceOwner[u])
+            else pieceOwner[u] = h end
         elseif vendorOf[h] and (pieceOwner[u] or buying(h)) then
             -- Part of a stack sold: that many, out of WoW's stacks of that entry. Split in the drag, no look has seen it.
             local seller = pieceOwner[u] or Hero.Uuid()
@@ -1349,7 +1403,7 @@ function M.Start(id)
         if tick % 60 == 0 then
             pcall(M.SaveUsed)
             state.Tick, state.RunId, state.MadeMs, state.ReqSeq = tick, runId, M.MadeMs, reqSeq
-            state.Stolen = M.Stolen
+            state.Stolen, state.Strays = M.Stolen, M.Strays
             Ext.IO.SaveFile(IO .. "inventory-status.json", Ext.Json.Stringify(state))
         end
     end)

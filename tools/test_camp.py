@@ -246,6 +246,7 @@ class Spend(unittest.TestCase):
         text = (LUA / 'Inventory.lua').read_text()
         body = section(text, 'local stackLast, stackSpent', "-- A party member's own clothes")
         L.execute(r'''
+          Ext.Entity = {Get = function(u) if stack[u] then return {} end end}
           M, state = {Items = nil, Spent = 0}, {Created = 0}
           tick = 0
           reqs, created = {}, {}
@@ -265,7 +266,7 @@ class Spend(unittest.TestCase):
           function tagOf(u) return "S4540@hero" end
           function eachOurs(f) for u in pairs(stack) do f(u) end end
         ''')
-        L.execute(body + '\nreconcile = reconcileStacks')
+        L.execute(body + '\nreconcile = reconcileStacks\npieces = pieceOwner')
 
     def go(self, total, have=True):
         L = self.L
@@ -366,6 +367,33 @@ class Spend(unittest.TestCase):
         self.go(20)
         self.assertEqual(L.globals().reqs[1]['Count'], 2)
 
+    def test_a_part_split_off_is_no_spending(self):
+        # A piece has no tag, so eachOurs does not see it: it still is the party's, in the barter columns.
+        L = self.L
+        L.execute('stack["u"] = 20')
+        self.go(20)
+        L.execute('function eachOurs(f) f("u") end; stack["u"] = 15; stack["piece"] = 5; pieces["piece"] = "hero"')
+        self.go(20)
+        self.go(20)
+        self.assertEqual(len(L.globals().reqs), 0)
+        self.assertEqual(L.eval('stack["u"]'), 15)  # not put back while it is out
+        L.execute('stack["piece"] = nil; pieces["piece"] = nil; stack["u"] = 20')  # it came back on the stack
+        self.go(20)
+        self.assertEqual(len(L.globals().reqs), 0)
+
+    def test_a_thrown_piece_is_spent_when_it_is_gone(self):
+        L = self.L
+        L.execute('stack["u"] = 5')
+        self.go(5)
+        L.execute('function eachOurs(f) f("u") end; stack["u"] = 4; stack["piece"] = 1; pieces["piece"] = "hero"')
+        self.go(5)
+        self.assertEqual(L.eval('stack["u"]'), 4)  # in the air: not put back, or every throw would be free
+        L.execute('stack["piece"] = nil; pieces["piece"] = nil')  # it broke where it landed
+        self.go(5)
+        self.go(5)
+        self.assertEqual(L.globals().reqs[1]['Count'], 1)
+        self.assertEqual(L.eval('stack["u"]'), 4)
+
     def test_other_items_untouched(self):
         L = self.L
         L.execute('''
@@ -462,6 +490,34 @@ class ListGaps(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.server(*lines).list('Tav')
 
+    def bridge(self, lists):
+        import inventory_bridge as ib, tempfile
+        b = ib.Bridge.__new__(ib.Bridge)
+        b.vendors, b.pockets, b.not_vendor, b.char, b.camp_on = {}, set(), {}, 'Tav', False
+        b.be = type('Be', (), {'vendor': lambda _, g, n: lists.pop(0) if lists else []})()
+        d = Path(tempfile.mkdtemp())
+        (d / 'mirror.json').write_text(json.dumps({'Mobs': [{'Guid': 'n1', 'Friendly': True}]}))
+        ib.LINK, self._link = d, ib.LINK
+        self.addCleanup(lambda: setattr(ib, 'LINK', self._link))
+        return ib, b
+
+    def test_a_vendor_refused_from_afar_is_asked_again(self):
+        ib, b = self.bridge([[], [{'Idx': 0, 'Entry': 117, 'Price': 25, 'Stock': -1}]])
+        b.prefetch()
+        self.assertEqual(b.vendors, {})
+        b.prefetch()  # too soon
+        self.assertEqual(b.not_vendor['n1'][0], 1)
+        b.not_vendor['n1'] = (1, 0)
+        self.assertTrue(b.prefetch())
+        self.assertEqual(b.vendors['n1'][0]['Entry'], 117)
+
+    def test_one_who_sells_nothing_stops_being_asked(self):
+        ib, b = self.bridge([])
+        for _ in range(ib.LIST_TRIES + 3):
+            b.prefetch()
+            b.not_vendor['n1'] = (b.not_vendor['n1'][0], 0)
+        self.assertEqual(b.not_vendor['n1'][0], ib.LIST_TRIES)
+
     def test_a_missing_list_deletes_nothing(self):
         L = runtime()
         text = (LUA / 'Inventory.lua').read_text()
@@ -469,9 +525,12 @@ class ListGaps(unittest.TestCase):
           M, state, deleted, Ext = {}, {}, {}, {}
           Osi = {RequestDelete = function(u) deleted[#deleted + 1] = u end}
           pendingItem = {}
-          function ours() return {["S117@hero"] = "stack", ["123"] = "sword"} end
+          function ours() return {["S117@hero"] = "stack", ["123"] = "sword", ["6F"] = "axe", ["V1A:0"] = "ware"} end
+          function isWowGuid(tag) return tag:match("^%x+$") ~= nil end
+          swept = {}
+          function sweepStrays() end
           function goldOf() return 0 end
-          function reconcileMember(uuid, m) if m.Items then wowOwner["123"] = uuid; stackWant["S117@hero"] = true end end
+          function reconcileMember(uuid, m) if m.Items then wowOwner["123"] = uuid; wowOwner["6F"] = uuid; stackWant["S117@hero"] = true end end
           M.Suppress = function() end
         """)
         L.execute(section(text, 'function M.Reconcile(inv)', "-- WoW's own words"))
@@ -480,7 +539,31 @@ class ListGaps(unittest.TestCase):
         L.execute('M.Reconcile({Members = {hero = {Char = "Tav", Items = {}}}})')
         self.assertEqual(L.eval('#deleted'), 0)
         L.execute('M.Reconcile({Members = {}})')
-        self.assertEqual(L.eval('#deleted'), 2)
+        self.assertEqual(L.eval('#deleted'), 3)  # the stack and both guids, one with a hex letter; no ware
+
+    def test_a_loads_bare_copies_go_and_the_stack_stays(self):
+        L = runtime()
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute(r'''
+          M, deleted = {Suppress = function() end}, {}
+          function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
+          local function holds(...)
+            local list = {}
+            for i, u in ipairs({...}) do list[i] = {Item = {Uuid = {EntityUuid = u}}} end
+            return {InventoryOwner = {PrimaryInventory = {InventoryContainer = {Items = list}}}}
+          end
+          ents = {hero = holds("stack", "sack", "potion"), sack = holds("stray", "food", "bun", "statless")}
+          ents.bun, ents.statless = {Data = {StatsId = ""}}, {Data = {StatsId = ""}}
+          Osi.GetTemplate = function(u) return u == "bun" and "CONS_GEN_Food_Bread_Bun_A_e604" or "BOOK_x" end
+          Ext.Entity = {Get = function(u) return ents[u] end}
+          Osi.RequestDelete = function(u) deleted[u] = true end
+          tags = {stack = "S117@hero", food = "S118@hero"}
+          function tagOf(u) return tags[u] end
+          function entryOf(u) if u == "stack" or u == "stray" or u == "food" then return 117 end end
+        ''')
+        L.execute(section(text, 'local function eachHeld', 'function M.Reconcile(inv)') + '\nsweep = sweepStrays')
+        L.execute('sweep("hero")')
+        self.assertEqual(sorted(L.eval('deleted').keys()), ['bun', 'stray'])
 
 
 if __name__ == '__main__':

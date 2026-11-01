@@ -34,8 +34,8 @@ This is the first public version. What we know is missing or rough:
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
-  music stays off there, and the WoW side shows nothing while you are at camp. Water from the bag, alcohol's
-  Drunk, and a successful pickpocket of food have not been tried in the game yet.
+  music stays off there, and the WoW side shows nothing while you are at camp. Food has no use from the bag (as in
+  BG3): it is eaten at camp, by a long rest.
 - The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
   in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is

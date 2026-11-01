@@ -61,6 +61,9 @@ def jsave(p, v):
     tmp.replace(p)
 
 
+LIST_TRIES, LIST_RETRY = 10, 30  # a friendly NPC's wares: how many times to ask, seconds apart
+
+
 class Fake:
     """WoW's inventory rules, small: 16-slot backpack, no bags, equipment by inventory type."""
 
@@ -357,7 +360,7 @@ class Bridge:
         self.replies = []
         self.vendors, self.loot = {}, {}
         self.last_list = 0
-        self.not_vendor = set()  # friendly NPCs a list was refused for (not vendors)
+        self.not_vendor = {}     # friendly NPCs a list was refused for -> (tries, time of the last)
         self.pockets = set()     # of those, the ones with food on them to steal (pocket())
         self.camp_on = (jload(IO / 'camp.json', {}) or {}).get('On') is True
 
@@ -457,14 +460,23 @@ class Bridge:
         mirror = jload(LINK / 'mirror.json', {}) or {}
         for m in mirror.get('Mobs') or []:
             g = str(m.get('Guid') or '')
-            if not m.get('Friendly') or not g or g in self.vendors or g in self.not_vendor:
+            if not m.get('Friendly') or not g or (g in self.vendors and g not in self.pockets):
+                continue
+            # A refusal is no proof it sells nothing: the server also refuses a vendor out of its 100 yards, and
+            # right after a far move every NPC of the new place is that. So a few tries more; a real list then
+            # takes the place of the pocket.
+            tries, at = self.not_vendor.get(g, (0, 0))
+            if tries >= LIST_TRIES or (tries and time.time() - at < LIST_RETRY):
                 continue
             wares = self.be.vendor(g, self.char)
             print('%s prefetch %s (%s): %d ware(s)' % (time.strftime('%H:%M:%S'), g, m.get('Name'), len(wares)), flush=True)
+            self.not_vendor[g] = (tries + 1, time.time())
             if wares:
                 self.vendors[g] = wares
+                self.pockets.discard(g)
                 return True
-            self.not_vendor.add(g)
+            if tries:
+                return False
             pocket = self.pocket(g, m)
             if pocket:
                 self.vendors[g] = pocket

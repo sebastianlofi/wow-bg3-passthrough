@@ -187,7 +187,9 @@ start() {
         # No restart of the server's own: vmangos schedules one for its weekly PvP rank calculation
         # (AutoHonorRestart, on in the dist config), which came mid-session ("[SERVER] Restart in 15
         # Minutes"). Set at every start, so configs written before this get it too.
-        set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0"
+        # No reuse of item guids: a gap in today's table can be an item a BG3 save's snapshot brings back, and a
+        # new item then had the guid of a restored one (wowsave.py keeps the highest above any snapshot).
+        set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0" "ReusableGuidPoolSize=0"
         rm -f "$RUN/console"; mkfifo -m 600 "$RUN/console"
         # The console reads the fifo; a holder keeps it open so mangosd never sees end of input.
         ( exec $sid sleep infinity > "$RUN/console" < /dev/null ) &
