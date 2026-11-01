@@ -34,6 +34,7 @@ M.JUMP = 150.0        -- metres in one teleport: a trip's start, never a walk
 M.PENDING = 180       -- ticks a teleported hero may take to count as in camp
 M.BACK_NEAR = 2.0     -- metres from the spot left: farther and the hero is put there
 M.LEFT_AFTER = 30     -- ticks out of DB_PlayerInCamp before the trip counts as over
+M.VOID_REACH = 2000.0 -- metres from the void's centre: a jump that lands within is no one's travel in the level
 
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
@@ -56,11 +57,12 @@ end
 local trip = nil
 function M.InTrip() return trip ~= nil end
 
+-- world.json while world mode runs, else nil.
 local function worldActive()
     local raw = Ext.IO.LoadFile("wow-bg3/link/world.json")
-    if not raw then return false end
+    if not raw then return nil end
     local ok, w = pcall(Ext.Json.Parse, raw)
-    return ok and type(w) == "table" and w.Active == true
+    return ok and type(w) == "table" and w.Active == true and w or nil
 end
 
 local function inCampDb(hero)
@@ -99,11 +101,17 @@ function M.Start(runId)
     -- Fires before the frame's client tick reads the state (server and client share the process, and the
     -- client holds its publish over a jump until it hears: WorldMode.lua).
     local function onTeleported(who, _, ox, oy, oz, nx, ny, nz, reason)
-        if trip or reason == "RegionSwap" or not worldActive() then return end
+        if trip or reason == "RegionSwap" then return end
+        local w = worldActive()
+        if not w then return end
         local hero = Hero.Uuid()
         if uuidOf(who) ~= hero then return end
         local dx, dz = nx - ox, nz - oz
         if math.sqrt(dx * dx + dz * dz) < M.JUMP then return end
+        -- Into the void: world mode's own Start. Undoing it put the hero on the host level's spot, inside camp's
+        -- ground, about 5 s after each load whose world.json a killed bridge had left Active.
+        local c = w.Centre
+        if type(c) == "table" and math.sqrt((nx - c[1]) ^ 2 + (nz - c[3]) ^ 2) < M.VOID_REACH then return end
         local mine = own and ticks <= own.Until and math.sqrt((nx - own.X) ^ 2 + (nz - own.Z) ^ 2) < M.JUMP
         own = nil
         pending = {Hero = hero, From = {ox, oy, oz}, Until = ticks + M.PENDING, Own = mine}
