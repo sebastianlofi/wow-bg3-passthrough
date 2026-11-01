@@ -529,6 +529,7 @@ class ListGaps(unittest.TestCase):
           function isWowGuid(tag) return tag:match("^%x+$") ~= nil end
           swept = {}
           function sweepStrays() end
+          listedAt, LISTED_WAIT, tick = {}, 900, 0
           function goldOf() return 0 end
           function reconcileMember(uuid, m) if m.Items then wowOwner["123"] = uuid; wowOwner["6F"] = uuid; stackWant["S117@hero"] = true end end
           M.Suppress = function() end
@@ -538,7 +539,9 @@ class ListGaps(unittest.TestCase):
         self.assertEqual(L.eval('#deleted'), 0)
         L.execute('M.Reconcile({Members = {hero = {Char = "Tav", Items = {}}}})')
         self.assertEqual(L.eval('#deleted'), 0)
-        L.execute('M.Reconcile({Members = {}})')
+        L.execute('M.Reconcile({Members = {}})')  # just listed and now not: the wait at a rest's end
+        self.assertEqual(L.eval('#deleted'), 0)
+        L.execute('tick = LISTED_WAIT; M.Reconcile({Members = {}})')
         self.assertEqual(L.eval('#deleted'), 3)  # the stack and both guids, one with a hex letter; no ware
 
     def test_a_loads_bare_copies_go_and_the_stack_stays(self):
