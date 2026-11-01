@@ -58,8 +58,11 @@ version is mostly complete.
   posts.
 - **Money.** WoW's copper is BG3's gold: 1 copper = 1 gold, so 1 silver = 100 gold and 1 WoW gold
   = 10,000 gold. Prices and corpse money use the same rule. Merchants show food and arrows as the stacks WoW sells, and you can split a
-  stack to buy or sell just part of it. The price the barter screen shows is the price you pay: BG3's
-  attitude and Persuasion count, and WoW's money follows. WoW's reputation discount shows in the base price.
+  stack to buy or sell just part of it. With no discount on the barter screen, a merchant charges WoW's
+  buy price and pays WoW's sell price, on every difficulty. BG3's attitude and Persuasion move both from
+  there, and the price the screen shows is the price you pay: WoW's money follows. BG3's item values are whole
+  numbers, so a buy price can show up to 1 copper off WoW's (a 1 copper item shows 3 on Balanced); sell prices
+  are exact. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.

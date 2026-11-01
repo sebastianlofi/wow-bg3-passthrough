@@ -32,6 +32,7 @@ local client = Ext.IsClient()
 local tick = 0 -- server ticks since Start (all timing below counts these)
 -- Hero.lua (the controlled character); a stand-in when loaded outside bootstrap (harness research).
 local Camp = Ext.Require("Camp.lua") -- the switch `camp`
+local Prices = Ext.Require("Prices.lua")
 local okHero, Hero = pcall(Ext.Require, "Hero.lua")
 if not okHero or type(Hero) ~= "table" then
     Hero = {Uuid = function()
@@ -180,6 +181,33 @@ function M.SaveUsed()
     Ext.IO.SaveFile(USED, Ext.Json.Stringify({Schema = 1, Entries = list}))
 end
 
+-- ---- prices (the rule: Prices.lua) ----
+-- BG3's trade prices read the item's own value (e.Value.Value), not its stats entry, so a merchant's
+-- ware and the party's copy of the same entry each hold their own: the screen shows WoW's buy price for
+-- the one and WoW's sell price for the other, with attitude and Persuasion on top. BG3 keeps the value
+-- in the save, so an item from an older save gets its value here too.
+local TRADE_MODIFIER = "TRADE_PRICE_MODIFIER_f52ca62e-e7ee-435a-853f-454b2303c278"
+local tradeBase = Prices.DEFAULT_BASE
+-- The save's own (it goes with the difficulty, and the player can change that in a running game).
+function M.TradeBase()
+    local v = q(Osi.GetRulesetModifierFloat, TRADE_MODIFIER)
+    if type(v) == "number" and v >= 1 then tradeBase = v end
+    return tradeBase
+end
+function M.ValueOf(row, ware)
+    local cpg = M.CopperPerGold or 1
+    local bp = (row.bp or 0) / cpg
+    if ware then return Prices.Ware(bp, tradeBase) end
+    return Prices.Held((row.sp or 0) / cpg, bp, tradeBase)
+end
+local function setValue(e, want)
+    local ok, cur = pcall(function() return e.Value.Value end)
+    if not ok or cur == want then return false end
+    if not pcall(function() e.Value.Value = want end) then return false end
+    pcall(function() e:Replicate("Value") end) -- the client's trade screen works it out from its own copy
+    return true
+end
+
 local makeStats -- below
 function M.MakeStats(row)
     local name = M.StatsName(row.e)
@@ -188,7 +216,6 @@ function M.MakeStats(row)
     assert(not client, "stats are made on the server")
     return makeStats(row, true)
 end
-local TRADE_MARKUP = 2.5 -- measured: a 200 copper shank showed 500, five 5 copper jerky 65
 makeStats = function(row, sync)
     local name = M.StatsName(row.e)
     local base = Ext.Stats.Get(row.b)
@@ -215,9 +242,8 @@ makeStats = function(row, sync)
             s.Boosts = (old ~= "" and old .. ";" or "") .. table.concat(boosts, ";")
         end
         if row.r then s.Rarity = row.r end
-        -- BG3's trade screen shows a value at TRADE_MARKUP times with no discount: what it shows is WoW's price.
-        local gold = (row.bp or 0) / (M.CopperPerGold or 1)
-        s.ValueOverride = gold > 0 and math.max(1, math.ceil(gold / TRADE_MARKUP)) or 0
+        -- Only where a new item's value starts: M.ValueOf sets each item's own from then on.
+        s.ValueOverride = M.ValueOf(row, false)
     end)
     -- WoW's food and drink are BG3's camp supplies (switch `camp`; `sv` from wow_items.py). BG3's water has
     -- no supply value and no supply tag of its own, its food has both.
@@ -370,6 +396,7 @@ function M.Create(entry, holder, count, tag, rand)
     local e = Ext.Entity.Get(u)
     dress(e, row)
     M.Dress(u, row)
+    setValue(e, M.ValueOf(row, tostring(tag):sub(1, 1) == "V"))
     M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (components settle)
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
@@ -477,6 +504,27 @@ local function entryOf(u)
     return type(sid) == "string" and tonumber(sid:match("^" .. PREFIX_STATS .. "(%d+)$")) or nil
 end
 local stackWant = {}
+
+-- A merchant's: in a vendor's stand-in, or a ware (tag V) on its stand-in or on nobody yet. Everything else,
+-- a ware just bought included, is priced as the party's: selling it back pays WoW's sell price.
+local function isWare(holder, tag)
+    if holder and vendorOf[holder] then return true end
+    if tostring(tag):sub(1, 1) ~= "V" then return false end
+    return not holder or (WOWBG3MirrorOwned or {})[holder] ~= nil
+end
+M.IsWare = isWare
+local function priceItem(u, holder, tag)
+    local e = q(Ext.Entity.Get, u)
+    local entry = e and entryOf(u)
+    local row = entry and M.Item(entry)
+    if row then setValue(e, M.ValueOf(row, isWare(holder, tag))) end
+end
+-- Every item of ours, by where it is now: after a load, a merge of a ware into a stack, a change of difficulty.
+function M.SetPrices()
+    M.TradeBase()
+    state.TradeBase = tradeBase
+    eachOurs(function(u, tag) priceItem(u, holderOf(u), tag) end)
+end
 
 -- Food and drink spent in BG3 (switch `camp`): eaten, or taken by BG3 for a long rest. WoW is the truth,
 -- so without this the next reconcile put them back and every rest was free. A drop of a BG3 stack below
@@ -950,6 +998,7 @@ local function notePieces()
             local row = entry and M.Item(entry)
             if row then
                 notePiece(it, row)
+                priceItem(it, standin)
                 for _, w in ipairs(((lastInv or {}).Vendors or {})[guid] or {}) do
                     if w.Entry == entry then M.SideTag[it] = "V" .. guid .. ":" .. tostring(w.Idx) end
                 end
@@ -960,7 +1009,7 @@ local function notePieces()
         local function look(it)
             local entry = not tagOf(it) and entryOf(it)
             local row = entry and M.Item(entry)
-            if row then notePiece(it, row); pieceOwner[it] = uuid end
+            if row then notePiece(it, row); priceItem(it, uuid); pieceOwner[it] = uuid end
         end
         eachHeld(uuid, function(it)
             look(it)
@@ -977,8 +1026,10 @@ end
 
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
-    if not u or not h or suppressed(u) then return end
+    if not u or not h then return end
     local tag = tagOf(u)
+    priceItem(u, h, tag) -- at once: a ware just bought can be sold straight back
+    if suppressed(u) then return end
     local members = memberSet(lastInv)
     if not tag and entryOf(u) then
         if members[h] then
@@ -1147,7 +1198,10 @@ function M.Start(id)
         for u, f in pairs(M.Fresh) do
             if tick - f.Tick >= 10 then M.Fresh[u] = nil; pcall(M.Dress, u, f.Row) end
         end
-        if tick % 20 == 0 then pcall(M.NotePieces) end
+        if tick % 20 == 0 then
+            pcall(M.NotePieces)
+            pcall(M.SetPrices)
+        end
         for u, t in pairs(pendingItem) do if tick - t > 1800 then pendingItem[u] = nil end end
         for u, d in pairs(M.CorpseDue) do
             local lt = lastInv and (lastInv.Loot or {})[d.Guid]
