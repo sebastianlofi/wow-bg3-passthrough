@@ -92,8 +92,6 @@ This is the first public version. What we know is missing or rough:
 - A WoW consumable uses BG3's own effect, not WoW's spell. One elixir at a time, as in BG3: eating a Well
   Fed food can replace a mana potion's elixir and take its spell slot. Dropping or destroying an item from
   BG3 has nowhere to go in WoW 1.12, which has no ground drop.
-- Rarely, at the end of a long rest, all of one member's food stacks vanish, from WoW too (2 of 9 rests; cause
-  not caught). Potions and elixirs in the same bag come back: [item-effects.md](item-effects.md).
 
 ## Fights and numbers
 

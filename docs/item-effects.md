@@ -205,7 +205,7 @@ How it behaves:
 - A stat elixir below 8 points is `Alertness` (+5 initiative): too small for a stat, still something.
 - **Spending:** every usable consumable that is no camp supply has `"us": 1` on its row, and `Inventory.lua` spends a use
   in WoW as it does a camp supply. During a long rest and 30 s after it, such a stack's drop is no spending: it is put back
-  from WoW's list (see "Known limits").
+  from WoW's list.
 
 ## Balance calls
 
@@ -312,10 +312,11 @@ Consumables, on a level 1 Wizard with 2 level 1 slots, each used from BG3 and re
 
 ## Known limits
 
-- **A member's stacks can vanish at the end of a long rest.** Seen in 2 of 9 rests, about 2 s after `LongRestFinished`: all of one
-  member's food and potion stacks at once, another member's kept, and with them WoW's copies. Cause not caught: no rest with the
-  call log on showed it, and no setup brings it on at will. Potions and elixirs now come back (`restGuard`, `Inventory.lua`).
-  **Food in such a stack is still lost**, since a rest spends food and the two look alike.
+- **Fixed: a member's stacks vanishing at the end of a long rest** (about 1 rest in 5, from WoW too). BG3 autosaves there, and
+  while it saved `Hero.lua` wrote `hero.json` without the hero. A list the inventory bridge made in that half second had no hero,
+  `M.Reconcile` read that as WoW holding nothing for it and deleted its stacks and gear, and the next list read the deleted stacks
+  as spent. Any save could do it. Now `hero.json` keeps the hero through a save, the bridge keeps the last hero listed, and a member
+  just listed and now missing removes nothing for 30 s.
 
 - The tooltip shows the BG3 base item's text (a bone for "Worn in WoW" pieces), not WoW's text, so a suffix's
   numbers show nowhere in BG3. The code that sets the description is older than this mapping.

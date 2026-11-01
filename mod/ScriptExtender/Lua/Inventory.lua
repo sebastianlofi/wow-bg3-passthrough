@@ -544,9 +544,8 @@ local stackLast, stackSpent = {}, {} -- tag -> amount last held; {Total, N, At}
 local pieceOwner = {} -- a part split off a stack (notePieces) -> the member whose stack it came from
 local SPEND_WAIT = 15000
 local dropSeen, DROP_WAIT = {}, 150 -- tag -> tick a drop was first seen; ticks it must last (about 5 s)
--- Nobody drinks during a long rest, yet at its end all of one member's stacks went at once, twice in nine rests
--- (harness, cause not caught; it lasted past DROP_WAIT and cost WoW every potion). Until this tick a potion's
--- drop is no spending, so the old rule below puts it back. Started to Finished is about 8 s.
+-- Nobody drinks during a long rest, so until this tick a potion's drop is no spending and the old rule below puts it
+-- back: a net under the fix for the wipe at a rest's end (M.Reconcile, listedAt). Started to Finished is about 8 s.
 local restGuard, REST_START, REST_AFTER = 0, 1800, 900
 M.Spent = 0
 local function spend(uuid, entry, n, items)
@@ -620,8 +619,8 @@ local function reconcileStacks(uuid, stacks, have, items)
             -- still counts (those the old rule below puts back; WoW's items are never destroyed for them).
             local gone = (now and now < was and not (u and pendingItem[u])) and math.min(was - now, partyDrop(entry)) or 0
             if row.us ~= nil and tick < restGuard then gone = 0 end
-            -- Spent only if it stays gone: a stack that vanished for one pass (seen once at a long rest's end,
-            -- cause not caught) must not cost WoW's food. Until then it is left as it is.
+            -- Spent only if it stays gone: a stack that vanished for one pass must not cost WoW's food. Until then
+            -- it is left as it is.
             if gone > 0 and not (dropSeen[tag] and tick - dropSeen[tag] >= DROP_WAIT) then
                 dropSeen[tag] = dropSeen[tag] or tick
                 waiting = true
@@ -830,6 +829,7 @@ local function sweepStrays(uuid)
     end)
 end
 
+local listedAt, LISTED_WAIT = {}, 900 -- member -> tick of its last list; ticks it may be missing (about 30 s)
 function M.Reconcile(inv)
     for uuid, m in pairs(inv.Members or {}) do
         if not swept[uuid] and type(m) == "table" and type(m.Items) == "table" then
@@ -842,14 +842,21 @@ function M.Reconcile(inv)
     local blind = false
     for uuid, m in pairs(inv.Members or {}) do
         reconcileMember(uuid, m, have)
-        if type(m) ~= "table" or type(m.Items) ~= "table" then blind = true end
+        if type(m) ~= "table" or type(m.Items) ~= "table" then blind = true else listedAt[uuid] = tick end
+    end
+    -- A member just listed and now not: at a long rest's end the hero left the list for a moment (hero.json).
+    for uuid, at in pairs(listedAt) do
+        if not (inv.Members or {})[uuid] then
+            if tick - at < LISTED_WAIT then blind = true else listedAt[uuid] = nil end
+        end
     end
     -- What WoW no longer has: plain WoW items (guid tags) not in any member's list, stacks it has none of.
-    -- Not while a member's list is missing (WoW offline, a far move): that says nothing about what it holds,
-    -- and a stack deleted here would next read as food spent.
+    -- Not while a member's list is missing (WoW offline, a far move, the above): that says nothing about what it
+    -- holds. What goes here was not spent, so a stack that comes back later starts over.
     for tag, u in pairs(blind and {} or have) do
         if ((isWowGuid(tag) and not wowOwner[tag]) or (tag:match("^S") and not stackWant[tag])) and not pendingItem[u] then
             M.Suppress(u)
+            stackLast[tag], stackSpent[tag], dropSeen[tag] = nil, nil, nil
             pcall(Osi.RequestDelete, u)
         end
     end

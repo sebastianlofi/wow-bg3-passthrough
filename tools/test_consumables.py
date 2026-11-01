@@ -3,11 +3,13 @@
 
   python3 tools/test_consumables.py
 """
-import collections, json, sys, unittest
+import collections, json, sys, tempfile, types, unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import inventory_bridge
 import wow_items
 
 RULES = json.loads((HERE / 'wow_items_rules.json').read_text())
@@ -154,6 +156,20 @@ class Kept(unittest.TestCase):
     def test_schema_matches_the_coordinator(self):
         text = (HERE / 'wowbg3-coord.py').read_text()
         self.assertIn('int(m.group(1)) >= %d' % wow_items.ITEMS_SCHEMA, text)
+
+
+class HeroInTheList(unittest.TestCase):
+    """A save writes hero.json without the hero: a list without it cost the hero everything (Inventory.lua)."""
+
+    def test_hero_stays_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            io = Path(tmp)
+            (io / 'party-chars.json').write_text(json.dumps({'A': 'Astarion'}))
+            bridge = types.SimpleNamespace(char='Hero', extra={}, hero=None)
+            with mock.patch.object(inventory_bridge, 'IO', io), mock.patch.object(inventory_bridge, 'LINK', io):
+                for hero, want in (('G', 'G'), (None, 'G'), ('A', 'G'), ('T', 'T')):
+                    (io / 'hero.json').write_text(json.dumps({'Uuid': hero} if hero else {'State': 'Save'}))
+                    self.assertEqual(inventory_bridge.Bridge.members(bridge), {want: 'Hero', 'A': 'Astarion'})
 
 
 if __name__ == '__main__':

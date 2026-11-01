@@ -363,13 +363,19 @@ class Bridge:
         self.not_vendor = {}     # friendly NPCs a list was refused for -> (tries, time of the last)
         self.pockets = set()     # of those, the ones with food on them to steal (pocket())
         self.camp_on = (jload(IO / 'camp.json', {}) or {}).get('On') is True
+        self.hero = None         # the last hero hero.json named (members())
 
     def members(self):
         out = {}
-        hero = jload(IO / 'hero.json', {}) or {}
-        if hero.get('Uuid'):
-            out[hero['Uuid']] = self.char
-        for u, n in (jload(LINK / 'party-chars.json', {}) or {}).items():
+        hero = (jload(IO / 'hero.json', {}) or {}).get('Uuid')
+        chars = jload(LINK / 'party-chars.json', {}) or {}
+        # hero.json may name nobody or a companion for a moment. The hero stays listed: a list without it reads in BG3
+        # as WoW holding nothing for it (Inventory.lua).
+        if hero and hero not in chars:
+            self.hero = hero
+        if self.hero:
+            out[self.hero] = self.char
+        for u, n in chars.items():
             out[u] = n
         out.update(self.extra)
         return out

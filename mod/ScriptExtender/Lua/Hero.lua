@@ -210,6 +210,9 @@ function M.Start(id)
     Ext.Events.Tick:Subscribe(function()
         -- A change of hero reaches the file (and the client) within 15 ticks; the rest every 30.
         if tick % 15 ~= 0 then return end
+        -- A save (the autosave at a long rest's end, a quicksave) lasts under a second and the hero is still there.
+        -- A file without it then read as no hero: the inventory bridge listed nobody, BG3's copies of what WoW holds went.
+        if Ext.Utils.GetGameState() == "Save" then return end
         local now = Ext.Utils.GetGameState() == "Running" and M.Uuid() or nil
         if tick % every ~= 0 and now == lastUuid then return end
         lastUuid = now
