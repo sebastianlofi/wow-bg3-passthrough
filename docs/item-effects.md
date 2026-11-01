@@ -11,8 +11,8 @@ It works when the item table is built. Any one of these turns it on:
 - `WOW_BG3_ITEM_EFFECTS=1` in the environment of the first start
 - `"enabled": true` under `"effects"` in `wow_items_rules.json`
 
-The first start builds the table only if `items.json` is missing, so an existing install needs a rebuild
-by hand. Off again: rebuild without it; a member's added boosts leave at the next sync.
+The first start builds the table if `items.json` is missing or of an older schema, so a changed rule needs a
+new `ITEMS_SCHEMA`, or a rebuild by hand. Off again: rebuild without it; a member's added boosts leave at the next sync.
 
 ## How it works
 
@@ -42,8 +42,8 @@ server's `item_template` (17,707 items, highest patch row) and `spell_template`,
 | +spell damage | 937 | 928 | pool `sp`: SpellSaveDC({n}) per 40, cap 2, single-school spell damage counts like any school (balance call) |
 | +crit % | 384 | 384 | pool `crit`: ReduceCriticalAttackThreshold({n}) per 5, cap 2 |
 | mana per 5 s | 344 | 344 | not mapped: BG3 has spell slots, no mana |
-| +ranged attack power | 305 | 305 | pool `rap`: RollBonus(RangedWeaponDamage,{n}) per 32, cap 3 |
-| +attack power | 291 | 291 | pool `ap`: RollBonus(MeleeWeaponDamage,{n}) per 32, cap 3 |
+| +ranged attack power | 305 | 305 | pool `rap`: the same boost as `ap`, the larger total counts |
+| +attack power | 291 | 291 | pool `ap`: CharacterWeaponDamage({n}) per 32, cap 3, every weapon attack |
 | +skill (defense, weapon) | 216 | 206 | only defense; weapon skills not mapped |
 | +spell crit % | 215 | 215 | pool `crit`: ReduceCriticalAttackThreshold({n}) per 5, cap 2, shares melee crit's pool |
 | +hit % | 192 | 192 | pool `hit`: RollBonus(MeleeWeaponAttack,{n});RollBonus(RangedWeaponAttack,{n}) per 5, cap 2 |
@@ -203,18 +203,18 @@ How it behaves:
   water.
 - **What WoW makes for free stays at the first tier**: healthstones and mana gems, so a mage's gem is never a level 4 slot.
 - A stat elixir below 8 points is `Alertness` (+5 initiative): too small for a stat, still something.
-- **Spending:** every usable consumable that is no camp supply has `"us": 1` on its row, for `Inventory.lua` to spend a
-  use in WoW as it does a camp supply. See "Not proven".
+- **Spending:** every usable consumable that is no camp supply has `"us": 1` on its row, and `Inventory.lua` spends a use
+  in WoW as it does a camp supply.
 
-## Balance calls still open
+## Balance calls
 
-Every number below is a proposal in `wow_items_rules.json` (`effects`), and the game runs on them until
-The maintainer chooses. "Conservative" marks a number taken low on purpose: when in doubt, gear gives less. The
-boosts work in the game; whether the numbers feel right has not been played.
+Each is taken as proposed, as the recommended answer, and is in `wow_items_rules.json` (`effects`); the maintainer can
+overrule any. "Conservative" marks a number taken low on purpose: when in doubt, gear gives less. Whether the
+numbers feel right has not been played.
 
 | # | Call | Proposed | Reasoning, and what it does |
 |---|---|---|---|
-| 1 | Attack power per +1 weapon damage (melee and ranged separately) | 32, cap +3 | From the existing stat rule: 8 strength = +1 STR = +0.5 damage and 2 attack power per strength, so 32 AP = 16 strength = +1 damage. 106 items reach a step alone. |
+| 1 | Attack power per +1 weapon damage | 32, cap +3, melee and ranged one boost | From the existing stat rule: 8 strength = +1 STR = +0.5 damage and 2 attack power per strength, so 32 AP = 16 strength = +1 damage. 106 items reach a step alone. BG3 cannot split melee from ranged here (see "Proven"), so ranged-only attack power also raises melee. |
 | 2 | Crit % per natural crit threshold step | 5, cap 2 (crit on 18). **Conservative** | One d20 step is 5%. **It barely bites:** full Bloodfang (epic rogue set) has 4% and gets nothing. 3 would give it a step. Spell crit shares this pool. |
 | 3 | Hit % per +1 to hit | 5, cap 2. **Conservative** | As 2. Full Bloodfang has 3% and gets nothing. Spell hit is its own pool on the same numbers. |
 | 4 | Spell damage per +1 spell save DC | 40, cap 2 | Budget comparison with the stat rule, not a measurement. Full Netherwind (204) sits at the cap, so 2 is reached well before end game. Only DC, because spell attacks are what spell hit gives. |
@@ -223,7 +223,7 @@ boosts work in the game; whether the numbers feel right has not been played.
 | 7 | Run speed | WoW's % as a movement multiplier, cap 15. **Conservative** | Direct, no scale. Only BG3's turn movement. WoW's own sum could be used up to 30. |
 | 8 | Resistance from gear in total | 30 points = Resistant, once per school. **Conservative** | Resistant halves a whole school, so the sum takes twice the 15 a single item needs under the fixed-stat rule. |
 | 9 | Suffix abilities | 8 points per +1, cap +2 per ability over **all** worn gear | Existing rule and numbers. The cap is the question: a full set "of the Bear" gets the same +2 as one level 60 piece (+29). It comes on top of the fixed stats' +2 per item. |
-| 10 | Potion tiers by WoW's heal | On: under 300 Healing, 300 Greater, 600 Superior, 1000 Supreme | Bases read from BG3's stats. **A use stays free until `Inventory.lua` reads `us`**, see "Not proven". |
+| 10 | Potion tiers by WoW's heal | On: under 300 Healing, 300 Greater, 600 Superior, 1000 Supreme | Bases read from BG3's stats. |
 | 11 | Mana per spell slot level | 0 level 1, 500 level 2, 1000 level 3, 1500 level 4 | Puts Minor and Lesser at 1, Mana and Greater at 2, Superior at 3, Major at 4. A low level character has no use for a slot above its own. Rejuvenation counts as mana; its health is lost. |
 | 12 | Well Fed | From 8 points a stat elixir's effect, below that plain food | **Heroism on food may be strong**: 21 foods, 10 temporary HP and 1d4 on attacks and saves for the price of a meal. The other answer is raising `food_from`. |
 | 13 | Rage, energy | Bloodlust (a kill gives temporary HP and an action), Alertness. **Conservative for energy** | BG3 has no potion for a class's resource. Haste would fit energy better, and is too much for a 15th level recipe. |
@@ -242,7 +242,29 @@ boosts work in the game; whether the numbers feel right has not been played.
 
 ## Proven
 
-In the game (release build, a fresh `items.json`), driving a level 60 Barbarian's items from WoW's side:
+In the game (release build, a fresh `items.json`), driving a level 60 Barbarian's items from WoW's side.
+
+In a fight, axe 1d6+3:
+
+- Worn attack power of 160 gives `CharacterWeaponDamage(3)`. Without it hits did 6, 6, 7, 6; with it 9, 9, 8, 10, 10, 10.
+  Gear off, the boost leaves.
+- What was tried first did nothing: `RollBonus(MeleeWeaponDamage,3)` showed on the character but a hit still did 4.
+  A condition cannot separate melee from ranged: with `CharacterWeaponDamage(40)`, `IF(IsMeleeWeaponAttack())`,
+  `IF(IsMeleeAttack())` and `IF(IsAttackType(AttackType.MeleeWeaponAttack))` hit for 8, 9 and 5, no condition for 46, and
+  `IF(not IsRangedWeaponAttack())` for 46. So through `Osi.AddBoosts` an attack condition reads false.
+
+On the character, from WoW's worn list:
+
+- Attack power and hit from worn trinkets, rings and a cloak; +1 to hit from 6% summed over four items.
+- Run speed: 15% takes movement from 9.0 to 10.35.
+- Resistance: 32 frost points over three items give Resistant to Cold, 22 do not.
+- Armour: AC up by 2 from an item of 10 points; spell hit +1 from 5% over three items.
+
+A suffix item from a kill: a boar with the item added to its loot table dropped it, the server rolled it (`Rand` 757),
+WoW's loot verb took it, BG3 shows it worn as "Pioneer Tunic of the Owl". No vendor on this server sells an item that can
+roll a suffix, so buying one cannot happen.
+
+Earlier runs:
 
 - Every boost string the rules can make, 21 in all, once on the hero: BG3 took each and took each off again.
 - On equip and off again from WoW: `ReduceCriticalAttackThreshold(2)`, `SpellSaveDC(2)`, and Dexterity and
@@ -261,18 +283,15 @@ at the start of play makes them).
 - **Consumables: nothing has run in the game.** Unit tests (`tools/test_consumables.py`) and the rules run over the
   server's real table; every base exists in BG3's stats. Not seen: drinking any of them, the slot appearing and leaving at
   a long rest, the tooltip, a buffed food offered and spent at camp on a potion base (camp proved food and water bases).
-- **A use comes back until `Inventory.lua` reads `us`:** `reconcileStacks` spends only rows with `sv`. Until that line is
-  changed, a mana potion drunk in BG3 returns at the next sync, so slots are free, as healing potions already were.
-- In a fight: nothing here has been rolled on, so a raised crit range or DC is only proven to be on the sheet.
-- Run speed, hit, attack power and resistances from worn gear: their strings are proven, their items were not
-  worn (the test character cannot wear plate or those weapons).
-- A companion's worn gear, and a suffix item bought or looted rather than added.
+- In a fight only weapon damage was measured. Hit, crit range, DC, AC and resistance from gear are on the character, not
+  measured on a roll.
+- Attack power on a ranged weapon: the test character has none. BG3's own Sharpshooter uses the same boost.
+- A companion's worn gear.
 - An item that exists when the switch goes on keeps its old BG3 base and text until it is made again.
 
 ## Known limits
 
 - The tooltip shows the BG3 base item's text (a bone for "Worn in WoW" pieces), not WoW's text, so a suffix's
   numbers show nowhere in BG3. The code that sets the description is older than this mapping.
-- An existing install keeps its `items.json`: the first start builds one only if it is missing.
 - Gauntlets on the base `ARM_Gloves_Metal` count as Medium Armour, so a Barbarian's Unarmoured Defence drops
   (AC 13 to 11 in the test). That base rule is older than this mapping.

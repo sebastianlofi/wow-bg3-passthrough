@@ -125,6 +125,13 @@ function M.EffectBoosts(wornItems)
             add(((M.Props or {})[it.Rand or 0] or {}).ef)
         end
     end
+    -- One boost for two kinds (attack power, ranged attack power): the larger total counts, not their sum.
+    for kind, r in pairs(rules) do
+        if r.into and pts[kind] then
+            pts[r.into] = math.max(pts[r.into] or 0, pts[kind])
+            pts[kind] = nil
+        end
+    end
     for kind, v in pairs(pts) do
         local r = rules[kind]
         if r then

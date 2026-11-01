@@ -154,8 +154,8 @@
       "64": {"kind": "res_force"}
     },
     "kinds": {
-      "ap":       {"per": 32, "cap": 3, "b": "RollBonus(MeleeWeaponDamage,{n})"},
-      "rap":      {"per": 32, "cap": 3, "b": "RollBonus(RangedWeaponDamage,{n})"},
+      "ap":       {"per": 32, "cap": 3, "b": "CharacterWeaponDamage({n})"},
+      "rap":      {"per": 32, "cap": 3, "b": "CharacterWeaponDamage({n})", "into": "ap"},
       "crit":     {"per": 5,  "cap": 2, "b": "ReduceCriticalAttackThreshold({n})"},
       "hit":      {"per": 5,  "cap": 2, "b": "RollBonus(MeleeWeaponAttack,{n});RollBonus(RangedWeaponAttack,{n})"},
       "spellhit": {"per": 5,  "cap": 2, "b": "RollBonus(MeleeSpellAttack,{n});RollBonus(RangedSpellAttack,{n})"},
