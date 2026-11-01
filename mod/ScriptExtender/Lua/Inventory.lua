@@ -533,7 +533,9 @@ local function reconcileStacks(uuid, stacks, have, items)
         local tag = stackTag(entry, uuid)
         stackWant[tag] = true
         local u = have[tag]
-        local supply = Camp.On() and (M.Item(entry) or {}).sv ~= nil
+        -- What BG3 uses up is gone from WoW too: camp supplies, and potions and the like (`us`, wow_items.py).
+        local row = M.Item(entry) or {}
+        local supply = (Camp.On() and row.sv ~= nil) or row.us ~= nil
         local waiting = false
         if supply then
             local wow = total
