@@ -1336,6 +1336,7 @@ std::atomic<float> g_pick_eye[3];    // the eye the see-through's capsule starts
 std::atomic<float> g_pick_her[3];    // and where it ends: her chest
 constexpr float kCutRadiusM = 4.4f * 0.9144f;  // benilla's SeeSettings: R, the cut reaches half of it
 constexpr float kCutScreen = 0.45f * 0.52f;    // and its cap, a share of the half height at her distance
+constexpr float kGroundNormalY = 0.64f;        // benilla 0098's: a terrain face this level is ground (50 degrees)
 constexpr float kCutNearM = 0.6f * 0.9144f;    // nothing nearer her than this toward the camera is cut
 constexpr float kCutFloorM = 0.35f * 0.9144f;  // nothing lower than this over her feet is cut
 constexpr float kCutChestM = 1.37f;            // kChestM, her chest over her feet, where the capsule ends
@@ -1531,8 +1532,9 @@ bool in_see_cut(PickFilter const& f, glm::vec3 const& p) {
     return glm::length(p - (f.Eye - toEye * t)) < reach;
 }
 
-bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind) {
-    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && in_see_cut(f, p);  // benilla 0097: terrain is cut too
+bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind, glm::vec3 const& n) {
+    // benilla 0097 and 0098: terrain is cut too, but for ground one can walk on.
+    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && std::abs(n.y) <= kGroundNormalY && in_see_cut(f, p);
     return p.y > f.Top || (f.Cut && in_see_cut(f, p));
 }
 
@@ -1563,7 +1565,7 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
                 if (kinds != kKindAll && ((kinds >> (r.Kind.empty() ? 0 : r.Kind[i])) & 1u) == 0) continue;
                 float t;
                 if (tri_hit(r.Tris[i], a, d, t) && t < best
-                    && (!pick.On || !pick_ignores(pick, a + d * t, r.Kind.empty() ? 0 : r.Kind[i]))) {
+                    && (!pick.On || !pick_ignores(pick, a + d * t, r.Kind.empty() ? 0 : r.Kind[i], r.Tris[i].N))) {
                     best = t;
                     normal = r.Tris[i].N;
                 }
@@ -1605,6 +1607,34 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
         }
     }
     return best <= 1.0f;
+}
+
+// BG3's own camera collision: a sweep along the camera's axis from its look point out toward the eye (or
+// back). Playtest feedback, 2026-10-31: "ignore all collisions altogether", and the plugin's own clearance moved 0
+// of 33416 eyes while posts and trees still bumped the camera, so the bump is taken to be this (not seen
+// directly: the log's "camera: sweep" lines say whether it is). WoW's triangles are left out of such a
+// query. Not the cursor's (context 1), whose ray starts at the eye too.
+std::atomic<float> g_axis[3]{};            // BG3's forward
+std::atomic<float> g_axis_from[3]{};       // who it looks at, the selected character
+std::atomic<bool> g_axis_on{false};
+std::atomic<std::uint64_t> g_axis_sweeps{0};
+constexpr float kSweepNearM = 6.0f;        // one end this near her
+constexpr float kSweepLineup = 0.97f;      // and along the axis, this closely
+bool camera_sweep(glm::vec3 const& a, glm::vec3 const& b, int context) {
+    if (context == 1 || !g_axis_on.load(std::memory_order_relaxed)) return false;
+    const glm::vec3 d = b - a;
+    const float len = glm::length(d);
+    if (!(len > 0.5f)) return false;
+    const glm::vec3 axis{g_axis[0].load(std::memory_order_relaxed), g_axis[1].load(std::memory_order_relaxed),
+                         g_axis[2].load(std::memory_order_relaxed)};
+    if (std::abs(glm::dot(d / len, axis)) < kSweepLineup) return false;
+    const glm::vec3 her{g_axis_from[0].load(std::memory_order_relaxed), g_axis_from[1].load(std::memory_order_relaxed),
+                        g_axis_from[2].load(std::memory_order_relaxed)};
+    if (glm::length(a - her) > kSweepNearM && glm::length(b - her) > kSweepNearM) return false;
+    if (g_axis_sweeps.fetch_add(1, std::memory_order_relaxed) < 8) {
+        logf("camera: sweep context %d (%.1f %.1f %.1f) to (%.1f %.1f %.1f) gets no WoW triangles", context, a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+    return true;
 }
 
 bool wants_wow(ArenaRays const& r, bg3se::PhysicsType type, bg3se::PhysicsGroupFlags in, bg3se::PhysicsGroupFlags ex) {
@@ -1716,7 +1746,7 @@ bool hook_closest(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx
     }
     float t;
     glm::vec3 n;
-    if (wants_wow(*r, type, in, ex) && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context)) && (!got || t < hit.Distance)) {
+    if (wants_wow(*r, type, in, ex) && !camera_sweep(a, b, context) && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context)) && (!got || t < hit.Distance)) {
         fill_wow_hit(*r, a, b, t, n, hit);
         s->Stats.Wow[0].fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -3442,6 +3472,11 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     glm::mat3 rot = glm::mat3_cast(q);
     if (order >= 2) rot = glm::transpose(rot);
     const glm::vec3 fwd = glm::normalize(rot[2]);
+    for (int k = 0; k < 3; ++k) {
+        g_axis[k].store(fwd[k], std::memory_order_relaxed);
+        g_axis_from[k].store(who[k], std::memory_order_relaxed);
+    }
+    g_axis_on.store(g_indoor == IndoorMode::Free, std::memory_order_relaxed);
     bool wasTested = false;
     float target = 1.0f;
     glm::vec3 chest = who + glm::vec3(0.0f, kChestM, 0.0f);

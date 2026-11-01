@@ -1,0 +1,21 @@
+WOW-BG3 benilla patch 0098: the see-through leaves ground one can walk on.
+
+Playtest feedback: "some ground turns see through despite me just walking on the surface and looking from an angle
+with the camera near the cliff side." 0097 let the capsule cut terrain, and any slope above her feet in the
+capsule went. Terrain under 50 degrees now stays, and a cliff still opens. The plugin's cursor keeps the same line.
+
+diff --git a/crates/benilla-assets/src/shaders/terrain.wgsl b/crates/benilla-assets/src/shaders/terrain.wgsl
+--- a/crates/benilla-assets/src/shaders/terrain.wgsl
++++ b/crates/benilla-assets/src/shaders/terrain.wgsl
+@@ -320,7 +320,10 @@
+     // default: a close camera puts the ground right in front of her inside the circle, and ground
+     // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
+     // between BG3's camera and her is the eye clearance's job, not the circle's.
+-    if (wow_light.cut_params.w > 0.5 && wow_cut(in.world_position.xyz, in.uv)) {
++    // Patch 0098: ground one can walk on stays, however the camera looks at it; a cliff goes (50 degrees,
++    // the arena's slope limit). From under the terrain nothing is drawn anyway, so a camera in a hill still sees.
++    let cut_slope = abs(normalize(cross(dpdx(in.world_position.xyz), dpdy(in.world_position.xyz))).y);
++    if (wow_light.cut_params.w > 0.5 && cut_slope <= 0.64 && wow_cut(in.world_position.xyz, in.uv)) {
+         discard;
+     }
+ 
