@@ -68,7 +68,7 @@ lifecycle.log = log  # the watcher's lines in the same log
 def settings():
     """WOW-BG3/settings.conf: `key = value` lines, # comments."""
     s = {'debug_commands': '1', 'host': 'BGO_Main_A', 'wow_sound': '1', 'view_distance': '',
-         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '0', 'difficulty': 'balanced'}
+         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '0', 'difficulty': 'balanced', 'wow_spells': '0'}
     try:
         for line in (HOME / 'settings.conf').read_text().splitlines():
             line = line.split('#', 1)[0].strip()
@@ -550,7 +550,7 @@ def items_current():
 
 def datagen_needed():
     return not (items_current() and (LINK / 'abilities.json').is_file() and (IO / 'gui/wow-icons.json').is_file()
-                and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file())
+                and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file() and (LINK / 'spells.json').is_file())
 
 
 def datagen():
@@ -566,6 +566,8 @@ def datagen():
     if not (LINK / 'abilities.json').is_file() and game_data():
         steps.append(('abilities', py('wow_abilities', 'make', LINK / 'abilities.json', '--data', WOW / 'Data', '--bg3', game_data(),
                                       '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
+    if not (LINK / 'spells.json').is_file():
+        steps.append(('spells', py('wow_spells', '--data', WOW / 'Data', '--out', LINK / 'spells.json')))
     if not (IO / 'gui/wow-icons.json').is_file() and game_data():
         steps.append(('icons', py('wow_icons', 'build', '--data', WOW / 'Data', '--bg3', game_data(), '--out', IO / 'gui',
                                   '--items', LINK / 'items.json')))
@@ -669,6 +671,7 @@ def main():
     (IO / 'mob-abilities.json').write_text(json.dumps({'On': S.get('mob_abilities') == '1'}))
     (IO / 'companions.json').write_text(json.dumps({'On': S.get('companions') == '1'}))
     (IO / 'camp.json').write_text(json.dumps({'On': S.get('camp') == '1'}))
+    (IO / 'wow-spells.json').write_text(json.dumps({'On': S.get('wow_spells') == '1'}))
     (IO / 'scaling.json').write_text(json.dumps({'On': S.get('scaling') == '1', 'Difficulty': S.get('difficulty')}))
     REL = Release()
     log('window %dx%d, settings %s' % (REL.size + (S,)))

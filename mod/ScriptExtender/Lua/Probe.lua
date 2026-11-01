@@ -68,6 +68,8 @@ function Probe.Start(context)
         local okUi, errUi = pcall(function() Ext.Require("WowUi.lua").Start(report.RunId) end)
         if not okUi then Ext.Log.Print("WOW-BG3 ui: " .. tostring(errUi)) end
         pcall(function() Ext.Require("Abilities.lua").Start(report.RunId) end)
+        local okSpC, errSpC = pcall(function() Ext.Require("WowSpells.lua").Start("client") end)
+        if not okSpC then Ext.Log.Print("WOW-BG3 spells: " .. tostring(errSpC)) end
         local okInvC, errInvC = pcall(function() Ext.Require("InventoryClient.lua").Start(report.RunId) end)
         if not okInvC then Ext.Log.Print("WOW-BG3 inventory client: " .. tostring(errInvC)) end
         -- World mode only in games started with WOW-BG3.
@@ -136,6 +138,8 @@ function Probe.Start(context)
         pcall(function() Ext.Require("Abilities.lua").Start(report.RunId) end)
         local okInv, errInv = pcall(function() Ext.Require("Inventory.lua").Start(report.RunId) end)
         if not okInv then Ext.Log.Print("WOW-BG3 inventory: " .. tostring(errInv)) end
+        local okSp, errSp = pcall(function() Ext.Require("WowSpells.lua").Start("server") end)
+        if not okSp then Ext.Log.Print("WOW-BG3 spells: " .. tostring(errSp)) end
         Ext.Require("Arena.lua").Start(report.RunId)
         -- WoW's light as BG3's gameplay light round the party: cones, sight, stealth.
         local okWl, errWl = pcall(function() Ext.Require("WorldLight.lua").Start(report.RunId) end)

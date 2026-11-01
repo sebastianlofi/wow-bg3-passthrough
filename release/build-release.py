@@ -57,6 +57,7 @@ TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthro
                "tavtex.py", "bg3tex.py", "bg3pak.py", "bg3shade.py", "bg3index.py",  # Tav's textures (with --python)
                "wow_icons.py", "wowcursor.py",  # the icon atlas and the quest cursors (first run, with --python)
                "wow_abilities.py", "wow_abilities_rules.json",  # the mobs' abilities (first run, with --python)
+               "wow_spells.py",  # our spells' names from the player's client (first run, with --python)
                "seenoise.py"]  # BG3's see-through noise for benilla (first run, with --python)
 
 
@@ -94,6 +95,9 @@ def pak_files(version: str, native_plugins):
         raise SystemExit("no Lua in " + str(MOD_SRC))
     for p in lua:
         files.append((f"Mods/{FOLDER}/ScriptExtender/Lua/{p.name}", p.read_bytes()))
+    # The stats of our own spells: never an empty file (an empty stats .txt hangs BG3's load).
+    for p in sorted((MOD_SRC / f"Public/{FOLDER}/Stats/Generated/Data").glob("*.txt")):
+        files.append((f"Public/{FOLDER}/Stats/Generated/Data/{p.name}", p.read_bytes()))
     return files
 
 

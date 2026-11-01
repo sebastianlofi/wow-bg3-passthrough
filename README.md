@@ -266,6 +266,19 @@ Each of these in detail, with the smaller ones: [docs/known-issues.md](docs/know
 - **Multiplayer**, then **The Burning Crusade** and **Wrath of the Lich King** once vanilla is mostly
   complete.
 
+### WoW's signature spells (off by default)
+
+With `wow_spells = 1` in `settings.conf`, Wizards and Sorcerers learn the first batch of the Mage's spells from their
+class level, always prepared and under WoW's names: Frost Armor at 2, Frost Nova and Conjure Food at 3, Ice Barrier at 5.
+BG3's own effects draw them for now. BG3's Level Up screen doesn't list them: they arrive just after you accept it.
+
+- **Frost Armor:** +2 AC with no armour, until a long rest; a melee attacker that damages you loses 3 m of movement. It and Mage Armour replace each other.
+- **Frost Nova:** enemies within 4 m save on Dexterity: 1d8 cold and no moving for 2 turns, or half and free. Once a fight. Damage does not free them.
+- **Ice Barrier:** a bonus action, 15 temporary hit points. Once a fight. A higher slot adds nothing.
+- **Conjure Food:** out of combat, 2 food and 1 drink for your WoW level into your WoW bag, 15 supplies. Once a long rest.
+
+Turn it off and they are gone at the next load; a Frost Armor already on lasts to the next long rest.
+
 ### Resting
 
 BG3's camp is the rest in WOW-BG3, with WoW's food and drink as its supplies (`camp = 1` in `settings.conf`;
