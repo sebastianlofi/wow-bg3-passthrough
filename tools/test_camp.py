@@ -389,6 +389,19 @@ class Supply(unittest.TestCase):
         it['class'] = 0
         return wow_items.map_item(rules, it, {})
 
+    def test_supply_follows_the_price_of_one(self):
+        import collections
+        import wow_items
+        rules = json.loads((HERE / 'wow_items_rules.json').read_text())
+        def sv(price):
+            it = collections.defaultdict(int, entry=1, name='Bread', buy_price=price * 5, buy_count=5, item_level=5, spellcategory_1=11, stackable=20)
+            it['class'] = 0
+            return wow_items.map_item(rules, it, {})['sv']
+        self.assertEqual([sv(p) for p in (5, 25, 100, 200, 400, 800)], [5, 15, 30, 40, 55, 80])
+
+    def test_water_is_bg3_water_at_any_level(self):
+        self.assertEqual(self.row('Morning Glory Water', 55, 59)['b'], 'CONS_DRINK_Water')
+
     def test_a_price_is_for_one_not_for_what_one_purchase_gives(self):
         import collections
         import wow_items

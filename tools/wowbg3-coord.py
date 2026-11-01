@@ -545,7 +545,7 @@ def items_current():
             m = re.match(r'\{"Schema":\s*(\d+)', f.read(40))
     except OSError:
         return False
-    return bool(m) and int(m.group(1)) >= 2
+    return bool(m) and int(m.group(1)) >= 3
 
 
 def datagen_needed():

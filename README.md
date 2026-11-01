@@ -269,21 +269,20 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
 - **Long and short rests are BG3's own**, so spell slots, long-rest-only abilities and rest effects work
   as BG3 has them. BG3's story nights do not play: no story runs here, so a night is just sleep.
 - **Food and drink are the supplies.** Anything your party carries counts, buying it at a WoW vendor or
-  pickpocketing it from a townsperson. A long rest costs BG3's 40 supplies, and WoW's food is worth more
-  than BG3's so you can rest more often:
+  pickpocketing it from a townsperson. A long rest costs BG3's 40 supplies, and the dearer the food, the more it is worth:
 
-  | WoW food or drink (item level) | Example | Supply | Needed for a long rest | Vendor cost of a rest |
+  | Price of one | Example | Supply | Needed for a long rest | Vendor cost of a rest |
   |---|---|---|---|---|
-  | 5 | Tough Hunk of Bread, Refreshing Spring Water | 20 | 2 | 10 copper |
-  | 15 | Freshly Baked Bread, Ice Cold Milk | 20 | 2 | 50 copper |
-  | 25 | Moist Cornbread, Melon Juice | 20 | 2 | 2 silver |
-  | 35 | Mulgore Spice Bread, Sweet Nectar | 25 | 2 | 4 silver |
-  | 45 | Soft Banana Bread, Moonberry Juice | 30 | 2 | 8 silver |
-  | 55 | Homemade Cherry Pie, Morning Glory Dew | 40 | 1 | 8 silver |
+  | 5 copper | Tough Hunk of Bread, Refreshing Spring Water | 5 | 8 | 40 copper |
+  | 25 copper | Freshly Baked Bread, Ice Cold Milk | 15 | 3 | 75 copper |
+  | 1 silver | Moist Cornbread, Melon Juice | 30 | 2 | 2 silver |
+  | 2 silver | Mulgore Spice Bread, Sweet Nectar | 40 | 1 | 2 silver |
+  | 4 silver | Soft Banana Bread, Moonberry Juice | 55 | 1 | 4 silver |
+  | 8 silver | Homemade Cherry Pie, Morning Glory Dew | 80 | 1 | 8 silver |
 
   What is spent or eaten in BG3 is gone from the WoW character's bags too.
 - **Eating and drinking heal a little,** more for better food: 1d4 up to 4d4 HP, as BG3's own food does. Alcohol
-  makes the drinker Drunk, and counts for only 5 supply. Conjured food counts for 5 and sells for nothing.
+  makes the drinker Drunk, and counts for only 5 supply. WoW's water and alcohol use BG3's water bottle and beer, so they should throw as those do (not tried yet). Conjured food counts for 5 and sells for nothing.
 
 ## Good to know
 

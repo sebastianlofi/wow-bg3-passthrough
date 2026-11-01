@@ -42,7 +42,7 @@ COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 
         'dmg_min1', 'dmg_max1', 'dmg_type1', 'dmg_min2', 'dmg_max2', 'dmg_type2', 'armor', 'block',
         'holy_res', 'fire_res', 'nature_res', 'frost_res', 'shadow_res', 'arcane_res', 'spellcategory_1', 'spellid_1'] + \
        ['stat_type%d' % i for i in range(1, 11)] + ['stat_value%d' % i for i in range(1, 11)]
-ITEMS_SCHEMA = 2  # 2: bp is the price of one, bc added. wowbg3-coord.py makes an older table again.
+ITEMS_SCHEMA = 3  # 2: bp is the price of one, bc added. 3: supply by price, water is water. wowbg3-coord.py makes an older table again.
 STAT_NAMES = {0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina'}
 DIES = [(4, 2.5), (6, 3.5), (8, 4.5), (10, 5.5), (12, 6.5)]
 SPELL_COLS = ['random_property'] + ['%s_%d' % (c, i) for i in range(1, 6) for c in ('spellid', 'spelltrigger')]
@@ -229,6 +229,8 @@ def map_item(rules, it, icons):
         elif 'drink' in o and (it['spellcategory_1'] == rules.get('drink_category', 59)
                                or any(re.search(r'\b%s' % w, low) for w in rules['drink_words'])):
             base = by_level(rules['drink_heal']) if it['spellcategory_1'] == rules.get('drink_category', 59) else o['drink']
+            if re.search(r'\bwater\b', low):
+                base = rules['water']
         elif 'food' in o and (it['spellcategory_1'] == rules.get('food_category', 11)
                               or any(re.search(r'\b%s' % w, low) for w in rules['food_words'])):
             base = by_level(rules['food_heal']) if it['spellcategory_1'] == rules.get('food_category', 11) else o['food']
@@ -237,7 +239,10 @@ def map_item(rules, it, icons):
         if alcohol:
             row['sv'] = rules['alcohol_supply']
         elif it['spellcategory_1'] in (rules.get('food_category', 11), rules.get('drink_category', 59)):
-            row['sv'] = rules['conjured_supply'] if 'conjured' in low else by_level(rules['camp_supply'])
+            step = rules['supply_step']
+            row['sv'] = (rules['conjured_supply'] if 'conjured' in low
+                         else max(step, round(rules['supply_per_root_copper'] * math.sqrt(row['bp']) / step) * step) if row['bp']
+                         else by_level(rules['camp_supply']))
     if row['k'] in ('weapon', 'armor', 'worn'):
         boosts = ability_boosts(rules, it) + boosts
     if boosts:
