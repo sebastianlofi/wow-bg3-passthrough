@@ -61,6 +61,8 @@ function M.Start(runId)
     -- Probe.lua needs no change.
     local okI, errI = pcall(function() Ext.Require("Interact.lua").Start(runId) end)
     if not okI then Ext.Log.Print("WOW-BG3 interact: " .. tostring(errI)) end
+    local okS, errS = pcall(function() Ext.Require("StatusFx.lua").Start() end)
+    if not okS then Ext.Log.Print("WOW-BG3 statusfx: " .. tostring(errS)) end
     local ticks, events, listeners, seq = 0, {}, {}, 0
     local function host()
         local ok, h = pcall(Osi.GetHostCharacter)

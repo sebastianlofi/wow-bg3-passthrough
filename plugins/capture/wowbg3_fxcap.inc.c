@@ -2705,7 +2705,9 @@ static void ibage_put(IbAge* t, uint64_t k, uint64_t first, uint64_t last) {
 // slices count towards a bulk (`skinned`): the guard is for a body arriving (a stand-in spawning before
 // the hide list names it); scenery streaming in is kept out by the distance anyway, and a spell's
 // debris brings nine or ten unskinned meshes back at once (Chromatic Orb), which tripped it.
+static __thread int t_ib_aged;  // this slice passed fxpropage just now (a log line in void_skip)
 static int ib_young(uint64_t k, int skinned) {
+    t_ib_aged = 0;
     uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     IbAge *ea = ibage_get(g_ibage[0], k), *eb = ibage_get(g_ibage[1], k);
     uint64_t a = ea ? __atomic_load_n(&ea->first, __ATOMIC_ACQUIRE) : 0, b = eb ? __atomic_load_n(&eb->first, __ATOMIC_ACQUIRE) : 0;
@@ -2738,7 +2740,115 @@ static int ib_young(uint64_t k, int skinned) {
         __atomic_add_fetch(&g_fxprops_bulk, 1, __ATOMIC_RELAXED);
         return 0;
     }
+    t_ib_aged = now - p > (uint64_t)g_cc.fxpropage && now - p <= (uint64_t)g_cc.fxpropage + 8;
     return now - p <= (uint64_t)g_cc.fxpropage;
+}
+// Word "fxprops", a status's mesh (2026-11-01). The age above suits what a spell leaves for a moment. A
+// status plays its effect for as long as it lasts: NET (Hooked Net, Projectile_ThrowNet) loops
+// VFX_Status_Ensnared_Net_Loop_Root_01, whose net is an opaque mesh (VFX_Model_DefaultLit_VertexOffset_FishNet)
+// drawn in the G-buffer like any prop, so the age took it after 900 presents (6.4 s at 140 a second, seen in
+// layer.log: 1000 draws per 300 presents, then none) and the hero stayed "Immobile: Ensnared" with no net. It
+// is not on the keep list: BG3 hangs it on no character's Attachments.
+//
+// The mod knows what the layer can't: which status is on whom, and that it has an effect (StatusFx.lua, link/
+// fxhold.txt). So a young slice placed at a character within HOLD_NEW presents of a status with an effect
+// beginning on it belongs to that status, and stays kept until no one has that status any more. Keyed on
+// the status's name, not the character: two nets are one slice.
+#define HOLD_MAX 64u
+#define HELD_MAX 64u
+#define HOLD_NEW 300u      // presents after the status's start in which a slice can be claimed
+#define HOLD_REACH 3.0f    // metres from the character (the net's effect: bounding sphere 2.2, 1 m below the root)
+typedef struct { uint64_t status, holder, since; float at[3]; } HoldOn;
+typedef struct { uint64_t slice, status; } Held;
+static HoldOn g_hold[HOLD_MAX];
+static uint32_t g_hold_n;
+static Held g_held[HELD_MAX];
+static uint32_t g_held_n;
+static uint64_t g_hold_open;  // present + 1 until which some status is new enough to claim a slice
+static struct timespec g_hold_seen;
+static __thread float t_prop_at[3];  // prop_near: where the draw is
+static int prop_held(uint64_t k) {
+    if (!__atomic_load_n(&g_held_n, __ATOMIC_RELAXED)) return 0;
+    for (uint32_t i = 0; i < HELD_MAX; i++) if (__atomic_load_n(&g_held[i].slice, __ATOMIC_RELAXED) == k) return 1;
+    return 0;
+}
+static void hold_claim(uint64_t k, uint32_t count) {
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    if (now + 1 > __atomic_load_n(&g_hold_open, __ATOMIC_RELAXED) || prop_held(k)) return;
+    uint64_t status = 0;
+    pthread_mutex_lock(&g_fxl_lock);
+    for (uint32_t i = 0; i < g_hold_n && !status; i++) {
+        float dx = t_prop_at[0] - g_hold[i].at[0], dy = t_prop_at[1] - g_hold[i].at[1], dz = t_prop_at[2] - g_hold[i].at[2];
+        if (now <= g_hold[i].since + HOLD_NEW && dx * dx + dy * dy + dz * dz < HOLD_REACH * HOLD_REACH) status = g_hold[i].status;
+    }
+    if (status) {
+        uint32_t i = 0;
+        while (i < HELD_MAX && g_held[i].slice) i++;
+        if (i < HELD_MAX) {
+            g_held[i].status = status;
+            __atomic_store_n(&g_held[i].slice, k, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_held_n, 1, __ATOMIC_RELAXED);
+        }
+        logf_("fxhold: slice of ib %llx count %u at %.1f %.1f %.1f kept for status %016llx%s", (unsigned long long)t_ib, count, t_prop_at[0], t_prop_at[1],
+              t_prop_at[2], (unsigned long long)status, i < HELD_MAX ? "" : " (table full, not held)");
+    }
+    pthread_mutex_unlock(&g_fxl_lock);
+}
+static uint64_t hold_hash(const char* c) { return fnv64(c, strlen(c), FNV0) | 1; }
+static void hold_read(void) {
+    if (!g_tav.init || !g_tav.plan[0]) return;
+    char path[sizeof g_tav.plan];
+    snprintf(path, sizeof path, "%s", g_tav.plan);
+    char* slash = strrchr(path, '/');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "fxhold.txt");
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (st.st_mtim.tv_sec == g_hold_seen.tv_sec && st.st_mtim.tv_nsec == g_hold_seen.tv_nsec) return;
+    if (st.st_mtim.tv_sec < g_tav.born.tv_sec) return;  // left over from an earlier BG3 run
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    g_hold_seen = st.st_mtim;
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    HoldOn next[HOLD_MAX];
+    uint32_t n = 0;
+    char line[256], name[96], who[128];
+    float at[3];
+    if (!fgets(line, sizeof line, f) || strncmp(line, "HOLD ", 5)) { fclose(f); return; }
+    pthread_mutex_lock(&g_fxl_lock);
+    while (fgets(line, sizeof line, f) && n < HOLD_MAX) {
+        if (sscanf(line, "%95s %127s %f %f %f", name, who, &at[0], &at[1], &at[2]) != 5) continue;
+        HoldOn e = {hold_hash(name), hold_hash(who), now, {at[0], at[1], at[2]}};
+        int old = 0;
+        for (uint32_t i = 0; i < g_hold_n; i++) if (g_hold[i].status == e.status && g_hold[i].holder == e.holder) { e.since = g_hold[i].since; old = 1; }
+        if (!old) {
+            logf_("fxhold: %s on %s at %.1f %.1f %.1f (status %016llx), present %llu", name, who, at[0], at[1], at[2], (unsigned long long)e.status, (unsigned long long)now);
+            // A status beginning is a spell being on: its mesh may come with no other effect (a web from a surface).
+            __atomic_store_n(&g_fx_seen_at, now + 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_hold_open, now + 1 + HOLD_NEW, __ATOMIC_RELAXED);
+        }
+        next[n++] = e;
+    }
+    fclose(f);
+    memcpy(g_hold, next, n * sizeof next[0]);
+    g_hold_n = n;
+    for (uint32_t i = 0; i < HELD_MAX; i++) {
+        if (!g_held[i].slice) continue;
+        int on = 0;
+        for (uint32_t j = 0; j < n; j++) if (g_hold[j].status == g_held[i].status) on = 1;
+        if (on) continue;
+        logf_("fxhold: status %016llx is over, its slice let go", (unsigned long long)g_held[i].status);
+        __atomic_store_n(&g_held[i].slice, 0, __ATOMIC_RELEASE);
+        __atomic_sub_fetch(&g_held_n, 1, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&g_fxl_lock);
+}
+static void hold_forget(void) {  // a load: buffers are recycled
+    pthread_mutex_lock(&g_fxl_lock);
+    memset(g_held, 0, sizeof g_held);
+    __atomic_store_n(&g_held_n, 0, __ATOMIC_RELAXED);
+    g_hold_n = 0;
+    pthread_mutex_unlock(&g_fxl_lock);
 }
 // Once per present: turn the generations over, and start a warm-up when BG3 comes back from a load.
 static void ibage_present(void) {
@@ -2746,7 +2856,7 @@ static void ibage_present(void) {
     uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     // The table learns slices only inside void_skip, so on the present the void engages (world mode
     // starts: KEEP 1) every visible level slice is "first seen" at once; the same after a load.
-    if (g_bg3_running && !was_running) glow_forget();
+    if (g_bg3_running && !was_running) { glow_forget(); hold_forget(); }
     if (!started || (g_bg3_running && !was_running) || (g_keep_active && !was_void)) {
         __atomic_store_n(&g_ibage_warm, now + IBAGE_WARM, __ATOMIC_RELAXED);
         started = 1;
@@ -2823,6 +2933,7 @@ static int prop_near(const Recipe* r, uint32_t fi, uint32_t first, int32_t vo) {
     float m[16], at[3];
     int how = fxc_place(r, fi, at, m);
     if (how == 1 || how == 2) {
+        memcpy(t_prop_at, at, sizeof t_prop_at);
         float dx = at[0] - g_tav_root[0], dy = at[1] - g_tav_root[1], dz = at[2] - g_tav_root[2], rad = fxc_radius();
         return dx * dx + dy * dy + dz * dz < rad * rad;
     }
@@ -2850,6 +2961,7 @@ static int prop_near(const Recipe* r, uint32_t fi, uint32_t first, int32_t vo) {
     const float* eye = (const float*)fxc_slot_cpu(0, 1, 112);
     if (!eye) return 2;
     for (int c = 0; c < 3; c++) w[c] = eye[24 + c] + p[0] * m[c] + p[1] * m[4 + c] + p[2] * m[8 + c] + m[12 + c];
+    memcpy(t_prop_at, w, sizeof t_prop_at);
     float dx = w[0] - g_tav_root[0], dy = w[1] - g_tav_root[1], dz = w[2] - g_tav_root[2], rad = fxc_radius();
     return dx * dx + dy * dy + dz * dz < rad * rad;  // NaN counts as far
 }
@@ -2877,11 +2989,25 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
     // props. Decals near Tav are the word "fxdecals"'s to keep (below).
     RecInfo* pri = g_cc.fxprops && t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
     Recipe* pr = pri ? pri->r : NULL;
-    if (g_cc.fxprops && t_dec_cb != cb && ib_young(ib_slice(t_ib, t_ibo, first, count, vo), !pr || pr->nskin) && !hide_has(t_ib) && pr) {
-        if ((pr->have & 1) && g_tav_root_ok && prop_near(pr, fi, first, vo) == 1) {
-            __atomic_add_fetch(&g_fxprops_kept, 1, __ATOMIC_RELAXED);
-            t_prop_cb = cb;  // fxwhy shows it as decision Y
-            return 0;
+    if (g_cc.fxprops && t_dec_cb != cb) {
+        uint64_t slice = ib_slice(t_ib, t_ibo, first, count, vo);
+        const int young = ib_young(slice, !pr || pr->nskin), held = prop_held(slice);
+        if ((young || held || t_ib_aged) && !hide_has(t_ib) && pr && (pr->have & 1) && g_tav_root_ok && prop_near(pr, fi, first, vo) == 1) {
+            if (young || held) {
+                __atomic_add_fetch(&g_fxprops_kept, 1, __ATOMIC_RELAXED);
+                t_prop_cb = cb;  // fxwhy shows it as decision Y
+                if (young) hold_claim(slice, count);
+                return 0;
+            }
+            // A slice near Tav that BG3 still draws and the age has just taken: a status's or a long effect's
+            // mesh no status claimed, or scenery kept by mistake. Names it, a few lines per 300 presents.
+            static uint64_t said_win;
+            static uint32_t said;
+            uint64_t win = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED) / 300;
+            if (__atomic_exchange_n(&said_win, win, __ATOMIC_RELAXED) != win) __atomic_store_n(&said, 0, __ATOMIC_RELAXED);
+            if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 8)
+                logf_("fxprops: aged out, still drawn: ib %llx count %u first %u vo %d nskin %u at %.1f %.1f %.1f", (unsigned long long)t_ib, count, first, vo,
+                      (unsigned)pr->nskin, t_prop_at[0], t_prop_at[1], t_prop_at[2]);
         }
     }
     if ((t_fxl_cb == cb || (t_dec_cb == cb && g_cc.fxdecals)) && t_bind_cb == cb && t_pipe) {
@@ -3060,7 +3186,7 @@ static void fxc_present(QueueData* q) {
     tav_log_present();
     fxw_present();
     if (g_cc.on && g_cc.void_) keep_read();
-    if (g_cc.on && g_cc.void_ && g_cc.fxprops) hide_read();
+    if (g_cc.on && g_cc.void_ && g_cc.fxprops) { hide_read(); hold_read(); }
     int want = g_cc.on && g_cc.fxcopy && !g_tav.off;
     route_present(want);
     if (!want) {
