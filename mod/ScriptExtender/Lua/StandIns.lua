@@ -451,6 +451,9 @@ function M.Start(runId)
                 end
                 -- Osiris: source, x, y, z, event, linked characters, party followers, summons, leave combat, snap to ground
                 Osi.TeleportToPosition(uuid, p[1], p[2], p[3], "", 0, 0, 0, 0, c.Snap == false and 0 or 1)
+                -- On the log's clock: the server stopped for seconds soon after some of these (plugin op 70's trace).
+                Ext.Log.Print(string.format("WOW-BG3 stand-ins: %s %s to %.1f %.1f %.1f, snap %s", c.Action,
+                    uuid == Hero.Uuid() and "the hero" or uuid, p[1], p[2], p[3], tostring(c.Snap ~= false)))
                 local healed
                 if c.Action == "Return" then
                     home[uuid] = nil

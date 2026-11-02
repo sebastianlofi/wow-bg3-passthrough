@@ -427,6 +427,8 @@ function M.Start(runId)
         if c.Upkeep ~= nil then upkeep = c.Upkeep == true end
         local at = (type(c.Position) == "table" and #c.Position == 3) and c.Position or pos(hero)
         local heroRegion = q(Osi.GetRegion, hero)
+        Ext.Utils.Print("WOW-BG3 party: Gather at " .. (at and string.format("%.1f %.1f %.1f", at[1], at[2], at[3]) or "?")
+            .. " (upkeep " .. tostring(upkeep) .. ")")
         local done = {}
         for i, u in ipairs(M.Party()) do
             if u ~= hero then

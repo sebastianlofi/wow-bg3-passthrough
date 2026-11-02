@@ -10,7 +10,7 @@ N.Op = {Ping = 1, Stamp = 2, Restore = 3, Rays = 4, RaysOff = 5, RaysStats = 6, 
     CamPose = 8, CamOff = 9, CamStats = 10, CountOn = 11, CountRead = 12, CountOff = 13, Basis = 14,
     Follow = 15, Status = 16, Limits = 17, CamHold = 18, GridSurvey = 19, Columns = 20, SceneCounts = 21,
     Lead = 22, Pool = 23, Place = 24, PoolRestore = 25, ProxyCheck = 26, Bounds = 27, PickRegion = 28,
-    LeadSource = 29, SpatialGrid = 30, SightSync = 31, PoolSurfaces = 60, PoolFree = 61}
+    LeadSource = 29, SpatialGrid = 30, SightSync = 31, PoolSurfaces = 60, PoolFree = 61, Beat = 70}
 
 local function get(id)
     local ok, v = pcall(Ext.Plugins.Get, NAME, id)

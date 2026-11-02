@@ -47,17 +47,24 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <functional>
+#include <link.h>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <pthread.h>
+#include <signal.h>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
+#include <thread>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -5376,6 +5383,367 @@ bool sound_mute(Out& o, bool client, std::uint64_t object, int mode) {
     return true;
 }
 
+// ==== Server stall trace (op 70) ====
+// Some re-origins stop BG3's server for 4 to 13 s (no Osiris event, no Lua tick, no answer) while the
+// client runs on; nothing the server runs logs while it is stopped, so the log cannot say where it is.
+// The server's Lua beats once a tick (Arena.lua, op 70: armed while the pool is out). A watchdog thread
+// sees the beats stop and, every kStallSampleS while they stay away, logs what the server thread is doing:
+// its state and CPU share, the syscall it is in (/proc), the busiest other threads, how many raycasts
+// came through this plugin's hooks, and one stack sample (a signal handler on that thread copies its
+// program counter and the return addresses on its stack that point into bg3 or this plugin; addr2line
+// -f -C -e bin/bg3 on the bg3+ offsets names the functions). The beat after a gap logs its length.
+// Every server op of this plugin that takes 1 ms or more is logged with its time (channel_call).
+// WOWBG3_STALL_TRACE=0 turns the watchdog off; the op timing stays.
+
+constexpr double kStallS = 0.75;        // no server tick for this long: a stall
+constexpr double kStallSampleS = 0.5;   // one sample this often while it lasts
+constexpr int kStallSamples = 40;       // at most this many per stall
+constexpr double kTickGapLogS = 0.3;    // a beat after a gap this long logs it
+constexpr int kStackScan = 24;          // return addresses kept per sample
+
+struct StallTrace {
+    std::atomic<double> Beat{0};          // the server's last beat (mono s)
+    std::atomic<bool> Armed{false};
+    std::atomic<long> Tid{0};
+    std::atomic<unsigned long> Thread{0};  // its pthread_t
+    std::atomic<std::uint32_t> LastOp{0};
+    std::atomic<double> LastOpEnd{0}, LastOpMs{0};
+    std::atomic<bool> Started{false};
+    bool Off = false;
+    std::uintptr_t ExeLo = 0, ExeHi = 0, ExeBias = 0, SelfLo = 0, SelfHi = 0, SelfBias = 0;
+    // Written by the watchdog before each signal, read by the handler.
+    std::atomic<std::uintptr_t> StackLo{0}, StackHi{0};
+    std::atomic<int> Signal{0};
+};
+StallTrace g_stall;
+
+struct StallSample {
+    std::atomic<int> Seq{0};
+    std::uintptr_t Pc = 0, Sp = 0;
+    int N = 0;
+    std::uintptr_t Ret[kStackScan] = {};
+};
+StallSample g_sample;
+std::atomic<int> g_sample_want{0};
+
+// On the server thread, in a signal: reads its own stack only, no lock, no allocation.
+void stall_sample_handler(int, siginfo_t*, void* ctx) {
+    auto const* uc = static_cast<ucontext_t const*>(ctx);
+    const std::uintptr_t pc = (std::uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    const std::uintptr_t sp = (std::uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    const std::uintptr_t lo = g_stall.StackLo.load(std::memory_order_acquire), hi = g_stall.StackHi.load(std::memory_order_acquire);
+    int n = 0;
+    if (sp >= lo && sp < hi) {
+        const std::uintptr_t end = std::min<std::uintptr_t>(hi, sp + 256 * 1024);
+        for (std::uintptr_t p = sp & ~(std::uintptr_t)7; p + 8 <= end && n < kStackScan; p += 8) {
+            const std::uintptr_t v = *reinterpret_cast<std::uintptr_t const*>(p);
+            if ((v >= g_stall.ExeLo && v < g_stall.ExeHi) || (v >= g_stall.SelfLo && v < g_stall.SelfHi)) g_sample.Ret[n++] = v;
+        }
+    }
+    g_sample.Pc = pc;
+    g_sample.Sp = sp;
+    g_sample.N = n;
+    g_sample.Seq.store(g_sample_want.load(std::memory_order_relaxed), std::memory_order_release);
+}
+
+int stall_ranges(dl_phdr_info* info, std::size_t, void*) {
+    const bool exe = info->dlpi_name == nullptr || info->dlpi_name[0] == 0;
+    const bool self = !exe && std::strstr(info->dlpi_name, "wowbg3.so") != nullptr;
+    if (!exe && !self) return 0;
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        ElfW(Phdr) const& ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0) continue;
+        const std::uintptr_t lo = info->dlpi_addr + ph.p_vaddr, hi = lo + ph.p_memsz;
+        if (exe && g_stall.ExeLo == 0) g_stall.ExeLo = lo, g_stall.ExeHi = hi, g_stall.ExeBias = info->dlpi_addr;
+        if (self && g_stall.SelfLo == 0) g_stall.SelfLo = lo, g_stall.SelfHi = hi, g_stall.SelfBias = info->dlpi_addr;
+    }
+    return 0;
+}
+
+bool read_small(char const* path, char* buf, std::size_t cap) {
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const ssize_t n = ::read(fd, buf, cap - 1);
+    ::close(fd);
+    if (n < 0) return false;
+    std::size_t len = (std::size_t)n;
+    while (len > 0 && buf[len - 1] == '\n') --len;
+    buf[len] = 0;
+    return true;
+}
+
+// One thread's state, comm and CPU ticks (utime + stime) from /proc/self/task/<tid>/stat.
+bool task_stat(long tid, char& state, std::string& comm, std::uint64_t& cpu) {
+    char path[64], buf[1024];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%ld/stat", tid);
+    if (!read_small(path, buf, sizeof(buf))) return false;
+    char const* open = std::strchr(buf, '(');
+    char const* close = std::strrchr(buf, ')');
+    if (open == nullptr || close == nullptr || close < open || close[1] == 0) return false;
+    comm.assign(open + 1, close - open - 1);
+    char const* p = close + 2;
+    state = *p;
+    // After ") ": state(0) ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime(11) stime(12)
+    unsigned long long utime = 0, stime = 0;
+    int field = 0;
+    for (char const* q = p; *q != 0 && field <= 12; ++q) {
+        if (*q == ' ') {
+            ++field;
+            if (field == 11) utime = std::strtoull(q + 1, nullptr, 10);
+            if (field == 12) stime = std::strtoull(q + 1, nullptr, 10);
+        }
+    }
+    cpu = utime + stime;
+    return true;
+}
+
+void all_tasks(std::unordered_map<long, std::uint64_t>& cpu, std::unordered_map<long, std::string>& names) {
+    cpu.clear();
+    DIR* d = ::opendir("/proc/self/task");
+    if (d == nullptr) return;
+    while (dirent* e = ::readdir(d)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        const long tid = std::strtol(e->d_name, nullptr, 10);
+        char state = '?';
+        std::string comm;
+        std::uint64_t c = 0;
+        if (task_stat(tid, state, comm, c)) {
+            cpu[tid] = c;
+            names[tid] = comm;
+        }
+    }
+    ::closedir(d);
+}
+
+std::string code_name(std::uintptr_t a) {
+    char buf[160];
+    if (a >= g_stall.ExeLo && a < g_stall.ExeHi) {
+        std::snprintf(buf, sizeof(buf), "bg3+%#zx", (std::size_t)(a - g_stall.ExeBias));
+    } else if (a >= g_stall.SelfLo && a < g_stall.SelfHi) {
+        std::snprintf(buf, sizeof(buf), "wowbg3+%#zx", (std::size_t)(a - g_stall.SelfBias));
+    } else {
+        Dl_info di{};
+        if (::dladdr(reinterpret_cast<void*>(a), &di) != 0 && di.dli_fname != nullptr) {
+            char const* base = std::strrchr(di.dli_fname, '/');
+            base = base != nullptr ? base + 1 : di.dli_fname;
+            if (di.dli_sname != nullptr) {
+                std::snprintf(buf, sizeof(buf), "%s:%s+%#zx", base, di.dli_sname, (std::size_t)(a - (std::uintptr_t)di.dli_saddr));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%s+%#zx", base, (std::size_t)(a - (std::uintptr_t)di.dli_fbase));
+            }
+        } else {
+            std::snprintf(buf, sizeof(buf), "%#zx", (std::size_t)a);
+        }
+    }
+    return buf;
+}
+
+std::uint64_t server_ray_calls() {
+    SceneSwap& s = g_scene[0];
+    std::uint64_t n = 0;
+    for (auto const& c : s.Stats.Calls) n += c.load(std::memory_order_relaxed);
+    for (auto const& c : s.SweepCalls) n += c.load(std::memory_order_relaxed);
+    return n;
+}
+
+// One sample of a stalled server thread: two or three log lines.
+void stall_sample(double since, std::unordered_map<long, std::uint64_t>& prev, std::unordered_map<long, std::string>& names,
+                  double& prevAt, std::uint64_t& prevRays) {
+    const long tid = g_stall.Tid.load();
+    const double now = mono_seconds();
+    std::unordered_map<long, std::uint64_t> cur;
+    all_tasks(cur, names);
+    const double dt = std::max(1e-3, now - prevAt);
+    const double hz = (double)::sysconf(_SC_CLK_TCK);
+    auto share = [&](long t) {
+        auto a = cur.find(t), b = prev.find(t);
+        if (a == cur.end() || b == prev.end() || a->second < b->second) return 0;
+        return (int)std::lround(100.0 * (double)(a->second - b->second) / hz / dt);
+    };
+    char state = '?';
+    std::string comm;
+    std::uint64_t c = 0;
+    task_stat(tid, state, comm, c);
+    char path[64], sys[256] = "?", wchan[96] = "?";
+    std::snprintf(path, sizeof(path), "/proc/self/task/%ld/syscall", tid);
+    read_small(path, sys, sizeof(sys));
+    std::snprintf(path, sizeof(path), "/proc/self/task/%ld/wchan", tid);
+    read_small(path, wchan, sizeof(wchan));
+    // The three busiest other threads over the interval.
+    std::vector<std::pair<int, long>> busy;
+    for (auto const& [t, v] : cur) {
+        if (t != tid) busy.push_back({share(t), t});
+    }
+    std::sort(busy.begin(), busy.end(), [](auto const& x, auto const& y) { return x.first > y.first; });
+    std::string others;
+    for (std::size_t i = 0; i < busy.size() && i < 3; ++i) {
+        char one[96];
+        std::snprintf(one, sizeof(one), "%s%s %ld %d%%", i ? ", " : "", names[busy[i].second].c_str(), busy[i].second, busy[i].first);
+        others += one;
+    }
+    const std::uint64_t rays = server_ray_calls();
+    logf("server stall +%.1f s: thread %ld (%s) state %c, cpu %d%%, syscall %.60s, wchan %s; raycasts through our hooks +%llu;"
+         " busiest others: %s",
+         since, tid, comm.c_str(), state, share(tid), sys, wchan, (unsigned long long)(rays - prevRays), others.c_str());
+    prevRays = rays;
+    prev.swap(cur);
+    prevAt = now;
+    // The stack sample. A thread blocked in a syscall is read where it waits: /proc's syscall line ends with its
+    // user stack pointer and program counter, and its stack is read from here (no signal: one would end a
+    // sleep or a wait early and change what is being measured). A running one is asked by the signal.
+    pthread_attr_t attr;
+    void* base = nullptr;
+    std::size_t size = 0;
+    if (::pthread_getattr_np((pthread_t)g_stall.Thread.load(), &attr) == 0) {
+        ::pthread_attr_getstack(&attr, &base, &size);
+        ::pthread_attr_destroy(&attr);
+    }
+    const std::uintptr_t lo = (std::uintptr_t)base, hi = lo + size;
+    std::uintptr_t pc = 0, sp = 0;
+    int n = 0;
+    std::uintptr_t ret[kStackScan] = {};
+    char const* how = "running";
+    if (state != 'R' && sys[0] >= '0' && sys[0] <= '9') {
+        // "nr a1 a2 a3 a4 a5 a6 sp pc"
+        std::vector<std::uintptr_t> f;
+        for (char* q = sys; *q != 0;) {
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(q, &end, 0);
+            if (end == q) break;
+            f.push_back((std::uintptr_t)v);
+            q = end;
+            while (*q == ' ') ++q;
+        }
+        if (f.size() != 9) {
+            logf("server stall: no stack sample (syscall line not understood)");
+            return;
+        }
+        sp = f[7];
+        pc = f[8];
+        how = "blocked";
+        if (sp >= lo && sp < hi) {
+            std::vector<std::uintptr_t> words(std::min<std::size_t>((hi - sp) / 8, 256 * 1024 / 8));
+            iovec local{words.data(), words.size() * 8};
+            iovec remote{reinterpret_cast<void*>(sp & ~(std::uintptr_t)7), words.size() * 8};
+            if (::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == (ssize_t)(words.size() * 8)) {
+                for (std::uintptr_t v : words) {
+                    if (n >= kStackScan) break;
+                    if ((v >= g_stall.ExeLo && v < g_stall.ExeHi) || (v >= g_stall.SelfLo && v < g_stall.SelfHi)) ret[n++] = v;
+                }
+            }
+        }
+    } else {
+        if (g_stall.Signal.load() == 0) return;
+        g_stall.StackLo.store(lo, std::memory_order_release);
+        g_stall.StackHi.store(hi, std::memory_order_release);
+        const int want = g_sample_want.fetch_add(1) + 1;
+        if (::syscall(SYS_tgkill, (long)::getpid(), tid, g_stall.Signal.load()) != 0) {
+            logf("server stall: no stack sample (tgkill failed)");
+            return;
+        }
+        for (int i = 0; i < 200 && g_sample.Seq.load(std::memory_order_acquire) != want; ++i) ::usleep(1000);
+        if (g_sample.Seq.load(std::memory_order_acquire) != want) {
+            logf("server stall: no stack sample within 200 ms (state %c)", state);
+            return;
+        }
+        pc = g_sample.Pc;
+        sp = g_sample.Sp;
+        n = g_sample.N;
+        for (int i = 0; i < n; ++i) ret[i] = g_sample.Ret[i];
+    }
+    std::string line = std::string("server stall stack (") + how + "): pc " + code_name(pc) + ", returns";
+    for (int i = 0; i < n; ++i) {
+        line += (i == 12 ? "\n" : " ") + code_name(ret[i]);
+    }
+    std::size_t at = 0;
+    for (int part = 0; at < line.size(); ++part) {
+        const std::size_t nl = line.find('\n', at);
+        const std::string piece = line.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        logf("%s%s", part ? "server stall stack (more):" : "", piece.c_str());
+        at = nl == std::string::npos ? line.size() : nl + 1;
+    }
+}
+
+void stall_watch() {
+    ::dl_iterate_phdr(stall_ranges, nullptr);
+    // A real-time signal nobody handles carries the stack sample request.
+    for (int sig = SIGRTMIN + 4; sig <= SIGRTMAX - 2 && g_stall.Signal.load() == 0; ++sig) {
+        struct sigaction old {};
+        if (::sigaction(sig, nullptr, &old) != 0 || old.sa_handler != SIG_DFL) continue;
+        struct sigaction sa {};
+        sa.sa_sigaction = stall_sample_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        if (::sigaction(sig, &sa, nullptr) == 0) g_stall.Signal.store(sig);
+    }
+    logf("server stall trace: watching (bg3 text %#zx..%#zx, wowbg3 %#zx..%#zx, sample signal %d)",
+         (std::size_t)(g_stall.ExeLo - g_stall.ExeBias), (std::size_t)(g_stall.ExeHi - g_stall.ExeBias),
+         (std::size_t)(g_stall.SelfLo - g_stall.SelfBias), (std::size_t)(g_stall.SelfHi - g_stall.SelfBias), g_stall.Signal.load());
+    bool stalled = false;
+    double stallBeat = 0, lastSample = 0, prevAt = 0;
+    int samples = 0;
+    std::uint64_t prevRays = 0;
+    std::unordered_map<long, std::uint64_t> prev;
+    std::unordered_map<long, std::string> names;
+    for (;;) {
+        ::usleep(100 * 1000);
+        const double now = mono_seconds(), beat = g_stall.Beat.load();
+        const double since = now - beat;
+        if (!stalled) {
+            if (!g_stall.Armed.load() || beat <= 0 || since < kStallS) continue;
+            stalled = true;
+            stallBeat = beat;
+            samples = 0;
+            all_tasks(prev, names);
+            prevAt = now;
+            prevRays = server_ray_calls();
+            lastSample = now;
+            const double opEnd = g_stall.LastOpEnd.load();
+            if (opEnd > 0) {
+                logf("server stall: no server tick for %.2f s; the last plugin op on the server: %u (%.1f ms), ended %.2f s"
+                     " before the last tick",
+                     since, g_stall.LastOp.load(), g_stall.LastOpMs.load(), beat - opEnd);
+            } else {
+                logf("server stall: no server tick for %.2f s; no plugin op on the server yet", since);
+            }
+            continue;
+        }
+        if (beat != stallBeat) {  // ticking again: op 70 logs the gap
+            stalled = false;
+            continue;
+        }
+        if (now - lastSample >= kStallSampleS && samples < kStallSamples) {
+            stall_sample(since, prev, names, prevAt, prevRays);
+            lastSample = now;
+            ++samples;
+        }
+    }
+}
+
+// Op 70 (server; the client answers too, unwatched): a.x 1 armed (the pool is out), 0 not.
+// R0 1 watched, R1 the sample signal (0 none).
+bool server_beat(Out& o, bool client, float armed) {
+    if (client) return true;
+    const double now = mono_seconds();
+    const double last = g_stall.Beat.exchange(now);
+    const bool wasArmed = g_stall.Armed.exchange(armed != 0.0f);
+    g_stall.Tid.store(::syscall(SYS_gettid));
+    g_stall.Thread.store((unsigned long)::pthread_self());
+    if (wasArmed && last > 0 && now - last >= kTickGapLogS) {
+        const double opEnd = g_stall.LastOpEnd.load();
+        logf("server tick gap %.2f s (the last plugin op on the server: %u, %.1f ms, ended %.2f s before the gap)", now - last,
+             g_stall.LastOp.load(), g_stall.LastOpMs.load(), opEnd > 0 ? last - opEnd : -1.0);
+    }
+    if (armed != 0.0f && !g_stall.Started.exchange(true)) {
+        if (char const* v = std::getenv("WOWBG3_STALL_TRACE"); v != nullptr && std::strcmp(v, "0") == 0) g_stall.Off = true;
+        if (!g_stall.Off) std::thread(stall_watch).detach();
+        else logf("server stall trace: off (WOWBG3_STALL_TRACE=0)");
+    }
+    o.R[0] = g_stall.Started.load() && !g_stall.Off;
+    o.R[1] = g_stall.Signal.load();
+    return true;
+}
+
 enum Op : std::uint32_t {
     kPing = 1,
     kStamp = 2,        // a: minX, minZ, anchorY; b.x layer tolerance (m), b.y void, b.z void layer Y; tiles from arena-tiles.bin
@@ -5425,6 +5793,8 @@ enum Op : std::uint32_t {
     kPoolSurfaces = 60, // server: ground surfaces on pool subgrid a.x (-1 every one); a.y 1: remove them the engine's
                         // way (only from a placed one; Place and PoolRestore do it themselves), 2: report; R0 tiles
                         // with a ground surface, R1 with a cloud, R2 subgrids looked at, R3 1 removed
+    kBeat = 70,         // server Lua, once a tick: a.x 1 armed (the pool is out), 0 not; a stall watchdog logs where
+                        // the server thread is while the beats stay away (server_beat); R0 1 watched, R1 sample signal
     kPoolFree = 61,     // a.x pool index, a.y a.z the square's min corner: R0 1 when Place would take it there now
                         // (the spot it already holds, or nothing registered on its tiles,
                         // nothing attached), R1 tiles holding something, R2 attached objects, R3 entities seen;
@@ -5450,7 +5820,27 @@ void* address_of(glm::vec3 const& a) {
     return reinterpret_cast<void*>(p0 | (p1 << 16) | (p2 << 32));
 }
 
+bool channel_op(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 const& b);
+
+// Every op, timed: a server op of 1 ms or more is logged, and the last one is kept for the stall trace.
 bool channel_call(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 const& b) {
+    if (op == kBeat) return channel_op(side, op, a, b);
+    const double t0 = mono_seconds();
+    const bool ok = channel_op(side, op, a, b);
+    const double t1 = mono_seconds(), ms = (t1 - t0) * 1000.0;
+    if (side == 0) {
+        g_stall.LastOp.store(op);
+        g_stall.LastOpMs.store(ms);
+        g_stall.LastOpEnd.store(t1);
+        if (ms >= 1.0) {
+            logf("server op %u took %.1f ms (a %.2f %.2f %.2f, b %.2f %.2f %.2f)%s", op, ms, a.x, a.y, a.z, b.x, b.y, b.z,
+                 ok ? "" : ", refused");
+        }
+    }
+    return ok;
+}
+
+bool channel_op(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 const& b) {
     Out& o = g_out[side];
     out_reset(o);
     const bool client = side == 1;
@@ -5831,6 +6221,8 @@ bool channel_call(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 cons
         if (b.y != std::floor(b.y)) return fail(o, 1501, "mode is 0, 1 or 2");
         return sound_mute(o, client, object, (int)b.y);
     }
+    case kBeat:
+        return server_beat(o, client, a.x);
     default:
         return fail(o, 1, "unknown plugin op");
     }

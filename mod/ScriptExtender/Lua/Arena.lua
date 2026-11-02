@@ -369,8 +369,20 @@ function M.Start(runId)
         return st.F, st
     end
 
+    -- The server's beat (plugin op 70): its stall watchdog logs where the server thread is when the beats stop
+    -- while the pool is out (re-origins stopped the server for 4 to 13 s with nothing in the log). An older
+    -- plugin refuses the op: no more beats then. Unarmed (no pool, or a load or a save) it beats once to say so.
+    local beating, beatArmed = not client, false
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
+        if beating then
+            local armed = pool ~= nil and Ext.Require("Session.lua").Live()
+            if armed or beatArmed then
+                local okBeat, beat = pcall(N.Call, N.Op.Beat, armed and 1 or 0)
+                if okBeat and beat.Err ~= 0 then beating = false end
+                beatArmed = armed
+            end
+        end
         if stamp or rays or camera or pool or pick then
             if not Ext.Require("Session.lua").Live() then -- Running, or held under the loading screen
                 -- A save (Save, Paused) keeps the level and the moved squares: hold, never restore.
