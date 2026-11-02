@@ -713,17 +713,15 @@ function M.Start(runId)
     -- under MIN_AVG_HIT: BG3's AI does not attack with an expected damage of about 0. Health: max HP
     -- standInMaxHp(WoW max HP) (IncreaseMaxHP; the "scaled" stage sets the WoW fraction after).
     local MIN_AVG_HIT = 1
+    -- Counted once per mob, the first time it is seen, and kept: its numbers do not move as more comes into view.
+    local campFixed = {}
     local function campOf(sp)
         if not sp.Hostile then return 1 end
+        if campFixed[sp.Guid] then return campFixed[sp.Guid] end
         local list = {}
         for _, v in pairs(M.WantNow or {}) do list[#list + 1] = v end
-        return Scaling.CampOf(sp, list)
-    end
-    -- More of its camp came into view: looked at once a second.
-    local function campGrew(m, sp, ticks)
-        if not (m.ScaleCamp and sp.Hostile) or ticks - (m.ScaleCampAt or 0) < 30 then return false end
-        m.ScaleCampAt = ticks
-        return campOf(sp) > m.ScaleCamp
+        campFixed[sp.Guid] = Scaling.CampOf(sp, list)
+        return campFixed[sp.Guid]
     end
     -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves at its own level. Boosts
     -- under one cause, so a camp that grew can take them off and set new ones.
@@ -734,8 +732,7 @@ function M.Start(runId)
         if not base or base[2] <= 0 or wowMax <= 0 or level <= 0 then info.Skipped = "no numbers"; return end
         m.ScaleBase = base
         local fixed = Scaling.Fixed()
-        -- A hostile mob's camp: only the mobs near enough to be listed count, so it can grow as the party comes closer.
-        m.ScaleCamp, m.ScaleCampAt = campOf(sp), ticks
+        m.ScaleCamp = campOf(sp)
         local n = Scaling.Compute({Level = level, WowMaxHp = wowMax, WowDamage = tonumber(sp.WowDamage), Map = world and world.Map,
             Camp = m.ScaleCamp, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
         local okAc, ac = pcall(function() return Ext.Entity.Get(m.Uuid).Stats.ArmorClass end)
@@ -1196,11 +1193,6 @@ function M.Start(runId)
                     m.FriendlyReset = (m.FriendlyReset or 0) + 1
                 end
                 nameOf(m, mob)
-                -- The camp came into view: new numbers, on a stand-in out of every fight.
-                if m.ScaleKey and m.Stage ~= "spawned" and not inFight and not combat and not dead
-                    and campGrew(m, mob, ticks) then
-                    m.Stage = "spawned"
-                end
                 if m.Stage == "spawned" and ticks - m.Born >= SCALE_AFTER then
                     local ok, err = pcall(scale, m, tonumber(plan.HeroWowMaxHp))
                     if not ok then note("scale " .. guid .. ": " .. tostring(err)) end
