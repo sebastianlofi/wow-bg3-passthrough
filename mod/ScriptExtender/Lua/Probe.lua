@@ -80,6 +80,8 @@ function Probe.Start(context)
         -- The world's turn in turn-based mode outside combat (TurnHold.lua releases WoW's creatures then).
         pcall(function() Ext.Require("TurnHold.lua").StartClient(report.RunId) end)
         if not okRs then Ext.Log.Print("WOW-BG3 render screen: " .. tostring(errRs)) end
+        local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").Start() end)
+        if not okMl then Ext.Log.Print("WOW-BG3 move loading: " .. tostring(errMl)) end
         Ext.Events.Tick:Subscribe(captureMenu)
         Ext.Require("MenuProbe.lua").Start(report.RunId)
         -- New game straight into world mode: research hook in any game state.

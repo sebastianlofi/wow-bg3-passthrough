@@ -1063,6 +1063,9 @@ typedef struct {
 } ComposeCfg;
 static ComposeCfg g_cc;
 static volatile int g_move_cover;
+// BG3's LoadingScreen.xaml is up (link/bg3moveui.txt, MoveLoading.lua): opaque over all of BG3's picture, so
+// during a move that picture is the loading screen itself, live, and the cover steps aside.
+static volatile int g_move_ui;
 
 // OUT_DIR/compose present = on. Optional words: "noui" (keep BG3's final picture where WoW shows
 // instead of rebuilding it from the UI target), "light" (add BG3's picture over WoW: effects in
@@ -1501,6 +1504,7 @@ static float hdr_sum(VkFormat f, const uint8_t* p) {
 // Returns a semaphore the present must wait on, or null (frame untouched).
 static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info) {
     if (g_move_cover) {
+        if (g_move_ui) return VK_NULL_HANDLE;
         VkSemaphore s = VK_NULL_HANDLE;
         cover_gpu(q, c, index, info, &s, 0);
         return s;
@@ -3522,6 +3526,14 @@ static void screen_check(void) {
         g_screen = on;
     }
     g_screen_dialog = on && strstr(line, "Dialogue") != NULL;
+    static char ui_path[512];
+    if (!ui_path[0]) snprintf(ui_path, sizeof ui_path, "%s/bg3moveui.txt", link_dir());
+    char ui[8] = {0};
+    f = stat(ui_path, &fs) == 0 && fs.st_mtime >= born ? fopen(ui_path, "r") : NULL;
+    if (f) { if (!fgets(ui, sizeof ui, f)) ui[0] = 0; fclose(f); }
+    const int ui_on = ui[0] == '1';
+    if (ui_on != g_move_ui) logf_("compose: BG3's loading screen for the move %s", ui_on ? "up: its picture passes" : "closed");
+    g_move_ui = ui_on;
 }
 static void tav_present(QueueData* q) {
     if (!g_tav.init) {
