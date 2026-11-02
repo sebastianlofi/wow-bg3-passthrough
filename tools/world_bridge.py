@@ -13,7 +13,7 @@ get the same squares' WoW triangles. Four squares around the lattice node neares
 placed (at least 24 m of ground on every side of her), and up to two more ahead of her along the
 way she is heading. When she crosses 8 m past a square's middle the window moves on: squares behind
 her are moved ahead and the triangles are swapped in one step (no moment without ground).
-A fall guard puts Tav back where she last stood if she ends up 8 m below the WoW floor under her.
+A fall alarm logs a member under every WoW face (it moves nobody: World.fall_alarm).
 "Tav" here is the hero: whichever character the player controls (the custom Tav of
 the test save, or a new game's character such as the origin Gale), as the mod's Hero.lua reports it
 in wow-bg3/hero.json; the bridge waits for the hero to be ready (in the tutorial level, no dialog,
@@ -30,8 +30,8 @@ its own window of squares (the same rules as the hero's: the 2 x 2 round its lat
 squares ahead or the --floor block), all from one pool, so members can be any distance apart. When
 the pool is short, squares go in tiers: first the square under every member, then every member's
 2 x 2, then the rest of each window, members nearest BG3's camera (bg3cam.bin) first; so the member
-farthest from the camera gets fewer squares, never none. The fall guard runs per member (the hero
-through StandIns Teleport, a companion through StandIns Rescue). link/party-wow.json (Format 1) says
+farthest from the camera gets fewer squares, never none. The fall alarm runs per member.
+link/party-wow.json (Format 1) says
 where every member stands in WoW (for the bots that stand in for them on the server: the fight bridge,
 link/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs from it). The plugin
 (0.2.9) builds the ray hooks' cell grids per cluster of squares, so the triangles of members far
@@ -98,7 +98,10 @@ SLOPE_FLAG_M = 0.25
 # square of ground needs), and the pool asks for STOREY_SPARE more than --pool for them. A storey
 # with fewer than STOREY_MIN walkable tiles is left out.
 STOREYS = os.environ.get('WOW_BG3_STOREYS', '1') != '0'
-GUARD_FEET_M, GUARD_HEAD_M = 3.0, 1.5  # fall guard: how far under and over a walker's feet a face counts as its floor
+FALL_UNDER_M = 3.0   # fall alarm: within this far under a tile's floor a walker is on it, no faces read
+FALL_HEAD_M = 1.5    # fall alarm: a face up to this far over a walker's feet still counts as under it
+FALL_READ_S = 0.5    # fall alarm: at most so often per walker a square's faces are read (a cave is read all the time)
+FALL_SAY_S = 10.0    # fall alarm: at most so often per walker it is said
 STOREY_SPARE = 2
 STOREY_MIN = 8
 # The flags a seam tile (where a storey meets the ground) gets in both sections: 4 SubgridEdge, 8
@@ -292,34 +295,41 @@ def camera_wow():
     return eye if all(math.isfinite(v) for v in eye) else None
 
 
-def face_under(tris, x, y, z):
-    """The height of a WoW face within reach of a walker's feet at BG3 (x, y, z), or None. A square's tiles
-    hold one floor, so in a cave they can name the hill over it; what the walker stands on is still a face."""
+def faces_over(tris, x, z):
+    """The height of every WoW face over BG3 (x, z), walls left out by having no area seen from above. Also a
+    hair to each side: a point on the line between two triangles lies on neither."""
+    points = ((x, z), (x + 0.15, z + 0.05), (x - 0.15, z - 0.05), (x + 0.05, z - 0.15), (x - 0.05, z + 0.15))
+    x0, x1, z0, z1 = x - 0.15, x + 0.15, z - 0.15, z + 0.15
+    out = []
     for ax, ay, az, bx, by, bz, cx, cy, cz in struct.iter_unpack('<9f', tris):
-        if (x < ax and x < bx and x < cx) or (x > ax and x > bx and x > cx) \
-                or (z < az and z < bz and z < cz) or (z > az and z > bz and z > cz):
+        if (x1 < ax and x1 < bx and x1 < cx) or (x0 > ax and x0 > bx and x0 > cx) \
+                or (z1 < az and z1 < bz and z1 < cz) or (z0 > az and z0 > bz and z0 > cz):
             continue
         d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz)
         if abs(d) < 1e-6:
             continue
-        u = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d
-        v = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d
-        if u < 0.0 or v < 0.0 or u + v > 1.0:
-            continue
-        h = u * ay + v * by + (1.0 - u - v) * cy
-        if y - GUARD_FEET_M < h < y + GUARD_HEAD_M:
-            return h
-    return None
+        for px, pz in points:
+            u = ((bz - cz) * (px - cx) + (cx - bx) * (pz - cz)) / d
+            v = ((cz - az) * (px - cx) + (ax - cx) * (pz - cz)) / d
+            if u >= 0.0 and v >= 0.0 and u + v <= 1.0:
+                out.append(u * ay + v * by + (1.0 - u - v) * cy)
+                break
+    return out
+
+
+def under_every_face(tris, x, y, z):
+    """True when nothing of WoW's lies under a walker's feet at BG3 (x, y, z): the only real fall. Anything else
+    is standing, or in the air over something it will land on (a shove off a cliff, a drop into a cave)."""
+    return not any(h < y + FALL_HEAD_M for h in faces_over(tris, x, z))
 
 
 class Walker:
-    """One party member's window on the lattice (its own node, look-ahead axis and fall guard)."""
+    """One party member's window on the lattice (its own node, look-ahead axis and fall alarm)."""
     def __init__(self, uuid, name):
         self.uuid, self.name = uuid, name
         self.node = (0, 0)
         self.ahead_axis = None
-        self.last_good = None
-        self.rescued = 0.0
+        self.fall_said = 0.0
         self.faces_read = 0.0
         self.seen = 0.0
 
@@ -503,7 +513,7 @@ class World:
                 cell['storey'] = cell['storeys'][0]
         self.cells[ij] = cell
         # Every placed square stays cached (its triangles go to the plugin at every Stream, and the
-        # fall guard reads its floors): a pool of up to 128 squares, plus room for squares coming in.
+        # fall alarm reads its floors and faces): a pool of up to 128 squares, plus room for squares coming in.
         keep = set(self.placed.values()) | {ij}
         while len(self.cells) > max(40, self.pool + 24):
             old = next((k for k in self.cells if k not in keep), None)
@@ -645,11 +655,9 @@ class World:
         return out
 
     def write_floor(self, squares):
-        """wow-bg3/floor.json: the squares world mode keeps (BG3 min corners, 64 m), for Party.lua's
-        upkeep (rescue only a member off the floor or falling, not by distance from the hero)."""
-        # MemberGuard: this bridge keeps every member on its own ground and runs the fall
-        # guard per member, so Party.lua's upkeep never moves anyone (see the Requests to progression).
-        body = {'RunId': self.run, 'PartyFloor': True, 'MemberGuard': True, 'Cell': CELL,
+        """wow-bg3/floor.json: the squares world mode keeps (BG3 min corners, 64 m), for Mirrors.lua (no
+        stand-in spawned past the ground's edge)."""
+        body = {'RunId': self.run, 'PartyFloor': True, 'Cell': CELL,
                 'Squares': [[self.centre[0] + CELL * i, self.centre[2] + CELL * j] for i, j in squares]}
         try:
             atomic_write(IO / 'floor.json', json.dumps(body).encode())
@@ -835,49 +843,31 @@ class World:
         walk, y = struct.unpack_from('<Bf', cell['tiles'], (r * TILES + c) * 5)
         return bool(walk), y
 
-    def guard(self, w, bx, by, bz, is_hero):
-        """Fall guard, per member: one more than 8 m below the WoW floor under it and with no WoW face
-        at its feet (a gap in the ground, a fight knocking it off) goes back to where it last stood on it: the hero through
-        StandIns Teleport (as WorldMode does), a companion through StandIns Rescue. At most once
-        every 10 s per member."""
+    def fall_alarm(self, w, bx, by, bz):
+        """Says when a member is somewhere nothing of WoW's can hold it, and moves nobody: BG3's own fall stands
+        (a shove off a cliff, a drop down a shaft). Every walkable tile of every level has a WoW face within 1 m
+        and neighbouring squares' floors meet (read from real cuts), so walking finds no gap; what is left is a
+        forced move over a hole in the terrain with nothing below it, or a square that did not arrive.
+        A tile holds the ground's one floor, which in a cave is the hill over it, so being under a tile says
+        nothing: the cave's floor is in a storey and in the faces, and the faces decide."""
+        now = time.time()
         f = self.floor_at(bx, bz)
         if f is None:
+            # Off every placed square, in the level's own grid (a member at camp, say) or on no ground at all.
+            if not self.in_level((bx, by, bz)) and not camp_state(self.run) and now - w.fall_said >= FALL_SAY_S:
+                w.fall_said = now
+                print(time.strftime('%H:%M:%S'), 'fall alarm: %s at %.1f %.1f %.1f, no square placed under it; placed %d'
+                      % (w.name, bx, by, bz, len(self.placed)), flush=True)
             return
-        walk, floor = f
-        if walk and abs(by - floor) < 3.0:
-            w.last_good = (bx, floor, bz)
+        if by >= f[1] - FALL_UNDER_M or now - w.faces_read < FALL_READ_S:
             return
-        if by > floor - 8.0 or not w.last_good or time.time() - w.rescued < 10.0:
-            return
-        # Under the tile's floor, on a face all the same: a cave under a hill, not a fall.
-        if time.time() - w.faces_read < 0.5:
-            return
-        w.faces_read = time.time()
+        w.faces_read = now
         ij = (int(math.floor((bx - self.centre[0]) / CELL)), int(math.floor((bz - self.centre[2]) / CELL)))
-        h = face_under(self.cells[ij]['tris'], bx, by, bz)
-        if h is not None:
-            w.last_good = (bx, h, bz)
+        if not under_every_face(self.cells[ij]['tris'], bx, by, bz) or now - w.fall_said < FALL_SAY_S:
             return
-        w.rescued = time.time()
-        x, y, z = w.last_good
-        target = w.uuid
-        if is_hero:
-            h = hero(self.run)
-            if not h:
-                print('fall guard: no hero in wow-bg3/hero.json', flush=True)
-                return
-            target = h['Uuid']
-        print(time.strftime('%H:%M:%S'), 'fall guard: %s at %.1f %.1f %.1f, floor %.1f; back to %.1f %.1f %.1f'
-              % (w.name, bx, by, bz, floor, x, y, z), flush=True)
-        path = IO / 'stand-in-command.json'
-        try:
-            old = json.loads(path.read_text())
-            seq = old.get('Sequence', 0) if old.get('RunId') == self.run else 0
-        except (FileNotFoundError, json.JSONDecodeError):
-            seq = 0
-        body = {'RunId': self.run, 'Sequence': seq + 1, 'Action': 'Teleport' if is_hero else 'Rescue',
-                'Target': target, 'Position': [x, y + 1.0, z]}
-        atomic_write(path, json.dumps(body).encode())
+        w.fall_said = now
+        print(time.strftime('%H:%M:%S'), 'fall alarm: %s at %.1f %.1f %.1f, under every WoW face of square %s, tile floor %.1f'
+              % (w.name, bx, by, bz, ij, f[1]), flush=True)
 
     def publish_party(self):
         """link/party-wow.json (Format 1): every member's WoW position (for its WoW character, a bot
@@ -1060,7 +1050,7 @@ class World:
         members = self.read_members(hero_pos)
         for w, p, dead in members:
             if not dead:
-                self.guard(w, p[0], p[1], p[2], w is self.hero_walker)
+                self.fall_alarm(w, p[0], p[1], p[2])
         self.publish_party()
         self.control()
         want = self.wanted(members)

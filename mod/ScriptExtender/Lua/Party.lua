@@ -41,15 +41,12 @@
 --   (Level {Level}, raised everyone's XP to a BG3 level: retired, all BG3 XP comes
 --   from the WoW levels now)
 -- Add refuses when the WoW level has not opened another party slot (WoW levels 1 to 4, one each).
--- Upkeep (world mode): members range freely (a treadmill per member keeps ground under
--- each), so nobody is pulled back for distance any more. Only a member that falls through the world (40 m
--- or more below where it last stood still, out of every fight) is put back where it stood. Checked every
--- 30 ticks. While world_bridge.py's floor.json says MemberGuard (a treadmill and a fall guard per member,
--- the default), the bridge rescues falls and this upkeep moves nobody.
+-- Upkeep (world mode): members range freely (a treadmill per member keeps ground under each), and nobody
+-- is ever put back: a fall is BG3's own, and world_bridge.py's fall alarm logs one that nothing can stop.
 -- Help (world mode): out of every fight, a downed member is helped up by the nearest standing companion
 -- with BG3's own Help (Target_Help), as the player would after a fight won with the hero down.
 -- Status: wow-bg3/party.json (on change within 10 ticks, else every 300): {RunId, Tick, Hero, Members =
--- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Upkeep, Moved}.
+-- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Upkeep}.
 -- Read by TavPlan.lua/WorldMode.lua (the figures WoW draws), Mirrors.lua and ActionMonitor.lua (the
 -- party in fights) and the tools.
 local M = {}
@@ -58,7 +55,6 @@ local Prog = Ext.Require("Progression.lua") -- WoW levels to BG3 levels
 local REGION = Hero.REGION -- host level (Hero.lua, host.json)
 local TUT_REGION = "TUT_Avernus_C" -- the tutorial level; the tutorial's own goals and procs run only there
 local VOID_X = -1000 -- world mode's void lies west of this (the level's AI grid starts at x -296)
-local FALL = 40.0 -- a member this far below where it last stood still fell through the world
 
 -- The companions this tool recruits (BG3's origin companions; a name or its first letters).
 local KNOWN = {
@@ -195,7 +191,7 @@ function M.Start(runId)
         local okc, c = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/party-command.json") or "")
         if okc and type(c) == "table" and c.RunId == runId and math.type(c.Sequence) == "integer" then sequence = c.Sequence end
     end
-    local upkeep, moved, lastKey, lastWrite = false, 0, nil, -1000
+    local upkeep, lastKey, lastWrite = false, nil, -1000
     local function wait(n)
         local due = tick + n
         while tick < due do coroutine.yield() end
@@ -572,38 +568,6 @@ function M.Start(runId)
         return r
     end
 
-    -- Upkeep (see the header): only a member that fell through the world is put back, out of fights.
-    -- steady[u]: where it last stood still (two checks in a row within 0.5 m up or down).
-    local steady, lastPos = {}, {}
-    local function floorNow()
-        local raw = Ext.IO.LoadFile("wow-bg3/floor.json")
-        if not raw or raw == "" then return nil end
-        local ok, fl = pcall(Ext.Json.Parse, raw)
-        return ok and type(fl) == "table" and fl or nil
-    end
-    local function keepUp()
-        local fl = floorNow()
-        if fl and fl.MemberGuard == true then return end
-        local hero = Hero.Uuid()
-        if not hero then return end
-        for _, u in ipairs(M.Party()) do
-            local p = pos(u)
-            if p and u ~= hero and q(Osi.IsInCombat, u) ~= 1 and q(Osi.GetRegion, u) == q(Osi.GetRegion, hero) then
-                local last, back = lastPos[u], steady[u]
-                if back and p[2] < back[2] - FALL then
-                    Osi.TeleportToPosition(u, back[1], back[2] + 0.5, back[3], "", 0, 0, 0, 0, 1)
-                    lastPos[u], steady[u] = nil, nil
-                    moved = moved + 1
-                    Ext.Utils.Print(string.format("WOW-BG3 party: %s fell %.0f m through the world: put back where it last stood",
-                        nameOf(u), back[2] - p[2]))
-                else
-                    if last and math.abs(last[2] - p[2]) < 0.5 then steady[u] = p end
-                    lastPos[u] = p
-                end
-            end
-        end
-    end
-
     -- Help (world mode): once the party is out of every fight, a downed member (the hero too) is helped up
     -- by the nearest companion still standing within 40 m, with BG3's own Help (Target_Help: it walks
     -- there and the downed one stands at 1 HP), as the player does in BG3 after a fight. The hero never
@@ -642,7 +606,7 @@ function M.Start(runId)
         if not force and key == lastKey and tick - lastWrite < 300 then return end
         lastKey, lastWrite = key, tick
         Ext.IO.SaveFile("wow-bg3/party.json", Ext.Json.Stringify({RunId = runId, Tick = tick, Hero = Hero.Uuid(),
-            Members = snap, Upkeep = upkeep, Moved = moved}))
+            Members = snap, Upkeep = upkeep}))
     end
 
     -- Origin portraits: BG3's own re-render has its coloured backdrop since the capture layer keeps
@@ -667,10 +631,6 @@ function M.Start(runId)
                 cacheTick = -1
                 pcall(writeStatus, true)
             end
-        end
-        -- A trip to camp (Camp.lua) is no fall: a member there stands about 110 m below the void.
-        if upkeep and tick % 30 == 11 and not jobs[1] then
-            if Ext.Require("Camp.lua").InTrip() then lastPos, steady = {}, {} else pcall(keepUp) end
         end
         if upkeep and tick % 30 == 21 and not jobs[1] then pcall(helpUp) end
         if tick % 10 == 3 then pcall(writeStatus, false) end

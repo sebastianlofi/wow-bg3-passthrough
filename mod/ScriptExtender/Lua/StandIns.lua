@@ -430,20 +430,6 @@ function M.Start(runId)
                 assert(type(u) == "string", "ClearSurfaces needs a Target")
                 for _, layer in ipairs({"Ground", "Cloud"}) do Osi.RemoveSurfaceLayer(u, layer, tonumber(c.Radius) or 130.0) end
                 return {Cleared = u}
-            elseif c.Action == "Rescue" then
-                -- A party member that fell off the treadmill's ground (world_bridge.py's fall guard per
-                -- member) back to where it last stood on WoW ground: no home
-                -- kept (it is no stand-in), out of any fight only, at most 20 km from the void's middle.
-                local uuid = c.Target
-                assert(type(uuid) == "string" and Ext.Require("Party.lua").IsCompanion(uuid), "Rescue: not a companion of the hero")
-                local p = c.Position
-                assert(type(p) == "table" and #p == 3, "Position required")
-                for i = 1, 3 do assert(type(p[i]) == "number" and p[i] == p[i], "Position must be numbers") end
-                assert(math.abs(p[1] - LEVEL_SPOT[1]) < 20000 and math.abs(p[3] - LEVEL_SPOT[3]) < 20000, "Rescue: position out of range")
-                assert(q(Osi.IsInCombat, uuid) ~= 1, "Rescue: in a fight")
-                Osi.TeleportToPosition(uuid, p[1], p[2], p[3], "", 0, 0, 0, 0, 1)
-                Ext.Utils.Print(string.format("WOW-BG3 stand-ins: %s rescued to %.1f %.1f %.1f (fell off the ground)", uuid, p[1], p[2], p[3]))
-                return {Rescued = uuid}
             elseif c.Action == "Teleport" or c.Action == "Return" then
                 local uuid = (c.Target == Hero.Uuid() or (c.Action == "Return" and type(c.Target) == "string" and home[c.Target]))
                     and c.Target or live(c.Target)
