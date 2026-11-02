@@ -331,6 +331,54 @@ fn bg3_hit_points_go_to_the_server_as_levels_and_a_kill_once() {
     assert!(f.log.iter().any(|l| l == "Young Wolf (e1) dies"));
 }
 #[test]
+fn a_member_missing_from_the_roster_or_first_seen_at_0_hp_is_a_kill() {
+    // The roster drops a member BG3 reported before: hp 0, and the kill before Tav's own 0.
+    let mut f = fight();
+    let e1 = |hp| actor("e1", "f130000000012b01", hp, 11);
+    f.apply(&Message::Roster {
+        encounter: e(),
+        joins: 0,
+        actors: vec![actor("hero", "0000000000000001", 14, 14), e1(11)],
+    })
+    .unwrap();
+    f.handoff.clear();
+    let without = Message::Roster {
+        encounter: e(),
+        joins: 0,
+        actors: vec![actor("hero", "0000000000000001", 0, 14)],
+    };
+    f.apply(&without).unwrap();
+    f.apply(&without).unwrap();
+    assert_eq!(f.enemies[0].status, "dead");
+    let h: Vec<String> = f.handoff.iter().filter_map(Handoff::command).collect();
+    assert_eq!(h.len(), 3, "the kill once: {h:?}");
+    assert!(h[0].starts_with(".wowbg3 pos pull-1 f130000000012b01 "));
+    assert_eq!(h[1], ".wowbg3 hp pull-1 f130000000012b01 0 11");
+    assert_eq!(h[2], ".wowbg3 hero pull-1 0 14", "the mob's kill goes first");
+    // Never reported: not BG3's to lose (the first roster may name only part of a fight).
+    let mut f = fight();
+    f.handoff.clear();
+    f.apply(&Message::Roster {
+        encounter: e(),
+        joins: 0,
+        actors: vec![actor("hero", "0000000000000001", 14, 14)],
+    })
+    .unwrap();
+    assert_eq!(f.enemies[0].status, "in");
+    // BG3's first numbers say 0: the kill, not a template's HP.
+    let mut f = fight();
+    f.handoff.clear();
+    f.apply(&Message::Roster {
+        encounter: e(),
+        joins: 0,
+        actors: vec![e1(0)],
+    })
+    .unwrap();
+    assert_eq!(f.enemies[0].status, "dead");
+    let h: Vec<String> = f.handoff.iter().filter_map(Handoff::command).collect();
+    assert_eq!(h.last().unwrap(), ".wowbg3 hp pull-1 f130000000012b01 0 11");
+}
+#[test]
 fn a_stand_in_at_the_wow_mobs_own_fraction_is_no_damage_at_the_start() {
     // A wolf WoW has at 21/42 HP; its stand-in keeps the template's 11 HP at that
     // fraction (5.5, which BG3 shows as 5 or 6). Only HP under that (Tav's opening hit) is damage.

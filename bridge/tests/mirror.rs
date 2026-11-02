@@ -4,7 +4,7 @@ use wow_bg3_link::{
     bridge::{Combatant, CreatureStats, Fight},
     coords::{Basis, Point},
     handoff::{Handoff, ServerHandoff},
-    mirror::{Mapping, Mirror, bg3_forward, parse_mobs, parse_status},
+    mirror::{KILL_RETRY_MS, Mapping, Mirror, bg3_forward, parse_mobs, parse_status},
 };
 
 const MOBS: &str = "seq 7\n\
@@ -206,9 +206,97 @@ fn a_one_blow_kill_outside_a_fight_still_reaches_the_server() {
         }
     );
     assert!(matches!(&rec.0[2], Handoff::End { outcome, .. } if outcome == "victory"));
-    // Settled: not sent twice.
+    // Waiting for the server's answer: not sent twice.
     wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
     assert_eq!(rec.0.len(), 3);
+}
+
+fn kill_encounter(h: &Handoff) -> String {
+    match h {
+        Handoff::Begin { encounter, .. } => encounter.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_kill_refused_because_the_player_is_dead_waits_for_the_hero_and_is_not_settled() {
+    const GUID: &str = "f130000000012b01";
+    let mut m = mirror();
+    m.status = parse_status(&json!({"Tav": {"Hp": 0, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u1", "Hp": 0, "MaxHp": 11, "Dead": true, "HitByTav": true}}}));
+    let dead_hero = "seq 8\nhero 0000000000000001 -8920 53 132 0.5 0 52 1 1\n\
+        mob f130000000012b01 299 1 1 -8915 53 132 3.14159 100 100 0 Young Wolf\n";
+    m.mobs = parse_mobs(dead_hero);
+    let mut rec = Record(Vec::new());
+    wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
+    assert_eq!(rec.0.len(), 3);
+    let first = kill_encounter(&rec.0[0]);
+    m.kill_event(&format!("WOWBG3 begin {first} refused dead -"));
+    m.kill_event(&format!("WOWBG3 hp {first} F130000000012B01 refused unknown"));
+    m.kill_event(&format!("WOWBG3 end {first} refused unknown"));
+    // Refused: still dead, nothing sent, and the mob stays listed for the mod.
+    wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
+    assert_eq!(rec.0.len(), 3);
+    assert!(m.wanted(&[], m.now()).iter().any(|u| u.guid == GUID));
+    // The hero lives: at once, as a new encounter.
+    m.mobs = parse_mobs(MOBS);
+    wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
+    assert_eq!(rec.0.len(), 6);
+    let second = kill_encounter(&rec.0[3]);
+    assert_ne!(first, second);
+    // Landed: settled, not sent again.
+    m.kill_event(&format!("WOWBG3 hp {second} F130000000012B01 killed 0 42"));
+    wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
+    assert_eq!(rec.0.len(), 6);
+    assert!(!m.wanted(&[], m.now()).iter().any(|u| u.guid == GUID));
+}
+
+#[test]
+fn a_kill_refused_for_another_reason_is_asked_again_later() {
+    const GUID: &str = "f130000000012b01";
+    let mut m = mirror();
+    m.status = parse_status(&json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u1", "Hp": 0, "MaxHp": 11, "Dead": true, "HitByTav": true}}}));
+    m.kill_sent(GUID, "kill-1", 1_000);
+    m.kill_event("WOWBG3 begin kill-1 refused far F130000000012B01");
+    assert!(m.kills_due(1_000 + KILL_RETRY_MS - 1).is_empty());
+    assert_eq!(m.kills_due(1_000 + KILL_RETRY_MS), vec![GUID.to_string()]);
+    // The mob itself dead in WoW: nothing more to send.
+    m.kill_event("WOWBG3 begin kill-1 refused dead F130000000012B01");
+    assert!(m.settled.contains_key(GUID));
+    assert!(m.kills_due(m.now()).is_empty());
+}
+
+#[test]
+fn a_dead_stand_ins_mob_counts_as_respawned_only_after_a_confirmed_kill_and_leaving_the_list() {
+    const GUID: &str = "f130000000012b01";
+    let dead = json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u1", "Hp": 0, "MaxHp": 11, "Dead": true}}});
+    let without = "seq 9\nhero 0000000000000001 -8920 53 132 0.5 52 52 1\n";
+    let mut m = mirror();
+    m.status = parse_status(&dead);
+    m.note_respawns();
+    assert!(m.respawned().is_empty(), "the kill has not landed yet");
+    // Confirmed, and benilla has not caught up: still no respawn.
+    m.kill_event("WOWBG3 hp pull-1 F130000000012B01 killed 0 42");
+    m.note_respawns();
+    assert!(m.respawned().is_empty());
+    // Gone from mobs.txt (a corpse), then back: WoW respawned it.
+    m.mobs = parse_mobs(without);
+    m.note_respawns();
+    assert!(m.respawned().is_empty());
+    m.mobs = parse_mobs(MOBS);
+    m.note_respawns();
+    assert_eq!(m.respawned(), vec![GUID.to_string()]);
+    assert_eq!(
+        m.plan(1, "s1", &[], None, "t", None, "n", 0)["WowRespawned"],
+        json!([GUID])
+    );
+    // Its stand-in is remade: done with.
+    m.status = parse_status(&json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u2", "Hp": 11, "MaxHp": 11}}}));
+    m.note_respawns();
+    assert!(m.respawned().is_empty());
 }
 
 #[test]

@@ -637,6 +637,15 @@ pub fn parse_status(v: &Value) -> Status {
     s
 }
 
+/// A kill sent as its own encounter, not yet answered (`bridge::kills_outside_fights`).
+#[derive(Debug)]
+struct PendingKill {
+    encounter: String,
+    sent: u64,
+    /// The server refused it because the player is dead: again once the hero lives.
+    player_dead: bool,
+}
+
 /// What the bridge knows about the mirrors. Pure apart from `poll` and the clock.
 #[derive(Debug, Default)]
 pub struct Mirror {
@@ -675,6 +684,11 @@ pub struct Mirror {
     /// The running fight's living enemies, whose stand-ins BG3 runs: a mob that joined with no
     /// mirror has a stand-in all the same, so it is listed for benilla (portrait, clicks).
     pub in_fight: Vec<String>,
+    /// Kills sent outside a fight and not yet answered, by mob guid.
+    kills: HashMap<String, PendingKill>,
+    /// Mobs the server confirmed dead: guid -> left `mobs.txt` since (benilla lists the living
+    /// only). Back on the list after that, WoW has respawned it ([`Mirror::respawned`]).
+    wow_killed: HashMap<String, bool>,
 }
 
 /// Set by SIGTERM or SIGINT once [`catch_stop`] ran: the bridge's loops end at the next
@@ -700,6 +714,9 @@ pub fn catch_stop() {
 /// Milliseconds a mob of an ended fight stays unmirrored (its stand-in is respawned fresh, out of
 /// BG3's combat, afterwards).
 pub const SETTLE_MS: u64 = 60_000;
+/// Milliseconds before a kill the server refused for another reason than the player's death, or
+/// left unanswered, is asked again (the server's answer decides, not this time).
+pub const KILL_RETRY_MS: u64 = 15_000;
 
 impl Mirror {
     pub fn new(session: &str) -> Self {
@@ -932,7 +949,7 @@ impl Mirror {
             "HeroWowMaxHp": hero.map(|h| h.max_hp), "Hero": hero.map(|h| map.to_bg3(h.pos)),
             "HeroWowHp": hero.map(|h| h.hp), "HeroState": hero.map(|h| hero_state_name(h.state)),
             "Hostile": hostile_faction, "Neutral": neutral_faction,
-            "Mobs": mobs, "Fight": fight})
+            "Mobs": mobs, "Fight": fight, "WowRespawned": self.respawned()})
     }
     /// Mirrored mobs in Tav's BG3 combat (alive, not settled), nearest first.
     pub fn in_bg3_combat(&self, now: u64) -> Vec<String> {
@@ -993,6 +1010,92 @@ impl Mirror {
             })
             .map(|m| m.guid.clone())
             .collect()
+    }
+    /// The dead-unfought mobs whose kill should go to the server now: never sent, or refused
+    /// because the player was dead and the hero lives again, or `KILL_RETRY_MS` after any other
+    /// refusal or no answer. One still waiting stays listed in `mirror.json`.
+    pub fn kills_due(&mut self, now: u64) -> Vec<String> {
+        let dead = self.dead_unfought(now);
+        self.kills.retain(|g, _| dead.contains(g));
+        let alive = self.hero().is_some_and(|h| h.hp > 0 && h.state == 0);
+        dead.into_iter()
+            .filter(|g| match self.kills.get(g) {
+                None => true,
+                Some(k) if k.player_dead => alive,
+                Some(k) => now >= k.sent + KILL_RETRY_MS,
+            })
+            .collect()
+    }
+    /// A kill went out as this encounter.
+    pub fn kill_sent(&mut self, guid: &str, encounter: &str, now: u64) {
+        self.kills.insert(
+            guid.to_string(),
+            PendingKill {
+                encounter: encounter.to_string(),
+                sent: now,
+                player_dead: false,
+            },
+        );
+    }
+    fn player_dead_for(&mut self, encounter: &str) {
+        if let Some(k) = self.kills.values_mut().find(|k| k.encounter == encounter) {
+            k.player_dead = true;
+        }
+    }
+    /// A server line about kills. `hp ENC GUID killed|gone|dead ...` is WoW's word that the mob is
+    /// dead, in a fight or out of one. `begin ENC refused dead -` is the player dead;
+    /// `begin ENC refused dead GUID` the mob, which needs no kill any more.
+    pub fn kill_event(&mut self, line: &str) {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        if w.len() < 5 || w[0] != "WOWBG3" {
+            return;
+        }
+        let enc = w[2];
+        let killed = match (w[1], w[4]) {
+            ("hp", "killed" | "gone" | "dead") => guid_ok(w[3]),
+            ("begin", "dead") if w[3] == "refused" => match w.get(5).copied() {
+                Some("-") | None => {
+                    self.player_dead_for(enc);
+                    None
+                }
+                Some(mob) => guid_ok(mob),
+            },
+            ("hp", "refused") if w.get(5) == Some(&"dead") => {
+                self.player_dead_for(enc);
+                None
+            }
+            _ => None,
+        };
+        let Some(g) = killed else {
+            return;
+        };
+        self.wow_killed.entry(g.clone()).or_insert(false);
+        if self.kills.remove(&g).is_some() {
+            let now = self.now();
+            self.settle([g], now);
+        }
+    }
+    /// Mobs WoW has respawned: the server confirmed the kill, they left `mobs.txt`, and they are
+    /// listed again. Their dead stand-ins are stale (`mirror.json` `WowRespawned`, Mirrors.lua). A
+    /// listed mob with a dead stand-in and no confirmed kill is a kill not landed yet: not here.
+    pub fn respawned(&self) -> Vec<String> {
+        self.wow_killed
+            .iter()
+            .filter(|(g, gone)| **gone && self.unit(g).is_some())
+            .map(|(g, _)| g.clone())
+            .collect()
+    }
+    /// `mobs.txt` read: who of the killed left it, and who of them is done with (back on the list,
+    /// its stand-in no longer the dead one).
+    pub fn note_respawns(&mut self) {
+        let (mobs, status) = (&self.mobs.mobs, &self.status.mobs);
+        self.wow_killed.retain(|g, gone| {
+            let listed = mobs.iter().any(|m| m.guid == *g);
+            if !listed {
+                *gone = true;
+            }
+            !(*gone && listed && !status.get(g).is_some_and(|s| s.dead))
+        });
     }
     /// A pull (benilla's `pull.json` shape) for these mobs, from what benilla last reported.
     pub fn pull(&self, guids: &[String], seq: u64) -> Option<Value> {
@@ -1090,6 +1193,7 @@ impl Mirror {
         if let Some(v) = read_value(&link.join("mirror-status.json")) {
             self.status = parse_status(&v);
         }
+        self.note_respawns();
         self.seq += 1;
         let plan = self.plan(
             self.seq,

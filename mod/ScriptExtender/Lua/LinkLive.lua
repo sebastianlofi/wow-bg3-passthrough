@@ -470,20 +470,71 @@ local function newBackend(actors, void, runId, session)
         Ext.IO.SaveFile(DIR .. "standins.bin", string.pack("<c4I4I4d", "SIN1", WOWBG3SinSeq, n, Ext.Utils.MonotonicTime() * 1.0)
             .. table.concat(parts) .. string.pack("<I4", WOWBG3SinSeq))
     end
-    -- Every combatant as BG3 has it, for Roster (and what WoW was told last).
+    -- A combatant's HP and BG3 position: hp, max, position. This context's own entity first. A stand-in
+    -- can read nothing here while BG3's server has it (logs: Doras dead 50 m under his tower, a guard alive
+    -- at full HP 53 m off; both fell out of the roster), so then the server's word: mirror-status.json.
+    -- Listed nowhere (world mode): the stand-in is gone from BG3, HP 0 (max and position may be nil).
+    -- nil: nothing to go on just now (the hero, or the file unreadable); never a guess at a death.
+    local serverStatus, serverStatusAt, unread = nil, nil, {}
+    local function memberReading(id, uuid)
+        local hp, max = health(uuid)
+        local p = positionOf(uuid)
+        if hp and p then return hp, max, p end
+        if id == "hero" or not inWorld or not guids[id] then return nil end
+        if serverStatusAt ~= ticks then serverStatus, serverStatusAt = mirrorStatus(), ticks end
+        local st = serverStatus
+        if not (st and type(st.Mobs) == "table") then return nil end
+        local m = st.Mobs[guids[id]]
+        if not (type(m) == "table" and m.Uuid == uuid) then
+            m = type(st.FightSpawned) == "table" and st.FightSpawned[uuid] or nil
+        end
+        if not unread[id] then
+            unread[id] = true
+            Ext.Utils.Print("WOW-BG3 roster: " .. id .. " " .. tostring(uuid) .. " reads nothing here (HP "
+                .. tostring(hp) .. ", position " .. tostring(p ~= nil) .. "); server: "
+                .. (type(m) == "table" and ("HP " .. tostring(m.Hp) .. "/" .. tostring(m.MaxHp) .. " dead " .. tostring(m.Dead))
+                    or "no such stand-in"))
+        end
+        if type(m) ~= "table" then return 0 end
+        local maxHp, at = tonumber(m.MaxHp), type(m.Pos) == "table" and m.Pos or nil
+        maxHp = maxHp and maxHp > 0 and math.floor(maxHp) or nil
+        if m.Dead == true then return 0, maxHp, at end
+        local now = tonumber(m.Hp)
+        if not (now and maxHp) then return nil end
+        return math.floor(now), maxHp, at
+    end
+    -- Whether BG3 has this enemy standing; one with no reading just now counts as last reported.
+    local function memberAlive(a)
+        local hp = memberReading(a.id, actors[a.id])
+        if hp == nil and inWorld then hp = reported[a.id] end
+        return hp ~= nil and hp > 0
+    end
+    -- HP changed from what WoW was told last.
+    local function hpChanged(id, uuid)
+        if reported[id] == nil then return false end
+        local hp = memberReading(id, uuid)
+        return hp ~= nil and math.max(hp, 0) ~= reported[id]
+    end
+    -- Every combatant as BG3 has it, for Roster (and what WoW was told last). An enemy is always
+    -- listed: the bridge takes one that goes missing for the kill.
+    local rosterLast = {}
     local function rosterActors()
         local list = {}
-        local function add(id, uuid)
-            local hp, max = health(uuid)
-            local p = positionOf(uuid)
-            if hp and p and guids[id] then
+        local function add(id, uuid, a)
+            local hp, max, p = memberReading(id, uuid)
+            local last = rosterLast[id] or (a and {hp = a.hp, max = a.max_hp, position = a.position})
+            if hp == nil and last then hp = last.hp end
+            max = max or (last and last.max)
+            local position = (p and toBridge(p)) or (last and last.position)
+            if hp and max and position and guids[id] then
                 hp = math.max(0, math.min(hp, max))
-                list[#list + 1] = {id = id, wow_guid = guids[id], position = toBridge(p), hp = hp, max_hp = max}
+                list[#list + 1] = {id = id, wow_guid = guids[id], position = position, hp = hp, max_hp = max}
                 reported[id] = hp
+                rosterLast[id] = {hp = hp, max = max, position = position}
             end
         end
         add("hero", Hero.Uuid())
-        for _, a in ipairs(enemies) do add(a.id, actors[a.id]) end
+        for _, a in ipairs(enemies) do add(a.id, actors[a.id], a) end
         return list
     end
     -- BG3's own camera for hero actions: its cursor picking ignores an imposed rotation.
@@ -980,8 +1031,7 @@ local function newBackend(actors, void, runId, session)
             -- stand-ins still in BG3's combat never followed their mobs again.
             local alive, fighting = 0, 0
             for _, a in ipairs(enemies) do
-                local ehp = health(actors[a.id])
-                if ehp and ehp > 0 then
+                if memberAlive(a) then
                     alive = alive + 1
                     local st = combatState[a.id]
                     if not st or st.In or ticks - st.At < LEFT_GRACE then fighting = fighting + 1 end
@@ -1010,10 +1060,7 @@ local function newBackend(actors, void, runId, session)
         -- The last blow may have come from a direct BG3 action (world mode): WoW hears every final
         -- HP (the kill gives the server's credit) before the fight is over.
         for id, uuid in pairs(actors) do
-            local h = health(uuid)
-            if h and reported[id] ~= nil and math.max(h, 0) ~= reported[id] then
-                return ad:roster(joinsDone, rosterActors())
-            end
+            if hpChanged(id, uuid) then return ad:roster(joinsDone, rosterActors()) end
         end
         finished = true
         Ext.Utils.Print("WOW-BG3 fight over: " .. outcome .. (inWorld and " (BG3's combat)" or ""))
@@ -1177,8 +1224,7 @@ local function newBackend(actors, void, runId, session)
                     elseif ticks % 30 == 0 and not job and not npc and not ad.pending and ad.phase == "active" then
                         -- HP that changed without an Effect (a direct BG3 action): Roster.
                         for id, uuid in pairs(actors) do
-                            local hp = health(uuid)
-                            if hp and reported[id] ~= nil and math.max(hp, 0) ~= reported[id] then
+                            if hpChanged(id, uuid) then
                                 ad:roster(joinsDone, rosterActors())
                                 break
                             end
@@ -1192,8 +1238,7 @@ local function newBackend(actors, void, runId, session)
                     -- The fight may already be over (the last enemy died): nothing to end.
                     local alive = false
                     for _, a in ipairs(enemies) do
-                        local ehp = health(actors[a.id])
-                        if ehp and ehp > 0 then alive = true end
+                        if memberAlive(a) then alive = true end
                     end
                     if not alive then job = nil
                     elseif ticks % 10 == 0 then
