@@ -8,9 +8,10 @@
 --   {Seq, Session, Active, HeroWowMaxHp, Hostile = faction, Neutral = faction, Fight = {guid...},
 --    Mobs = {{Guid, Template, Kind, Hostile, Pos = {x,y,z} BG3, Dir = {fx,fz} BG3 forward, WowHp,
 --             WowMaxHp, WowDamage, BaseDamage, Name}...}}
--- Each listed mob gets one stand-in (Osiris CreateAt of the template, the hostile or neutral
--- faction) with its template's own BG3 max HP at the WoW mob's HP fraction (set in the tick that
--- creates it) and a DamageBonus boost as the world-fights notes says (BG3 still rolls
+-- Each listed mob gets one stand-in (Osiris CreateAt of the template, the faction Relations.lua
+-- gives it: hostile for WoW's hostile and neutral mobs, so BG3's left click attacks them; neutral
+-- for friendly NPCs) with its template's own BG3 max HP at the WoW mob's HP fraction (set in the
+-- tick that creates it) and a DamageBonus boost as the world-fights notes says (BG3 still rolls
 -- everything), kept where the mob is (TeleportToPosition with
 -- snap, turned to its facing) and at its HP fraction while out of BG3 combat. Mobs in the
 -- running fight (Fight) are never moved, healed or removed: BG3 runs them. Unlisted stand-ins are
@@ -112,6 +113,7 @@ local Hero = Ext.Require("Hero.lua") -- the hero: the character the player contr
 local Party = Ext.Require("Party.lua")
 local Scaling = Ext.Require("Scaling.lua")
 local Death = Ext.Require("Death.lua")
+local Relations = Ext.Require("Relations.lua") -- a stand-in's faction and when it may join a combat
 local KILL_LANDS, REVIVE_AGAIN = 60, 150 -- ticks: ApplyDamage reaching her; between asks for a WoW revive
 local STRIKE_PARTY = 16
 local REGION = Ext.Require("Hero.lua").REGION -- host level (Hero.lua, host.json)
@@ -323,14 +325,16 @@ function M.Start(runId)
     -- Stand-ins Tav has hurt (a kill outside a fight is hers only then).
     local hitByTav = {}
     -- Group aggro as in WoW: a neutral WoW mob fights only when Tav
-    -- attacks it herself. BG3 would pull every neutral stand-in near the one she attacked (one
-    -- shared faction, TEMPORARILY_HOSTILE), so neutral stand-ins cannot join a combat
-    -- (SetCanJoinCombat 0) until Tav targets or hurts that one. Hostile mobs keep BG3's joining.
+    -- attacks it herself. Its stand-in is hostile in BG3 (Relations.lua: BG3's left click attacks
+    -- it), so BG3 would start a fight when it sees her and pull every neutral stand-in near one she
+    -- attacked; neutral stand-ins cannot join a combat (SetCanJoinCombat 0) until Tav targets or
+    -- hurts that one. Hostile mobs keep BG3's joining. uuid -> tick of the last aim, hit, fight or
+    -- combat: a neutral one out of all of them for Relations.CALM ticks forgets (`NeutralCalmed`).
     local provoked = {}
     local function provoke(uuid)
-        if uuid and M.Owned[uuid] and not provoked[uuid] then
-            provoked[uuid] = true
-            pcall(Osi.SetCanJoinCombat, uuid, 1)
+        if uuid and M.Owned[uuid] then
+            if not provoked[uuid] then pcall(Osi.SetCanJoinCombat, uuid, 1) end
+            provoked[uuid] = ticks
         end
     end
     -- Friendly NPCs (see the header): uuid -> tick of Tav's last aim or hit; its crime reaction is
@@ -752,10 +756,10 @@ function M.Start(runId)
         for _, s in ipairs(KIND_SPELLS[mob.Kind] or {}) do pcall(Osi.AddSpell, uuid, s, 0, 1) end
         pcall(Abilities.Grant, uuid, mob.Entry)
         local plan = readJson("mirror.json") or {}
-        local faction = mob.Hostile and plan.Hostile or plan.Neutral
-        if type(faction) == "string" and uuidOf(faction) then Osi.SetFaction(uuid, faction) end
+        local faction = Relations.FactionOf(mob, plan)
+        if faction and uuidOf(faction) then Osi.SetFaction(uuid, faction) end
         M.Owned[uuid] = mob.Guid
-        if not mob.Hostile then pcall(Osi.SetCanJoinCombat, uuid, 0) end
+        if not Relations.JoinsOnSight(mob) then pcall(Osi.SetCanJoinCombat, uuid, 0) end
         local friendly = mob.Friendly == true
         local outfit, outfitError
         if friendly then
@@ -1263,7 +1267,15 @@ function M.Start(runId)
                         combat = nil -- not reported as in Tav's combat, so the bridge does not pull it
                     end
                 end
-                if inFight then provoke(m.Uuid) end
+                if inFight or (combat and provoked[m.Uuid]) then provoke(m.Uuid) end
+                -- A provoked neutral mob left alone again (the fight over without its death, a miss
+                -- BG3 and WoW let go): it forgets, as a WoW mob that evaded, and does not start a
+                -- fight on sight (Relations.lua).
+                if Relations.Calms(m, provoked[m.Uuid], ticks, inFight, combat and true or false, dead) then
+                    provoked[m.Uuid] = nil
+                    pcall(Osi.SetCanJoinCombat, m.Uuid, 0)
+                    m.NeutralCalmed = (m.NeutralCalmed or 0) + 1
+                end
                 -- A friendly stand-in Tav left alone again without a fight: back to blocked
                 -- reactions and out of combats (a heal, a zero-damage warning, a missed aim).
                 if friendlyAimed[m.Uuid] and not inFight and not combat and not dead and not searching[m.Uuid]
@@ -1367,7 +1379,7 @@ function M.Start(runId)
                 Friendly = m.Friendly, Guard = m.Guard, CrimeReady = friendlyAimed[m.Uuid] ~= nil,
                 Searching = searching[m.Uuid] ~= nil,
                 FriendlyReset = m.FriendlyReset,
-                Provoked = provoked[m.Uuid] == true, LeftCombat = m.LeftCombat,
+                Provoked = provoked[m.Uuid] ~= nil, NeutralCalmed = m.NeutralCalmed, LeftCombat = m.LeftCombat,
                 Named = m.Named, NameText = m.NameText, NameError = m.NameError, Aimed = aimed[m.Uuid] and ticks - aimed[m.Uuid] or nil,
                 SpawnHp = m.SpawnHp, SpawnFrac = m.SpawnFrac, HpInit = m.HpInit,
                 Outfit = m.Outfit, OutfitError = m.OutfitError,

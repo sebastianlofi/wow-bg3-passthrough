@@ -415,7 +415,8 @@ local function newBackend(actors, void, runId, session)
             scaled[a.id] = {Adopted = uuid, Kind = specs[a.id] and specs[a.id].Kind, Name = specs[a.id] and specs[a.id].Name,
                 Scale = mirror.Scale, Hp = {mirror.Hp, mirror.MaxHp}}
             -- A neutral mob in the fight was provoked in WoW: BG3 only lets a hostile character
-            -- join (Osiris EnterCombat did nothing for a neutral stand-in in the harness).
+            -- join (Osiris EnterCombat did nothing for a neutral stand-in in the harness). Mirrors.lua
+            -- spawns WoW-neutral mobs hostile already (Relations.lua); this covers a plan without one.
             -- A friendly NPC WoW's rules pulled in (its creature group) turns
             -- on Tav the way BG3 turns someone attacked: a temporary hostile relation, its own
             -- faction kept (the one Tav attacked is in BG3's combat already, its crime flow did it).
