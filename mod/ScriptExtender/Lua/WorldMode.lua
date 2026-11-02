@@ -32,12 +32,11 @@
 -- BG3's way to attack someone who is not hostile, or an aimed attack or spell; WowCursor.lua sets
 -- WOWBG3BG3TakesClick), the click is BG3's alone and WoW never hears of it.
 --
--- Pickpocket where BG3's pick misses: BG3's own click runs a client task (CharacterTask_Pickpocket: it
--- walks there, then asks the server, which raises RequestPickpocket), started only from BG3's pick of
--- the victim; Osiris has no move-and-pickpocket. WoW's model and the stand-in do not cover the same pixels,
--- so on the model alone BG3 picks ground. That click is held back (below, aimPickpocket) and BG3 gets
--- its click where it does pick the stand-in, the way LinkLive.lua aims: pointer there, BG3's pick
--- must agree, click, pointer back. If it does not agree nothing happens (world-status.json PickAim).
+-- WoW's model and the stand-in do not cover the same pixels, so on the model alone BG3 picked ground.
+-- StandInAim.lua (from WowCursor.lua's tick, plugin op 32) has BG3's own pick find the stand-in of the unit
+-- WoW has under the pointer, so BG3's click there is BG3's own for every action aimed at it (attack,
+-- spell, shove, throw, talk, pickpocket: CharacterTask_Pickpocket starts only from BG3's pick of the
+-- victim). A sneaking click on a friendly NPC that BG3 still does not pick is held back (nothing happens).
 --
 -- Errands (merchants and bodies used from far away): the WoW body never
 -- walks by itself, it follows Tav. A click on a WoW NPC, body or object out of reach makes benilla
@@ -342,56 +341,6 @@ function M.Start(runId)
         return ok and yes
     end
     M.Bg3WindowOpen = bg3WindowOpen
-    -- Pickpocket where BG3's pick misses (see the header). Heights: the middle of the body first.
-    local PICK_LIFTS = {1.0, 0.4, 1.6}
-    local PICK_SETTLE = 10 -- ticks for BG3's pick to follow the pointer (as ActionProbe's ClickWorld)
-    local pickAim = nil
-    local function aimPickpocket(uuid)
-        if pickAim then return end
-        pickAim = {Uuid = uuid, Lift = 1, Stage = "aim", At = ticks, Back = cursor()}
-    end
-    local function stepPickAim()
-        local j = pickAim
-        if not j then return end
-        local function finish(result)
-            pickAim = nil
-            local now = cursor()
-            -- The pointer back, unless the player has moved it meanwhile.
-            if j.Back and j.X and now and math.abs(now[1] - j.X) < 2 and math.abs(now[2] - j.Y) < 2 then
-                Ext._Internal.InjectMouse(0, 0, false, math.floor(j.Back[1] + 0.5), math.floor(j.Back[2] + 0.5))
-            end
-            local r = {Uuid = j.Uuid, Result = result, From = j.Back, To = j.X and {j.X, j.Y} or nil,
-                Lift = PICK_LIFTS[j.Lift], Pick = j.Pick, Tick = ticks}
-            Ext.Log.Print("WOW-BG3 world: pickpocket click " .. Ext.Json.Stringify(r))
-            writeStatus({PickAim = r})
-        end
-        if not (state and state.Started) or M.InCamp() then return finish("world mode left") end
-        if j.Stage == "aim" then
-            local e = assert(Ext.Entity.Get(j.Uuid), "no stand-in on the client")
-            local t = e.Transform.Transform.Translate
-            local dc = Probe.FindUnique("HotBar", "HotBar").DataContext
-            local w, h = Probe.ScreenSize(dc)
-            local s = Probe.Project({t[1], t[2] + PICK_LIFTS[j.Lift], t[3]}, w, h)
-            local x, y, safe = math.floor(s.X + 0.5), math.floor(s.Y + 0.5), Probe.Safe(w, h)
-            if x < safe.x0 or x > safe.x1 or y < safe.y0 or y > safe.y1 then return finish("stand-in off the screen area") end
-            Ext._Internal.InjectMouse(0, 0, false, x, y)
-            j.X, j.Y, j.Stage, j.At = x, y, "check", ticks
-        elseif j.Stage == "check" and ticks - j.At >= PICK_SETTLE then
-            local pick = Probe.PickInfo()
-            j.Pick = {pick.Character1, pick.Character2}
-            if pick.Character1 == j.Uuid or pick.Character2 == j.Uuid then
-                Ext._Internal.InjectMouse(1, 1, true, j.X, j.Y)
-                j.Stage, j.At = "release", ticks
-            elseif PICK_LIFTS[j.Lift + 1] then
-                j.Lift, j.Stage = j.Lift + 1, "aim"
-            else
-                finish("BG3's pick did not agree")
-            end
-        elseif j.Stage == "release" and ticks - j.At >= 3 then
-            Ext._Internal.InjectMouse(1, 1, false, j.X, j.Y)
-            finish("BG3's click")
-        end
-    end
     -- Errands (below): BG3 ignores the player's clicks while an Osiris move runs on Tav (harness
     -- tests), so a press during an errand stops her at once (stopErrandNow, set further down),
     -- before BG3 takes the click at its release.
@@ -422,9 +371,8 @@ function M.Start(runId)
                 if fc then
                     unheard = true
                     takes = fc.Mode == "talk" or fc.Mode == "pickpocket"
-                    if fc.Mode == "pickpocket" then
-                        if ev.Pressed == false then aimPickpocket(fc.Uuid) end
-                    elseif takes and ev.Pressed == false then
+                    -- "pickpocket": BG3 does not pick the stand-in even under WoW's model; held back.
+                    if fc.Mode ~= "pickpocket" and takes and ev.Pressed == false then
                         M.FriendlySeq = math.max((M.FriendlySeq or 0) + 1, math.floor(Ext.Utils.MonotonicTime()))
                         Ext.IO.SaveFile("wow-bg3/link/friendlyclick.txt",
                             string.format("%d %s %s %s\n", M.FriendlySeq, fc.Mode, fc.Guid or "0", fc.Uuid))
@@ -782,19 +730,7 @@ function M.Start(runId)
                 local ok, err = pcall(readErrand)
                 if not ok then lastExtra.ErrandError = tostring(err) end
             end
-            if pickAim then
-                local okA, errA = pcall(stepPickAim)
-                if not okA then
-                    Ext.Log.Print("WOW-BG3 world: pickpocket click failed: " .. tostring(errA))
-                    lastExtra.PickAim = {Uuid = pickAim.Uuid, Result = tostring(errA), Tick = ticks}
-                    if pickAim.X and pickAim.Back then
-                        pcall(Ext._Internal.InjectMouse, 0, 0, false, math.floor(pickAim.Back[1] + 0.5), math.floor(pickAim.Back[2] + 0.5))
-                    end
-                    pickAim = nil
-                end
-            elseif not M.InCamp() then
-                publishInput(false) -- not during an aim: WoW's pointer stays where the player's is
-            end
+            if not M.InCamp() then publishInput(false) end
             if ticks % 600 == 0 then writeStatus() end
             -- Tav's meshes and poses for WoW (TavPlan.lua), checked every TavPlan.Every ticks (since
             -- Every 10, was 30: a weapon drawn or an attachment of a cast reaches WoW
