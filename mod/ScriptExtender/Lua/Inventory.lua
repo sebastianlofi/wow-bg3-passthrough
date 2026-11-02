@@ -44,6 +44,9 @@ pcall(Ext.Vars.RegisterUserVariable, VAR, {Server = true, Client = false, SyncTo
 -- On an item: its WoW entry (the stats entry name says it too, but only once that entry exists).
 local ENTRY_VAR = "WowBg3Entry"
 pcall(Ext.Vars.RegisterUserVariable, ENTRY_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+-- On an item: the BG3 base it was made from. Its template stays that base's, whatever the table says later.
+local BASE_VAR = "WowBg3Base"
+pcall(Ext.Vars.RegisterUserVariable, BASE_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
 -- On a party member: the boosts of the WoW-only pieces (shoulders, legs, ...) its WoW character wears.
 local WORN_VAR = "WowBg3Worn"
 pcall(Ext.Vars.RegisterUserVariable, WORN_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
@@ -368,7 +371,10 @@ end
 -- the body part under it (a playtest report: no feet in the world or the examine screen; harness: his
 -- WoW boots, entry 140, were in neither his nor the harness's used list). Such an item is removed (its
 -- entry now marked used) and the next reconcile makes it again from WoW's list, equipped if WoW wears it.
+-- A thrown weapon from a save made before it was a dagger goes the same way: it has the dart's template and
+-- may sit in BG3's ranged slot, which BG3 does not throw from.
 M.Remade = 0
+function M.OldThrown(row, base) return row.s == "Thrown" and base ~= row.b end
 local suffixed = {} -- uuid -> the suffix its name shows (reconcile)
 function M.Redress()
     local n, broken = 0, {}
@@ -381,7 +387,9 @@ function M.Redress()
             entry = type(sid) == "string" and tonumber(sid:match("^" .. PREFIX_STATS .. "(%d+)$"))
         end
         local row = entry and M.Item(entry)
-        if row and M.Dress(u, row) then n = n + 1 end
+        if row and M.OldThrown(row, q(function() return e.Vars[BASE_VAR] end)) then
+            broken[#broken + 1] = {u, entry}
+        elseif row and M.Dress(u, row) then n = n + 1 end
     end)
     for _, b in ipairs(broken) do
         if math.type(b[2]) == "integer" and not M.Used[b[2]] then M.Used[b[2]] = true; M.UsedDirty = true end
@@ -414,6 +422,7 @@ function M.Create(entry, holder, count, tag, rand)
     M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (components settle)
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
+    e.Vars[BASE_VAR] = row.b
     M.Suppress(u)
     -- The whole stack before it moves: BG3 sends camp supplies on to the Camp Supply Sack, and of a stack
     -- raised after the move only the moved 1 went, a stray bare copy WoW's list does not know.
@@ -681,6 +690,23 @@ local function keepsOwn(uuid, row)
 end
 M.KeepsOwn = keepsOwn
 
+-- A WoW thrown weapon is a BG3 dagger: BG3 throws it from the bag or a hand, never from its ranged slot
+-- (Throw_Throw's ThrowableTargetConditions). WoW wears it in its ranged slot, beside its main hand, and BG3 has
+-- one main hand for both: while WoW holds something there, that goes in BG3's, and the dagger waits in the bag.
+function M.ThrownWaits(row, list)
+    if row.s ~= "Thrown" then return false end
+    for _, it in ipairs(list) do
+        if it.Bag == 255 and it.Slot == 15 then return true end
+    end
+    return false
+end
+-- WoW's hand slots in BG3. What WoW puts there may push a worn dagger out of BG3's hand: WoW's ranged slot stays.
+local BG3_HAND = {[15] = "MeleeMainHand", [16] = "MeleeOffHand"}
+local function freeHand(uuid, slot)
+    local held = BG3_HAND[slot] and uuidOf(q(Osi.GetEquippedItem, uuid, BG3_HAND[slot]))
+    if held and (M.Item(entryOf(held) or -1) or {}).s == "Thrown" then M.Suppress(held) end
+end
+
 local function reconcileMember(uuid, m, have)
     if type(m) ~= "table" or m.Error or type(m.Items) ~= "table" then return end
     if not q(Ext.Entity.Get, uuid) then return end
@@ -715,7 +741,9 @@ local function reconcileMember(uuid, m, have)
                 pcall(Osi.ToInventory, u, uuid, it.Count or 1, 0, 0)
             end
             local eq = equipped(u)
-            if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row) then
+            if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row)
+                and not M.ThrownWaits(row, m.Items) then
+                freeHand(uuid, it.Slot)
                 M.Suppress(u)
                 pcall(Osi.Equip, uuid, u)
             elseif not wantEquip and eq then
