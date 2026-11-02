@@ -414,11 +414,15 @@ class Life:
         known = [m['Char'] for m in members if m.get('Char')] + ([self.a.char] if self.a.char else [])
         self.wait_offline(known)
         sid = lc_.get('SaveId')
+        lost = set()  # characters the loaded save's snapshot holds and the database lacks: never made again
         if self.keep_chars:
             self.keep_chars = False
             log('benilla again: WoW characters as they are')
         elif sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
             secs = wowsave.sections(sid)
+            # A new database (a reinstall kept the saves): the server's start put them back (wowsave.py rehome,
+            # wowbg3-server.sh start); one still missing would come back as a new level 1 character.
+            lost = {n for n in secs if not wowsave.exists(n)}
             if self.wait_offline(list(secs), 60):
                 try:
                     wowsave.restore(sid)
@@ -456,6 +460,13 @@ class Life:
             self.why = 'no WoW character for the hero'
             log('no WoW character for the hero: WoW stays down')
             return False
+        was = (snap if isinstance(snap, dict) else {}).get(members[0]['Uuid'])
+        if hero_char in lost or was in lost:
+            self.why = ('WoW character %s is in save %s\'s snapshot but not in the server\'s database: the server puts '
+                        'it back when it starts (start BG3 again; logs/server.log says why it did not)' % (
+                            was if was in lost else hero_char, sid))
+            log(self.why)
+            return False
         self.phase(session, 'benilla', Char=hero_char)
         if members[0]['Uuid'] in make:
             # Made and logged in by one benilla start; the name may change if the server refuses it.
@@ -491,6 +502,9 @@ class Life:
         for m in members[1:]:
             name = self.chars.get(m['Uuid'])
             if not name:
+                continue
+            if name in lost:  # `bot add` would make it again, at level 1
+                log('bot %s stays offline: in the snapshot, not in the server\'s database' % name)
                 continue
             if bots:
                 self.bot_in(hero_char, m, name)

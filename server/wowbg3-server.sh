@@ -54,19 +54,35 @@ progress() { mkdir -p "$RUN"; echo "$1" > "$RUN/progress.tmp" && mv -f "$RUN/pro
 fail() { mkdir -p "$RUN"; echo "$*" > "$RUN/error"; die "$*"; }
 # The release's python (python/ beside server/), else the runtime's.
 PY="$ROOT/../python/bin/python3"; [ -x "$PY" ] || PY=python3
-alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+# Whether pid $2 is the $1 this server folder started for this var/: told by its own command line (the
+# program and its config or data folder, as start() and db_start() pass them) and, for the console holder, by
+# the console pipe it holds open. Not by name: mangosd and realmd call their main thread mangosd-main and
+# realmd-main in /proc/PID/comm (the name check took the running server for a left-over pid file, so stop()
+# skipped its saveall and the sweep killed it), and another copy of the server has the same names. A
+# finished process (gone, or a zombie with no command line) is not ours.
+ours() {
+    local cmd
+    cmd=$(tr '\0' ' ' < "/proc/$2/cmdline" 2>/dev/null) || return 1
+    case "$1:$cmd" in
+        mangosd:*"$ROOT/bin/mangosd -c $V/etc/mangosd.conf "*) return 0 ;;
+        realmd:*"$ROOT/bin/realmd -c $V/etc/realmd.conf "*) return 0 ;;
+        mariadb:*"/bin/mariadbd "*" --datadir=$V/db "*) return 0 ;;
+        console-holder:"sleep infinity ")
+            [ -p "$RUN/console" ] && [ "$(readlink -f "/proc/$2/fd/1" 2>/dev/null)" = "$(readlink -f "$RUN/console")" ] ;;
+        *) return 1 ;;
+    esac
+}
+alive() { [ -f "$RUN/$1.pid" ] && ours "$1" "$(cat "$RUN/$1.pid")"; }
 # A pid file left by a game that was killed: this start runs in a new container, whose low pids are handed out
-# again, so such a file can name a live process that is something else. `alive` would then say a server that is
-# not running is, and it would never be started (the character stays "online", benilla waits at the realm list).
+# again, so such a file can name a live process that is something else. A plain `kill -0` would then say a server
+# that is not running is, and it would never be started (the character stays "online", benilla waits at the realm
+# list). Such a file goes; one that names the live process we started stays.
 stale_pids() {
     local p pid
     for p in mangosd realmd console-holder mariadb; do
         [ -f "$RUN/$p.pid" ] || continue
         pid=$(cat "$RUN/$p.pid")
-        case "$p:$(cat "/proc/$pid/comm" 2>/dev/null)" in
-            mangosd:mangosd|realmd:realmd|console-holder:sleep|mariadb:mariadbd) ;;
-            *) say "$p's pid file names pid $pid, which is not $p: left over"; rm -f "$RUN/$p.pid" ;;
-        esac
+        ours "$p" "$pid" || { say "$p's pid file names pid $pid, which is not our $p: left over"; rm -f "$RUN/$p.pid"; }
     done
 }
 secret() { grep "^$1=" "$V/secrets.env" | cut -d= -f2; }
@@ -195,6 +211,19 @@ init() {
     say "initialised; start with: $0 start"
 }
 
+# A BG3 save's WoW character the database lacks (a new database, BG3's saves and their snapshots kept: a
+# reinstall) is put back from its snapshot on its own account (wowsave.py rehome), here, before mangosd starts:
+# mangosd reads its highest guids and its character names only when it starts. The release only (its tools sit
+# beside server/, and the launcher gives the paths); a failure is logged and the server starts anyway.
+rehome() {
+    local t="$ROOT/../tools/link/tools/relenv.py"
+    [ -f "$t" ] && [ -n "${WOWBG3_HOME:-}" ] && [ -n "${WOWBG3_DATA:-}" ] && [ -n "${WOWBG3_IO:-}" ] || return 0
+    if ! WOWBG3_SERVER_VAR="$V" WOW_BG3_SERVER="$ROOT" "$PY" "$t" wowsave rehome; then
+        say "the snapshots' characters were not all put back (the lines above say why)"
+    fi
+    return 0
+}
+
 # `run` owns its children: they stay in this script's process group, so one signal to the group reaches
 # every one of them and nothing is left behind when the script is killed outright. mangosd and realmd both
 # shut down cleanly on SIGTERM, and stop() still does the saveall. `start` (a server meant to outlive the
@@ -220,6 +249,7 @@ start() {
         # No reuse of item guids: a gap in today's table can be an item a BG3 save's snapshot brings back, and a
         # new item then had the guid of a restored one (wowsave.py keeps the highest above any snapshot).
         set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0" "ReusableGuidPoolSize=0"
+        rehome
         rm -f "$RUN/console"; mkfifo -m 600 "$RUN/console"
         # The console reads the fifo; a holder keeps it open so mangosd never sees end of input.
         ( exec $sid sleep infinity > "$RUN/console" < /dev/null ) &
@@ -263,13 +293,8 @@ stop() {
 reap() {
     local p pid pgid
     for p in mangosd realmd console-holder mariadb; do
-        alive "$p" || continue
+        alive "$p" || continue   # only the process we started (ours): a pid given since to something else is left alone
         pid=$(cat "$RUN/$p.pid")
-        # A pid file left by a crash can name a pid the system has since given to something else.
-        case "$p:$(cat "/proc/$pid/comm" 2>/dev/null)" in
-            mangosd:mangosd|realmd:realmd|console-holder:sleep|mariadb:mariadbd) ;;
-            *) say "$p's pid file names pid $pid, which is not $p now: left alone"; continue ;;
-        esac
         say "$p (pid $pid) did not stop: killing it"
         kill -9 "$pid" 2>/dev/null || true
     done

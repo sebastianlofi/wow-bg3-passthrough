@@ -69,7 +69,9 @@ the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and not
 
 World mode only happens in games started with WOW-BG3 enabled; older saves stay plain BG3 (loading
 one says so in a message box). Saving and loading work as in BG3: each BG3 save keeps a snapshot of
-the WoW characters, and loading an older save takes them back to that point too.
+the WoW characters, and loading an older save takes them back to that point too. A new server
+database (a reinstall that dropped `~/.local/share/wow-bg3/server/` but kept the snapshots) keeps
+them as well: when the server starts, it puts each saved WoW character back from its snapshot.
 
 ## Removing it
 
