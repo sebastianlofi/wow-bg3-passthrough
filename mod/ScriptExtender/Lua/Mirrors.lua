@@ -909,7 +909,11 @@ function M.Start(runId)
         -- report; harness: the caught-stealing dialog on Duokna).
         if ticks % 5 == 0 then
             for u in pairs(hiddenInDialog) do
-                if not inDialog(u) then hiddenInDialog[u] = nil; pcall(Osi.SetVisible, u, 1) end
+                if not inDialog(u) then
+                    hiddenInDialog[u] = nil
+                    pcall(Osi.SetVisible, u, 1)
+                    Ext.Utils.Print(string.format("WOW-BG3 dialog: %s out, tick %d", u, ticks))
+                end
             end
         end
         for guid, m in pairs(mirrors) do
@@ -917,6 +921,10 @@ function M.Start(runId)
                 hiddenInDialog[m.Uuid] = true
                 pcall(Osi.SetVisible, m.Uuid, 0)
                 M.DialogHides = (M.DialogHides or 0) + 1
+                -- What it holds, for the shine on a shield in a dialog (no recording; layer.log's "void:" lines).
+                Ext.Utils.Print(string.format("WOW-BG3 dialog: %s in, hand %s, off hand %s, tick %d", m.Uuid,
+                    tostring(q(Osi.GetEquippedItem, m.Uuid, "MeleeMainHand")),
+                    tostring(q(Osi.GetEquippedItem, m.Uuid, "MeleeOffHand")), ticks))
             end
             local p, dir = liveWant(guid)
             m.LiveAt = p and ticks or m.LiveAt
@@ -1338,6 +1346,7 @@ function M.Start(runId)
             Session = session, FaceMode = M.FaceMode, FaceStats = M.FaceStats, Tav = tav, Mobs = mobs, Problems = problems,
             Strikes = M.Strikes or 0, LiveStats = M.LiveStats, Life = M.Life, HeroState = heroState,
             HpGuard = M.HpGuard, HpRises = M.HpRises, Spawns = M.Spawns, Removes = M.Removes, HelpCalled = M.HelpCalled,
+            DialogHides = M.DialogHides,
             Pickpockets = M.Pickpockets,
             Searches = M.Searches, CrimeKinds = M.CrimeKinds, LastCrime = M.LastCrime,
             Respawned = (function()
