@@ -44,6 +44,9 @@ pcall(Ext.Vars.RegisterUserVariable, VAR, {Server = true, Client = false, SyncTo
 -- On an item: its WoW entry (the stats entry name says it too, but only once that entry exists).
 local ENTRY_VAR = "WowBg3Entry"
 pcall(Ext.Vars.RegisterUserVariable, ENTRY_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+-- On an item: the BG3 base it was made from. Its template stays that base's, whatever the table says later.
+local BASE_VAR = "WowBg3Base"
+pcall(Ext.Vars.RegisterUserVariable, BASE_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
 -- On a party member: the boosts of the WoW-only pieces (shoulders, legs, ...) its WoW character wears.
 local WORN_VAR = "WowBg3Worn"
 pcall(Ext.Vars.RegisterUserVariable, WORN_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
@@ -208,12 +211,16 @@ function M.TradeBase()
     if type(v) == "number" and v >= 1 then tradeBase = v end
     return tradeBase
 end
-function M.ValueOf(row, ware)
+-- A BG3 thrown dagger is one item, as BG3's own are, and stands for a whole WoW stack: a ware for WoW's lot (lp), the
+-- party's for what its WoW stack holds (count), which is what WoW buys and sells when it moves.
+function M.ValueOf(row, ware, count)
     local cpg = M.CopperPerGold or 1
     local bp = (row.bp or 0) / cpg
-    if ware then return Prices.Ware(bp, tradeBase) end
-    return Prices.Held((row.sp or 0) / cpg, bp, tradeBase)
+    if ware then return Prices.Ware((row.lp or row.bp or 0) / cpg, tradeBase) end
+    return Prices.Held((row.sp or 0) * (count or 1) / cpg, bp, tradeBase)
 end
+-- How many BG3 holds for WoW's count: always one dagger.
+function M.AmountOf(row, count) return row.s == "Thrown" and 1 or count end
 local function setValue(e, want)
     local ok, cur = pcall(function() return e.Value.Value end)
     if not ok or cur == want then return false end
@@ -368,7 +375,10 @@ end
 -- the body part under it (a playtest report: no feet in the world or the examine screen; harness: his
 -- WoW boots, entry 140, were in neither his nor the harness's used list). Such an item is removed (its
 -- entry now marked used) and the next reconcile makes it again from WoW's list, equipped if WoW wears it.
+-- A thrown weapon from a save made before it was a dagger goes the same way: it has the dart's template and
+-- may sit in BG3's ranged slot, which BG3 does not throw from.
 M.Remade = 0
+function M.OldThrown(row, base) return row.s == "Thrown" and base ~= row.b end
 local suffixed = {} -- uuid -> the suffix its name shows (reconcile)
 function M.Redress()
     local n, broken = 0, {}
@@ -381,7 +391,9 @@ function M.Redress()
             entry = type(sid) == "string" and tonumber(sid:match("^" .. PREFIX_STATS .. "(%d+)$"))
         end
         local row = entry and M.Item(entry)
-        if row and M.Dress(u, row) then n = n + 1 end
+        if row and M.OldThrown(row, q(function() return e.Vars[BASE_VAR] end)) then
+            broken[#broken + 1] = {u, entry}
+        elseif row and M.Dress(u, row) then n = n + 1 end
     end)
     for _, b in ipairs(broken) do
         if math.type(b[2]) == "integer" and not M.Used[b[2]] then M.Used[b[2]] = true; M.UsedDirty = true end
@@ -396,6 +408,7 @@ M.Fresh = {}
 -- A new BG3 item for WoW entry `entry` (count for stacks) in `holder`'s inventory; tag = WowBg3Item.
 function M.Create(entry, holder, count, tag, rand)
     local row = M.Variant(assert(M.Item(entry), "no item " .. tostring(entry)), rand)
+    count = M.AmountOf(row, count)
     M.MakeStats(row)
     M.MakeStrings(row)
     local rt = assert(rootOf(row), "no root template for " .. tostring(row.b))
@@ -414,6 +427,7 @@ function M.Create(entry, holder, count, tag, rand)
     M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (components settle)
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
+    e.Vars[BASE_VAR] = row.b
     M.Suppress(u)
     -- The whole stack before it moves: BG3 sends camp supplies on to the Camp Supply Sack, and of a stack
     -- raised after the move only the moved 1 went, a stray bare copy WoW's list does not know.
@@ -530,11 +544,12 @@ local function isWare(holder, tag)
     return not holder or (WOWBG3MirrorOwned or {})[holder] ~= nil
 end
 M.IsWare = isWare
+local wowCount = {} -- WoW item guid -> what its stack holds (reconcile)
 local function priceItem(u, holder, tag)
     local e = q(Ext.Entity.Get, u)
     local entry = e and entryOf(u)
     local row = entry and M.Item(entry)
-    if row then setValue(e, M.ValueOf(row, isWare(holder, tag))) end
+    if row then setValue(e, M.ValueOf(row, isWare(holder, tag), row.s == "Thrown" and wowCount[tag] or nil)) end
 end
 -- Every item of ours, by where it is now: after a load, a merge of a ware into a stack, a change of difficulty.
 function M.SetPrices()
@@ -681,6 +696,23 @@ local function keepsOwn(uuid, row)
 end
 M.KeepsOwn = keepsOwn
 
+-- A WoW thrown weapon is a BG3 dagger: BG3 throws it from the bag or a hand, never from its ranged slot
+-- (Throw_Throw's ThrowableTargetConditions). WoW wears it in its ranged slot, beside its main hand, and BG3 has
+-- one main hand for both: while WoW holds something there, that goes in BG3's, and the dagger waits in the bag.
+function M.ThrownWaits(row, list)
+    if row.s ~= "Thrown" then return false end
+    for _, it in ipairs(list) do
+        if it.Bag == 255 and it.Slot == 15 then return true end
+    end
+    return false
+end
+-- WoW's hand slots in BG3. What WoW puts there may push a worn dagger out of BG3's hand: WoW's ranged slot stays.
+local BG3_HAND = {[15] = "MeleeMainHand", [16] = "MeleeOffHand"}
+local function freeHand(uuid, slot)
+    local held = BG3_HAND[slot] and uuidOf(q(Osi.GetEquippedItem, uuid, BG3_HAND[slot]))
+    if held and (M.Item(entryOf(held) or -1) or {}).s == "Thrown" then M.Suppress(held) end
+end
+
 local function reconcileMember(uuid, m, have)
     if type(m) ~= "table" or m.Error or type(m.Items) ~= "table" then return end
     if not q(Ext.Entity.Get, uuid) then return end
@@ -691,6 +723,7 @@ local function reconcileMember(uuid, m, have)
         local u = have[tag]
         local wantEquip = it.Bag == 255 and it.Slot < 19
         local row = M.Item(it.Entry)
+        wowCount[tag] = it.Count
         if row and row.k == "object" then
             stacks[it.Entry] = (stacks[it.Entry] or 0) + (it.Count or 1)
             row = nil -- handled as a stack below
@@ -705,17 +738,21 @@ local function reconcileMember(uuid, m, have)
                 note(made)
             end
         end
-        if u and row and not pendingItem[u] then
+        -- A thrown dagger lies where it landed until BG3 picks it up; WoW still has the stack.
+        local landed = u and row and row.s == "Thrown" and not holderOf(u) and not equipped(u)
+        if u and row and not pendingItem[u] and not landed then
             if it.Rand and M.Props and M.Props[it.Rand] and suffixed[u] ~= it.Rand then
                 suffixed[u] = it.Rand -- a bought or looted item learns its suffix here; after a load too
                 pcall(M.Dress, u, M.Variant(row, it.Rand))
             end
             if holderOf(u) ~= uuid and not equipped(u) then
                 M.Suppress(u)
-                pcall(Osi.ToInventory, u, uuid, it.Count or 1, 0, 0)
+                pcall(Osi.ToInventory, u, uuid, M.AmountOf(row, it.Count) or 1, 0, 0)
             end
             local eq = equipped(u)
-            if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row) then
+            if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row)
+                and not M.ThrownWaits(row, m.Items) then
+                freeHand(uuid, it.Slot)
                 M.Suppress(u)
                 pcall(Osi.Equip, uuid, u)
             elseif not wantEquip and eq then
@@ -723,7 +760,8 @@ local function reconcileMember(uuid, m, have)
                 pcall(Osi.Unequip, uuid, u)
             end
             local amount = q(Osi.GetStackAmount, u)
-            if amount and it.Count and amount ~= it.Count then pcall(Osi.SetStackAmount, u, it.Count) end
+            local want = M.AmountOf(row, it.Count)
+            if amount and want and amount ~= want then pcall(Osi.SetStackAmount, u, want) end
         end
     end
     reconcileStacks(uuid, stacks, have, m.Items)
@@ -947,14 +985,16 @@ local function askFor(u, tag, count, thief)
     if kind == "V" then
         local ware = nil
         for _, w in ipairs(((lastInv.Vendors or {})[guid]) or {}) do if tostring(w.Idx) == idx then ware = w end end
+        local row = ware and M.Item(ware.Entry) or {}
+        local bc = row.bc or 1
+        -- One thrown dagger is the whole lot, whatever BG3 says of its amount.
+        local n = row.s == "Thrown" and bc or count or 1
         if ware and thief then
-            M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = count or 1, Item = u, Npc = guid, Idx = ware.Idx})
+            M.Request({Op = "add", Member = member, Entry = ware.Entry, Count = n, Item = u, Npc = guid, Idx = ware.Idx})
             M.Stolen = (M.Stolen or 0) + 1
         elseif ware then
             -- WoW sells a food stack as one purchase (shown as a stack of bc, fillHolder): whole purchases
             -- go as WoW's own buy, the rest of a stack split earlier at the price of one.
-            local bc = (M.Item(ware.Entry) or {}).bc or 1
-            local n = count or 1
             if (ware.Price or 0) > 0 then M.Barter[member] = M.Barter[member] or {At = tick} end
             if n % bc == 0 or (ware.Price or 0) <= 0 then -- price 0: a pocket's food, no vendor's (the bridge refuses it)
                 M.Request({Op = "buy", Member = member, Npc = guid, Entry = ware.Entry, Count = n // bc, Item = u})
@@ -1010,7 +1050,10 @@ local function fillHolder(standin, prefix, list)
     for _, w in ipairs(list or {}) do
         local tag = prefix .. tostring(w.Idx)
         want[tag] = true
-        if prefix:sub(1, 1) == "V" then size[tag] = w.Count or (M.Item(w.Entry) or {}).bc or 1 end
+        if prefix:sub(1, 1) == "V" then
+            local row = M.Item(w.Entry) or {}
+            size[tag] = M.AmountOf(row, w.Count or row.bc or 1)
+        end
         -- Gone without a trace: the player took it and BG3 merged it into a stack of theirs (no
         -- RemovedFrom for a merge, harness).
         local old = sideUuid[tag]
@@ -1018,7 +1061,7 @@ local function fillHolder(standin, prefix, list)
             if buying(standin) then askFor(old, tag, sideCount[tag]) else deleted[old] = true end
         end
         if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) then
-            local n = w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1
+            local n = M.AmountOf(M.Item(w.Entry), w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1)
             local ok, made = pcall(M.Create, w.Entry, standin, n, tag)
             if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = n else note(made) end
         end

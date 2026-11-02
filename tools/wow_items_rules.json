@@ -5,7 +5,7 @@
 
   "rarity_by_quality": {"0": "Common", "1": "Common", "2": "Uncommon", "3": "Rare", "4": "VeryRare", "5": "Legendary", "6": "Legendary"},
 
-  "_weapons": "WoW weapon subclass -> BG3 weapon stats entry (its root template is the look). 'fast' is used instead when the WoW swing time (delay, ms) is at most fast_delay.",
+  "_weapons": "WoW weapon subclass -> BG3 weapon stats entry (its root template is the look). 'fast' is used instead when the WoW swing time (delay, ms) is at most fast_delay. Thrown is BG3's dagger: WPN_Dart is a two-handed ranged weapon with ammunition and no Thrown property, and BG3 throws nothing from its ranged slot.",
   "weapons": {
     "0":  {"name": "Axe",          "base": "WPN_Handaxe"},
     "1":  {"name": "Axe 2H",       "base": "WPN_Greataxe"},
@@ -20,7 +20,7 @@
     "13": {"name": "Fist weapon",  "base": "WPN_Club"},
     "14": {"name": "Misc weapon",  "base": "WPN_Club"},
     "15": {"name": "Dagger",       "base": "WPN_Dagger"},
-    "16": {"name": "Thrown",       "base": "WPN_Dart"},
+    "16": {"name": "Thrown",       "base": "WPN_Dagger"},
     "17": {"name": "Spear",        "base": "WPN_Spear"},
     "18": {"name": "Crossbow",     "base": "WPN_LightCrossbow"},
     "19": {"name": "Wand",         "base": "WPN_HandCrossbow"},
