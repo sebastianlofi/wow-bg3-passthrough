@@ -102,6 +102,16 @@ def kind_of(text):
     return 'other'
 
 
+def is_move(text):
+    """Whether a command line moves the party. A second one while one runs is refused, not queued: clicks made
+    during a long wait each moved the party again, one after the other, for minutes."""
+    try:
+        verb, rest = W.verb_of(text.split())
+    except Exception:  # noqa: BLE001  W.run reports it
+        return False
+    return verb == 'tp' or (verb == 'waypoint' and rest[:1] == ['go'])
+
+
 def handle(replies, seq, who, text, refused=None):
     first = [True]
 
@@ -113,8 +123,13 @@ def handle(replies, seq, who, text, refused=None):
     ctx = W.Ctx(char=who or None, debug=debug_commands(), out=out, chat=True)
     t0 = time.time()
     try:
-        with LOCKS[kind_of(text)]:
+        lock = LOCKS[kind_of(text)]
+        if not lock.acquire(blocking=not is_move(text)):
+            raise W.CmdError('already on the way')
+        try:
             W.run(ctx, text)
+        finally:
+            lock.release()
         result = 'ok'
     except W.CmdError as e:
         out(str(e) or 'failed', True)

@@ -24,6 +24,7 @@ The rules, one place:
 
   wow_waypoints.py table DBC_DIR                    every point by team (DBC_DIR holds TaxiNodes.dbc)
   wow_waypoints.py stand DBC_DIR                    each point's height and the floor it lands on
+  wow_waypoints.py prewarm DBC_DIR                  movement tiles round every point, ahead of the first trip
                                                     (needs the server's map data: WOW_BG3_MAPS, _MMAPS, _VMAPS)
 Python 3.9, standard library only, except `stand` (wow_stand.py's needs).
 """
@@ -39,6 +40,7 @@ RACE_TEAM = {1: ALLIANCE, 3: ALLIANCE, 4: ALLIANCE, 7: ALLIANCE, 2: HORDE, 5: HO
 # uses 1, 3, 9, 15 and 57; 36 is a "Generic" flight target; 84 to 87 are the capture towers' own flights.
 NO_MASTER = frozenset((1, 3, 9, 15, 36, 57, 84, 85, 86, 87))
 FLOOR_REACH = 15.0  # yards: a floor farther than this from a flight point's height is another storey
+PREWARM_REACH = 80.0  # yards round a flight point: the squares a move's Start cuts
 
 
 def enabled():
@@ -191,7 +193,26 @@ def stand_z(map_id, x, y, z, terrain=None):
     return nearest_floor(best, drawn, wow_stand.SNAP_YD)
 
 
+def prewarm(dbc_dir):
+    """Builds the movement tiles round every flight point ahead of the first trip there: a city's tile takes
+    the generator 45 s, which a move would otherwise wait for. Tiles are kept, so a later run only looks. Ends with
+    the process that started it."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import wow_arena
+    import wow_stand
+    maps, mmaps = wow_stand.data_dir('WOW_BG3_MAPS', 'maps'), wow_stand.data_dir('WOW_BG3_MMAPS', 'mmaps')
+    parent = os.getppid()
+    for n in nodes(dbc_dir):
+        if os.getppid() != parent:
+            return 0
+        if can_be_waypoint(n, ALLIANCE) or can_be_waypoint(n, HORDE):
+            wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH)
+    return 0
+
+
 def main(argv):
+    if len(argv) == 2 and argv[0] == 'prewarm':
+        return prewarm(argv[1])
     if len(argv) != 2 or argv[0] not in ('table', 'stand'):
         print(__doc__)
         return 2

@@ -38,7 +38,7 @@ link/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs
 apart need no huge grid, and takes the pool from several out-of-bounds layers at once (--layer
 "-1.981,9.74").
 """
-import argparse, json, math, os, re, signal, struct, subprocess, sys, time
+import argparse, concurrent.futures, json, math, os, re, signal, struct, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
@@ -52,6 +52,7 @@ import wow_stand  # noqa: E402
 
 YD = 0.9144
 CELL = 64.0      # metres: one pool subgrid, 128 x 128 tiles of 0.5 m
+CUT_JOBS = 4     # wow_arena.py cuts side by side
 TILES = 128
 HYST = 8.0       # metres past a square's middle before the window moves
 # Moves (link/tools/tele.sh): wow-bg3/world-move.json {RunId, Seq, Wow: [x, y, z or
@@ -329,6 +330,7 @@ class World:
         self.run = run_id()
         self.seq = 0
         self.serial = 0
+        self.ready = set()      # squares precut has cut and cut has not read yet
         # The WoW continent whose ground world mode cuts (Kalimdor too): the player's.
         self.map = map_id if map_id is not None else (player_map() or 0)
         assert self.map in CONTINENTS, 'world mode has ground for Eastern Kingdoms and Kalimdor only (map %s)' % self.map
@@ -392,11 +394,8 @@ class World:
         return False, 'no report from the mod in %d s' % timeout
 
     # ---- squares ----
-    def cut(self, ij):
-        """WoW ground for square ij: tiles (for the AI grid), triangles (for the ray hooks), base."""
-        if ij in self.cells:
-            self.cells[ij] = self.cells.pop(ij)  # newest last
-            return self.cells[ij]
+    def cut_cmd(self, ij):
+        """The wow_arena.py command for square ij, and its output folder."""
         minx, minz = self.cell_min(ij)
         cx, cz = minx + CELL / 2, minz + CELL / 2
         wx, wy = self.wow_xy(cx, cz)
@@ -410,7 +409,38 @@ class World:
         ox, oy, oz = self.origin
         if STOREYS and oz < self.terrain.height(ox, oy) - wow_arena.UNDER_CLEAR:
             cmd += ['--under', str(ox), str(oy), str(oz)]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        return cmd, out
+
+    def precut(self, squares):
+        """The squares a round needs, cut side by side: a city's takes 3 s, and a move waited for each in turn.
+        Their movement tiles first, one at a time, so no two cuts build the same tile."""
+        todo = [ij for ij in dict.fromkeys(squares) if ij not in self.cells and ij not in self.ready]
+        if len(todo) < 2:
+            return
+        maps, mmaps = wow_stand.data_dir('WOW_BG3_MAPS', 'maps'), wow_stand.data_dir('WOW_BG3_MMAPS', 'mmaps')
+        cmds = {ij: self.cut_cmd(ij) for ij in todo}
+        for ij in todo:
+            minx, minz = self.cell_min(ij)
+            wx, wy = self.wow_xy(minx + CELL / 2, minz + CELL / 2)
+            wow_arena.ensure_mmtiles(mmaps, maps, self.map, wx, wy, CELL / 2 / wow_arena.YD + 3)
+        with concurrent.futures.ThreadPoolExecutor(CUT_JOBS) as pool:
+            for ij, f in [(ij, pool.submit(subprocess.run, cmds[ij][0], check=True, stdout=subprocess.DEVNULL)) for ij in todo]:
+                f.result()
+                self.ready.add(ij)
+
+    def cut(self, ij):
+        """WoW ground for square ij: tiles (for the AI grid), triangles (for the ray hooks), base."""
+        if ij in self.cells:
+            self.cells[ij] = self.cells.pop(ij)  # newest last
+            return self.cells[ij]
+        cmd, out = self.cut_cmd(ij)
+        if ij in self.ready:
+            self.ready.discard(ij)
+        else:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        minx, minz = self.cell_min(ij)
+        cx, cz = minx + CELL / 2, minz + CELL / 2
+        by = self.centre[1] + (self.terrain.height(*self.wow_xy(cx, cz)) - self.origin[2]) * YD
         tiles = (out / 'tiles.bin').read_bytes()
         tris = (out / 'triangles.bin').read_bytes()
         kinds = (out / 'kinds.bin').read_bytes()
@@ -658,6 +688,7 @@ class World:
     def cells_for(self, pairs):
         """Writes each square's tiles for the plugin (section-<k>-<serial>.bin) -> Cells for the mod."""
         out = []
+        self.precut([ij[:2] for _, ij in pairs])
         for k, ij in pairs:
             cell = self.cut(ij[:2])
             if len(ij) == 3:
@@ -1107,6 +1138,13 @@ def main():
     # --party-floor is what every run does now: a treadmill per party member.
     a.floor = max(2, min(6, a.floor))
     wait_hero(a.wait_hero)
+    # The first trip to a flight point waits for nothing: its movement tiles are built ahead, at the lowest priority.
+    if os.environ.get('WOW_BG3_SERVER') and os.environ.get('WOWBG3_SERVER_VAR'):
+        try:
+            subprocess.Popen(['nice', '-n', '19', sys.executable, str(Path(__file__).resolve().parent / 'wow_waypoints.py'), 'prewarm',
+                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            print('movement tiles ahead:', e, flush=True)
     w = World(a)
     # A bridge that was killed left Active true: Camp.lua would take the coming Start's jump to the void for BG3's own travel.
     w.publish(False)

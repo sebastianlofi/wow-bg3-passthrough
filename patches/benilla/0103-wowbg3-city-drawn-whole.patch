@@ -1,0 +1,38 @@
+WOW-BG3 benilla patch 0103: a city is drawn whole under the see-through's camera.
+A playtest outside in Orgrimmar: "buildings get cut in half", "ground is seethrough and building up above are all
+cut". The portal walk chooses a WMO's groups from where the eye is, and world mode's eye stands anywhere, inside
+rock too since 0097, so a city lost whole groups in straight edges and its buried terrain showed. Wider than a house,
+every group is drawn while the see-through is live.
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -382,6 +382,17 @@
+ /// space): a doorway or a stair edge puts her a little out.
+ const SEE_ROOM_MARGIN: f32 = 0.5;
+ 
++/// Patch 0103: a placement wider than [`CLIP_HOUSE_YD`]: a city, a keep, a big cave.
++fn wider_than_a_house(model: &WmoModel) -> bool {
++    let (mut lo, mut hi) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
++    for n in &model.group_nav {
++        let (a, b) = (wow_to_bevy(n.bbox_min), wow_to_bevy(n.bbox_max));
++        lo = lo.min(a.min(b));
++        hi = hi.max(a.max(b));
++    }
++    (hi.x - lo.x).max(hi.z - lo.z) > CLIP_HOUSE_YD
++}
++
+ /// Is `p` (WMO model space, WoW axes) inside any group's box, grown by `margin`? Patch 0090's
+ /// cheap gate: only the placement she stands in runs the second flood.
+ fn inside_any_group(model: &WmoModel, p: [f32; 3], margin: f32) -> bool {
+@@ -593,6 +604,11 @@
+                 }
+             }
+         }
++        // Patch 0103: the see-through's camera looks from above, often from inside rock, where the portal
++        // walk seeds in one group and a city's other pieces fail it. Depth hides what cannot be seen.
++        if cut_anchor.is_some() && wider_than_a_house(model) {
++            fresh.visible.fill(true);
++        }
+         if inst.bypass_change_detection().visible != fresh.visible {
+             inst.bypass_change_detection().visible = fresh.visible;
+             inst.set_changed();

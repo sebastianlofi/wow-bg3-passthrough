@@ -536,7 +536,6 @@ function M.Start(runId)
                 assert(MUSIC_EVENTS[c.Event], "Music: Event must be Music_Off")
                 Osi.MusicPlayGeneral(c.Event)
                 fightThemesOn = true
-                math.randomseed(math.floor(Ext.Utils.MonotonicTime()))
                 return {Event = c.Event}
             elseif c.Action == "Scale" then
                 local uuid = live(c.Target)

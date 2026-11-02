@@ -584,6 +584,12 @@ def tele(ctx, args, at=None):
         via.sort(key=lambda q: (q[2] - x) ** 2 + (q[3] - y) ** 2)
         body.update(Char=char, Via=via[0][0])
     atomic_write(path, json.dumps(body))
+    # The screen answers the click at once; the world bridge takes the cover off when it is done.
+    cover = Path(os.environ.get('WOWBG3_CAPTURE_DIR') or '/nonexistent') / 'compose.move'
+    try:
+        cover.touch()
+    except OSError:
+        pass
     ctx.say('moving to %s (WoW %.1f %.1f, %s%s)...' % (what, x, y, cont(mapid), ', through %s' % body['Via'] if cross else ''))
     res = None
     for _ in range(600 if cross else 240):
@@ -596,6 +602,7 @@ def tele(ctx, args, at=None):
             res = r
             break
     if not res:
+        cover.unlink(missing_ok=True)
         raise CmdError('tp: no answer from the world bridge in time (see its log)')
     if not res.get('OK'):
         raise CmdError('tp: ' + str(res.get('Value')))
