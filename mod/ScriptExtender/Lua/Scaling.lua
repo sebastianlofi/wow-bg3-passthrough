@@ -34,19 +34,21 @@ M.NORMAL_HP = {42, 48, 71, 78, 102, 120, 138, 146, 177, 187, 222, 253, 274, 300,
 M.NORMAL_HIT = {2.1, 2.1, 3.3, 3.9, 7.0, 7.2, 10, 11.2, 13.6, 14, 14.5, 18.4, 21.6, 21.6, 22.5, 26.4, 28.8, 29.8, 30.1, 33.3, 33.9,
     36.3, 37.1, 37.5, 39.3, 41.4, 42.3, 46.8, 49.4, 49.4, 52.2, 52.2, 52.2, 55, 57.9, 59.3, 60.5, 62.7, 63.2, 66.7, 68.9, 73.2,
     77.4, 80.6, 86.8, 90, 91.8, 93, 96.1, 98.2, 100.3, 101.5, 104.9, 105.9, 109.4, 110.4, 115, 115, 118.5, 120.9, 123.2, 200.8, 204.4}
+-- The playtest measure for four against normal mobs of their level: 2 comfortable, 4 a bit of a challenge, 6 harder but
+-- doable (simulator: party HP lost about 13%, 27%, 52%, won 99% or more).
 -- Rank: member-turns to kill at party size 4, the WoW HP (x normal) it is meant for, AC, to-hit, DC above the
 -- curve, and damage: the share of a member's HP an enemy turn deals is 30% (easing off past level 8, as BG3's
 -- enemies do) x (WoW hit / normal's) ^ 0.35 within
 -- Low and High.
 M.RANKS = {
-    normal = {Turns = 8, Rel = 1, AC = 0, Hit = 0, DC = 0, Low = 0, High = 0.60},
-    elite = {Turns = 14, Rel = 2.7, AC = 1, Hit = 1, DC = 1, Low = 0, High = 0.60},
-    dungeon_trash = {Turns = 10, Rel = 2.7, AC = 1, Hit = 1, DC = 1, Low = 0, High = 0.60},
-    dungeon_boss = {Turns = 26, Rel = 8, AC = 3, Hit = 2, DC = 2, Low = 0.49, High = 0.60},
-    raid_trash = {Turns = 12, Rel = 6, AC = 2, Hit = 2, DC = 2, Low = 0, High = 0.60},
-    raid_boss = {Turns = 36, Rel = 80, AC = 4, Hit = 3, DC = 3, Low = 0.62, High = 0.62},
+    normal = {Turns = 6, Rel = 1, AC = 0, Hit = 0, DC = 0, Low = 0, High = 0.60},
+    elite = {Turns = 10.5, Rel = 2.7, AC = 1, Hit = 1, DC = 1, Low = 0, High = 0.60},
+    dungeon_trash = {Turns = 7.5, Rel = 2.7, AC = 1, Hit = 1, DC = 1, Low = 0, High = 0.60},
+    dungeon_boss = {Turns = 19.5, Rel = 8, AC = 3, Hit = 2, DC = 2, Low = 0.49, High = 0.60},
+    raid_trash = {Turns = 9, Rel = 6, AC = 2, Hit = 2, DC = 2, Low = 0, High = 0.60},
+    raid_boss = {Turns = 27, Rel = 80, AC = 4, Hit = 3, DC = 3, Low = 0.62, High = 0.62},
 }
-M.TURNS_CAP = 48
+M.TURNS_CAP = 36
 -- BG3's AI needs an average hit of 1 (Boosts). Below that the shortfall comes off to-hit, about 9 points for all of it.
 M.MISS = 9
 -- The reach: 40 yd chained.

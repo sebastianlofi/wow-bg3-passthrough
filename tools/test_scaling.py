@@ -40,7 +40,7 @@ class Scaling(unittest.TestCase):
         n = self.mob(60, 4059, 120.9)
         self.assertEqual(n['Rank'], 'normal')
         self.assertEqual(n['E'], 18)
-        self.assertEqual(n['MaxHp'], 214)     # 26.8 x 8
+        self.assertEqual(n['MaxHp'], 161)     # 26.8 x 6
         self.assertEqual(n['AC'], 20)
         self.assertEqual(n['ToHit'], 12)
         self.assertAlmostEqual(n['Damage'], 0.30 * 0.65 * 147, places=0)
