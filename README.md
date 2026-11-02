@@ -227,15 +227,44 @@ step. In short:
    option. It still runs your other Script Extender mods; `--uninstall` undoes it.
 5. Start BG3, enable WoW-BG3 Passthrough in the mod manager, start a New Game.
 
-The first start takes a few minutes: the local WoW server builds its data from your WoW files while
-BG3's loading screen waits. Later starts and loads take under a minute. Switching WOW-BG3 off in the
-mod manager stops the whole WoW side.
+The first start takes a few minutes and needs the internet once: the local WoW server builds its data
+from your WoW files and downloads its world database (about 48 MB, from vmangos' public sources; this
+mod ships no game data). The mobs' abilities are made from that database, so the first time, BG3 stays
+on its loading screen for about two minutes before the main menu. Offline, it stops with a message
+saying so; start BG3 again once you are connected. Later starts and loads take under a minute and need
+no internet. Switching WoW-BG3 Passthrough off in the mod manager stops the whole WoW side.
 
 To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder and your
 `settings.conf`) and run the installer again. Your saves and `~/.local/share/wow-bg3/` stay.
 
 More: [docs/install.md](docs/install.md). Known issues of this version:
 [docs/known-issues.md](docs/known-issues.md).
+
+### Changing mob abilities
+
+Which BG3 abilities a WoW mob gets comes from rules in `WOW-BG3/tools/link/tools/wow_abilities_rules.json`.
+To give or take away a mob's spells (a boss fight of your own, a mod pack's), put a file of your own in
+`~/.local/share/wow-bg3/abilities-rules.json` (or several in `~/.local/share/wow-bg3/abilities-rules.d/*.json`,
+read in name order). It is merged over the shipped rules and survives updates; BG3's next start uses it.
+Mobs are keyed by creature entry and spells by WoW spell id (look them up in any vanilla database site);
+names are only comments (`_name`). A value is a BG3 spell, `null` (the mob does not get it) or `true` (the
+shipped rules decide); a spell the mob does not cast in WoW is given to it. `spells` outside `mobs` applies to
+every mob.
+
+```json
+{
+  "overrides": {
+    "mobs": {
+      "448": {"_name": "Hogger", "spells": {"6016": null, "8599": {"b": "Shout_Rage", "every": "fight"}}}
+    },
+    "spells": {"9532": "Projectile_FireBolt"}
+  }
+}
+```
+
+That takes Pierce Armor (6016) from Hogger, gives him BG3's Rage once a fight, named after WoW's Enrage (8599), and
+makes every mob's Lightning Bolt (9532) a Fire Bolt. What came of it is in `logs/abilities.log` and
+`wow-bg3/link/abilities-status.json` (BG3's Script Extender folder).
 
 ## Work in progress
 
