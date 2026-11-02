@@ -21,12 +21,9 @@ class Scaling(unittest.TestCase):
         cls.lua = LuaRuntime(unpack_returned_tuples=True)
         cls.M = cls.lua.execute(LUA.read_text())
 
-    def mob(self, level, wow_hp, hit, w=None, n=4, cap=18, party=None, diff='balanced', map_=0, camp=1):
-        w = level if w is None else w
-        c = self.lua.table_from({'Level': level, 'WowMaxHp': wow_hp, 'WowDamage': hit, 'Map': map_, 'Members': n, 'Camp': camp, 'WowLevel': w,
-                                 'Cap': cap, 'Difficulty': diff})
-        if party is not None:
-            c['PartyLevel'] = party
+    def mob(self, level, wow_hp, hit, cap=18, diff='balanced', map_=0, camp=1, **party):
+        c = self.lua.table_from({'Level': level, 'WowMaxHp': wow_hp, 'WowDamage': hit, 'Map': map_, 'Camp': camp,
+                                 'Cap': cap, 'Difficulty': diff, **party})
         return self.M.Compute(c)
 
     def test_table(self):
@@ -56,14 +53,18 @@ class Scaling(unittest.TestCase):
         self.assertEqual(self.mob(60, 12000, 500, map_=409)['Rank'], 'raid_trash')
         self.assertEqual(self.mob(60, 1099230, 1922, map_=409)['Rank'], 'raid_boss')
 
-    def test_members_present(self):
-        full, one = self.mob(40, 1865, 66.7), self.mob(40, 1865, 66.7, n=1)
-        self.assertLess(one['MaxHp'], full['MaxHp'])
-        self.assertLess(one['Damage'], full['Damage'])
+    def test_nothing_of_the_party_goes_in(self):
+        base = self.mob(40, 1865, 66.7)
+        for party in ({'Members': 1}, {'PartyLevel': 1}, {'WowLevel': 60}, {'WowLevel': 1, 'PartyLevel': 20, 'Members': 2}):
+            other = self.mob(40, 1865, 66.7, **party)
+            for k in ('E', 'MaxHp', 'Damage', 'AC', 'ToHit', 'DC', 'Save'):
+                self.assertEqual(other[k], base[k], (k, party))
 
-    def test_party_below_the_table_pulls_mobs_down(self):
-        self.assertAlmostEqual(self.mob(60, 4059, 120.9, party=12)['E'], 12)
-        self.assertEqual(self.mob(60, 4059, 120.9, party=20)['E'], 18)
+    def test_a_mobs_numbers_follow_its_own_level(self):
+        low, high = self.mob(10, 187, 14), self.mob(50, 2769, 98.2)
+        self.assertLess(low['E'], high['E'])
+        self.assertLess(low['MaxHp'], high['MaxHp'])
+        self.assertLess(low['AC'], high['AC'])
 
     def test_camp(self):
         a, b, c = self.mob(20, 484, 33.3), self.mob(20, 484, 33.3, camp=3), self.mob(20, 484, 33.3, camp=20)
@@ -79,8 +80,8 @@ class Scaling(unittest.TestCase):
         self.assertEqual(self.M.CampOf(me, lua.table_from([me, near, chained, far, neutral])), 3)
 
     def test_hp_stops_at_about_a_hits_worth(self):
-        # Solo against a big camp of mobs well under the player: every cut together must not make a 1 HP mob.
-        n = self.mob(6, 137, 7.2, w=12, n=1, camp=20, party=1)
+        # The biggest camp must not make a 1 HP mob.
+        n = self.mob(1, 42, 2.1, camp=60)
         self.assertGreaterEqual(n['MaxHp'], 4)
 
     def test_camps_of_any_size(self):
@@ -96,26 +97,12 @@ class Scaling(unittest.TestCase):
         s, _ = self.M.Boosts(self.mob(40, 1865, 66.7, camp=45), 'human', 40, 8, None)
         self.assertGreater(len(s), 0)
 
-    def test_smaller_party_counts_the_camp_for_more(self):
-        self.assertAlmostEqual(self.M.CrowdOf(6, 4), 6)
-        self.assertAlmostEqual(self.M.CrowdOf(6, 1), 12)
-        self.assertLess(self.mob(40, 1865, 66.7, n=2, camp=3)['Damage'] / 0.65, self.mob(40, 1865, 66.7, camp=3)['Damage'])
-
     def test_a_hit_under_one_comes_off_to_hit(self):
-        lone, big = self.mob(1, 42, 2.1, n=1), self.mob(1, 42, 2.1, n=1, camp=14)
+        lone, big = self.mob(1, 42, 2.1), self.mob(1, 42, 2.1, camp=14)
         self.assertEqual(lone['ToHit'], 3)
         self.assertLess(big['Damage'], 1)
         self.assertEqual(big['ToHit'], 3 - round(9 * (1 - big['Damage'])))
         self.assertEqual(self.mob(60, 4059, 120.9, camp=14)['ToHit'], 11)   # a real hit: nothing comes off
-
-    def test_gray_mob_dies_to_a_hit(self):
-        n = self.mob(25, 713, 37.5, w=40)
-        self.assertLessEqual(n['MaxHp'], 0.6 * 24.5)
-
-    def test_above_the_player(self):
-        a, b = self.mob(45, 2218, 86.8, w=40), self.mob(45, 2218, 86.8)
-        self.assertGreater(a['MaxHp'], b['MaxHp'])
-        self.assertEqual(a['AC'], b['AC'] + 1)
 
     def test_difficulty(self):
         b, h = self.mob(40, 1865, 66.7), self.mob(40, 1865, 66.7, diff='tactician')
@@ -123,14 +110,14 @@ class Scaling(unittest.TestCase):
         self.assertAlmostEqual(h['MaxHp'], b['MaxHp'] * 1.3, delta=1)
 
     def test_boosts(self):
-        n = self.mob(1, 42, 2.1, n=1)
+        n = self.mob(1, 42, 2.1)
         s, bonus = self.M.Boosts(n, 'wolf', 11, 7.0, None)
         self.assertIn('DamageBonus(%d)' % bonus, s)
         self.assertGreaterEqual(7.0 + bonus, 1)     # BG3's AI needs an average hit
         self.assertNotIn('(0)', s)
 
     def test_low_level_floor(self):
-        n = self.mob(1, 42, 2.1, n=1)
+        n = self.mob(1, 42, 2.1)
         self.assertEqual(n['AC'], 12)
         self.assertEqual(n['ToHit'], 3)
 

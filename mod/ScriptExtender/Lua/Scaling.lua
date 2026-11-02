@@ -1,6 +1,8 @@
 -- Stand-in numbers from the balance research (docs/agents-20261031/balance-research.md in the private
 -- workspace; the simulator is tools/balance-sim there): a WoW mob's BG3 stats follow BG3's own enemy curves
--- at an effective level, and its HP follows what a party deals in a turn. Switch: `scaling` in settings.conf,
+-- at the effective level of its own WoW level, and its HP follows what a party of four deals in a turn at that
+-- level. Nothing of the player's party goes in, not its level and not its size (playtest feedback): a mob is what it is
+-- for good, and WoW's zones are the order to go through them. Switch: `scaling` in settings.conf,
 -- the launcher's wow-bg3/scaling.json {On, Difficulty}; off, Mirrors.lua keeps HP = WoW ^ 0.65.
 --
 -- Fights last what BG3's own do (about 3.5 rounds on average, all four members played), and the usual fight
@@ -10,14 +12,13 @@
 -- effective level, so a camp of 14 or 30 is one fight. A lone mob is one strong mob, about 3 rounds.
 --
 -- The level table is Progression.lua's curve (M.CURVE, 4x18 at WoW 60): effective level of a WoW level W
--- = 1 + (W - 4) x (Cap - 1) / 56. A party below that for its own WoW level (no level mod, level-ups not
--- spent, the curve's switch off) pulls every mob down by the same gap; a party above it is left strong.
+-- = 1 + (W - 4) x (Cap - 1) / 56.
 --
 -- From the WoW mob only its level, max HP, hit and the map are read. Rank comes from its HP against a
 -- normal mob of its level (a rare is a normal; vmangos' rank is not in the mirror plan).
 --
 -- HP = party damage a member-turn at E x member-turns of the rank x (mob's WoW HP / its rank's usual) ^ 0.5
--- x the camp's and the party size's share. A smaller party's camp counts for more (CrowdOf).
+-- x the camp's share.
 -- AC, to-hit, DC and saves: BG3's Combatant curve at E, plus the rank's. Damage: a share of a member's HP
 -- at E. One attack a turn: the boss's extra attacks and area ability of the research are in that one hit.
 -- All BG3 boosts, all applied by Mirrors.lua.
@@ -48,9 +49,6 @@ M.RANKS = {
     raid_boss = {Turns = 36, Rel = 80, AC = 4, Hit = 3, DC = 3, Low = 0.62, High = 0.62},
 }
 M.TURNS_CAP = 48
--- By party members present, 1 to 4.
-M.SIZE_HP = {0.33, 0.58, 0.8, 1}
-M.SIZE_DAMAGE = {0.4, 0.65, 0.85, 1}
 -- By the mob's camp, 1 to 8. Past 8 the mobs weaken fast enough that the whole camp stays one fight: a member kills
 -- at most about one a turn, and every mob left alive attacks. HP stops at about a hit's worth. Levels: effective
 -- levels off AC, to-hit, DC and saves per mob over one, at most CAMP_LEVELS.
@@ -65,8 +63,6 @@ local function between(t, k)
 end
 function M.CampHp(k) return k <= 8 and between(M.CAMP_HP, k) or math.max(0.1, 0.4 * (8 / k) ^ 1.2) end
 function M.CampDamage(k) return k <= 8 and between(M.CAMP_DAMAGE, k) or 0.46 * (8 / k) ^ 1.1 end
--- A smaller party meets the same camp with fewer to kill and to spread the attacks.
-function M.CrowdOf(camp, members) return camp * (4 / members) ^ 0.5 end
 -- BG3's AI needs an average hit of 1 (Boosts). Below that the shortfall comes off to-hit, about 9 points for all of it.
 M.MISS = 9
 -- The reach: 40 yd chained.
@@ -96,13 +92,6 @@ local function at(t, level) return t[math.max(1, math.min(#t, math.floor(level +
 local function round(x) return math.floor(x + 0.5) end
 
 function M.Effective(w, cap) return math.min(18, 1 + math.max(0, w - 4) * (cap - 1) / 56) end
--- WoW's gray line for a player level (MaNGOS XP::GetGrayLevel).
-function M.GrayLine(p)
-    if p <= 5 then return 0 end
-    if p <= 39 then return p - 5 - p // 10 end
-    if p <= 59 then return p - 1 - p // 5 end
-    return p - 9
-end
 function M.RankOf(rel, map)
     if rel >= 25 then return "raid_boss" end
     if M.RAIDS[map] then return "raid_trash" end
@@ -111,41 +100,26 @@ function M.RankOf(rel, map)
     return "normal"
 end
 
--- The numbers for one mob. c: Level, WowMaxHp, WowDamage (WoW), Map, Members, Camp, WowLevel, PartyLevel (the
--- party's mean BG3 level), Cap, Difficulty. No game calls: tools/test_scaling.py runs this.
+-- The numbers for one mob. c: Level, WowMaxHp, WowDamage (WoW), Map, Camp, Cap, Difficulty. No game calls:
+-- tools/test_scaling.py runs this.
 function M.Compute(c)
-    local members = math.max(1, math.min(4, c.Members or 1))
     local cap = c.Cap or 18
     local camp = c.Camp or 1
     local d = M.DIFFICULTY[c.Difficulty] or M.DIFFICULTY.balanced
-    local gap = c.PartyLevel and math.min(0, c.PartyLevel - M.Effective(c.WowLevel, cap)) or 0
-    local E = math.max(1, M.Effective(c.Level, cap) + gap)
+    local E = M.Effective(c.Level, cap)
     local rel = c.WowMaxHp / at(M.NORMAL_HP, c.Level)
     local reld = (c.WowDamage or 0) / at(M.NORMAL_HIT, c.Level)
     local rank = M.RankOf(rel, c.Map)
     local r = M.RANKS[rank]
     local turns = math.min(M.TURNS_CAP, r.Turns * (rel / r.Rel) ^ 0.5)
-    local crowd = M.CrowdOf(camp, members)
-    local hp = lerp(M.DPR, E) * turns * M.SIZE_HP[members] * M.CampHp(crowd) * d.HP
+    local hp = lerp(M.DPR, E) * turns * M.CampHp(camp) * d.HP
     local share = math.max(r.Low, math.min(r.High, 0.30 * (1 - 0.035 * math.max(0, E - 8)) * math.max(reld, 0.01) ^ 0.35))
-    local damage = share * lerp(M.MEMBER_HP, E) * M.SIZE_DAMAGE[members] * M.CampDamage(crowd) * d.Damage
-    -- Level against the player: WoW's own gap, softened.
-    local under = c.WowLevel - c.Level
-    if under > 0 then
-        local f = math.max(0.25, 1 - 0.07 * under)
-        hp, damage = hp * f, damage * f
-    end
-    local over = math.max(0, -under)
-    hp, damage = hp * (1 + 0.06 * over), damage * (1 + 0.06 * over)
-    local steps = over // 3
-    if c.Level <= M.GrayLine(c.WowLevel) then
-        hp = math.min(hp, 0.6 * lerp(M.DPR, M.Effective(c.WowLevel, cap) + gap))
-    end
+    local damage = share * lerp(M.MEMBER_HP, E) * M.CampDamage(camp) * d.Damage
     local Es = math.max(1, E - math.min(M.CAMP_LEVELS, M.CAMP_LEVEL * (math.max(1, camp) - 1)))
-    -- Whatever cut it (a camp, a small party, a low level): at least about a hit's worth, 60% of a member's turn.
+    -- However big its camp: at least about a hit's worth, 60% of a member's turn.
     return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(round(M.MIN_HP * lerp(M.DPR, E)), round(hp)), Damage = damage,
-        AC = math.max(12, round(10.7 + 0.5 * Es)) + r.AC + steps,
-        ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit + steps - round(M.MISS * math.max(0, 1 - damage)),
+        AC = math.max(12, round(10.7 + 0.5 * Es)) + r.AC,
+        ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit - round(M.MISS * math.max(0, 1 - damage)),
         DC = round(8.4 + 0.63 * Es) + r.DC + d.DC,
         Save = 1 + math.floor(Es * 0.4) + r.AC // 2}
 end
@@ -185,7 +159,7 @@ function M.CampOf(me, mobs)
     return n
 end
 
--- From here on the game's side: the switch, read once per Lua session, and what the party is now.
+-- From here on the game's side: the switch, read once per Lua session.
 local settings = nil
 local function read()
     if settings == nil then
@@ -199,22 +173,9 @@ function M.Difficulty()
     local d = tostring(read().Difficulty or "balanced"):lower()
     return M.DIFFICULTY[d] and d or "balanced"
 end
--- Members present, the hero's WoW level, the party's mean BG3 level, the curve's cap. Cached for a second;
--- Key says when stand-ins should be redone.
-local snap, snapAt = nil, -1000
-function M.Party(ticks)
-    if snap and ticks - snapAt < 30 then return snap end
-    local Party, Progression = Ext.Require("Party.lua"), Ext.Require("Progression.lua")
-    local list = Party.Party()
-    local sum, n = 0, 0
-    for _, u in ipairs(list) do
-        local ok, l = pcall(Osi.GetLevel, u)
-        if ok and type(l) == "number" then sum, n = sum + l, n + 1 end
-    end
-    local w = Progression.WowLevel()
-    local mean = n > 0 and sum / n or nil
-    snap, snapAt = {Members = math.max(1, #list), WowLevel = w, PartyLevel = mean, Cap = Progression.CURVE and Progression.CURVE.Cap or 18,
-        Difficulty = M.Difficulty(), Key = string.format("%d:%d:%.2f", #list, w, mean or 0)}, ticks
-    return snap
+-- What Compute takes besides the mob: neither changes during a game.
+function M.Fixed()
+    local Progression = Ext.Require("Progression.lua")
+    return {Cap = Progression.CURVE and Progression.CURVE.Cap or 18, Difficulty = M.Difficulty()}
 end
 return M

@@ -725,19 +725,19 @@ function M.Start(runId)
         m.ScaleCampAt = ticks
         return campOf(sp) > m.ScaleCamp
     end
-    -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves and the party. Boosts
-    -- under one cause, so a change of party or level can take them off and set new ones.
+    -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves at its own level. Boosts
+    -- under one cause, so a camp that grew can take them off and set new ones.
     local function scaleByRules(m, info)
         local sp = m.Want
         local base = m.ScaleBase or hp(m.Uuid)
         local wowMax, level = tonumber(sp.WowMaxHp) or 0, tonumber(sp.Level) or 0
         if not base or base[2] <= 0 or wowMax <= 0 or level <= 0 then info.Skipped = "no numbers"; return end
         m.ScaleBase = base
-        local party = Scaling.Party(ticks)
+        local fixed = Scaling.Fixed()
         -- A hostile mob's camp: only the mobs near enough to be listed count, so it can grow as the party comes closer.
         m.ScaleCamp, m.ScaleCampAt = campOf(sp), ticks
         local n = Scaling.Compute({Level = level, WowMaxHp = wowMax, WowDamage = tonumber(sp.WowDamage), Map = world and world.Map,
-            Camp = m.ScaleCamp, Members = party.Members, WowLevel = party.WowLevel, PartyLevel = party.PartyLevel, Cap = party.Cap, Difficulty = party.Difficulty})
+            Camp = m.ScaleCamp, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
         local okAc, ac = pcall(function() return Ext.Entity.Get(m.Uuid).Stats.ArmorClass end)
         -- The stand-in's AC only before our boost is on it.
         if m.ScaleAC == nil then m.ScaleAC = okAc and type(ac) == "number" and ac or false end
@@ -747,9 +747,9 @@ function M.Start(runId)
             if m.ScaleBoosts then pcall(Osi.RemoveBoosts, m.Uuid, m.ScaleBoosts, 0, "WOWBG3_SCALE", m.Uuid) end
             if boosts ~= "" then Osi.AddBoosts(m.Uuid, boosts, "WOWBG3_SCALE", m.Uuid) end
         end
-        m.ScaleBoosts, m.ScaleKey = boosts, party.Key
+        m.ScaleBoosts, m.ScaleKey = boosts, true
         info.MaxHp, info.DamageBonus, info.Base, info.Boosts, info.BaseAC = n.MaxHp, bonus, base, boosts, m.ScaleAC
-        info.Camp, info.Rules, info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = m.ScaleCamp, party.Key, n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
+        info.Camp, info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = m.ScaleCamp, n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
         info.Health = "rules"
     end
     local function scale(m, heroWowMax)
@@ -1196,9 +1196,9 @@ function M.Start(runId)
                     m.FriendlyReset = (m.FriendlyReset or 0) + 1
                 end
                 nameOf(m, mob)
-                -- The party, the WoW level or the camp changed: new numbers, on a stand-in out of every fight.
+                -- The camp came into view: new numbers, on a stand-in out of every fight.
                 if m.ScaleKey and m.Stage ~= "spawned" and not inFight and not combat and not dead
-                    and (Scaling.Party(ticks).Key ~= m.ScaleKey or campGrew(m, mob, ticks)) then
+                    and campGrew(m, mob, ticks) then
                     m.Stage = "spawned"
                 end
                 if m.Stage == "spawned" and ticks - m.Born >= SCALE_AFTER then

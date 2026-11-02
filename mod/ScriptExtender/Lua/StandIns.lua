@@ -520,10 +520,9 @@ function M.Start(runId)
                 -- A mob that joined a fight with no mirror (LinkLive.lua), with `scaling` on: the rules Mirrors.lua uses.
                 local Scaling = Ext.Require("Scaling.lua")
                 if type(c.Rules) == "table" and Scaling.On() and (tonumber(c.Rules.Level) or 0) > 0 and (tonumber(c.Rules.WowMaxHp) or 0) > 0 then
-                    local r, party = c.Rules, Scaling.Party(ticks)
+                    local r, fixed = c.Rules, Scaling.Fixed()
                     local n = Scaling.Compute({Level = tonumber(r.Level), WowMaxHp = tonumber(r.WowMaxHp), WowDamage = tonumber(r.WowDamage),
-                        Map = r.Map, Camp = r.Camp, Members = party.Members, WowLevel = party.WowLevel, PartyLevel = party.PartyLevel,
-                        Cap = party.Cap, Difficulty = party.Difficulty})
+                        Map = r.Map, Camp = r.Camp, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
                     local text = Scaling.Boosts(n, r.Kind, h.MaxHp, tonumber(r.BaseDamage) or 0, nil)
                     if text ~= "" then Osi.AddBoosts(uuid, text, "WOWBG3_SCALE", uuid) end
                     return {Target = uuid, Before = before, Boosts = text, MaxHp = n.MaxHp, Rules = true}
