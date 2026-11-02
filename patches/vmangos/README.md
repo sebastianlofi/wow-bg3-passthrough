@@ -26,6 +26,7 @@ fights, party members and the merged inventory.
 | 0018 vendor-list-from-afar | `vendor list` answers for a vendor within 100 yd, so BG3 holds its wares before the trade screen opens |
 | 0019 any-proficiency | an equip from BG3 first learns the weapon or armour proficiency the item needs, so any item can be worn (for now) |
 | 0020 forced-reaction-interact | a forced reaction counts when talking to an NPC, so `faction alliance` or `faction horde` opens that side's merchants |
+| 0022 join-idempotent | a `join` of mobs already in the encounter drops them and answers `ok`, as `begin`'s resend does |
 
 Upstream `Unit.cpp` uses CRLF line endings, so some hunks are CRLF: never convert line endings in
 these files.

@@ -568,13 +568,15 @@ impl Fight {
                 c.wow_hp =
                     ((hp as f64 / max_hp.max(1) as f64) * c.wow_max_hp as f64).round() as u32;
                 self.handoff.push_back(Handoff::Hp {
-                    encounter,
+                    encounter: encounter.clone(),
                     mob: c.guid.clone(),
                     hp,
                     max_hp,
                 });
             }
-        } else if hp != before && c.status != "dead" {
+        }
+        // HP 0 is the kill whenever it is first seen, BG3's first numbers included.
+        if c.status != "dead" && ((known && hp != before) || hp == 0) {
             c.wow_hp = ((hp as f64 / max_hp.max(1) as f64) * c.wow_max_hp as f64).round() as u32;
             if hp == 0 {
                 c.status = "dead";
@@ -668,14 +670,34 @@ impl Fight {
                 self.say("BG3: the fight is set up".into());
             }
             Message::Roster { joins, actors, .. } => {
-                for a in actors {
+                // Mobs first: Tav's 0 kills the WoW character, and the server takes no `hp` from a
+                // dead player, so a mob that fell in the same report would keep its WoW HP.
+                let hero_id = self.hero.id.clone();
+                let (hero, mobs): (Vec<_>, Vec<_>) = actors.iter().partition(|a| a.id == hero_id);
+                for a in mobs {
                     let pos = self.basis.to_wow(a.position);
                     if let Some(c) = self.enemies.iter_mut().find(|c| c.id == a.id)
                         && c.status == "joining"
                     {
                         c.status = "in";
                     }
-                    self.set_hp(&a.id, a.hp, a.max_hp, (a.id != "hero").then_some(pos));
+                    self.set_hp(&a.id, a.hp, a.max_hp, Some(pos));
+                }
+                // A BG3 kill is a WoW kill: a member BG3 reported before and lists no more is out
+                // of its fight. The mod lists every member it can read, on the client or from the
+                // server's mirror-status.json, so this is a stand-in BG3 no longer has at all.
+                let gone: Vec<(String, u32)> = self
+                    .enemies
+                    .iter()
+                    .filter(|c| c.status == "in" && c.bg3 && c.hp > 0)
+                    .filter(|c| !actors.iter().any(|a| a.id == c.id))
+                    .map(|c| (c.id.clone(), c.max_hp))
+                    .collect();
+                for (id, max_hp) in gone {
+                    self.set_hp(&id, 0, max_hp, None);
+                }
+                for a in hero {
+                    self.set_hp(&a.id, a.hp, a.max_hp, None);
                 }
                 self.joins_done = self.joins_done.max(*joins);
                 let refused: Vec<usize> = (0..self.enemies.len())
@@ -1474,6 +1496,7 @@ fn drive(
                 event_seq = event_seq.max(n);
                 mirror.arm_event(&line);
                 mirror.feed_event(&line);
+                mirror.kill_event(&line);
                 // A mob the server held as an add of this encounter (its pack joined, 0015, or it
                 // aggroed a party bot): it joins the BG3 fight even where benilla cannot see it
                 // (a far member's fight under Far Sight elsewhere).
@@ -1673,17 +1696,19 @@ pub fn server_add(line: &str, enc: &str, mirror: &Mirror) -> Option<Combatant> {
 }
 
 /// A stand-in BG3 killed with one blow out of combat (no fight started): the server gets the kill
-/// as a one-mob encounter (XP, loot and quest credit once).
+/// as a one-mob encounter (XP, loot and quest credit once). Settled only on the server's answer:
+/// a refusal is sent again when it can succeed ([`Mirror::kills_due`]).
 pub fn kills_outside_fights(
     mirror: &mut Mirror,
     server: &mut dyn ServerHandoff,
 ) -> Result<(), Error> {
     let now = mirror.now();
-    for g in mirror.dead_unfought(now) {
+    for g in mirror.kills_due(now) {
         let max_hp = mirror.status.mobs.get(&g).map_or(1, |s| s.max_hp.max(1));
         // A friendly NPC killed with one blow is turned on the player first (server patch 0006).
         let server_guid = mirror.server_guid(&g);
         let encounter = format!("kill-{}", &random_hex()?[..12]);
+        mirror.kill_sent(&g, &encounter, now);
         let list = vec![
             Handoff::Begin {
                 encounter: encounter.clone(),
@@ -1705,7 +1730,6 @@ pub fn kills_outside_fights(
             println!("handoff: {}", h.describe());
             server.send(&h)?;
         }
-        mirror.settle([g], now);
     }
     Ok(())
 }
@@ -1737,6 +1761,7 @@ pub fn server_events_step(mirror: &mut Mirror, events: &Path, event_seq: &mut u6
         *event_seq = (*event_seq).max(n);
         mirror.arm_event(&line);
         mirror.feed_event(&line);
+        mirror.kill_event(&line);
         // Patch 0015's walk answers.
         mirror.party.event(&line);
     }

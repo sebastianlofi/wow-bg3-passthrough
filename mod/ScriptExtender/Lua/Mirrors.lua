@@ -1189,8 +1189,16 @@ function M.Start(runId)
         local spawned = false
         local count = 0
         for _ in pairs(mirrors) do count = count + 1 end
+        -- WoW respawned the mob (the bridge: the server confirmed the kill, the mob left mobs.txt and came
+        -- back; never a stand-in whose kill has not landed yet). The corpse, knocked out too, gives way.
+        local respawned = {}
+        for _, g in ipairs(plan.WowRespawned or {}) do respawned[g] = true end
         for guid, mob in pairs(want) do
             local m = mirrors[guid]
+            if m and respawned[guid] and not fight[guid] and (q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid]) then
+                remove(guid)
+                m, count = nil, count - 1
+            end
             if not m then
                 -- One spawn per step spreads the load; only near a party member, on placed ground.
                 if not spawned and count < MAX and nearParty(mob.Pos, anchors) and not fight[guid] and onGround(mob.Pos) then
@@ -1346,8 +1354,18 @@ function M.Start(runId)
                 return out
             end)
         end
+        -- Stand-ins a fight spawned with no mirror, for LinkLive.lua (which cannot read a far one itself).
+        local fightSpawned = {}
+        for uuid in pairs(WOWBG3FightSpawned or {}) do
+            if Ext.Entity.Get(uuid) then
+                local h = hp(uuid) or {0, 0}
+                fightSpawned[uuid] = {Hp = h[1], MaxHp = h[2], Pos = pos(uuid),
+                    Dead = q(Osi.IsDead, uuid) == 1 or M.KnockedOut[uuid] == true}
+            end
+        end
         Ext.IO.SaveFile(DIR .. "mirror-status.json", Ext.Json.Stringify({RunId = runId, Seq = lastSeen, Tick = ticks,
             Session = session, FaceMode = M.FaceMode, FaceStats = M.FaceStats, Tav = tav, Mobs = mobs, Problems = problems,
+            FightSpawned = fightSpawned,
             Strikes = M.Strikes or 0, LiveStats = M.LiveStats, Life = M.Life, HeroState = heroState,
             HpGuard = M.HpGuard, HpRises = M.HpRises, Spawns = M.Spawns, Removes = M.Removes, HelpCalled = M.HelpCalled,
             Pickpockets = M.Pickpockets,

@@ -1,0 +1,68 @@
+WOW-BG3 vmangos patch 0022: join is idempotent.
+
+A `join` naming a mob already in the encounter was refused whole with `member`, though the server
+had added that mob by itself (a pack mate, a summon) and the bridge only named it after the server's
+own `mob ... aggro` line. Now, as `begin`'s resend does: mobs already in this encounter are dropped,
+and if none remain the answer is `ok`, with nothing changed.
+
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -698,14 +698,37 @@ namespace
+                 if (guids.empty())
+                     return out.Add(head + "refused empty -");
+ 
++                // A join is idempotent as begin's resend is: a mob already in this encounter (a pack
++                // mate or summon the server added by itself, then named by the bridge) is dropped.
++                // If that leaves none, the answer is the resend's: ok, nothing changes.
++                if (join)
++                {
++                    std::vector<ObjectGuid> fresh;
++                    for (ObjectGuid g : guids)
++                    {
++                        if (f.active->Find(g))
++                            resend.push_back(g);
++                        else
++                            fresh.push_back(g);
++                    }
++                    guids.swap(fresh);
++                    std::vector<ObjectGuid> freshProvokes;
++                    for (ObjectGuid g : provokes)
++                    {
++                        if (!f.active->Find(g))
++                            freshProvokes.push_back(g);
++                    }
++                    provokes.swap(freshProvokes);
++                    if (!guids.empty())
++                        resend.clear();
++                }
++
+                 size_t const have = f.active ? f.active->mobs.size() : 0;
+                 if (have + guids.size() > MAX_MOBS)
+                     return out.Add(head + "refused toomany -");
+ 
+                 for (ObjectGuid g : guids)
+                 {
+-                    if (f.active && f.active->Find(g))
+-                        return out.Add(head + "refused member " + Hex(g));
+                     auto it = g_held.find(g);
+                     if (it != g_held.end() && it->second != pg)
+                         return out.Add(head + "refused held " + Hex(g));
+@@ -715,7 +738,7 @@ namespace
+ 
+         if (!resend.empty())
+         {
+-            // Same begin again: answer it again, change nothing.
++            // Same begin (or a join of members only) again: answer it again, change nothing.
+             uint32 alive = 0;
+             std::vector<std::string> lines;
+             for (ObjectGuid g : resend)
+@@ -724,7 +747,7 @@ namespace
+                 if (c && c->IsAlive())
+                 {
+                     ++alive;
+-                    lines.push_back(MobLine(enc, c, "begin"));
++                    lines.push_back(MobLine(enc, c, verb.c_str()));
+                 }
+             }
+             out.Add(head + "ok " + std::to_string(alive) + " " + std::to_string(p->GetHealth()) + " " + std::to_string(p->GetMaxHealth()));
