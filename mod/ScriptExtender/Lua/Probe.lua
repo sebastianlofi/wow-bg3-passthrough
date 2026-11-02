@@ -80,6 +80,8 @@ function Probe.Start(context)
         -- The world's turn in turn-based mode outside combat (TurnHold.lua releases WoW's creatures then).
         pcall(function() Ext.Require("TurnHold.lua").StartClient(report.RunId) end)
         if not okRs then Ext.Log.Print("WOW-BG3 render screen: " .. tostring(errRs)) end
+        local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").StartClient() end)
+        if not okMl then Ext.Log.Print("WOW-BG3 move loading: " .. tostring(errMl)) end
         Ext.Events.Tick:Subscribe(captureMenu)
         Ext.Require("MenuProbe.lua").Start(report.RunId)
         -- New game straight into world mode: research hook in any game state.
@@ -106,6 +108,8 @@ function Probe.Start(context)
         if not okSi then Ext.Log.Print("WOW-BG3 silence: " .. tostring(errSi)) end
     end
     if context == "server" then
+        local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").StartServer() end)
+        if not okMl then Ext.Log.Print("WOW-BG3 move fade: " .. tostring(errMl)) end
         -- New game straight into world mode: the nautiloid intro skipped with the
         -- story's own data, only when BG3 was started for a new game (WOW_BG3_NEW_GAME=1).
         local okNg, errNg = pcall(function() Ext.Require("NewGame.lua").Start(report.RunId, "server") end)
