@@ -58,7 +58,7 @@ Extender, and whether it works on the Linux Script Extender in this download is 
 ## Play
 
 1. Start BG3 from Steam.
-2. Mod Manager: enable WOW-BG3.
+2. Mod Manager: enable WoW-BG3 Passthrough.
    The local WoW server starts in the background now; nothing is online.
    The very first time it builds its data from your WoW files (a few minutes);
    a New Game started meanwhile keeps its loading screen up until it is done.

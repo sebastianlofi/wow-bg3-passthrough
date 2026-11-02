@@ -73,7 +73,7 @@ the WoW characters, and loading an older save takes them back to that point too.
 
 ## Removing it
 
-Disable WOW-BG3 in the mod manager, then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/`. Delete
+Disable WoW-BG3 Passthrough in the mod manager, then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/`. Delete
 `~/.local/share/wow-bg3/` to drop the server data and snapshots as well. Run the Script Extender
 installer with `--uninstall` if you no longer want bg3le. World-mode saves need the mod to load
 properly.
