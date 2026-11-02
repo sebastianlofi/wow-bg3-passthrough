@@ -1,0 +1,85 @@
+WOW-BG3 vmangos patch 0023: an owner between maps is not an owner gone.
+
+In a far teleport (the hero's worldport to another continent, WoW's loading screen) a player is out of
+every map for a few seconds, and ObjectAccessor::FindPlayer does not find it. The bot tick took that for
+"the owner went without a logout hook" and logged every party bot out, the feeds were dropped, and every
+later `view`, `move` and `inv` was refused `offline` (0.1.3013.58: after one move to Elwynn, Far Sight
+onto Astarion 700 m away was refused, so WoW's view stayed on the hero and showed void). The owner is now
+looked up in or out of a map: bots stay, a feed waits while its owner or member is between maps, and a
+Far Sight is decided once its owner is in a map again.
+
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+--- a/src/game/WowBg3Party.cpp
++++ b/src/game/WowBg3Party.cpp
+@@ -868,13 +868,20 @@ namespace
+         for (auto it = g_feeds.begin(); it != g_feeds.end();)
+         {
+             Feed& f = *it;
+-            Player* owner = ObjectAccessor::FindPlayer(f.owner);
+-            Player* m = ObjectAccessor::FindPlayer(f.member);
++            // Not-in-world too (patch 0023): an owner or a member in a far teleport is between maps for a
++            // few seconds (the hero's worldport to another continent: WoW's loading screen); its feed waits.
++            Player* owner = ObjectAccessor::FindPlayerNotInWorld(f.owner);
++            Player* m = ObjectAccessor::FindPlayerNotInWorld(f.member);
+             if (!owner)
+             {
+                 it = g_feeds.erase(it);
+                 continue;
+             }
++            if (!owner->IsInWorld() || (m && !m->IsInWorld() && m->IsBeingTeleportedFar()))
++            {
++                ++it;
++                continue;
++            }
+             if (!m || !m->IsInWorld())
+             {
+                 SayTo(owner, "WOWBG3 feed " + f.memberName + " off gone");
+@@ -1333,7 +1340,10 @@ void UpdateParty(uint32 diff)
+         }
+         for (auto const& v : views)
+         {
+-            Player* owner = ObjectAccessor::FindPlayer(ObjectGuid(v.first));
++            Player* owner = ObjectAccessor::FindPlayerNotInWorld(ObjectGuid(v.first));
++            // An owner between maps (patch 0023): decided when it is in a map again, so it hears of it.
++            if (owner && !owner->IsInWorld() && owner->IsBeingTeleportedFar())
++                continue;
+             if (owner && owner->IsInWorld() && owner->GetCamera().GetBody() &&
+                 owner->GetCamera().GetBody()->GetObjectGuid().GetRawValue() == v.second)
+                 continue;
+@@ -1394,7 +1404,11 @@ void UpdateParty(uint32 diff)
+ 
+     for (Bot const& b : snapshot)
+     {
+-        Player* owner = ObjectAccessor::FindPlayer(b.owner);
++        // The owner in a map, and the owner at all: between maps (a far teleport: the hero's worldport to
++        // another continent) it has no map for a few seconds but has not gone (patch 0023; before it,
++        // every bot was logged out at the hero's first worldport, as "an owner gone without a logout").
++        Player* const ownerAny = ObjectAccessor::FindPlayerNotInWorld(b.owner);
++        Player* owner = ownerAny && ownerAny->IsInWorld() ? ownerAny : nullptr;
+         uint32 const age = WorldTimer::getMSTimeDiff(b.since, now);
+         // Not-in-world too: a bot in a far teleport is between maps for a moment.
+         Player* m = b.guid.IsEmpty() ? nullptr : ObjectAccessor::FindPlayerNotInWorld(b.guid);
+@@ -1427,11 +1441,13 @@ void UpdateParty(uint32 diff)
+             {
+                 if (age < CREATE_WAIT_MS)
+                     break;
+-                if (!owner)
++                if (!ownerAny)
+                 {
+                     changes.push_back({ b.name, b.state, b.guid, b.account, true, false });
+                     break;
+                 }
++                if (!owner)
++                    break;                                  // logs in once its owner is in a map again
+                 if (sPlayerBotMgr.AddBot(b.guid.GetCounter(), false, new PartyBotPuppetAI()))
+                     changes.push_back({ b.name, BotState::Loading, b.guid, b.account, false, false });
+                 else if (age > LOGIN_WAIT_MS)
+@@ -1513,7 +1529,7 @@ void UpdateParty(uint32 diff)
+                     if (!m->GetGroup() || m->GetGroup() != owner->GetGroup())
+                         JoinParty(owner, m);
+                 }
+-                if (!owner && m)
++                if (!ownerAny && m)
+                 {
+                     // The owner went without a logout hook (should not happen): log the bot out too.
+                     if (PlayerBotEntry* e = m->GetSession()->GetBot())

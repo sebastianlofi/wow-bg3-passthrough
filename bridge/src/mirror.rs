@@ -232,6 +232,12 @@ pub struct PartyLink {
     feeds: HashMap<String, u64>,
     /// The Far Sight target last asked for ("self" the hero).
     view: String,
+    /// When it was asked for (ms).
+    view_at: u64,
+    /// The server refused it (`WOWBG3 view NAME refused WHY`: a bot offline or between maps) or ended
+    /// it by itself (`WOWBG3 view self reset`: the member changed map or logged out): asked again
+    /// [`VIEW_RETRY_MS`] after the last ask while the player still controls that member.
+    view_lost: bool,
     /// Server patch 0015's `walk` (the bots teleported
     /// after their members): the server answered a walk, so it has the verb.
     walk_ok: bool,
@@ -255,14 +261,38 @@ pub const BOT_WALK_MS: u64 = 500;
 pub const BOT_WALK_REACH_YD: f64 = 35.0;
 /// No answer to a walk in this long and none ever came: a server without `walk`; `move` for a minute.
 pub const BOT_WALK_WAIT_MS: u64 = 5_000;
+/// A Far Sight the server refused or ended is asked for again this long after the last ask (ms).
+pub const VIEW_RETRY_MS: u64 = 2_000;
 
 impl PartyLink {
     /// The server's answer to a walk (`WOWBG3 walk NAME ok MAP X Y Z SPEED`, `WOWBG3 walk NAME refused
-    /// WHY [...]`), from `server-events.txt`.
+    /// WHY [...]`) or to Far Sight (`WOWBG3 view NAME ok GUID`, `WOWBG3 view NAME refused WHY`,
+    /// `WOWBG3 view self reset`), from `server-events.txt`.
     pub fn event(&mut self, line: &str) {
         let mut w = line.split_whitespace();
-        if w.next() != Some("WOWBG3") || w.next() != Some("walk") {
+        if w.next() != Some("WOWBG3") {
             return;
+        }
+        match w.next() {
+            Some("walk") => {}
+            Some("view") => {
+                let (name, what) = (w.next().unwrap_or(""), w.next().unwrap_or(""));
+                // t58: the server had logged the bots out, so `view Astarion` was refused and never asked
+                // again; WoW's view stayed on the hero 700 m from BG3's camera (void) until the switch back.
+                let lost = match what {
+                    "refused" => name.eq_ignore_ascii_case(&self.view),
+                    "reset" => self.view != "self",
+                    _ => false,
+                };
+                if what != "ok" {
+                    println!("bridge: far sight: {}", line.trim());
+                }
+                if lost {
+                    self.view_lost = true;
+                }
+                return;
+            }
+            _ => return,
         }
         let Some(name) = w.next() else { return };
         self.walk_pending.remove(name);
@@ -398,8 +428,11 @@ impl PartyLink {
         if self.view.is_empty() {
             self.view = "self".into();
         }
-        if want != self.view {
+        let again = self.view_lost && want != "self" && now >= self.view_at + VIEW_RETRY_MS;
+        if want != self.view || again {
             self.view = want.clone();
+            self.view_at = now;
+            self.view_lost = false;
             out.push(Handoff::Party {
                 line: format!("view {want}"),
             });

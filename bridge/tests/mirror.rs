@@ -778,6 +778,49 @@ fn the_servers_feed_adds_creatures_and_the_party_link_moves_bots() {
         lines(p.step(&dir, &dir, 0, 2300, &none)),
         vec![".wowbg3 view self"]
     );
+    // A refused Far Sight (t58: the bot offline) is asked again 2 s after the last ask, while the
+    // player still controls that member; a refusal of another name, or an ok, changes nothing.
+    std::fs::write(
+        dir.join("farsight.json"),
+        json!({"Format": 1, "On": true, "Uuid": "ast-u"}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        lines(p.step(&dir, &dir, 0, 10_000, &none)),
+        vec![".wowbg3 view Astarion"]
+    );
+    p.event("WOWBG3 view Karlach refused offline");
+    assert!(p.step(&dir, &dir, 0, 13_000, &none).is_empty());
+    p.event("WOWBG3 view Astarion refused offline");
+    assert!(
+        p.step(&dir, &dir, 0, 11_000, &none).is_empty(),
+        "not within 2 s of the ask"
+    );
+    assert_eq!(
+        lines(p.step(&dir, &dir, 0, 13_100, &none)),
+        vec![".wowbg3 view Astarion"]
+    );
+    assert!(p.step(&dir, &dir, 0, 16_000, &none).is_empty(), "asked once");
+    p.event("WOWBG3 view Astarion ok 0000000000000010");
+    assert!(p.step(&dir, &dir, 0, 20_000, &none).is_empty());
+    // The server ended it by itself (the member changed map): asked again.
+    p.event("WOWBG3 view self reset");
+    assert_eq!(
+        lines(p.step(&dir, &dir, 0, 20_100, &none)),
+        vec![".wowbg3 view Astarion"]
+    );
+    // Back on the hero: a reset then is the hero's own and nothing is asked.
+    std::fs::write(
+        dir.join("farsight.json"),
+        json!({"Format": 1, "On": false}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        lines(p.step(&dir, &dir, 0, 20_200, &none)),
+        vec![".wowbg3 view self"]
+    );
+    p.event("WOWBG3 view self reset");
+    assert!(p.step(&dir, &dir, 0, 30_000, &none).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

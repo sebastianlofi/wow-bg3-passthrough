@@ -28,6 +28,7 @@ fights, party members and the merged inventory.
 | 0020 forced-reaction-interact | a forced reaction counts when talking to an NPC, so `faction alliance` or `faction horde` opens that side's merchants |
 | 0021 vendor-stock-from-bg3 | `vendor list` adds a ware's maxcount and the vendor's level; `vendor buy` clears WoW's timed counts, since BG3's save holds what was bought since the long rest |
 | 0022 join-idempotent | a `join` of mobs already in the encounter drops them and answers `ok`, as `begin`'s resend does |
+| 0023 owner-between-maps | the hero between maps (a worldport to another continent) keeps its party bots, their feeds and Far Sight; before, every bot was logged out at the first such move |
 
 Upstream `Unit.cpp` uses CRLF line endings, so some hunks are CRLF: never convert line endings in
 these files.
