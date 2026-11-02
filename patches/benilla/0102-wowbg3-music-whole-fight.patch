@@ -1,0 +1,62 @@
+WOW-BG3 benilla patch 0102: WoW's music stays out of the whole fight.
+WoW's zone music followed tav.bin's combat flag only, the hero's own TurnBased state. That goes off
+during a fight that is still running (seen with the hero at 1 HP), so WoW's track started over BG3's
+combat music. The fight's own state counts too, from the pull to its end, which also starts the fade
+at the pull. The fade for a fight is 1.5 s, not the zone change's 4.0 s: BG3's music already plays.
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -288,6 +288,11 @@
+     SHARED.lock().is_ok_and(|s| s.held.contains(&attacker))
+ }
+ 
++/// Patch 0102: a fight runs, from the pull to its end, whatever the hero's own state.
++pub(crate) fn in_fight() -> bool {
++    SHARED.lock().is_ok_and(|s| s.active)
++}
++
+ /// A fight mob's model: where BG3 has it and what it still has to play.
+ #[derive(Default)]
+ struct Held {
+diff --git a/crates/benilla-app/src/sound/mod.rs b/crates/benilla-app/src/sound/mod.rs
+--- a/crates/benilla-app/src/sound/mod.rs
++++ b/crates/benilla-app/src/sound/mod.rs
+@@ -252,7 +252,10 @@
+ /// Copy BG3's fight into [`SoundConfig::music_yield`] (world mode only). In `WorldStage::Stream`
+ /// like the cinematic's flag, so [`zone::zone_audio`] in `Present` sees it the same frame.
+ fn feed_music_yield(mut config: ResMut<SoundConfig>) {
+-    let fight = crate::wowbg3_lead::hide_self() && crate::wowbg3_lead::bg3_combat();
++    // Patch 0102: the fight too, from its pull: BG3's flag is the hero's and goes off while the fight
++    // and its music go on.
++    let fight = crate::wowbg3_lead::hide_self()
++        && (crate::wowbg3_lead::bg3_combat() || crate::wowbg3_fight::in_fight());
+     if config.music_yield != fight {
+         config.music_yield = fight;
+     }
+diff --git a/crates/benilla-app/src/sound/zone.rs b/crates/benilla-app/src/sound/zone.rs
+--- a/crates/benilla-app/src/sound/zone.rs
++++ b/crates/benilla-app/src/sound/zone.rs
+@@ -60,6 +60,9 @@
+ /// 3.0 s would start WoW's track over that.
+ const FIGHT_MUSIC_RESUME_SECS: f64 = 8.0;
+ 
++/// WOW-BG3 (patch 0102): how fast the zone track leaves for BG3's fight music, which is already playing.
++const FIGHT_MUSIC_FADE_OUT_MS: u64 = 1500;
++
+ fn phase(clock: &GameClock) -> usize {
+     if (330..1260).contains(&clock.minute) {
+         0
+@@ -480,11 +483,11 @@
+     zone.music_yielding = yielding;
+     if yielding {
+         if let Some(h) = zone.lua_music.as_mut() {
+-            h.pause(mixer::fade(MUSIC_FADE_OUT_MS));
++            h.pause(mixer::fade(FIGHT_MUSIC_FADE_OUT_MS));
+             info!("Lua music: paused for BG3's fight");
+         }
+         if let Some(mut h) = zone.music.take() {
+-            h.stop(mixer::fade(MUSIC_FADE_OUT_MS));
++            h.stop(mixer::fade(FIGHT_MUSIC_FADE_OUT_MS));
+             info!("zone music: fades out, BG3's fight music plays");
+         }
+         // The next track starts at position 0, behind this one's baseline.
