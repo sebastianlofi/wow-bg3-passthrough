@@ -1,0 +1,46 @@
+WOW-BG3 benilla patch 0105: a held model's shadow and ring stand where the model is.
+Playtest feedback: "shadows keep moving without their 3D models", and the selected Grunt's shadow and green circle stood at
+her guard post. The wire's movers write the server's position into a unit's Transform every frame (WorldStage::Net);
+fight_hold put BG3's back only in PostUpdate, just before propagation. So the model was drawn at BG3's place while every
+Update reader of Transform (blob_shadow, the target ring, and "Net entities are roots, so Transform is this frame's
+world position" elsewhere) saw the server's. fight_hold now runs right after the movers.
+diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transport.rs
+--- a/crates/benilla-app/src/transport.rs
++++ b/crates/benilla-app/src/transport.rs
+@@ -611,7 +611,7 @@ fn compose_riders(
+ /// when the horizontal step exceeds 3 yd (`[0x80c5bc]` = 9.0, squared) or 60 yd/s, the common
+ /// first substep on a deck; ours re-grounds that frame, and both settle the same the next.
+ #[allow(clippy::type_complexity)] // one Bevy system's full input set
+-fn ground_deck_riders(
++pub(crate) fn ground_deck_riders(
+     world: benilla_world::collision::WorldCollision,
+     mut riders: Query<
+         (
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -734,13 +734,18 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+         write_us: (0, 0),
+     })
+     .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
++    // Patch 0105: right after the wire's movers (and a deck rider's), before everything that reads
++    // this frame's unit `Transform`, the ground ring and the blob shadow among them. The server's
++    // position is written over the model's every frame in `WorldStage::Net`; put back only in
++    // `PostUpdate`, the model was drawn at BG3's place while its readers saw the server's.
+     .add_systems(
+-        PostUpdate,
+-        (
+-            fight_hold.before(bevy::transform::TransformSystems::Propagate),
+-            stream_mobs_live.after(fight_hold).before(bevy::transform::TransformSystems::Propagate),
+-        ),
+-    );
++        Update,
++        fight_hold
++            .after(benilla_world::schedule::WorldStage::Net)
++            .after(crate::transport::ground_deck_riders)
++            .before(benilla_world::schedule::WorldStage::Input),
++    )
++    .add_systems(PostUpdate, stream_mobs_live.before(bevy::transform::TransformSystems::Propagate));
+ }
+ 
+ fn say(chat: &mut Option<ResMut<ChatLog>>, line: String) {
