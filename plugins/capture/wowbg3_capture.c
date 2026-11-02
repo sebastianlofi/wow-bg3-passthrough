@@ -1062,10 +1062,6 @@ typedef struct {
     uint64_t frames, skipped, why[8];
 } ComposeCfg;
 static ComposeCfg g_cc;
-static volatile int g_move_cover;
-// BG3's LoadingScreen.xaml is up (link/bg3moveui.txt, MoveLoading.lua): opaque over all of BG3's picture, so
-// during a move that picture is the loading screen itself, live, and the cover steps aside.
-static volatile int g_move_ui;
 
 // OUT_DIR/compose present = on. Optional words: "noui" (keep BG3's final picture where WoW shows
 // instead of rebuilding it from the UI target), "light" (add BG3's picture over WoW: effects in
@@ -1116,13 +1112,6 @@ static int has_word(const char* line, const char* w) {
 }
 static void compose_config(void) {
     struct stat st;
-    // OUT_DIR/compose.move, written by world_bridge.py for a move: every present black (cover_gpu), for the moments
-    // the party stands in BG3's own level. Old after 120 s: a bridge killed mid-move does not leave the screen black.
-    {
-        const int cover = stat(outp("/compose.move"), &st) == 0 && time(NULL) - st.st_mtim.tv_sec < 120;
-        if (cover != g_move_cover) logf_("compose: move cover %s", cover ? "on" : "off");
-        g_move_cover = cover;
-    }
     if (stat(outp("/compose"), &st) != 0) { if (g_cc.on) logf_("compose off"); g_cc.on = 0; return; }
     if (st.st_mtim.tv_sec == g_cc.seen.tv_sec && st.st_mtim.tv_nsec == g_cc.seen.tv_nsec) return;
     g_cc.seen = st.st_mtim;
@@ -1503,12 +1492,6 @@ static float hdr_sum(VkFormat f, const uint8_t* p) {
 
 // Returns a semaphore the present must wait on, or null (frame untouched).
 static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info) {
-    if (g_move_cover) {
-        if (g_move_ui) return VK_NULL_HANDLE;
-        VkSemaphore s = VK_NULL_HANDLE;
-        cover_gpu(q, c, index, info, &s, 0);
-        return s;
-    }
     {  // the GPU compositor, unless it does not apply (wowbg3_compose_gpu.inc.c)
         VkSemaphore s = VK_NULL_HANDLE;
         if (compose_gpu(q, c, index, info, &s) >= 0) return s;
@@ -3476,7 +3459,6 @@ static char g_screen_path[512];
 // LoadLevel... and the PrepareRunning hold after it: BG3's own loading screen then. 1 Running (or no
 // file: as before), 0 anything else. Read at each present: one stat, and the file only when it changed.
 static int g_bg3_running = 1;
-static int g_bg3_holding;  // the launcher holds the client on BG3's loading screen ("Holding": 1)
 static void bg3_state_check(void) {
     static char path[1024];
     static struct timespec seen;
@@ -3502,9 +3484,6 @@ static void bg3_state_check(void) {
     if (running != g_bg3_running) logf_("bg3 client %s: WoW's picture %s", running ? "running" : "loading or held", running ? "composited" : "not composited");
     if (!running && g_bg3_running) wr_forget();  // the world before the load is gone (wowbg3_compose_gpu.inc.c)
     g_bg3_running = running;
-    const char* h = strstr(buf, "\"Holding\"");
-    const char* colon = h ? strchr(h, ':') : NULL;
-    g_bg3_holding = colon && atoi(colon + 1) == 1;
 }
 static void screen_check(void) {
     if (!g_screen_path[0]) {
@@ -3526,14 +3505,6 @@ static void screen_check(void) {
         g_screen = on;
     }
     g_screen_dialog = on && strstr(line, "Dialogue") != NULL;
-    static char ui_path[512];
-    if (!ui_path[0]) snprintf(ui_path, sizeof ui_path, "%s/bg3moveui.txt", link_dir());
-    char ui[8] = {0};
-    f = stat(ui_path, &fs) == 0 && fs.st_mtime >= born ? fopen(ui_path, "r") : NULL;
-    if (f) { if (!fgets(ui, sizeof ui, f)) ui[0] = 0; fclose(f); }
-    const int ui_on = ui[0] == '1';
-    if (ui_on != g_move_ui) logf_("compose: BG3's loading screen for the move %s", ui_on ? "up: its picture passes" : "closed");
-    g_move_ui = ui_on;
 }
 static void tav_present(QueueData* q) {
     if (!g_tav.init) {
@@ -3640,22 +3611,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
             pthread_mutex_unlock(&g_trace_lock);
         }
         bg3_state_check();
-        // BG3's loading screen, for a move (wowbg3_compose_gpu.inc.c, g_ls).
-        if (g_bg3_holding && !g_bg3_running && info->swapchainCount >= 1 && now_ns() - g_ls.last_ns >= LS_EVERY_NS) {
-            SwapchainData* c = chain_data(info->pSwapchains[0]);
-            if (c && info->pImageIndices[0] < c->count) {
-                g_ls.last_ns = now_ns();
-                VkSemaphore s = VK_NULL_HANDLE;
-                pthread_mutex_lock(&g_trace_lock);
-                cover_gpu(q, c, info->pImageIndices[0], info, &s, 1);
-                pthread_mutex_unlock(&g_trace_lock);
-                if (s != VK_NULL_HANDLE) {
-                    wait = s;
-                    copy.waitSemaphoreCount = 1;
-                    copy.pWaitSemaphores = &wait;
-                }
-            }
-        }
         if (g_cc.on && g_bg3_running && info->swapchainCount >= 1) {
             t = now_ns();
             SwapchainData* c = chain_data(info->pSwapchains[0]);
@@ -3664,7 +3619,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
             // the dark backdrop ("screenvoid"), but without WoW's frame, so the pacing stays out.
             const int scr_dark = g_screen && g_cc.screenvoid;
             if (c && info->pImageIndices[0] < c->count && !g_cc.raw && (!g_screen || scr_dark || g_screen_dialog)) {
-                const int paced = !scr_dark && !g_move_cover;
+                const int paced = !scr_dark;
                 if (paced) pace_before_compose();  // which WoW frame, and a bounded wait for it (no trace lock held)
                 pthread_mutex_lock(&g_trace_lock);
                 VkSemaphore w = compose_frame(q, c, info->pImageIndices[0], info);

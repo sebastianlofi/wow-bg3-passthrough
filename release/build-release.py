@@ -95,9 +95,6 @@ def pak_files(version: str, native_plugins):
         raise SystemExit("no Lua in " + str(MOD_SRC))
     for p in lua:
         files.append((f"Mods/{FOLDER}/ScriptExtender/Lua/{p.name}", p.read_bytes()))
-    # BG3's state machine, extended (MoveLoading.lua).
-    for p in sorted((MOD_SRC / "GUI/StateMachines").glob("*.xaml")):
-        files.append((f"Mods/{FOLDER}/GUI/StateMachines/{p.name}", p.read_bytes()))
     # The stats of our own spells: never an empty file (an empty stats .txt hangs BG3's load).
     for p in sorted((MOD_SRC / f"Public/{FOLDER}/Stats/Generated/Data").glob("*.txt")):
         files.append((f"Public/{FOLDER}/Stats/Generated/Data/{p.name}", p.read_bytes()))

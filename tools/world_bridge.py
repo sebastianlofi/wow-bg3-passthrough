@@ -181,17 +181,13 @@ CAMP_WORDS = 'camp bg3tav'
 
 
 def move_cover(on):
-    """A move: the screen stays black (the compositor's compose.move) while the party stands in BG3's own level."""
-    d = os.environ.get('WOWBG3_CAPTURE_DIR')
-    f = (Path(d) if d else ROOT / 'bg3/private/logs/capture') / 'compose.move'
-    flag = LINK / 'wowmove.flag'  # MoveLoading.lua: BG3's loading screen
+    """A move: BG3's own screen fade covers the party's stay in BG3's level (MoveLoading.lua)."""
+    flag = LINK / 'wowmove.flag'
     try:
         if on:
-            f.touch()
             flag.write_text('%.3f\n' % time.time())
-            time.sleep(0.5)  # the compositor looks every 15 presents
+            time.sleep(1.0)  # the mod looks every 5 ticks, then BG3 fades for 0.5 s
         else:
-            f.unlink(missing_ok=True)
             flag.unlink(missing_ok=True)
     except OSError as e:
         print('move: cover file:', e, flush=True)

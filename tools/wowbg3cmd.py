@@ -585,10 +585,8 @@ def tele(ctx, args, at=None):
         body.update(Char=char, Via=via[0][0])
     atomic_write(path, json.dumps(body))
     # The screen answers the click at once; the world bridge takes the cover off when it is done.
-    cover = Path(os.environ.get('WOWBG3_CAPTURE_DIR') or '/nonexistent') / 'compose.move'
     flag = ctx.link / 'wowmove.flag'  # MoveLoading.lua: BG3's loading screen
     try:
-        cover.touch()
         flag.write_text('%.3f\n' % time.time())
     except OSError:
         pass
@@ -604,7 +602,6 @@ def tele(ctx, args, at=None):
             res = r
             break
     if not res:
-        cover.unlink(missing_ok=True)
         flag.unlink(missing_ok=True)
         raise CmdError('tp: no answer from the world bridge in time (see its log)')
     if not res.get('OK'):

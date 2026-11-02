@@ -1,94 +1,80 @@
--- MoveLoading.lua (client): BG3's own loading screen during a move. A move is no load to BG3, so its game
--- never fires GE.OnStateLoadingStart; mod/GUI/StateMachines adds a state holding BG3's LoadingScreen.xaml
--- (art, tips, spinner, all BG3's and live), opened and closed by events through a widget's CustomEvent
--- command, the way BG3's own widgets fire theirs.
--- link/wowmove.flag: written by tools/ when a move starts (a new text each time), gone when it ends.
--- link/bg3moveui.txt: "1" while the widget is up. Only then the capture layer lets BG3's picture through
--- instead of the move cover (wowbg3_capture.c, compose_frame), so a state that did not open leaves the
--- cover, and the log says so.
+-- MoveLoading.lua: a move's cover is BG3's own screen fade (Osiris ScreenFadeTo, as its camp and prison
+-- scripts use it). BG3 draws it in its UI (ScreenFade.xaml, in every running game), which the capture layer
+-- composites over WoW's picture, so it fades over the world, stays black while the party is away, and fades
+-- out at the new place. Its wheel is that widget's too, shown when BG3's ScreenFadeHasSpin says so.
+-- link/wowmove.flag: written by tools/ when a move starts, a new text each time; gone when it ends.
 local M = {}
 
-local CHECK_EVERY = 10   -- ticks
-local RETRY_MS = 1000    -- an event that showed no result yet
-local WARN_MS = 5000
-local OLD_MS = 120000    -- as compose.move: a bridge killed mid-move does not leave the screen covered
+local CHECK_EVERY = 5     -- ticks
+local FADE_S, CLEAR_S = 0.5, 1.0
+local OLD_MS = 120000     -- a bridge killed mid-move does not leave the screen black
+local ID = "WOWBG3_Move"
+local FLAG = "wow-bg3/link/wowmove.flag"
 
-local function widgets()
-    local out = {}
-    local function walk(node, depth)
-        if not node or depth > 5 then return end
-        if node.Type == "ls.UIWidget" then out[#out + 1] = node; return end
-        for i = 1, math.min(node.VisualChildrenCount or 0, 128) do walk(node:VisualChild(i), depth + 1) end
-    end
-    walk(Ext.UI.GetRoot(), 0)
-    return out
-end
-
--- LoadingScreen.xaml's x:Name is "root", as for ten other widgets; of BG3's XAML only it binds LoadingHints.
-local function isLoading(node)
-    local ok, hints = pcall(function() return node.DataContext.LoadingHints end)
-    return ok and hints ~= nil
-end
-
-local function fire(list, event)
-    for _, node in ipairs(list) do
-        local ok, done = pcall(function()
-            local cmd = node.DataContext.CustomEvent
-            if not cmd or not cmd:CanExecute(event) then return false end
-            cmd:Execute(event)
-            return true
-        end)
-        if ok and done then return true end
-    end
-    return false
-end
-
-function M.Start()
-    local ticks = 0
-    local seen = Ext.IO.LoadFile("wow-bg3/link/wowmove.flag") or "" -- one from before this start is no move
-    local want, up, since, tried, warned = false, false, 0, nil, false
-    Ext.IO.SaveFile("wow-bg3/link/bg3moveui.txt", "0\n")
-    local function setUp(v)
-        if v ~= up then
-            up = v
-            Ext.IO.SaveFile("wow-bg3/link/bg3moveui.txt", v and "1\n" or "0\n")
-            Ext.Log.Print("WOW-BG3 move loading: BG3's loading screen " .. (v and "up" or "closed"))
-        end
+function M.StartServer()
+    local ticks, seen, on, since, first = 0, nil, false, 0, true
+    local function fade(open)
+        local host = Osi.GetHostCharacter()
+        local ok, err
+        if open then ok, err = pcall(Osi.ScreenFadeTo, host, FADE_S, 0, ID)
+        else ok, err = pcall(Osi.ClearScreenFade, host, CLEAR_S, ID, 0) end
+        Ext.Log.Print("WOW-BG3 move fade: " .. (open and "to black" or "cleared") .. (ok and "" or " failed: " .. tostring(err)))
     end
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
-        if ticks % CHECK_EVERY ~= 0 then return end
+        if ticks % CHECK_EVERY ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         local now = Ext.Utils.MonotonicTime()
-        local flag = Ext.IO.LoadFile("wow-bg3/link/wowmove.flag") or ""
+        local flag = Ext.IO.LoadFile(FLAG) or ""
+        if first then
+            first = false
+            seen = flag -- from before this load: no move, but a save or reload may have kept its fade
+            if flag ~= "" then fade(false) end
+        elseif flag ~= seen then
+            seen = flag
+            since = now
+            if (flag ~= "") ~= on then
+                on = flag ~= ""
+                fade(on)
+            end
+        elseif on and now - since > OLD_MS then
+            Ext.Log.Print("WOW-BG3 move fade: no end of the move in " .. OLD_MS / 1000 .. " s")
+            on = false
+            fade(false)
+        end
+    end)
+end
+
+-- What the in-game check needs: BG3's own values for the fade, 3 s into a move (its wheel stays hidden for 2).
+function M.StartClient()
+    local ticks, seen, at = 0, Ext.IO.LoadFile(FLAG) or "", nil
+    Ext.Events.Tick:Subscribe(function()
+        ticks = ticks + 1
+        if ticks % 30 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
+        local flag = Ext.IO.LoadFile(FLAG) or ""
         if flag ~= seen then
             seen = flag
-            since, tried, warned = now, nil, false
-            want = flag ~= ""
-        elseif want and now - since > OLD_MS then
-            Ext.Log.Print("WOW-BG3 move loading: no end of the move in " .. OLD_MS / 1000 .. " s: closing")
-            want = false
+            at = flag ~= "" and Ext.Utils.MonotonicTime() + 3000 or nil
         end
-        if not want and not up then return end
-        -- Only in a running game: BG3's UI is replaced around a real load (the crash of UiWatch.lua).
-        if Ext.Utils.GetGameState() ~= "Running" then setUp(false); return end
-        local okW, list = pcall(widgets)
-        if not okW then Ext.Log.Print("WOW-BG3 move loading: " .. tostring(list)); return end
-        local open = false
-        for _, node in ipairs(list) do
-            if isLoading(node) then open = true; break end
-        end
-        setUp(open)
-        if want == open then return end
-        if not tried or now - tried > RETRY_MS then
-            tried = now
-            if not fire(list, want and "OpenWowMoveLoading" or "CloseWowMoveLoading") then
-                Ext.Log.Print("WOW-BG3 move loading: no widget took the event")
+        if not at or Ext.Utils.MonotonicTime() < at then return end
+        at = nil
+        local found = false
+        local function walk(node, depth)
+            if not node or depth > 5 or found then return end
+            if node.Type == "ls.UIWidget" then
+                if node.Name == "ScreenFade" then
+                    local d = node.DataContext.CurrentPlayer.UIData
+                    if tostring(d.ScreenFadeVisibility) == "Visible" then
+                        found = true
+                        Ext.Log.Print(string.format("WOW-BG3 move fade: BG3 says opacity %s, spin %s",
+                            tostring(d.ScreenFadeOpacity), tostring(d.ScreenFadeHasSpin)))
+                    end
+                end
+                return
             end
+            for i = 1, math.min(node.VisualChildrenCount or 0, 128) do walk(node:VisualChild(i), depth + 1) end
         end
-        if want and not warned and now - since > WARN_MS then
-            warned = true
-            Ext.Log.Print("WOW-BG3 move loading: the state did not open in " .. WARN_MS / 1000 .. " s (mod/GUI/StateMachines loaded?); the cover stays")
-        end
+        local ok, err = pcall(walk, Ext.UI.GetRoot(), 0)
+        if not ok or not found then Ext.Log.Print("WOW-BG3 move fade: no visible ScreenFade 3 s in " .. tostring(err or "")) end
     end)
 end
 
