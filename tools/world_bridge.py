@@ -60,6 +60,11 @@ HYST = 8.0       # metres past a square's middle before the window moves
 # stands there in BG3 and benilla puts WoW's player on her, as on any big gap ("placed on BG3's
 # character"). A WoW-side teleport alone never sticks: benilla's movement sync puts WoW's player back
 # on the hero within a second (tried with .tele). Answer: world-move-result.json.
+# On the session's own continent the session stays (World.reorigin, WorldMode.lua Reorigin): the lattice and
+# the pool subgrids stay where they are, only the WoW point the centre stands for changes. The squares placed
+# then still hold the old place (stale): a wanted one is retiled where it lies, one nobody wants goes first when
+# a square needs a subgrid, and a stale storey over wanted ground gets tiles all blocked, or BG3 would keep finding the
+# old place's upper floor there. Only a refusal, or another continent, takes Stop and Start.
 # Kalimdor too: Map in the request picks the continent. Another continent than the
 # session's: Stop, a server teleport of the WoW character to the game_tele place Via names on that
 # continent (server/tools/world-console.py tele CHAR VIA: a worldport, WoW's loading screen), wait for
@@ -69,6 +74,7 @@ HYST = 8.0       # metres past a square's middle before the window moves
 CONTINENTS = {0: 'Eastern Kingdoms', 1: 'Kalimdor'}
 MOVE = IO / 'world-move.json'
 MOVE_RESULT = IO / 'world-move-result.json'
+LANDED_YD = 100.0  # yards: benilla's player this near where it should be counts as having arrived (World.settle)
 AHEAD = 20.0     # metres from the window's node before squares are placed ahead of her
 # A placed square whose middle is this near a member keeps its WoW triangles (the cursor's ground and the
 # camera's) even when no window wants it (the 0.1.0 playtest: back at the quest giver
@@ -348,6 +354,10 @@ class World:
         self.ground_pool = a.pool                                   # squares of ground at most
         self.pool = a.pool + (STOREY_SPARE if STOREYS else 0)    # pool subgrids, storeys included
         self.started = 0.0
+        self.stale = set()      # pool indices whose square still holds the place before the last re-origin
+        self.blocked = set()    # the stale storeys already given tiles all blocked (still stale: no new ground yet)
+        self.to_block = set()   # those moves() has just asked cells_for to block
+        self.landed = None      # when the last re-origin landed, until benilla's player has followed (settle)
 
     # ---- mapping ----
     def to_bg3(self, w):
@@ -658,7 +668,9 @@ class World:
 
     def moves(self, want):
         """[(pool index, square)]: squares in `want` not placed yet, filled from pool subgrids not
-        in `want` (never placed ones first, then the farthest from every member)."""
+        in `want` (stale ones first, then never placed ones, then the farthest from every member); the stale
+        squares in `want` where they lie, nothing has to leave them for that (the plugin's pool_same_spot); and last
+        the stale storeys over a wanted square that no cut wants, which only go blocked (self.to_block)."""
         at = {ij: k for k, ij in self.placed.items()}
         missing = [ij for ij in want if ij not in at]
         # A pool subgrid one side moved and the other did not (a refused Place) holds its square on
@@ -682,14 +694,33 @@ class World:
             minx, minz = self.cell_min(self.placed[k])
             return min(math.hypot(minx + CELL / 2 - p[0], minz + CELL / 2 - p[2]) for p in spots)
         free = sorted((k for k in range(self.pool) if k not in self.split and self.placed.get(k) not in want
-                       and self.pinned.get(k, 0) < now), key=far, reverse=True)
-        return pairs + list(zip(free, missing))
+                       and self.pinned.get(k, 0) < now), key=lambda k: (k in self.stale, far(k)), reverse=True)
+        # In `want` order, new and stale alike: the square under every member comes first.
+        free, out = iter(free), []
+        for ij in want:
+            if ij in at:
+                if at[ij] in self.stale:
+                    out.append((at[ij], ij))
+            elif ij in missing:
+                k = next(free, None)
+                if k is not None:
+                    out.append((k, ij))
+        pairs += out
+        used = {k for k, _ in pairs}
+        self.to_block = {k for k in self.stale - self.blocked - used
+                         if len(self.placed.get(k, ())) == 3 and self.placed[k][:2] in want}
+        return pairs + sorted((k, self.placed[k]) for k in self.to_block)
 
     def cells_for(self, pairs):
         """Writes each square's tiles for the plugin (section-<k>-<serial>.bin) -> Cells for the mod."""
         out = []
-        self.precut([ij[:2] for _, ij in pairs])
+        self.precut([ij[:2] for k, ij in pairs if k not in self.to_block])
         for k, ij in pairs:
+            if k in self.to_block:
+                self.serial = self.serial % SERIALS + 1
+                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), (b'\0' + struct.pack('<f', self.centre[1])) * (TILES * TILES))
+                out.append([k, *self.cell_min(ij), self.centre[1], self.serial])
+                continue
             cell = self.cut(ij[:2])
             if len(ij) == 3:
                 cell = cell['storeys'][ij[2] - 1]
@@ -736,9 +767,45 @@ class World:
         self.placed = {k: server[k] for k in server if k < self.pool and server[k] is not None and server[k] == client.get(k)}
         self.split = {k: {server.get(k), client.get(k)} - {None} for k in range(self.pool)
                       if server.get(k) != client.get(k) and ({server.get(k), client.get(k)} - {None})}
+        self.stale &= set(self.placed)
+        self.blocked &= self.stale
         print('resync:', self.placed, 'split:', self.split, flush=True)
 
     # ---- session ----
+    def landing(self, at, login, want):
+        """The ground a Start or a re-origin lands on: the squares `want` cut, and, at a point on a raised floor (a city
+        street), its storeys, returned the level under the hero first; they go down with the ground, or the hero
+        teleported there finds only the terrain under them and stays on it. May correct self.origin to the floor the
+        cut has. `login`: the point is where WoW's player stands, the terrain will do."""
+        def cut_all():
+            self.precut(want)
+            for ij in want:
+                self.cut(ij)
+        cut_all()
+        if not at or abs(at[2] - self.terrain.height(at[0], at[1])) <= wow_arena.STOREY_CLEAR:
+            return []
+        # A cut holds one storey a tile: where it kept another floor of this column, that one.
+        y = self.storey_floors(self.centre[0], self.centre[2])
+        if y is None and login:
+            self.origin = (at[0], at[1], self.terrain.height(at[0], at[1]))
+            print('start: no raised floor under WoW\'s player, the terrain', flush=True)
+            self.cells.clear()
+            cut_all()
+        elif y is not None and abs(y - self.centre[1]) > wow_arena.STOREY_CLEAR * YD:
+            self.origin = (at[0], at[1], at[2] + (y - self.centre[1]) / YD)
+            print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.origin[2]), flush=True)
+            self.cells.clear()
+            cut_all()
+        # A Start holds 12 squares: the level under the hero first, the others stream in after it.
+        def gap(u):
+            st = self.cells[u[:2]]['storeys'][u[2] - 1]
+            c0, r0 = int((self.centre[0] - st['min'][0]) // 0.5), int((self.centre[2] - st['min'][1]) // 0.5)
+            if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
+                return abs(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0] - self.centre[1])
+            return math.inf
+        return sorted([ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in want
+                       if k < len(self.cells[ij].get('storeys') or ())], key=gap)
+
     def start(self, at=None):
         """World mode at WoW's player, or at the WoW point `at` (x, y, z): its origin for the session."""
         login = False
@@ -754,34 +821,9 @@ class World:
         w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
         w.node = (0, 0)
         want, _ = self.window(w, self.centre[0], self.centre[2])
-        pairs = list(zip(range(4), want))
+        ups = self.landing(at, login, want)
+        pairs = list(zip(range(4), want)) + list(zip(range(4, min(self.pool, 12)), ups))
         cells = self.cells_for(pairs)
-        # A point on a raised floor (a city street): its storeys go down with the ground, or the hero
-        # teleported there finds only the terrain under them and stays on it.
-        if at and abs(at[2] - self.terrain.height(at[0], at[1])) > wow_arena.STOREY_CLEAR:
-            # A cut holds one storey a tile: where it kept another floor of this column, that one.
-            y = self.storey_floors(self.centre[0], self.centre[2])
-            if y is None and login:
-                self.origin = (at[0], at[1], self.terrain.height(at[0], at[1]))
-                print('start: no raised floor under WoW\'s player, the terrain', flush=True)
-                self.cells.clear()
-                cells = self.cells_for(pairs)
-            elif y is not None and abs(y - self.centre[1]) > wow_arena.STOREY_CLEAR * YD:
-                self.origin = (at[0], at[1], at[2] + (y - self.centre[1]) / YD)
-                print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.origin[2]), flush=True)
-                self.cells.clear()
-                cells = self.cells_for(pairs)
-            # A Start holds 12 squares: the level under the hero first, the others stream in after it.
-            def gap(u):
-                st = self.cells[u[:2]]['storeys'][u[2] - 1]
-                c0, r0 = int((self.centre[0] - st['min'][0]) // 0.5), int((self.centre[2] - st['min'][1]) // 0.5)
-                if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
-                    return abs(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0] - self.centre[1])
-                return math.inf
-            ups = list(zip(range(4, min(self.pool, 12)), sorted([ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in want
-                                                                 if k < len(self.cells[ij].get('storeys') or ())], key=gap)))
-            cells += self.cells_for(ups)
-            pairs += ups
         self.write_triangles(want)
         self.rays = sorted(want)
         seq = self.command('Start', Centre=list(self.centre), WowOrigin=list(self.origin), Cells=cells, PoolSize=self.pool,
@@ -797,6 +839,75 @@ class World:
             pass
         print('pool of', self.pool, 'squares; placed', self.placed, flush=True)
         self.started = time.time()
+        self.publish(True)
+
+    def reorigin(self, at):
+        """This session at the WoW point `at` (see the notes at the top). None, or why not: then the caller goes on
+        with Stop and Start, which take everything home whatever this left (the mod may have stopped publishing)."""
+        self.origin = tuple(at)
+        self.cells.clear()
+        self.ready.clear()
+        self.walkers.clear()
+        self.pinned.clear()
+        self.stale = set(self.placed)
+        self.blocked = set()
+        w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
+        w.node = (0, 0)
+        want, _ = self.window(w, self.centre[0], self.centre[2])
+        ups = self.landing(at, False, want)
+        squares = want + ups[:max(0, min(self.pool, 12) - len(want))]
+        why = None
+        for _ in range(3):
+            pairs = self.moves(squares)
+            short = set(want) - {ij for _, ij in pairs}
+            if short:
+                return why or 'no pool subgrid for %s' % sorted(short)
+            cells = self.cells_for(pairs)
+            self.write_triangles(want)
+            seq = self.command('Reorigin', WowOrigin=list(self.origin), Cells=cells)
+            ok, why = self.wait_done(seq, 45)
+            if ok:
+                for k, ij in pairs:
+                    self.took(k, ij)
+                self.rays = sorted(want)
+                self.started = self.landed = time.time()
+                return None
+            # As in follow: a subgrid on its way to another square that something stands on waits, another one goes.
+            m = re.search(r'stands on pool ([0-9 ]+)', str(why))
+            if not m:
+                return why
+            for k in m.group(1).split():
+                self.pinned[int(k)] = time.time() + 15.0
+        return why
+
+    def took(self, k, ij):
+        """Pool subgrid k has square ij now, on both sides; one only blocked has no new ground yet."""
+        if k in self.to_block:
+            self.blocked.add(k)
+            return
+        self.placed[k] = ij
+        self.split.pop(k, None)
+        self.stale.discard(k)
+        self.blocked.discard(k)
+
+    def settle(self):
+        """After a re-origin world.json stays Active false until benilla's player has followed the hero (about 2 s):
+        with it Active the mirrors would map the mobs round the old place through the new mapping. A player that never
+        follows says so and leaves world.json off: mobs mapped wrong would only hide that."""
+        if self.landed is None:
+            return
+        try:
+            x, y, _ = player_wow()
+        except (AssertionError, OSError, struct.error):
+            return
+        t = tav(self.started + 1.0)
+        where = [self.origin] + ([t[0]] if t else [])  # she may have walked on since
+        if min(math.hypot(x - p[0], y - p[1]) for p in where) > LANDED_YD:
+            if time.time() - self.landed > 30:
+                self.landed = time.time()
+                print('move: benilla\'s player is still at WoW %.1f %.1f, not at %s' % (x, y, where), flush=True)
+            return
+        self.landed = None
         self.publish(True)
 
     def publish(self, active):
@@ -827,7 +938,7 @@ class World:
     def floor_at(self, bx, bz):
         """(walkable, floor y) of the placed square's tile under BG3 (x, z), or None."""
         ij = (int(math.floor((bx - self.centre[0]) / CELL)), int(math.floor((bz - self.centre[2]) / CELL)))
-        if ij not in self.placed.values() or ij not in self.cells:
+        if ij not in {s for k, s in self.placed.items() if k not in self.stale} or ij not in self.cells:
             return None
         cell = self.cells[ij]
         c = min(TILES - 1, max(0, int((bx - cell['min'][0]) / 0.5)))
@@ -936,11 +1047,12 @@ class World:
         print(time.strftime('%H:%M:%S'), 'far sight', ('on ' + w.name) if w else 'off (the hero again)', flush=True)
 
     def move(self, m):
-        """World mode again at the requested WoW point: Stop (hero, party and squares home), then a new
+        """World mode at the requested WoW point. On this continent the session goes on there (reorigin). Another
+        continent, or a refused re-origin: Stop (hero, party and squares home), then a new
         session with that point as the origin, on the request's continent (Map; another continent: a
         server teleport first, see CONTINENTS). A failed Start is tried again; if the new place never
-        starts, world mode starts again where WoW's player stands. Returns the new World (self if
-        refused)."""
+        starts, world mode starts again where WoW's player stands. Returns the World to go on with (self if
+        refused or re-origined)."""
         def answer(ok, value):
             atomic_write(MOVE_RESULT, json.dumps({'RunId': self.run, 'Seq': m['Seq'], 'OK': ok, 'Value': value}).encode())
         try:
@@ -986,6 +1098,15 @@ class World:
         print(time.strftime('%H:%M:%S'), 'move to', m.get('What') or '', 'WoW %.1f %.1f %.1f map %d' % (x, y, z, target), flush=True)
         move_cover(True)
         self.publish(False)
+        if not cross:
+            try:
+                why = self.reorigin((x, y, z))
+            except Exception as e:  # noqa: BLE001  Stop and Start cut again from nothing
+                why = e
+            if why is None:
+                answer(True, {'Origin': list(self.origin), 'Map': target})
+                return self
+            print('move: no re-origin (%s), Stop and Start' % why, flush=True)
         seq = self.command('Stop')
         ok, err = self.wait_done(seq, 60)
         if not ok:
@@ -1052,6 +1173,7 @@ class World:
         return self.arrive(target)
 
     def follow(self):
+        self.settle()
         # Tav's record counts once WorldMode has teleported her (it publishes only after Start).
         t = tav(self.started + 1.0)
         if not t:
@@ -1077,7 +1199,8 @@ class World:
         def near(ij):
             minx, minz = self.cell_min(ij)
             return any(math.hypot(minx + CELL / 2 - p[0], minz + CELL / 2 - p[2]) <= KEEP_RAYS for p in where)
-        squares = [ij for k, ij in self.placed.items() if k not in moving and (ij in want or near(ij))]
+        # A stale square's WoW triangles would be another place's than its tiles: it gets them as it is retiled.
+        squares = [ij for k, ij in self.placed.items() if k not in moving and k not in self.stale and (ij in want or near(ij))]
         squares += [ij for _, ij in pairs]
         # Squares one side still holds (a split pool subgrid) keep their WoW triangles too.
         squares += [ij for k, spots in self.split.items() if k not in moving for ij in spots
@@ -1091,8 +1214,7 @@ class World:
         if ok:
             self.rays = sorted(squares)
             for k, ij in pairs:
-                self.placed[k] = ij
-                self.split.pop(k, None)
+                self.took(k, ij)
         else:
             print('Stream refused:', err, flush=True)
             # A square with something on it (a fight's stand-in, a corpse, a surface) stays put for a
