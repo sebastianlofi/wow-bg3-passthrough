@@ -209,7 +209,7 @@ GOLD = r"""
 tick, pending, reqs, sets, adds = 100, {}, {}, 0, 0
 gold, blocked = 1000, false
 M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end,
-    Refunded = function(guid, adj) refunded = {guid, adj} end}, {}, {}
+    Refunded = function(guid, adj) refunded = {guid, adj} end, Dealt = function(u) return dealt == u end}, {}, {}
 BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
 function goldOf() return gold end
 function setGold(_, want) sets = sets + 1; if not blocked then gold = want end end
@@ -310,6 +310,23 @@ class Gold(unittest.TestCase):
         self.look(928)
         self.look(928)
         self.assertEqual(self.L.eval('gold'), 928)
+
+    def test_a_deal_over_bg3_s_own_item_moves_wow_s_money(self):
+        # 0.1.3013.58: a BG3 scroll sold to Flakk for 40; no WoW item, only his purse moved (M.Dealt).
+        self.L.execute('gold = 40; dealt = "hero"')
+        self.look(0)
+        self.assertEqual((self.L.eval('reqs[1].Op'), self.L.eval('reqs[1].Delta')), ('money', 40))
+        self.assertEqual((self.L.eval('gold'), self.L.eval('sets')), (40, 0))  # not WoW's 0 back over it
+        self.L.execute('dealt = nil')
+        self.look(0)  # the money is on its way: not asked twice, nothing taken
+        self.assertEqual((self.L.eval('#reqs'), self.L.eval('gold')), (1, 40))
+        self.look(40)
+        self.assertEqual((self.L.eval('M.Barter.hero'), self.L.eval('gold')), (None, 40))
+
+    def test_gold_with_no_deal_is_wow_s(self):
+        self.L.execute('gold = 40')
+        self.look(0)
+        self.assertEqual((self.L.eval('gold'), self.L.eval('#reqs')), (0, 0))
 
     def test_gold_above_wow_s_money_waits_for_the_end_of_the_trade(self):
         self.L.execute('blocked = true; gold = 1100')

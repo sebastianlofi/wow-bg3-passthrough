@@ -195,7 +195,7 @@ class Game(unittest.TestCase):
         ledger = section(text, 'local STOCK_VAR', '-- Replies that name a new WoW item')
         fund = section(text, "local funded, placed", 'local function fillVendors')
         L.execute((ledger + fund).replace('local function', 'function').replace('local ledger', 'ledger')
-                  .replace('local funded', 'funded').replace('local STOCK', 'STOCK').replace('local STOCK_OPS', 'STOCK_OPS'))
+                  .replace('local funded', 'funded').replace('local purseSeen', 'purseSeen').replace('local STOCK', 'STOCK').replace('local STOCK_OPS', 'STOCK_OPS'))
         L.execute('ledger = readLedger()')
 
     def tod(self, t):
@@ -280,6 +280,32 @@ class Game(unittest.TestCase):
         self.L.execute('Stock.SetPurse(ledger, "f1", 1000); M.Refunded("f1", -40)')
         self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 1040)
 
+    def test_a_deal_is_the_purse_moving_in_the_trader_s_trade(self):
+        L = self.L
+        L.execute('Hero = {Uuid = function() return "tav" end}; traderOf.farley = "tav"')
+        self.open()
+        L.execute('tick = tick + 100; fundMerchant("farley")')  # placed: the purse is there
+        self.assertFalse(L.eval('M.Dealt("tav")'))  # the first look only sees it
+        self.assertFalse(L.eval('M.Dealt("tav")'))
+        L.execute('gold.farley = gold.farley - 40')  # BG3's barter: a scroll of BG3's sold for 40
+        self.assertFalse(L.eval('M.Dealt("gale")'))  # not Gale's trade
+        self.assertTrue(L.eval('M.Dealt("tav")'))
+        self.assertFalse(L.eval('M.Dealt("tav")'))  # once
+
+    def test_a_refund_is_no_deal_and_a_closed_trade_has_none(self):
+        L = self.L
+        L.execute('traderOf.farley = "tav"')
+        self.open()
+        L.execute('tick = tick + 100; fundMerchant("farley"); M.Dealt("tav"); M.Refunded("f1", 900)')
+        self.assertFalse(L.eval('M.Dealt("tav")'))
+        L.execute('trading.farley = nil; gold.farley = 5')
+        self.assertFalse(L.eval('M.Dealt("tav")'))
+
+    def test_the_trader_is_the_one_who_opened_it(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.assertIn('traderOf[standin], purseSeen[standin] = uuidOf(member) or member, nil', section(text, 'function M.OpenVendor', '-- A WoW corpse'))
+        self.assertIn('if M.Dealt(uuid) and not b then', text)
+
     def test_a_barter_s_requests_carry_wow_s_prices(self):
         text = (LUA / 'Inventory.lua').read_text()
         self.L.execute(section(text, 'function M.NotePrice', '-- A character')
@@ -343,12 +369,12 @@ class ArrowTrade(unittest.TestCase):
         self.L.execute('lookArrows()')
         self.assertIsNone(self.L.eval('M.Barter.tav'))
 
-    def test_a_purchase_opens_a_barter_and_sends_no_wow_buy(self):
+    def test_a_purchase_is_counted_and_sends_no_wow_buy(self):
+        # Its gold is the purse's, as any deal's (Dealt below): no barter of its own.
         self.fill()
         self.L.execute('lookArrows()')
-        self.assertIsNone(self.L.eval('M.Barter.tav'))
         self.L.execute('local u = bag.farley[1]; amt[u] = amt[u] - 1; lookArrows()')
-        self.assertEqual(self.L.eval('M.Barter.tav.At'), self.L.eval('tick'))
+        self.assertIsNone(self.L.eval('M.Barter.tav'))
         self.assertEqual(self.L.eval('#reqs'), 0)
         self.assertEqual(sum(self.L.eval('Stock.Arrows(ledger, "f1")').values()), 11)
 
@@ -383,7 +409,8 @@ class SellMoney(unittest.TestCase):
         L.execute(r'''
           tick, pending, reqs = 100, {}, {}
           gold = 1000
-          M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
+          M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end,
+               Dealt = function() return false end}, {}, {}
           BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
           function goldOf() return gold end
           function setGold(_, want) gold = want end
