@@ -8,7 +8,7 @@
   "llvm_commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "6f6b253e42ba997c453baeef39e2678b3e7368174a316adaeb62b83c160c6da3",
+  "library_sha256": "e9a56f06729e628c587600c72ae3612f6e7c5a9e23b792e8cf1fbaef66f9d54c",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -137,9 +137,21 @@
           "after_sha256": "07e66943e26613ad71978aa907a5eb7676d11f7ba3d82883239c483620296008"
         }
       ]
+    },
+    {
+      "file": "patches/0007-loca-written-strings-stay-put.patch",
+      "sha256": "a9f01cbc1b276b2b9247349743d36c2d5b118332e036a18de93d05591af4a732",
+      "purpose": "Strings written through Ext.Loca stay where the index's views point: growing their vector left short handles' views dangling, and a later load crashed in bg3le_loca_set",
+      "targets": [
+        {
+          "path": "src/vendor/loca.cpp",
+          "before_sha256": "d15f240214ebc5e880f065cc7af4446bd430b7719efd0e8b0e516ae85248b933",
+          "after_sha256": "b07699acd0a3384a576daf3178859c156c8bb450e57e57b938a67677943f6e74"
+        }
+      ]
     }
   ],
-  "previous_library_sha256": "ddd870524eaf7915a39dc5cc0a5a753e6ffa3165678014d274c879f74485ed49",
+  "previous_library_sha256": "6f6b253e42ba997c453baeef39e2678b3e7368174a316adaeb62b83c160c6da3",
   "retired_patches": [
     {
       "file": "patches/0003-wow-arena-hooks.patch",

@@ -1,0 +1,22 @@
+diff --git a/src/vendor/loca.cpp b/src/vendor/loca.cpp
+--- a/src/vendor/loca.cpp
++++ b/src/vendor/loca.cpp
+@@ -25,6 +25,7 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstring>
++#include <deque>
+ #include <dirent.h>
+ #include <string>
+ #include <string_view>
+@@ -55,7 +56,9 @@
+     // What mods have set. Kept separately because these are owned copies
+     // rather than views into a blob, and because the distinction is worth
+     // keeping: everything else here came out of the game's own files.
+-    std::vector<std::pair<std::string, std::string>> Written;
++    // A deque: ByHandle and Order hold views of these strings, and a vector
++    // growing moves a short string's characters out from under its view.
++    std::deque<std::pair<std::string, std::string>> Written;
+ };
+ 
+ Strings& state() {

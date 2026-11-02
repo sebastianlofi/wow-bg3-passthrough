@@ -11,6 +11,7 @@ Baldur's Gate 3, at commit `5c729b72296defd4a09556ee723b12b76a0d445d`.
 | 0004-prepare-running-hold-and-static-data | holds BG3's client in PrepareRunning (the loading screen stays up) until the WoW side is ready; static data fix |
 | 0005-early-plugins | `EarlyNativePlugins`: plugins loaded before BG3 makes its Vulkan objects |
 | 0006-boot-path-overrides | path overrides from a file, set before BG3 loads its stats: no mod's Lua runs that early (the mob abilities' spell copies) |
+| 0007-loca-written-strings-stay-put | strings written through Ext.Loca stay where the index's views point: a vector growing left short handles' views dangling, and a later load crashed in `bg3le_loca_set` |
 
 `build.lock.json` pins every patch by sha256 with the file hashes before and after it, the compiler,
 the SDK image and the sha256 of the resulting `libbg3le.so`. `externals.lock.json` pins bg3le's
