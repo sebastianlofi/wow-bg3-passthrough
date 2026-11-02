@@ -23,6 +23,9 @@
 -- at 0 HP), and the WoW character's death ended the server's fight at once, so the mobs went home
 -- (a playtest report: Tav at 1 HP through Relentless Endurance, WoW Tav killed, the fight gone). Out
 -- of a fight a "down" must also hold for M.DownHold ticks (a 0 HP moment before such a save).
+-- That watch sees BG3's changes only, and a WoW character can die under a hero BG3 never counted down: the
+-- bridge's `hero ... 0` at a 0 HP moment, a downed hero helped up in the fight, a WoW-side death in BG3's
+-- combat. Mirrors.lua, which knows both states, calls M.ReviveWow while they differ.
 local M = {}
 local Hero = Ext.Require("Hero.lua")
 local Party = Ext.Require("Party.lua")
@@ -76,6 +79,14 @@ function M.Start(runId)
         if #events > 32 then table.remove(events, 1) end
         Ext.Log.Print("WOW-BG3 death: " .. tostring(events[#events].Name) .. " " .. what)
         save()
+    end
+    -- The WoW character is dead and the hero is up in BG3: BG3 decides, so an "up" event goes out (the
+    -- server's revive answers `alive` to a living character). False if BG3 has the hero down or dead too.
+    M.ReviveWow = function()
+        local u = Hero.Uuid()
+        if not u or life(u) ~= "up" then return false end
+        event(u, "up", true)
+        return true
     end
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1

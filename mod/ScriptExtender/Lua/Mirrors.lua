@@ -64,7 +64,9 @@
 --   character down: damage to 0 HP (Osiris ApplyDamage), which leaves her DOWNED (BG3 never lets a
 --   player's own character just die: Osiris Die did nothing to her, and her fight deaths leave her
 --   DOWNED at 0 HP too, which is what a playtest saw). Down counts as dead here (IsDead, DOWNED or
---   0 HP). Her death in a fight kills the WoW character as before (bridge `hero`).
+--   0 HP). Her death in a fight kills the WoW character as before (bridge `hero`). The WoW character
+--   dead while she stays up after all (in BG3's combat, or a 0 HP moment she came back from) is revived
+--   in place: BG3 decides who lives (Death.lua ReviveWow, asked again until WoW reports it alive).
 -- Health (a middle ground for a party of 4): max HP = round(WoW max HP ^
 -- HP_CURVE 0.65), an IncreaseMaxHP boost at the scale step (a level 1 wolf 42 -> 11, a level 24
 -- wolf 714 -> 72, a level 60 elite 30000 -> 813), then the WoW fraction again. Before that
@@ -109,6 +111,8 @@ local Hero = Ext.Require("Hero.lua") -- the hero: the character the player contr
 -- starts it as one that spots the hero does. Party.lua's lists.
 local Party = Ext.Require("Party.lua")
 local Scaling = Ext.Require("Scaling.lua")
+local Death = Ext.Require("Death.lua")
+local KILL_LANDS, REVIVE_AGAIN = 60, 150 -- ticks: ApplyDamage reaching her; between asks for a WoW revive
 local STRIKE_PARTY = 16
 local REGION = Ext.Require("Hero.lua").REGION -- host level (Hero.lua, host.json)
 local DIR = "wow-bg3/link/"
@@ -287,6 +291,7 @@ function M.Start(runId)
     -- The WoW HP fraction to give her once BG3's resurrection has landed (it restores full HP a
     -- moment after the Resurrect call, over a SetHitpointsPercentage made right after it).
     local reviveFrac, reviveAt = nil, 0
+    local killedAt, wowReviveAt = -KILL_LANDS, -REVIVE_AGAIN
     -- BG3's non-lethal hit: on BG3's side the mob lies knocked out at 1 HP, for WoW it is a kill (LinkLive.lua reads this list,
     -- so the bridge sends HP 0: WoW's corpse, loot, XP and respawn). It counts as dead here, and goes as a corpse does.
     M.KnockedOut = {}
@@ -954,7 +959,16 @@ function M.Start(runId)
         if not st then return end
         local before = heroState
         heroState = st
-        if st == before then return end
+        if st == before then
+            if st ~= "alive" and ticks - killedAt > KILL_LANDS and ticks - wowReviveAt > REVIVE_AGAIN
+                and Death.ReviveWow and Death.ReviveWow() then
+                wowReviveAt = ticks
+                M.Life.WowRevives = (M.Life.WowRevives or 0) + 1
+                M.Life.Last = "WoW " .. st .. " under a Tav BG3 has up: the WoW character goes back up"
+                Ext.Utils.Print("WOW-BG3 mirrors: " .. M.Life.Last)
+            end
+            return
+        end
         -- The first state a session sees is recorded only (Death.lua does the
         -- same): at a load BG3 decides who lives and the lifecycle brings each WoW character to BG3's state.
         if before == nil then
@@ -989,6 +1003,7 @@ function M.Start(runId)
             and q(Osi.IsInCombat, Hero.Uuid()) ~= 1 then
             local ok, err = pcall(Osi.ApplyDamage, Hero.Uuid(), math.max(1, (th and th[2] or 1) * 2), "Bludgeoning",
                 "NULL_00000000-0000-0000-0000-000000000000")
+            killedAt = ticks
             life.Killed = life.Killed + 1
             life.Last = string.format("WoW %s -> %s outside a fight: ApplyDamage %s", tostring(before), st, ok and "ok" or tostring(err))
         else
