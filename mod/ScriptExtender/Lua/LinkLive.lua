@@ -346,8 +346,7 @@ local function newBackend(actors, void, runId, session)
         -- Spiders (a showcase): BG3's spider web and the phase spider's teleport.
         local spells = sp.Kind == "spider" and {"Target_Web_Spider", "Target_EtherealJaunt"} or nil
         local got = standIn({Action = "Scale", Target = uuid, DamageBonus = bonus, MaxHp = maxHp, Spells = spells,
-            Rules = {Level = sp.Level, WowMaxHp = wowMax, WowDamage = sp.WowDamage, Kind = sp.Kind, BaseDamage = sp.BaseDamage,
-                Camp = #enemies + 1}})
+            Rules = {Level = sp.Level, WowMaxHp = wowMax, WowDamage = sp.WowDamage, Kind = sp.Kind, BaseDamage = sp.BaseDamage}})
         info.Boosts = got.Boosts
         if got.Rules then
             maxHp, hp = got.MaxHp, bg3Hp(got.MaxHp, percent)

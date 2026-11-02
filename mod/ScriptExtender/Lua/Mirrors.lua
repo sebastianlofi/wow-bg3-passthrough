@@ -713,18 +713,7 @@ function M.Start(runId)
     -- under MIN_AVG_HIT: BG3's AI does not attack with an expected damage of about 0. Health: max HP
     -- standInMaxHp(WoW max HP) (IncreaseMaxHP; the "scaled" stage sets the WoW fraction after).
     local MIN_AVG_HIT = 1
-    -- Counted once per mob, the first time it is seen, and kept: its numbers do not move as more comes into view.
-    local campFixed = {}
-    local function campOf(sp)
-        if not sp.Hostile then return 1 end
-        if campFixed[sp.Guid] then return campFixed[sp.Guid] end
-        local list = {}
-        for _, v in pairs(M.WantNow or {}) do list[#list + 1] = v end
-        campFixed[sp.Guid] = Scaling.CampOf(sp, list)
-        return campFixed[sp.Guid]
-    end
-    -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves at its own level. Boosts
-    -- under one cause, so a camp that grew can take them off and set new ones.
+    -- The switch `scaling` (Scaling.lua): the stand-in's numbers from BG3's curves at its own level, set once.
     local function scaleByRules(m, info)
         local sp = m.Want
         local base = m.ScaleBase or hp(m.Uuid)
@@ -732,9 +721,8 @@ function M.Start(runId)
         if not base or base[2] <= 0 or wowMax <= 0 or level <= 0 then info.Skipped = "no numbers"; return end
         m.ScaleBase = base
         local fixed = Scaling.Fixed()
-        m.ScaleCamp = campOf(sp)
         local n = Scaling.Compute({Level = level, WowMaxHp = wowMax, WowDamage = tonumber(sp.WowDamage), Map = world and world.Map,
-            Camp = m.ScaleCamp, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
+            Cap = fixed.Cap, Difficulty = fixed.Difficulty})
         local okAc, ac = pcall(function() return Ext.Entity.Get(m.Uuid).Stats.ArmorClass end)
         -- The stand-in's AC only before our boost is on it.
         if m.ScaleAC == nil then m.ScaleAC = okAc and type(ac) == "number" and ac or false end
@@ -746,7 +734,7 @@ function M.Start(runId)
         end
         m.ScaleBoosts, m.ScaleKey = boosts, true
         info.MaxHp, info.DamageBonus, info.Base, info.Boosts, info.BaseAC = n.MaxHp, bonus, base, boosts, m.ScaleAC
-        info.Camp, info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = m.ScaleCamp, n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
+        info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
         info.Health = "rules"
     end
     local function scale(m, heroWowMax)
@@ -1097,7 +1085,7 @@ function M.Start(runId)
         M.WantNow = want
         -- The switch `scaling`: the usual fight is a pack. Hostile stand-ins chained within reach of a mob in the
         -- fight join it (BG3's combat, so the bridge pulls them), which BG3's ally join mostly does by itself. No limit
-        -- but the stand-ins there are: Scaling.lua's numbers carry a camp of any size.
+        -- but the stand-ins there are.
         if Scaling.On() and plan and plan.Active == true then
             local chain = {}
             for g in pairs(fight) do

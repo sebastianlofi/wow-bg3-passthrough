@@ -21,8 +21,8 @@ class Scaling(unittest.TestCase):
         cls.lua = LuaRuntime(unpack_returned_tuples=True)
         cls.M = cls.lua.execute(LUA.read_text())
 
-    def mob(self, level, wow_hp, hit, cap=18, diff='balanced', map_=0, camp=1, **party):
-        c = self.lua.table_from({'Level': level, 'WowMaxHp': wow_hp, 'WowDamage': hit, 'Map': map_, 'Camp': camp,
+    def mob(self, level, wow_hp, hit, cap=18, diff='balanced', map_=0, **party):
+        c = self.lua.table_from({'Level': level, 'WowMaxHp': wow_hp, 'WowDamage': hit, 'Map': map_,
                                  'Cap': cap, 'Difficulty': diff, **party})
         return self.M.Compute(c)
 
@@ -55,7 +55,7 @@ class Scaling(unittest.TestCase):
 
     def test_nothing_of_the_party_goes_in(self):
         base = self.mob(40, 1865, 66.7)
-        for party in ({'Members': 1}, {'PartyLevel': 1}, {'WowLevel': 60}, {'WowLevel': 1, 'PartyLevel': 20, 'Members': 2}):
+        for party in ({'Members': 1}, {'Camp': 14}, {'PartyLevel': 1}, {'WowLevel': 60}, {'WowLevel': 1, 'PartyLevel': 20, 'Members': 2}):
             other = self.mob(40, 1865, 66.7, **party)
             for k in ('E', 'MaxHp', 'Damage', 'AC', 'ToHit', 'DC', 'Save'):
                 self.assertEqual(other[k], base[k], (k, party))
@@ -66,43 +66,11 @@ class Scaling(unittest.TestCase):
         self.assertLess(low['MaxHp'], high['MaxHp'])
         self.assertLess(low['AC'], high['AC'])
 
-    def test_camp(self):
-        a, b, c = self.mob(20, 484, 33.3), self.mob(20, 484, 33.3, camp=3), self.mob(20, 484, 33.3, camp=20)
-        self.assertAlmostEqual(b['MaxHp'], a['MaxHp'] * 0.62, delta=1)
-        self.assertLess(b['AC'] + b['ToHit'], a['AC'] + a['ToHit'] + 1)
-        self.assertLess(c['Damage'], b['Damage'])
-        lua = self.lua
-        me = lua.table_from({'Hostile': True, 'Pos': lua.table_from([0, 0, 0])})
-        near = lua.table_from({'Hostile': True, 'Pos': lua.table_from([30, 0, 0])})
-        chained = lua.table_from({'Hostile': True, 'Pos': lua.table_from([60, 0, 0])})
-        far = lua.table_from({'Hostile': True, 'Pos': lua.table_from([200, 0, 0])})
-        neutral = lua.table_from({'Hostile': False, 'Pos': lua.table_from([1, 0, 0])})
-        self.assertEqual(self.M.CampOf(me, lua.table_from([me, near, chained, far, neutral])), 3)
-
-    def test_hp_stops_at_about_a_hits_worth(self):
-        # The biggest camp must not make a 1 HP mob.
-        n = self.mob(1, 42, 2.1, camp=60)
-        self.assertGreaterEqual(n['MaxHp'], 4)
-
-    def test_camps_of_any_size(self):
-        self.assertIsNone(self.M.PullCap)
-        hp = [self.mob(40, 1865, 66.7, camp=k)['MaxHp'] for k in (1, 2, 3, 4, 6, 8, 10, 14, 18, 24, 30, 45)]
-        dmg = [self.mob(40, 1865, 66.7, camp=k)['Damage'] for k in (1, 2, 3, 4, 6, 8, 10, 14, 18, 24, 30, 45)]
-        self.assertEqual(hp, sorted(hp, reverse=True))
-        self.assertEqual(dmg, sorted(dmg, reverse=True))
-        self.assertAlmostEqual(self.M.CampHp(8), 0.4)
-        self.assertAlmostEqual(self.M.CampHp(8.001), 0.4, places=2)     # no step where the curves meet
-        self.assertAlmostEqual(self.M.CampDamage(8.001), 0.46, places=2)
-        self.assertAlmostEqual(self.M.CampHp(60), 0.1)
-        s, _ = self.M.Boosts(self.mob(40, 1865, 66.7, camp=45), 'human', 40, 8, None)
-        self.assertGreater(len(s), 0)
-
     def test_a_hit_under_one_comes_off_to_hit(self):
-        lone, big = self.mob(1, 42, 2.1), self.mob(1, 42, 2.1, camp=14)
-        self.assertEqual(lone['ToHit'], 3)
-        self.assertLess(big['Damage'], 1)
-        self.assertEqual(big['ToHit'], 3 - round(9 * (1 - big['Damage'])))
-        self.assertEqual(self.mob(60, 4059, 120.9, camp=14)['ToHit'], 11)   # a real hit: nothing comes off
+        weak = self.mob(1, 42, 0.02)
+        self.assertLess(weak['Damage'], 1)
+        self.assertEqual(weak['ToHit'], 3 - round(9 * (1 - weak['Damage'])))
+        self.assertEqual(self.mob(60, 4059, 120.9)['ToHit'], 12)   # a real hit: nothing comes off
 
     def test_difficulty(self):
         b, h = self.mob(40, 1865, 66.7), self.mob(40, 1865, 66.7, diff='tactician')

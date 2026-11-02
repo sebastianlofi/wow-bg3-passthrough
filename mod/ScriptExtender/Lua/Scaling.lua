@@ -5,11 +5,9 @@
 -- for good, and WoW's zones are the order to go through them. Switch: `scaling` in settings.conf,
 -- the launcher's wow-bg3/scaling.json {On, Difficulty}; off, Mirrors.lua keeps HP = WoW ^ 0.65.
 --
--- Fights last what BG3's own do (about 3.5 rounds on average, all four members played), and the usual fight
--- is a pack: every hostile stand-in chained within 40 yd of a mob in the fight joins it (Mirrors.lua; BG3's own
--- ally join does the same, a Defias pull at Moonbrook grew from 2 to 14). Nothing limits a pull but the stand-ins
--- there are. A mob's stats know its camp, the mobs so chained: a camp's mobs are each weaker, in HP, damage and
--- effective level, so a camp of 14 or 30 is one fight. A lone mob is one strong mob, about 3 rounds.
+-- Fights last what BG3's own do (about 3.5 rounds on average, all four members played) for one mob of the party's
+-- own level; a pack is as many of those as it is. Nothing limits a pull: every hostile stand-in chained within 40 yd
+-- of a mob in the fight joins it (Mirrors.lua; BG3's own ally join does the same).
 --
 -- The level table is Progression.lua's curve (M.CURVE, 4x18 at WoW 60): effective level of a WoW level W
 -- = 1 + (W - 4) x (Cap - 1) / 56.
@@ -18,7 +16,7 @@
 -- normal mob of its level (a rare is a normal; vmangos' rank is not in the mirror plan).
 --
 -- HP = party damage a member-turn at E x member-turns of the rank x (mob's WoW HP / its rank's usual) ^ 0.5
--- x the camp's share.
+-- Each mob's numbers are set when it first appears and never change.
 -- AC, to-hit, DC and saves: BG3's Combatant curve at E, plus the rank's. Damage: a share of a member's HP
 -- at E. One attack a turn: the boss's extra attacks and area ability of the research are in that one hit.
 -- All BG3 boosts, all applied by Mirrors.lua.
@@ -49,20 +47,6 @@ M.RANKS = {
     raid_boss = {Turns = 36, Rel = 80, AC = 4, Hit = 3, DC = 3, Low = 0.62, High = 0.62},
 }
 M.TURNS_CAP = 48
--- By the mob's camp, 1 to 8. Past 8 the mobs weaken fast enough that the whole camp stays one fight: a member kills
--- at most about one a turn, and every mob left alive attacks. HP stops at about a hit's worth. Levels: effective
--- levels off AC, to-hit, DC and saves per mob over one, at most CAMP_LEVELS.
-M.CAMP_HP = {1, 0.75, 0.62, 0.55, 0.5, 0.46, 0.43, 0.4}
-M.CAMP_DAMAGE = {1, 0.85, 0.72, 0.65, 0.6, 0.55, 0.5, 0.46}
-M.CAMP_LEVEL, M.CAMP_LEVELS = 0.6, 3
-M.MIN_HP = 0.6
-local function between(t, k)
-    k = math.max(1, k)
-    local a = math.floor(k)
-    return a >= #t and t[#t] or t[a] + (t[a + 1] - t[a]) * (k - a)
-end
-function M.CampHp(k) return k <= 8 and between(M.CAMP_HP, k) or math.max(0.1, 0.4 * (8 / k) ^ 1.2) end
-function M.CampDamage(k) return k <= 8 and between(M.CAMP_DAMAGE, k) or 0.46 * (8 / k) ^ 1.1 end
 -- BG3's AI needs an average hit of 1 (Boosts). Below that the shortfall comes off to-hit, about 9 points for all of it.
 M.MISS = 9
 -- The reach: 40 yd chained.
@@ -100,11 +84,10 @@ function M.RankOf(rel, map)
     return "normal"
 end
 
--- The numbers for one mob. c: Level, WowMaxHp, WowDamage (WoW), Map, Camp, Cap, Difficulty. No game calls:
+-- The numbers for one mob. c: Level, WowMaxHp, WowDamage (WoW), Map, Cap, Difficulty. No game calls:
 -- tools/test_scaling.py runs this.
 function M.Compute(c)
     local cap = c.Cap or 18
-    local camp = c.Camp or 1
     local d = M.DIFFICULTY[c.Difficulty] or M.DIFFICULTY.balanced
     local E = M.Effective(c.Level, cap)
     local rel = c.WowMaxHp / at(M.NORMAL_HP, c.Level)
@@ -112,16 +95,14 @@ function M.Compute(c)
     local rank = M.RankOf(rel, c.Map)
     local r = M.RANKS[rank]
     local turns = math.min(M.TURNS_CAP, r.Turns * (rel / r.Rel) ^ 0.5)
-    local hp = lerp(M.DPR, E) * turns * M.CampHp(camp) * d.HP
+    local hp = lerp(M.DPR, E) * turns * d.HP
     local share = math.max(r.Low, math.min(r.High, 0.30 * (1 - 0.035 * math.max(0, E - 8)) * math.max(reld, 0.01) ^ 0.35))
-    local damage = share * lerp(M.MEMBER_HP, E) * M.CampDamage(camp) * d.Damage
-    local Es = math.max(1, E - math.min(M.CAMP_LEVELS, M.CAMP_LEVEL * (math.max(1, camp) - 1)))
-    -- However big its camp: at least about a hit's worth, 60% of a member's turn.
-    return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(round(M.MIN_HP * lerp(M.DPR, E)), round(hp)), Damage = damage,
-        AC = math.max(12, round(10.7 + 0.5 * Es)) + r.AC,
-        ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit - round(M.MISS * math.max(0, 1 - damage)),
-        DC = round(8.4 + 0.63 * Es) + r.DC + d.DC,
-        Save = 1 + math.floor(Es * 0.4) + r.AC // 2}
+    local damage = share * lerp(M.MEMBER_HP, E) * d.Damage
+    return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(1, round(hp)), Damage = damage,
+        AC = math.max(12, round(10.7 + 0.5 * E)) + r.AC,
+        ToHit = math.max(3, round(2.2 + 0.57 * E)) + r.Hit + d.Hit - round(M.MISS * math.max(0, 1 - damage)),
+        DC = round(8.4 + 0.63 * E) + r.DC + d.DC,
+        Save = 1 + math.floor(E * 0.4) + r.AC // 2}
 end
 -- The boost string for those numbers over a stand-in of kind `kind`: base max HP, base attack average, and
 -- its AC if BG3 gave one. MIN_AVG_HIT: BG3's AI does not attack with an expected damage of about 0.
@@ -138,25 +119,6 @@ function M.Boosts(n, kind, baseMaxHp, baseDamage, baseAC)
     add("SpellSaveDC(%d)", n.DC - t[3])
     add("RollBonus(SavingThrow,%d)", n.Save - M.BASE_SAVE)
     return table.concat(out, ";"), bonus
-end
-
--- The camp of one mob: mobs is a list of {Pos = {x, y, z}, Hostile} (BG3 metres), each mob reaching on from the
--- last.
-function M.CampOf(me, mobs)
-    local seen, todo, n = {[me] = true}, {me}, 1
-    while #todo > 0 do
-        local a = table.remove(todo)
-        for _, b in ipairs(mobs) do
-            if not seen[b] and b.Hostile and type(b.Pos) == "table" and type(a.Pos) == "table" then
-                local dx, dz = a.Pos[1] - b.Pos[1], a.Pos[3] - b.Pos[3]
-                if dx * dx + dz * dz <= M.REACH_M * M.REACH_M then
-                    seen[b], n = true, n + 1
-                    todo[#todo + 1] = b
-                end
-            end
-        end
-    end
-    return n
 end
 
 -- From here on the game's side: the switch, read once per Lua session.

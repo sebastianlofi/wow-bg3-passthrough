@@ -522,7 +522,7 @@ function M.Start(runId)
                 if type(c.Rules) == "table" and Scaling.On() and (tonumber(c.Rules.Level) or 0) > 0 and (tonumber(c.Rules.WowMaxHp) or 0) > 0 then
                     local r, fixed = c.Rules, Scaling.Fixed()
                     local n = Scaling.Compute({Level = tonumber(r.Level), WowMaxHp = tonumber(r.WowMaxHp), WowDamage = tonumber(r.WowDamage),
-                        Map = r.Map, Camp = r.Camp, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
+                        Map = r.Map, Cap = fixed.Cap, Difficulty = fixed.Difficulty})
                     local text = Scaling.Boosts(n, r.Kind, h.MaxHp, tonumber(r.BaseDamage) or 0, nil)
                     if text ~= "" then Osi.AddBoosts(uuid, text, "WOWBG3_SCALE", uuid) end
                     return {Target = uuid, Before = before, Boosts = text, MaxHp = n.MaxHp, Rules = true}
