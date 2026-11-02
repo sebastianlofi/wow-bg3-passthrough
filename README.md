@@ -89,6 +89,18 @@ come from your BG3 race:
 | Tiefling | Undead | Horde | Deathknell (Tirisfal Glades) |
 | Dragonborn | Tauren | Horde | Camp Narache (Mulgore) |
 
+An origin character goes by the same table, through their race:
+
+| Origin | BG3 race | WoW race and class | Faction | Start zone |
+|---|---|---|---|---|
+| Gale | Human | Human Mage | Alliance | Northshire (Elwynn Forest) |
+| Wyll | Human | Human Warlock | Alliance | Northshire (Elwynn Forest) |
+| Shadowheart | Half-Elf | Human Priest | Alliance | Northshire (Elwynn Forest) |
+| Astarion | Elf | Night Elf Rogue | Alliance | Shadowglen (Teldrassil) |
+| Lae'zel | Githyanki | Troll Warrior | Horde | Valley of Trials (Durotar) |
+| Karlach | Tiefling | Undead Warrior | Horde | Deathknell (Tirisfal Glades) |
+| The Dark Urge | Your pick | By the race you pick | By race | By race |
+
 The WoW class follows your BG3 class where vanilla allows that race and class together, and
 otherwise the closest one it does allow (Warrior is legal for every race):
 

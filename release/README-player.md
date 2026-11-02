@@ -63,7 +63,23 @@ Extender, and whether it works on the Linux Script Extender in this download is 
    a New Game started meanwhile keeps its loading screen up until it is done.
 3. New Game. Make or pick a character and start.
    The loading screen stays up until the WoW side is ready, then you are in
-   the WoW start zone of your character's race.
+   the WoW start zone of your character's race:
+
+| BG3 race | Origin characters | WoW race | Faction | Start zone |
+|---|---|---|---|---|
+| Human | Gale, Wyll | Human | Alliance | Northshire (Elwynn Forest) |
+| Half-Elf | Shadowheart | Human | Alliance | Northshire (Elwynn Forest) |
+| Halfling | | Human | Alliance | Northshire (Elwynn Forest) |
+| Elf | Astarion | Night Elf | Alliance | Shadowglen (Teldrassil) |
+| Drow | | Night Elf | Alliance | Shadowglen (Teldrassil) |
+| Dwarf | | Dwarf | Alliance | Coldridge Valley (Dun Morogh) |
+| Gnome | | Gnome | Alliance | Coldridge Valley (Dun Morogh) |
+| Half-Orc | | Orc | Horde | Valley of Trials (Durotar) |
+| Githyanki | Lae'zel | Troll | Horde | Valley of Trials (Durotar) |
+| Tiefling | Karlach | Undead | Horde | Deathknell (Tirisfal Glades) |
+| Dragonborn | | Tauren | Horde | Camp Narache (Mulgore) |
+
+The Dark Urge goes by the race you pick for them.
 
 The first start takes a few minutes: the WoW server's data and the first
 movement maps are built from your WoW files while BG3's loading screen waits.
