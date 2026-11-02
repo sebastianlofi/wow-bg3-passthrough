@@ -517,6 +517,17 @@ function M.Start(runId)
                 local uuid = live(c.Target)
                 local h = Ext.Entity.Get(uuid).Health
                 local before = {h.Hp, h.MaxHp}
+                -- A mob that joined a fight with no mirror (LinkLive.lua), with `scaling` on: the rules Mirrors.lua uses.
+                local Scaling = Ext.Require("Scaling.lua")
+                if type(c.Rules) == "table" and Scaling.On() and (tonumber(c.Rules.Level) or 0) > 0 and (tonumber(c.Rules.WowMaxHp) or 0) > 0 then
+                    local r, party = c.Rules, Scaling.Party(ticks)
+                    local n = Scaling.Compute({Level = tonumber(r.Level), WowMaxHp = tonumber(r.WowMaxHp), WowDamage = tonumber(r.WowDamage),
+                        Map = r.Map, Camp = r.Camp, Members = party.Members, WowLevel = party.WowLevel, PartyLevel = party.PartyLevel,
+                        Cap = party.Cap, Difficulty = party.Difficulty})
+                    local text = Scaling.Boosts(n, r.Kind, h.MaxHp, tonumber(r.BaseDamage) or 0, nil)
+                    if text ~= "" then Osi.AddBoosts(uuid, text, "WOWBG3_SCALE", uuid) end
+                    return {Target = uuid, Before = before, Boosts = text, MaxHp = n.MaxHp, Rules = true}
+                end
                 local boosts = {}
                 local function int(v) return type(v) == "number" and v == math.floor(v) and v or nil end
                 local maxHp = int(c.MaxHp)

@@ -345,7 +345,14 @@ local function newBackend(actors, void, runId, session)
         info.Health, info.Base = "wow^0.65", {base, baseMax}
         -- Spiders (a showcase): BG3's spider web and the phase spider's teleport.
         local spells = sp.Kind == "spider" and {"Target_Web_Spider", "Target_EtherealJaunt"} or nil
-        info.Boosts = standIn({Action = "Scale", Target = uuid, DamageBonus = bonus, MaxHp = maxHp, Spells = spells}).Boosts
+        local got = standIn({Action = "Scale", Target = uuid, DamageBonus = bonus, MaxHp = maxHp, Spells = spells,
+            Rules = {Level = sp.Level, WowMaxHp = wowMax, WowDamage = sp.WowDamage, Kind = sp.Kind, BaseDamage = sp.BaseDamage,
+                Camp = #enemies + 1}})
+        info.Boosts = got.Boosts
+        if got.Rules then
+            maxHp, hp = got.MaxHp, bg3Hp(got.MaxHp, percent)
+            info.MaxHp, info.Hp, info.Health = maxHp, hp, "rules"
+        end
         pcall(Ext.Require("Abilities.lua").Grant, uuid, sp.Entry)
         info.MaxTook = waitUntil(function() return select(2, health(uuid)) == maxHp end, 90)
         if base ~= hp then
