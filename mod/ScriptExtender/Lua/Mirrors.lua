@@ -742,8 +742,11 @@ function M.Start(runId)
         -- The stand-in's AC only before our boost is on it.
         if m.ScaleAC == nil then m.ScaleAC = okAc and type(ac) == "number" and ac or false end
         local boosts, bonus = Scaling.Boosts(n, sp.Kind, base[2], tonumber(sp.BaseDamage) or 0, m.ScaleAC or nil)
-        if m.ScaleBoosts then pcall(Osi.RemoveBoosts, m.Uuid, m.ScaleBoosts, 0, "WOWBG3_SCALE", m.Uuid) end
-        if boosts ~= "" then Osi.AddBoosts(m.Uuid, boosts, "WOWBG3_SCALE", m.Uuid) end
+        -- The same string again changes nothing: taken off and put on in one tick, a stand-in was left without it.
+        if boosts ~= m.ScaleBoosts then
+            if m.ScaleBoosts then pcall(Osi.RemoveBoosts, m.Uuid, m.ScaleBoosts, 0, "WOWBG3_SCALE", m.Uuid) end
+            if boosts ~= "" then Osi.AddBoosts(m.Uuid, boosts, "WOWBG3_SCALE", m.Uuid) end
+        end
         m.ScaleBoosts, m.ScaleKey = boosts, party.Key
         info.MaxHp, info.DamageBonus, info.Base, info.Boosts, info.BaseAC = n.MaxHp, bonus, base, boosts, m.ScaleAC
         info.Camp, info.Rules, info.Rank, info.E, info.Rel, info.Damage, info.AC, info.ToHit, info.DC = m.ScaleCamp, party.Key, n.Rank, n.E, n.Rel, n.Damage, n.AC, n.ToHit, n.DC
