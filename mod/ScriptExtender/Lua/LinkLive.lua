@@ -171,7 +171,11 @@ local function health(uuid)
         local h = Ext.Entity.Get(uuid).Health
         return h.Hp, h.MaxHp
     end)
-    if ok and math.type(hp) == "integer" and math.type(max) == "integer" and max > 0 then return hp, max end
+    if ok and math.type(hp) == "integer" and math.type(max) == "integer" and max > 0 then
+        -- Knocked out at 1 HP on BG3's side is a kill for WoW (Mirrors.lua).
+        if hp == 1 and (Ext.IO.LoadFile("wow-bg3/link/knocked-out.json") or ""):find(uuid, 1, true) then return 0, max end
+        return hp, max
+    end
     return nil
 end
 local function findSlot(character, prototype)

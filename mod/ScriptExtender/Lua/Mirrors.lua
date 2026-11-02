@@ -287,13 +287,16 @@ function M.Start(runId)
     -- The WoW HP fraction to give her once BG3's resurrection has landed (it restores full HP a
     -- moment after the Resurrect call, over a SetHitpointsPercentage made right after it).
     local reviveFrac, reviveAt = nil, 0
-    -- BG3's non-lethal hit: WoW has no knocked out, so it is a kill. Dying here gives WoW's own corpse, loot, XP and respawn.
+    -- BG3's non-lethal hit: on BG3's side the mob lies knocked out at 1 HP, for WoW it is a kill (LinkLive.lua reads this list,
+    -- so the bridge sends HP 0: WoW's corpse, loot, XP and respawn). It counts as dead here, and goes as a corpse does.
+    M.KnockedOut = {}
+    Ext.IO.SaveFile("wow-bg3/link/knocked-out.json", "{}")
     pcall(Ext.Osiris.RegisterListener, "StatusApplied", 4, "after", function(o, status)
         if status ~= "KNOCKED_OUT" then return end
         local u = uuidOf(o)
         if u and (M.Owned[u] or (WOWBG3FightSpawned and WOWBG3FightSpawned[u])) then
-            pcall(Osi.RemoveStatus, u, status, "")
-            pcall(Osi.Die, u, 0, "NULL_00000000-0000-0000-0000-000000000000", 0, 0)
+            M.KnockedOut[u] = true
+            Ext.IO.SaveFile("wow-bg3/link/knocked-out.json", Ext.Json.Stringify(M.KnockedOut))
         end
     end)
     pcall(Ext.Osiris.RegisterListener, "Resurrected", 1, "after", function(c)
@@ -626,6 +629,7 @@ function M.Start(runId)
         if not m then return end
         M.Removes = M.Removes + 1
         M.Owned[m.Uuid] = nil
+        M.KnockedOut[m.Uuid] = nil
         hitByTav[m.Uuid] = nil
         provoked[m.Uuid] = nil
         friendlyAimed[m.Uuid] = nil
@@ -1138,7 +1142,7 @@ function M.Start(runId)
                 mirrors[guid] = nil
                 M.Owned[m.Uuid] = nil
             elseif not want[guid] and not fight[guid] then
-                if m.Dead or q(Osi.IsDead, m.Uuid) == 1 then
+                if m.Dead or q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid] then
                     m.Dead = true
                     m.DiedAt = m.DiedAt or ticks
                     local p = pos(m.Uuid)
@@ -1164,7 +1168,7 @@ function M.Start(runId)
                 m.Want = mob
                 local inFight = fight[guid] == true
                 local combat = combatOf(m.Uuid)
-                local dead = q(Osi.IsDead, m.Uuid) == 1
+                local dead = q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid] == true
                 -- A neutral one BG3 pulled in without Tav attacking it: back out, not hostile.
                 if not m.Hostile and not inFight and not provoked[m.Uuid] and not dead then
                     if q(Osi.HasActiveStatus, m.Uuid, "TEMPORARILY_HOSTILE") == 1 then
@@ -1265,7 +1269,7 @@ function M.Start(runId)
                 local combat = combatOf(m.Uuid)
                 m.InFight = true
                 m.Combat = combat ~= nil and partyCombats[combat] == true
-                m.Dead = q(Osi.IsDead, m.Uuid) == 1
+                m.Dead = q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid] == true
             end
         end
     end
