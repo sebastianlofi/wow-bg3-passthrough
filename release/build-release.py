@@ -22,7 +22,10 @@ Output in OUT/WOW-BG3-VERSION/ and OUT/WOW-BG3-VERSION.zip:
   --source NAME=DIR (repeatable): DIR goes into OUT/WOW-BG3-VERSION-sources.tar.gz as NAME/, the
       corresponding source of the GPL parts; patches/ and the build scripts are always added.
 
-No game files: nothing from WoW, BG3 or server data goes in. --server and --benilla are the
+No game files: nothing from WoW, BG3 or server data goes in, and nothing made from them (check_no_game_data
+refuses a build that has any). The server's database SQL and the mobs' abilities are made on the player's PC at
+the first start: server/fetch-sql.py downloads the SQL from vmangos' public sources (server/sql.lock), and the
+coordinator builds the abilities from that database and the player's client. --server and --benilla are the
 server pack (server/pack-portable.sh) and benilla's player build (patches/benilla/build.sh) for the
 Steam runtime (sniper); their licence texts are in LICENSES/. Without --allow-missing a
 missing part is an error; with it the part is listed as missing in MANIFEST.txt (test builds only).
@@ -116,6 +119,23 @@ def copy_tree(src: Path, dst: Path):
     shutil.copytree(src, dst, symlinks=False)
 
 
+# What a release must never carry: the server's database SQL (WoW's world, its texts), a table or seed made from
+# it, and the player's own files' products. Checked on the finished folder.
+GAME_DATA = (re.compile(r'\.sql(\.gz|\.7z|\.xz)?$', re.I), re.compile(r'(^|/)abilities[-_](seed|world)', re.I),
+             re.compile(r'(^|/)(items|abilities|spells)\.json$'), re.compile(r'\.(dbc|mpq|m2|blp|wmo|adt|wdt|mmtile|vmtile|vmtree)$', re.I))
+# MariaDB's own SQL (its system tables, help) is the database program's, not game data.
+GAME_DATA_OK = re.compile(r'^server/mariadb/share/')
+
+
+def check_no_game_data(folder: Path):
+    bad = []
+    for p in sorted(folder.rglob('*')):
+        rel = p.relative_to(folder).as_posix()
+        if p.is_file() and not GAME_DATA_OK.match(rel) and any(r.search(rel) for r in GAME_DATA):
+            bad.append(rel)
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", default=os.environ.get("WOWBG3_VERSION") or RELEASE_VERSION)
@@ -133,8 +153,6 @@ def main():
                     help="the bg3le build with WOW-BG3's patches (its sha256 should be patches/bg3le/build.lock.json's)")
     ap.add_argument("--python", help="a portable python with numpy, Pillow, lz4, zstandard (release/python/pack.sh): WOW-BG3/python")
     ap.add_argument("--fastlz", help="libfastlz.so built for sniper (Tav's textures)")
-    ap.add_argument("--abilities-seed", default=str(BUILD / "abilities-seed.json.gz"),
-                    help="wow_abilities.py seed from the server's database; without it a new install has no mob abilities until its second start")
     ap.add_argument("--allow-missing", action="store_true")
     ap.add_argument("--source", action="append", default=[], help="NAME=DIR for the sources archive")
     ap.add_argument("--sources", help="upstream sources of the GPL/LGPL/MPL parts, made by release/licences/collect.py "
@@ -173,11 +191,14 @@ def main():
     shutil.copy2(HERE / "launcher.conf.in", folder / "launcher.conf")
     shutil.copy2(HERE / "settings.conf", folder / "settings.conf")
 
-    # The portable server pack, with this tree's wowbg3-server.sh (run, WOWBG3_SERVER_VAR).
+    # The portable server pack, with this tree's wowbg3-server.sh (run, WOWBG3_SERVER_VAR) and SQL download
+    # (fetch-sql.py, sql.lock). An older pack's sql/ (vmangos' database) stays out.
     if a.server and (Path(a.server) / "wowbg3-server.sh").is_file():
-        shutil.copytree(a.server, folder / "server", symlinks=False, ignore=shutil.ignore_patterns("var", "var.*"))
-        shutil.copy2(ROOT / "server/wowbg3-server.sh", folder / "server/wowbg3-server.sh")
+        shutil.copytree(a.server, folder / "server", symlinks=False, ignore=shutil.ignore_patterns("var", "var.*", "sql"))
+        for f in ("wowbg3-server.sh", "fetch-sql.py", "sql.lock"):
+            shutil.copy2(ROOT / "server" / f, folder / "server" / f)
         os.chmod(folder / "server/wowbg3-server.sh", 0o755)
+        os.chmod(folder / "server/fetch-sql.py", 0o755)
     else:
         missing.append("server (wowbg3-server.sh)")
     # benilla: the binary, its world-mode HUD addon, its licences.
@@ -209,10 +230,6 @@ def main():
             missing.append(f"tool tools/{f}")
         else:
             print(f"note: tools/{f} not there yet (left out)")
-    if Path(a.abilities_seed).is_file():
-        shutil.copy2(a.abilities_seed, tools / "link/tools/abilities-seed.json.gz")
-    else:
-        print(f"note: no {a.abilities_seed}: a new install has no mob abilities until its second start")
     # bg3le, WOW-BG3's build (the release ships everything a player needs):
     # our installer (release/bg3le-install.py) with bg3le's own install.py and launch wrapper, unchanged.
     b3 = folder / "bg3le"
@@ -300,6 +317,11 @@ def main():
             t.add(d, arcname=f"{name}-sources/{arc}")
     if not a.sources:
         missing.append("upstream sources of the GPL/LGPL/MPL parts (--sources WOWBG3_BUILD/licences/sources)")
+
+    bad = check_no_game_data(folder)
+    if bad:
+        shutil.move(str(dist), str(out / f"{name}.incomplete"))
+        raise SystemExit("game data in the release: " + ", ".join(bad[:20]) + f" (moved to {name}.incomplete)")
 
     if missing and not a.allow_missing:
         shutil.move(str(dist), str(out / f"{name}.incomplete"))

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pack-portable.sh [DEST]: the portable server folder from build-portable.sh's output, the pinned
-# MariaDB bintar (only what a server needs), vmangos' database SQL (from the pinned database image)
-# and wowbg3-server.sh. DEST defaults to $WOWBG3_SERVER_BUILD/wowbg3-server. Libraries the programs
+# MariaDB bintar (only what a server needs), wowbg3-server.sh and fetch-sql.py with sql.lock. No game
+# data: vmangos' database SQL is downloaded on the player's PC at the first start (fetch-sql.py). DEST defaults to $WOWBG3_SERVER_BUILD/wowbg3-server. Libraries the programs
 # need beyond glibc and the sniper runtime's basics are copied next to them (lib/), from the same SDK
 # image they were built in. Needs Docker.
 set -euo pipefail
@@ -12,7 +12,7 @@ dest="${1:-$stage/wowbg3-server}"
 [[ -f "$stage/out/.complete" ]] || { echo "no finished build in $stage" >&2; exit 1; }
 [[ ! -e "$dest" ]] || { echo "Refusing: $dest exists" >&2; exit 1; }
 echo "$MARIADB_SHA256  $MARIADB_TAR" | sha256sum -c - >/dev/null
-mkdir -p "$dest"/{bin/Extractors,lib,etc,sql/migrations,mariadb}
+mkdir -p "$dest"/{bin/Extractors,lib,etc,mariadb}
 o="$stage/out/server"
 cp "$o/bin/mangosd" "$o/bin/realmd" "$dest/bin/"
 for t in MapExtractor VMapExtractor VMapAssembler MoveMapGenerator; do
@@ -34,12 +34,6 @@ rmdir "$tmpx"
 # The bintar's programs carry their debug info (mariadbd ~300 MB); not needed to run.
 strip --strip-debug "$dest"/mariadb/bin/*
 cp -P "$dest"/mariadb/lib/libmariadb.so.3 "$dest/lib/"
-# vmangos' database SQL, as the database image ships it.
-cid=$(docker create "$VMANGOS_DB_IMAGE")
-docker cp "$cid:/sql/world.sql" "$cid:/sql/characters.sql" "$cid:/sql/logon.sql" "$cid:/sql/logs.sql" "$dest/sql/" 2>/dev/null || {
-    for f in world characters logon logs; do docker cp "$cid:/sql/$f.sql" "$dest/sql/"; done; }
-docker cp "$cid:/sql/migrations/." "$dest/sql/migrations/"
-docker rm "$cid" >/dev/null
 # Libraries from the SDK the programs link that a plain host or the sniper runtime may lack.
 docker run --rm --network none -v "$dest:/p:Z" "$SNIPER_SDK" bash -c '
   set -e
@@ -48,6 +42,6 @@ docker run --rm --network none -v "$dest:/p:Z" "$SNIPER_SDK" bash -c '
     cp -L "$src" /p/lib/
   done
   chown -R '"$(id -u):$(id -g)"' /p/lib'
-cp "$WOWBG3_REPO/server/wowbg3-server.sh" "$dest/"
-chmod 755 "$dest/wowbg3-server.sh" "$dest"/bin/* "$dest"/bin/Extractors/*
+cp "$WOWBG3_REPO/server/wowbg3-server.sh" "$WOWBG3_REPO/server/fetch-sql.py" "$WOWBG3_REPO/server/sql.lock" "$dest/"
+chmod 755 "$dest/wowbg3-server.sh" "$dest/fetch-sql.py" "$dest"/bin/* "$dest"/bin/Extractors/*
 du -sh "$dest"; du -sh "$dest"/*

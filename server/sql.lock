@@ -1,0 +1,24 @@
+# The server's database SQL, fetched on the player's PC at the first start (server/fetch-sql.py), never shipped:
+# it describes WoW's world (creatures, items, quests, their texts) as the vmangos project publishes it.
+#   the world database: vmangos' world dump of 14 June 2021 (brotalnia/database, the dump vmangos' own
+#   setup and the vmangos-deploy database image use), a 7z of one SQL file;
+#   the rest (characters, logon, logs and every migration since that dump): vmangos core's sql/ at the core
+#   commit the server is built from (release/build-env.sh VMANGOS_COMMIT), its migrations merged as its own
+#   sql/migrations/merge.sh does.
+# Every file made is checked against its sha256 below (the files the database image of the same core carries), so a
+# download that differs never reaches the database. KEY=VALUE, sourced by server/pins.sh, read by fetch-sql.py.
+WORLD_DB_URL=https://raw.githubusercontent.com/brotalnia/database/fc4af4870578efa63b36824bfd48fca7933f7362/world_full_14_june_2021.7z
+WORLD_DB_SHA256=56040a3edecd9a9dabe328ba368f609933a2501a3ecabe68080892266f8c4212
+WORLD_DB_SIZE=16898241
+CORE_SQL_URL=https://codeload.github.com/vmangos/core/tar.gz/53d24d5c748bef5e0cde7b1155bcb3d979af614c
+CORE_SQL_COMMIT=53d24d5c748bef5e0cde7b1155bcb3d979af614c
+# GitHub makes this archive on request: its own bytes are not pinned (the files in it are), its size is for progress.
+CORE_SQL_SIZE=31246388
+SQL_SHA256_world=7c5c064a160a2e65b55b94d65cce26a19bac40f33b83454d5e89ecc2667fe8cf
+SQL_SHA256_characters=a87e2c307275400dfe75ae41747b073f23820ecb17925bb9d5e71d5ed71ca7de
+SQL_SHA256_logon=b7abc3171e931339702875f5cbf2a7650bb919537dce1d892edf50765fa9a478
+SQL_SHA256_logs=de431d58c50391e1e4d9e65fff941d53234cece51518310d47a38ef1ca9bae4e
+SQL_SHA256_world_updates=02b7636c82d24031128c491553dc87d4a5d89c0aa461b8ebee2f47207b0c8096
+SQL_SHA256_characters_updates=79cc1abc7ba7d2591c822dad42f8e7552d15b9f2befedb794de7775c45513b2c
+SQL_SHA256_logon_updates=8ac089497b02e18484d720f3c68e4842d5a6485d0e9843b956ebf64bb9d26bdb
+SQL_SHA256_logs_updates=e13dd6b0c8f07cfc9399eda7cc3295fb128d591c40fe0eba545bf388eaf758a1

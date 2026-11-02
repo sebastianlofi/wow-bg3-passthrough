@@ -26,7 +26,7 @@ with WOW-BG3's patches and build scripts (see the `README.md` inside it).
 ## vmangos: the WoW server
 
 - Files: `server/bin/mangosd`, `server/bin/realmd`, `server/bin/Extractors/*`,
-  `server/etc/*.conf.dist`, `server/sql/` (vmangos' databases).
+  `server/etc/*.conf.dist`.
 - Licence: GNU General Public License version 2, with vMaNGOS' OpenSSL exception
   (`LICENSES/vmangos/LICENSE`). vmangos bundles libmpq (GPL-2.0), Recast/Detour (zlib),
   G3D (BSD), gSOAP (GPL-2.0 option), nlohmann/json (MIT), utf8cpp (BSL-1.0) and others:
@@ -34,9 +34,10 @@ with WOW-BG3's patches and build scripts (see the `README.md` inside it).
 - Source: https://github.com/vmangos/core at commit 53d24d5c748bef5e0cde7b1155bcb3d979af614c
   with WOW-BG3's patches 0001 to 0023 (`patches/vmangos/` in the WOW-BG3 repository), built in the Steam Runtime 3
   SDK. The exact tree, patches and build script are in the sources archive.
-- `server/sql/world.sql` is vmangos' world database (the 14 June 2021 release, as the
-  image ghcr.io/mserajnik/vmangos-database ships it). It describes WoW's world (creatures,
-  items, quests) as the vmangos project publishes it.
+- vmangos' databases are not in the release: `server/fetch-sql.py` downloads them on your PC at the
+  first start, from the sources pinned in `server/sql.lock` (vmangos' world dump of 14 June 2021 from
+  https://github.com/brotalnia/database, and vmangos core's `sql/` at the commit above), and checks each
+  file's sha256. They describe WoW's world (creatures, items, quests) as the vmangos project publishes it.
 
 ## MariaDB: the server's database
 

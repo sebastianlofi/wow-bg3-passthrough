@@ -109,7 +109,10 @@ This is the first public version. What we know is missing or rough:
 
 ## Download size
 
-- The zip is about 270 MB, most of it the WoW engine, the server's world database and Python.
+- The zip is about 235 MB, most of it the WoW engine, Python and the Script Extender. The server's world
+  database is not in it: the first start downloads it (about 48 MB) and needs the internet that once.
+- On a new install the mobs get their WoW abilities from the second start on: BG3 reads them when it
+  starts, and the first start makes them from the database it has just downloaded.
 
 ## Licences
 

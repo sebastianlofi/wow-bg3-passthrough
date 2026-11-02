@@ -54,7 +54,7 @@ the sources archive carries the source of every GPL, LGPL and MPL part in the zi
 | quest cursor plugin | `plugins/early/build.sh` | `wowbg3-early/wowbg3-early.so` | |
 | fight bridge | `bridge/build.sh` | `link-target-sniper/release/wow-bg3-link` | tests: `cargo +1.98.1 test --locked` in `bridge/` |
 | benilla | `patches/benilla/build.sh` | `benilla-target-sniper-player/release/benilla` | the longest step (a large Rust and Bevy build) |
-| server | `server/build-portable.sh`, then `server/pack-portable.sh` | `portable-build/wowbg3-server/` | vmangos core with `patches/vmangos`, MariaDB 11.4.8, vmangos' database SQL |
+| server | `server/build-portable.sh`, then `server/pack-portable.sh` | `portable-build/wowbg3-server/` | vmangos core with `patches/vmangos`, MariaDB 11.4.8; no SQL: the player's PC downloads it (`server/fetch-sql.py`, pins in `server/sql.lock`) |
 | Python | `release/python/fetch.sh`, then `pack.sh` | `release/python/py/` | python-build-standalone 3.12 with numpy, Pillow, lz4, zstandard |
 | FastLZ | `tools/fastlz/build.sh` | `release/libfastlz.so` | |
 | licences | `release/licences/collect.py fetch texts sources` | `LICENSES/` (in the repository), `licences/sources/` | run `texts` again whenever a bundled part changes |

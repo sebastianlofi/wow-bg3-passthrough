@@ -35,8 +35,12 @@ The release zip has its own README with the same steps; this page adds what is b
    character. The loading screen stays up until the WoW side is ready; then you stand in the WoW start
    zone of your character's race.
 
-The very first start builds the server's data from your WoW files and the first movement maps (about
-three minutes behind the loading screen). Later starts and loads take under a minute.
+The very first start builds the server's data from your WoW files and the first movement maps, and
+downloads the server's world database once (about 48 MB from vmangos' public sources, checked against the
+hashes in `server/sql.lock`; kept in `~/.local/share/wow-bg3/server/downloads`): about three minutes behind
+the loading screen. It needs the internet that once; offline it stops with a message, and the next start
+tries again. The mobs' abilities are made from that database and your WoW files on the same start, and BG3
+uses them from its next start. Later starts and loads take under a minute and need no internet.
 
 ## What happens on your machine
 
@@ -46,7 +50,8 @@ three minutes behind the loading screen). Later starts and loads take under a mi
 - The coordinator makes a local WoW account and, per BG3 playthrough, a hidden WoW character that
   matches your BG3 character's race and class. You never log in to anything.
 - Data lives in `~/.local/share/wow-bg3/`: the server's data and database, the WoW side of your
-  saves (snapshots), logs (`logs/`) and status files (`run/launcher.json`, `run/coord.json`).
+  saves (snapshots), logs (`logs/`) and status files (`run/launcher.json`, `run/coord.json`: during the first
+  start its `Detail` says the server's step, such as the download's progress, and `Error` why it failed).
 - Settings: `Mods/WOW-BG3/settings.conf` (WoW's sound, view distance, test chat commands). Read when
   BG3 starts. This beta ships `debug_commands = 1`, so every `/wowbg3` command typed in WoW's chat
   works, the test ones included (`refill`, `tp`, `where`, `find`, `faction`, `level`, `xprate`, `learn`, `unlearn`); `0`

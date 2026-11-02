@@ -5,7 +5,10 @@
 # configs, the server data generated from the player's own WoW files, logs and the console pipe.
 #
 #   wowbg3-server.sh init WOW_DIR         first run: data from WOW_DIR/Data (maps, vmaps, dbc, ~25 s),
-#                                         databases (world import ~3 min), configs, ports
+#                                         the database SQL downloaded from vmangos' public sources (fetch-sql.py,
+#                                         sql.lock: ~48 MB, ~10 s; kept in var/downloads), databases (world import
+#                                         ~3 min), configs, ports. WOWBG3_SQL_DIR: a folder with the SQL already
+#                                         made (fetch-sql.py fetch), used in place of the download
 #   wowbg3-server.sh start | stop | status
 #   wowbg3-server.sh account NAME PASS [GMLEVEL]   a game account (console `account create`)
 #   wowbg3-server.sh console 'CMD' [SECONDS]       one line to mangosd's console; prints what it logs
@@ -16,7 +19,8 @@
 #                                         [server] child): init on the first run, start, stay in the
 #                                         foreground; SIGTERM or SIGINT stops it cleanly (saveall, exit 0);
 #                                         exit 1 when a daemon dies. Status in var/run/state: init, starting,
-#                                         running, stopping, stopped, failed.
+#                                         running, stopping, stopped, failed; during init var/run/progress says
+#                                         the step (one line), and a failed one says why in var/run/error.
 #
 # var/ is WOWBG3_SERVER_VAR when set (the release: ~/.local/share/wow-bg3/server), else this folder's var/.
 #
@@ -45,6 +49,11 @@ mdb_link() {
 
 say() { echo "wowbg3-server: $*"; }
 die() { echo "wowbg3-server: $*" >&2; exit 1; }
+# The first start's step for the launcher's status (wowbg3-coord.py: run/coord.json Detail), and why it failed.
+progress() { mkdir -p "$RUN"; echo "$1" > "$RUN/progress.tmp" && mv -f "$RUN/progress.tmp" "$RUN/progress"; }
+fail() { mkdir -p "$RUN"; echo "$*" > "$RUN/error"; die "$*"; }
+# The release's python (python/ beside server/), else the runtime's.
+PY="$ROOT/../python/bin/python3"; [ -x "$PY" ] || PY=python3
 alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
 # A pid file left by a game that was killed: this start runs in a new container, whose low pids are handed out
 # again, so such a file can name a live process that is something else. `alive` would then say a server that is
@@ -102,8 +111,9 @@ init() {
     [ -d "$wow/Data" ] || die "no $wow/Data"
     [ ! -e "$V/.initialized" ] || die "already initialised ($V); move var/ aside for a new one"
     mdb_link
-    mkdir -p "$V"/{db,run,logs,etc,data,honor}
+    mkdir -p "$V"/{run,logs,etc,data,honor}   # db/ only once the SQL is there: run() takes a db/ for a broken import
     chmod 700 "$V"
+    rm -f "$RUN/error"
     if [ ! -f "$V/secrets.env" ]; then
         ( umask 077; printf 'ROOT_PASS=%s\nMANGOS_PASS=%s\n' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" \
             "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" > "$V/secrets.env" )
@@ -111,6 +121,7 @@ init() {
     # 1. Server data from the player's own WoW files (read only; nothing of it is shipped).
     if [ ! -f "$V/data/.complete" ]; then
         say "generating maps, vmaps and dbc from $wow/Data"
+        progress "Making the server's maps from your WoW files"
         local t0=$SECONDS w="$V/data/work"
         rm -rf "$w"; mkdir -p "$w"; ln -s "$(cd "$wow" && pwd)/Data" "$w/Data"
         ( cd "$w" && "$ROOT/bin/Extractors/MapExtractor" --silent > "$V/logs/extract-maps.log" 2>&1 )
@@ -123,8 +134,20 @@ init() {
         touch "$V/data/.complete"
         say "data ready in $((SECONDS - t0)) s"
     fi
-    # 2. Databases.
+    # 2. The database SQL: downloaded from vmangos' public sources (pinned in sql.lock), never shipped.
+    local S="${WOWBG3_SQL_DIR:-$V/sql}"
+    if [ -z "${WOWBG3_SQL_DIR:-}" ] && [ ! -f "$S/.complete" ]; then
+        say "downloading the world database (fetch-sql.py, sql.lock)"
+        progress "Downloading the world database"
+        "$PY" "$ROOT/fetch-sql.py" fetch "$S" --cache "$V/downloads" --progress "$RUN/progress" --error "$RUN/error" \
+            > "$V/logs/fetch-sql.log" 2>&1 || fail "$(cat "$RUN/error" 2>/dev/null || echo "the database download failed (see var/logs/fetch-sql.log)")"
+        say "$(tail -1 "$V/logs/fetch-sql.log")"
+    fi
+    [ -f "$S/world.sql" ] || fail "no world.sql in $S"
+    # 3. Databases.
     say "creating the databases"
+    progress "Creating the databases"
+    mkdir -p "$V/db"
     "$MDB/scripts/mariadb-install-db" --no-defaults --basedir="$MDB" --datadir="$V/db" --auth-root-authentication-method=normal \
         --skip-test-db > "$V/logs/install-db.log" 2>&1
     db_start
@@ -137,16 +160,22 @@ init() {
             GRANT ALL ON mangos.* TO 'mangos'@'localhost'; GRANT ALL ON characters.* TO 'mangos'@'localhost';
             GRANT ALL ON realmd.* TO 'mangos'@'localhost'; GRANT ALL ON logs.* TO 'mangos'@'localhost'; FLUSH PRIVILEGES;"
     say "importing the world database (a few minutes)"
-    sql mangos < "$ROOT/sql/world.sql"
-    sql characters < "$ROOT/sql/characters.sql"
-    sql realmd < "$ROOT/sql/logon.sql"
-    sql logs < "$ROOT/sql/logs.sql"
-    sql mangos < "$ROOT/sql/migrations/world_db_updates.sql"
-    sql characters < "$ROOT/sql/migrations/characters_db_updates.sql"
-    sql realmd < "$ROOT/sql/migrations/logon_db_updates.sql"
-    sql logs < "$ROOT/sql/migrations/logs_db_updates.sql"
+    feed() { "$PY" "$ROOT/fetch-sql.py" feed "$1" --label "$2" --progress "$RUN/progress"; }
+    feed "$S/world.sql" "Importing the world database" | sql mangos
+    sql characters < "$S/characters.sql"
+    sql realmd < "$S/logon.sql"
+    sql logs < "$S/logs.sql"
+    feed "$S/migrations/world_db_updates.sql" "Updating the world database" | sql mangos
+    progress "Updating the other databases"
+    sql characters < "$S/migrations/characters_db_updates.sql"
+    sql realmd < "$S/migrations/logon_db_updates.sql"
+    sql logs < "$S/migrations/logs_db_updates.sql"
     sql realmd -e "DELETE FROM realmlist; INSERT INTO realmlist (id, name, address, localAddress, localSubnetMask, port, icon, realmflags, timezone, allowedSecurityLevel, population, gamebuild_min, gamebuild_max, flag, realmbuilds) VALUES (1, 'WOW-BG3', '127.0.0.1', '127.0.0.1', '255.255.255.0', $WORLD_PORT, 0, 0, 2, 0, 0, 0, 0, 0, '');"
     say "databases ready in $((SECONDS - t0)) s"
+    # Which SQL the database holds (wowbg3-coord.py keys the mobs' abilities by it); the downloads stay, the
+    # unpacked SQL (~200 MB) goes: a new var/ makes it again from var/downloads, offline.
+    "$PY" "$ROOT/fetch-sql.py" version > "$V/sql.version"
+    [ -n "${WOWBG3_SQL_DIR:-}" ] || rm -rf "$V/sql"
     # 3. Configs (the core's own dist files with our settings).
     local db="\".;0;mangos;$(secret MANGOS_PASS)"
     cp "$ROOT/etc/mangosd.conf.dist" "$V/etc/mangosd.conf"
@@ -161,6 +190,7 @@ init() {
         "RealmServerPort=$AUTH_PORT" "LogsDir=\"$V/logs\"" "PidFile=\"$RUN/realmd-self.pid\""
     printf 'WORLD_PORT=%s\nAUTH_PORT=%s\n' "$WORLD_PORT" "$AUTH_PORT" > "$V/ports.env"
     db_stop
+    rm -f "$RUN/progress"
     touch "$V/.initialized"
     say "initialised; start with: $0 start"
 }
@@ -319,6 +349,7 @@ run() {
             mv "$V" "$aside"
             mkdir -p "$V"; [ -d "$aside/data" ] && [ -f "$aside/data/.complete" ] && mv "$aside/data" "$V/data"
             [ -f "$aside/secrets.env" ] && mv "$aside/secrets.env" "$V/secrets.env"
+            [ -d "$aside/downloads" ] && mv "$aside/downloads" "$V/downloads"
         fi
         state init
         ( trap - TERM INT; init "$wow" ) & local ip=$!
@@ -326,7 +357,8 @@ run() {
             [ "$quit" = 1 ] && { say "stopped during the first start"; kill "$ip" 2>/dev/null; wait "$ip" || true; db_stop || true; state stopped; exit 0; }
             sleep 0.5 || true   # a SIGTERM to the process group ends the sleep (set -e must not end us)
         done
-        wait "$ip" || { state failed; die "first start failed (see $V/logs)"; }
+        wait "$ip" || { [ -s "$RUN/error" ] || echo "the first start failed (see $V/logs)" > "$RUN/error"
+                        state failed; die "first start failed: $(cat "$RUN/error")"; }
     fi
     state starting
     OWN=1
@@ -359,5 +391,5 @@ case "${1:-}" in
     mmtiles)
         r="${5:-1}"
         for dx in $(seq -"$r" "$r"); do for dy in $(seq -"$r" "$r"); do mmtile "$2" $(( $3 + dx )) $(( $4 + dy )); done; done;;
-    *) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+    *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
 esac
