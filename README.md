@@ -234,6 +234,12 @@ on its loading screen for about two minutes before the main menu. Offline, it st
 saying so; start BG3 again once you are connected. Later starts and loads take under a minute and need
 no internet. Switching WoW-BG3 Passthrough off in the mod manager stops the whole WoW side.
 
+Why the download: the WoW server needs a world database (every NPC, quest, item, vendor and spawn).
+It is Blizzard-derived, so this mod can't ship it, and your WoW client doesn't contain it, so it can't
+be built from your client either. The first start fetches it from vmangos' public sources (the WoW
+server this mod uses), at a pinned version, and checks every file against the checksums that ship with
+the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
+
 To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder and your
 `settings.conf`) and run the installer again. Your saves and `~/.local/share/wow-bg3/` stay.
 

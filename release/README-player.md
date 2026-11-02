@@ -21,6 +21,7 @@ playing it. Stop right away if you feel unwell.
   WOW-BG3 contains no Blizzard files. It reads your client's `Data/` folder
   to build what the local WoW server needs, on your machine.
 - About 10 GB free disk space for the generated server data.
+- An internet connection for the first start only (a 48 MB download).
 
 Everything else is in this download: the Linux Script Extender (bg3le, with
 WOW-BG3's patches), the local WoW server, the WoW engine (benilla) and the tools.
@@ -89,6 +90,12 @@ message says so; start BG3 again once connected. The first time, BG3 stays on
 its loading screen for about two minutes before the main menu: it waits for
 the mobs' abilities, made from that database. Later starts and loads take
 under a minute.
+
+Why the download: the WoW server needs a world database (every NPC, quest, item, vendor and spawn).
+It is Blizzard-derived, so this mod can't ship it, and your WoW client doesn't contain it, so it can't
+be built from your client either. The first start fetches it from vmangos' public sources (the WoW
+server this mod uses), at a pinned version, and checks every file against the checksums that ship with
+the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
 
 To change which abilities a mob gets, see "Changing mob abilities" in the
 project's README: a file of yours in ~/.local/share/wow-bg3/abilities-rules.json.

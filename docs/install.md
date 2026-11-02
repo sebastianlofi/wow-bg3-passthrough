@@ -9,6 +9,7 @@ The release zip has its own README with the same steps; this page adds what is b
 - Your own World of Warcraft 1.12.1 client, build 5875, English. WOW-BG3 never runs `WoW.exe`; it
   reads the client's `Data/` folder to build the local server's data and the textures it needs.
 - About 10 GB of free disk space for the generated server data.
+- An internet connection for the first start only (a 48 MB download, see below).
 - Nothing else: the release brings the Linux Script Extender (bg3le with WOW-BG3's patches), the
   local WoW server (vmangos and MariaDB), the WoW engine (benilla), a Python for its tools and the
   licence texts of all of them.
@@ -31,7 +32,7 @@ The release zip has its own README with the same steps; this page adds what is b
    shows what it would do. The same holds in reverse: installing or updating stock bg3le later
    (its own installer, or a mod manager that brings it) puts the stock library back over
    WOW-BG3's patched build, and WOW-BG3 stops working until you run this command again.
-5. Start BG3 from Steam, enable WOW-BG3 in the mod manager, start a New Game and make or pick a
+5. Start BG3 from Steam, enable WoW-BG3 Passthrough in the mod manager, start a New Game and make or pick a
    character. The loading screen stays up until the WoW side is ready; then you stand in the WoW start
    zone of your character's race.
 
@@ -42,6 +43,12 @@ the loading screen. It needs the internet that once; offline it stops with a mes
 tries again. The mobs' abilities are made from that database and your WoW files before BG3 reads its stats
 (bg3le patch 0008), so the first time WOW-BG3 runs BG3 stays on its loading screen for about two minutes
 before the main menu. Later starts and loads take under a minute and need no internet.
+
+Why the download: the WoW server needs a world database (every NPC, quest, item, vendor and spawn).
+It is Blizzard-derived, so this mod can't ship it, and your WoW client doesn't contain it, so it can't
+be built from your client either. The first start fetches it from vmangos' public sources (the WoW
+server this mod uses), at a pinned version, and checks every file against the checksums that ship with
+the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
 
 ## What happens on your machine
 
