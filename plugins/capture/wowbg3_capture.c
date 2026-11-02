@@ -1048,7 +1048,6 @@ typedef struct {
     int fxprops;    // a spell's 3D props kept in the void (word "fxprops"; see void_skip)
     int fxglow;     // a spell's glow on a figure captured, not dropped with her (word "fxglow"; see fxc_figure_extra)
     uint32_t fxpropage;  // ... while their mesh is younger than this many presents ("fxpropage=", 900)
-    uint32_t fxpropburst;  // ... unless their present brought more new slices than this ("fxpropburst=", 8)
     float sdec, sfwd, sfloor, stol;
     int fxtav;     // Effects kept only near Tav, as before (default: near Tav or BG3's eye)
     int screenvoid;  // BG3's own 3D screens: the character over one dark colour (word "screenvoid")
@@ -1094,7 +1093,7 @@ static volatile int g_move_cover;
 // "wowraw" (WoW's frame bytes as they are: an earlier version encoded its sRGB target twice,
 // the old look), "wowgamma=<g>" (benilla's `gamma` CVar, default 1; see put_pixel_from_wow).
 // "surf" (with "ground": BG3's ground surfaces, water, grease, fire..., laid onto WoW's ground in the
-// composite with BG3's own look; "surfdbg", "surfpix", "sdec=", "sfwd=", "sfloor=", "stol=", "surfscene", "surfpost", "fxprops", "fxpropage=", "fxpropburst=": see
+// composite with BG3's own look; "surfdbg", "surfpix", "sdec=", "sfwd=", "sfloor=", "stol=", "surfscene", "surfpost", "fxprops", "fxpropage=": see
 // wowbg3_surf.inc.c).
 // "noscreenlevel" (BG3's own 3D screens keep the world mode's voiding, which is what 0.1.0 did: the
 // character stands in an empty void with whatever of the host level the voiding does not reach, his
@@ -1174,8 +1173,6 @@ static void compose_config(void) {
     g_cc.fxglow = has_word(line, "fxglow");
     g_cc.fxpropage = 900;
     { const char* w = strstr(line, "fxpropage="); if (w) { unsigned long v = strtoul(w + 10, NULL, 10); if (v) g_cc.fxpropage = (uint32_t)v; } }
-    g_cc.fxpropburst = 8;
-    { const char* w = strstr(line, "fxpropburst="); if (w) { unsigned long v = strtoul(w + 12, NULL, 10); if (v) g_cc.fxpropburst = (uint32_t)v; } }
     g_cc.slight = !has_word(line, "noslight");
     g_cc.screenlevel = !has_word(line, "noscreenlevel");
     g_cc.screenvoid = has_word(line, "screenvoid");

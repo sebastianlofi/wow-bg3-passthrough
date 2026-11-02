@@ -2519,6 +2519,7 @@ static void keep_read(void) {
 // Health and spell props do not, so the mod can tell them apart exactly; the layer cannot.
 static uint64_t g_hide[KEEP_CAP];
 static uint32_t g_hide_n;
+static uint64_t g_hide_at;  // the present the last list was read at
 static struct timespec g_hide_seen;
 static int hide_has(uint64_t ib) {
     if (!g_hide_n || !ib) return 0;
@@ -2559,6 +2560,7 @@ static void hide_read(void) {
     memcpy(g_hide, next, sizeof g_hide);
     g_hide_n = n;
     pthread_mutex_unlock(&g_fxl_lock);
+    __atomic_store_n(&g_hide_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
 }
 
 // A pass begins (g_trace_lock held): is it one BG3's map draws into?
@@ -2622,9 +2624,12 @@ static int mesh_has(uint64_t ib) {
 // than `fxpropage` presents (900, about 30 s), with two guards against things that are also young:
 //  - after a load (BG3 leaves and re-enters Running) every slice is new: slices first seen within
 //    IBAGE_WARM presents of it count as scenery;
-//  - a stand-in that spawns, or level geometry that streams in, arrives as many new slices in one
-//    present; a spell's prop is one or a few. A present that brings more than `fxpropburst` new
-//    slices (8) is a bulk arrival and none of its slices are kept.
+//  - a character is young too when it spawns, changes form or comes back into view, and its draws look
+//    like a skinned prop's. BG3 knows which is which: a character has Health, and TavPlan.PublishKeep
+//    names every one around Tav in hide.txt. The only gap is the moments before the next list, so a
+//    young skinned slice waits for a list read IBAGE_HIDE_AFTER presents after it was first seen, and
+//    asks for one (hide-ask.txt); a slice the list does not name is the spell's. Level geometry that
+//    streams in is kept out by the distance.
 // The identity is the slice a draw reads -- buffer, byte offset, first index, index count and vertex
 // offset -- not the buffer: BG3 recycles index buffers, and an age keyed on the handle called the
 // blob's mesh old; the vertex offset too, as meshes packed into one buffer can share an index range.
@@ -2640,8 +2645,8 @@ static int mesh_has(uint64_t ib) {
 // instanced -- so after one spell had used it the next spell's identical chunk was "older than 30 s"
 // and culled; which spells lost theirs depended on what was cast before. `last` is the present the
 // slice was last drawn; one that comes back after IBAGE_GAP presents without a draw is made again, so
-// its age starts over (and counts towards a bulk arrival like any new slice). Scenery coming back
-// into view is the same event as before, and the same guards keep it out: placed near Tav, no bulk.
+// its age starts over. Scenery coming back into view is the same event as before, and the same guards
+// keep it out: placed near Tav, and a character's slices are on the hide list.
 #define IBAGE_GAP 60u
 // And only while a spell is on (the build session's quiet-baseline check, 2026-10-29 night): with
 // ages that start over, arriving somewhere made the things around Tav young -- at Razor Hill's inn an
@@ -2657,13 +2662,14 @@ static int mesh_has(uint64_t ib) {
 #define IBAGE_CAP 16384u
 #define IBAGE_EVERY 3600u
 #define IBAGE_WARM 300u
-#define IBAGE_BURSTS 1024u
+#define IBAGE_HIDE_AFTER 2u   // presents after a slice's first draw: a list read then was made after it
+#define IBAGE_HIDE_ASK_GAP 8u  // presents between two asks for a list
 typedef struct { uint64_t h; uint64_t first; uint64_t last; } IbAge;  // first, last: present + 1
 static IbAge g_ibage[2][IBAGE_CAP];
 static uint64_t g_ibage_warm;                 // slices first seen before this present are scenery
-static uint64_t g_ibage_burst[IBAGE_BURSTS];  // [p % IBAGE_BURSTS] == p + 1: present p was a bulk arrival
 static uint64_t g_ibage_new_at, g_ibage_new_n;  // new slices counted for one present
-static uint64_t g_fxprops_kept, g_fxprops_bulk, g_ibage_full, g_ibage_newmax;
+static uint64_t g_fxprops_kept, g_fxprops_wait, g_ibage_full, g_ibage_newmax;
+static uint32_t g_hide_ask;  // a new skinned slice wants a list made after it
 static uint64_t ib_slice(uint64_t ib, uint64_t off, uint32_t first, uint32_t count, int32_t vo) {
     uint64_t k[4] = {ib, off, ((uint64_t)first << 32) | count, (uint64_t)(uint32_t)vo};
     return fnv64(k, sizeof k, FNV0) | 1;
@@ -2700,11 +2706,12 @@ static void ibage_put(IbAge* t, uint64_t k, uint64_t first, uint64_t last) {
     }
     __atomic_add_fetch(&g_ibage_full, 1, __ATOMIC_RELAXED);  // probe limit: the slice stays unaged (not kept)
 }
-// A spell's prop: a slice first seen (or back after a gap) within the last `fxpropage` presents,
-// outside a load's warm-up and not in a present that brought a bulk of new slices. Only skinned
-// slices count towards a bulk (`skinned`): the guard is for a body arriving (a stand-in spawning before
-// the hide list names it); scenery streaming in is kept out by the distance anyway, and a spell's
-// debris brings nine or ten unskinned meshes back at once (Chromatic Orb), which tripped it.
+// A spell's prop: a slice first seen (or back after a gap) within the last `fxpropage` presents, outside
+// a load's warm-up. A skinned one (`skinned`) only once a list made after its first draw has been read, so the
+// caller's hide test can answer for it: a body is on that list, a spell's mesh is not. This replaces a limit of
+// 8 new skinned slices a present, which threw out every slice of such a present, the spell's too, counted
+// bodies already listed or a kilometre off towards it, and said so for every later draw of them (the 51528 of
+// the ship sweep is one body's draws, 172 a present, not as many lost effects).
 static int ib_young(uint64_t k, int skinned) {
     uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     IbAge *ea = ibage_get(g_ibage[0], k), *eb = ibage_get(g_ibage[1], k);
@@ -2715,17 +2722,20 @@ static int ib_young(uint64_t k, int skinned) {
     uint64_t fx = __atomic_load_n(&g_fx_seen_at, __ATOMIC_RELAXED);
     if (f & IBAGE_PEND) {
         uint64_t p = f & ~IBAGE_PEND;  // the present + 1 it was first seen at
-        if (fx >= p && fx <= p + IBAGE_PENDING) f = p, a = b = 0;      // a spell came on right after: made then
+        if (fx >= p && fx <= p + IBAGE_PENDING) {                      // a spell came on right after: made then
+            f = p, a = b = 0;
+            if (skinned) __atomic_store_n(&g_hide_ask, 1, __ATOMIC_RELAXED);
+        }
         else if (now + 1 > p + IBAGE_PENDING) f = 1, a = b = 0;        // none came: scenery
     }
     if (!f) {
         f = now < __atomic_load_n(&g_ibage_warm, __ATOMIC_RELAXED) ? 1 : now + 1;  // stored as present + 1
         if (f > 1 && now + 1 > fx + IBAGE_FX) f |= IBAGE_PEND;  // no spell on: wait and see
-        if (f > 1 && !(f & IBAGE_PEND) && skinned) {  // a new slice this present: count it towards a bulk arrival
+        if (f > 1 && !(f & IBAGE_PEND) && skinned) {  // a new slice this present
+            __atomic_store_n(&g_hide_ask, 1, __ATOMIC_RELAXED);
             if (__atomic_exchange_n(&g_ibage_new_at, now, __ATOMIC_ACQ_REL) != now) __atomic_store_n(&g_ibage_new_n, 0, __ATOMIC_RELAXED);
             uint64_t c = __atomic_add_fetch(&g_ibage_new_n, 1, __ATOMIC_RELAXED);
             if (c > __atomic_load_n(&g_ibage_newmax, __ATOMIC_RELAXED)) __atomic_store_n(&g_ibage_newmax, c, __ATOMIC_RELAXED);
-            if (c > g_cc.fxpropburst) __atomic_store_n(&g_ibage_burst[now % IBAGE_BURSTS], now + 1, __ATOMIC_RELAXED);
         }
     }
     if (ea && !a) __atomic_store_n(&ea->first, f, __ATOMIC_RELEASE);
@@ -2734,11 +2744,30 @@ static int ib_young(uint64_t k, int skinned) {
     if (eb) __atomic_store_n(&eb->last, now + 1, __ATOMIC_RELAXED); else ibage_put(g_ibage[1], k, f, now + 1);
     if (f <= 1 || now + 1 < f) return 0;
     uint64_t p = f - 1;  // the present it was first seen at
-    if (__atomic_load_n(&g_ibage_burst[p % IBAGE_BURSTS], __ATOMIC_RELAXED) == p + 1) {
-        __atomic_add_fetch(&g_fxprops_bulk, 1, __ATOMIC_RELAXED);
+    if (now - p > (uint64_t)g_cc.fxpropage) return 0;
+    if (skinned && __atomic_load_n(&g_hide_at, __ATOMIC_ACQUIRE) < p + IBAGE_HIDE_AFTER) {
+        __atomic_add_fetch(&g_fxprops_wait, 1, __ATOMIC_RELAXED);
         return 0;
     }
-    return now - p <= (uint64_t)g_cc.fxpropage;
+    return 1;
+}
+// Once per present: a new skinned slice asks TavPlan.PublishKeep for a list now (WorldMode.lua polls the file)
+// rather than at its next turn, so a spell's skinned mesh waits a few presents, not a third of a second.
+static void hide_ask(uint64_t now) {
+    static uint64_t last;
+    if (!__atomic_load_n(&g_hide_ask, __ATOMIC_RELAXED) || now < last + IBAGE_HIDE_ASK_GAP) return;
+    __atomic_store_n(&g_hide_ask, 0, __ATOMIC_RELAXED);
+    if (!g_tav.init || !g_tav.plan[0]) return;
+    last = now;
+    char path[sizeof g_tav.plan];
+    snprintf(path, sizeof path, "%s", g_tav.plan);
+    char* slash = strrchr(path, '/');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "hide-ask.txt");
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%llu\n", (unsigned long long)now);
+    fclose(f);
 }
 // Once per present: turn the generations over, and start a warm-up when BG3 comes back from a load.
 static void ibage_present(void) {
@@ -2754,15 +2783,16 @@ static void ibage_present(void) {
     was_running = g_bg3_running;
     was_void = g_keep_active;
     if (now && now % IBAGE_EVERY == 0) memset(g_ibage[(now / IBAGE_EVERY) & 1], 0, sizeof g_ibage[0]);
+    if (g_cc.fxprops && g_keep_active) hide_ask(now);
     if (now && now % 300 == 0 && g_cc.fxglow)
         logf_("fxglow: %llu draws of a figure's glow kept, %llu past the probe limit", (unsigned long long)__atomic_exchange_n(&g_glow_kept, 0, __ATOMIC_RELAXED),
               (unsigned long long)__atomic_exchange_n(&g_glow_full, 0, __ATOMIC_RELAXED));
     if (now && now % 300 == 0 && g_cc.fxprops)
-        logf_("fxprops: %llu draws kept as a spell's props, %llu of a bulk arrival not kept, busiest present %llu new slices "
-              "(bulk above %u), %llu slices past the probe limit",
+        logf_("fxprops: %llu draws kept as a spell's props, %llu skinned draws waiting for a hide list, busiest present %llu new "
+              "skinned slices, %llu slices past the probe limit",
               (unsigned long long)__atomic_exchange_n(&g_fxprops_kept, 0, __ATOMIC_RELAXED),
-              (unsigned long long)__atomic_exchange_n(&g_fxprops_bulk, 0, __ATOMIC_RELAXED),
-              (unsigned long long)__atomic_exchange_n(&g_ibage_newmax, 0, __ATOMIC_RELAXED), g_cc.fxpropburst,
+              (unsigned long long)__atomic_exchange_n(&g_fxprops_wait, 0, __ATOMIC_RELAXED),
+              (unsigned long long)__atomic_exchange_n(&g_ibage_newmax, 0, __ATOMIC_RELAXED),
               (unsigned long long)__atomic_exchange_n(&g_ibage_full, 0, __ATOMIC_RELAXED));
 }
 static void mesh_present(void) {

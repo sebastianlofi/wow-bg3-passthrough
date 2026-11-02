@@ -397,7 +397,7 @@ end
 -- keeps blended draws near Tav). M.KeepOthers = true lists every character within the radius.
 M.KeepOthers = false
 local Hero = Ext.Require("Hero.lua")
-local lastKeep, lastHide = nil, nil
+local lastKeep = nil
 -- party: the figures WoW draws (the hero and her companions), kept like her.
 -- The characters it leaves out (a fight's stand-ins, NPCs) go to wow-bg3/link/hide.txt ("HIDE 1",
 -- then one hex VkBuffer handle a line): the layer's "fxprops" keeps a spell's young prop meshes
@@ -431,16 +431,14 @@ function M.PublishKeep(centre, radius, party)
         Ext.IO.SaveFile("wow-bg3/link/keep.txt", body)
     end
     table.sort(hide)
-    local hbody = "HIDE 1\n" .. table.concat(hide, "\n") .. "\n"
-    if hbody ~= lastHide then
-        lastHide = hbody
-        Ext.IO.SaveFile("wow-bg3/link/hide.txt", hbody)
-    end
+    -- Written unchanged too: the layer lets a young skinned mesh through once it has read a list made after the
+    -- mesh's first draw that does not name it, so a new file is the answer "nothing new has Health".
+    Ext.IO.SaveFile("wow-bg3/link/hide.txt", "HIDE 1\n" .. table.concat(hide, "\n") .. "\n")
     return #ids
 end
 
 function M.ClearKeep()
-    lastKeep, lastHide = nil, nil
+    lastKeep = nil
     Ext.IO.SaveFile("wow-bg3/link/keep.txt", "KEEP 0\n")
     Ext.IO.SaveFile("wow-bg3/link/hide.txt", "HIDE 0\n")
 end
