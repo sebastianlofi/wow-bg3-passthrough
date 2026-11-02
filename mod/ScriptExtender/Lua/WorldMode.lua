@@ -801,7 +801,13 @@ function M.Start(runId)
             end
             -- The characters BG3 keeps drawing with its map off (compose word "void"): those within
             -- 60 m of Tav (her, a fight's stand-ins).
-            if ticks % 30 == 22 and not M.InCamp() then
+            -- And at once when the layer asks: a new skinned mesh waits for a list made after it (hide-ask.txt).
+            local listDue = ticks % 30 == 22
+            if not listDue and ticks % 2 == 0 then
+                local ask = Ext.IO.LoadFile("wow-bg3/link/hide-ask.txt")
+                if ask and ask ~= M.HideAsk then M.HideAsk, listDue = ask, true end
+            end
+            if listDue and not M.InCamp() then
                 local okp, p = pcall(Probe.HostPosition)
                 if okp then
                     local ok, n = pcall(TavPlan.PublishKeep, p, 60, figures())

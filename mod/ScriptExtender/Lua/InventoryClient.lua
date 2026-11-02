@@ -7,8 +7,8 @@
 --    ls::FileReader, as for WowUi.lua's XAML), so the names "WowBg3_<icon>" that Inventory.lua puts on
 --    its items' templates resolve to WoW's pictures in every BG3 screen (inventory, trade, loot,
 --    tooltips, hotbar). Without the files (tool not run) nothing changes: items keep the base's icon.
--- 2. The same stats entries and strings as the server (Inventory.MakeAll at StatsLoaded), so
---    tooltips show WoW names, WoW text and the mapped numbers.
+-- 2. The same stats entries as the server (Inventory.MakeUsed at StatsLoaded) and the one string table they
+--    share (Inventory.MakeStrings), so tooltips show WoW names, WoW text and the mapped numbers.
 -- Status: wow-bg3/inventory-client.json.
 local M = {}
 local SE_DIR = "Larian Studios/Baldur's Gate 3/Script Extender"

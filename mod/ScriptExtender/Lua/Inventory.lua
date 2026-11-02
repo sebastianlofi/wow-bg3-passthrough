@@ -174,7 +174,7 @@ function M.StatsName(entry) return PREFIX_STATS .. tostring(entry) end
 function M.NameHandle(entry) return "WowBg3_N" .. tostring(entry) end
 function M.DescHandle(entry) return "WowBg3_D" .. tostring(entry) end
 
--- ---- stats and strings for every entry (both sides, at StatsLoaded) ----
+-- ---- stats and strings for the entries in use (both sides) ----
 local WEAPON_SIDE = {WeaponEnchantment = true, WeaponDamage = true, WeaponProperty = true}
 local function statsType(row)
     if row.k == "weapon" then return "Weapon" end
@@ -289,10 +289,13 @@ function M.MakeStrings(row)
     Ext.Loca.UpdateTranslatedString(row.DescKey or M.DescHandle(row.e), desc)
 end
 
--- Strings for every entry, on both sides (cheap: a hash insert each). Stats entries are made only for
--- the entries in use (M.MakeStats: Ext.Stats.Create costs grow with the number of entries; all
--- 17,707 at StatsLoaded took over 160 s in the harness), synced to the clients and kept
--- in the save (SetPersistence), so a save's items find their stats when it loads.
+-- Strings for the entries in use only, like their stats entries (M.MakeStats: Ext.Stats.Create costs grow with
+-- the number of entries; all 17,707 at StatsLoaded took over 160 s in the harness). BG3's string table has room
+-- for about 28,000 new handles until the engine grows it itself, and bg3le never reallocates it: all 170,772
+-- (every entry and suffix, name and text) left 142,403 refused ("loca: no room to add" in bg3le.log), every suffix
+-- and 3,522 base names among them, and a later write of the same handle was refused as well. Client and server
+-- share the table, so an item's strings go in when an item is made or learns its suffix (M.Create, M.Redress, the
+-- reconcile), and the used entries' at each load for the items in the save.
 local made = false
 -- At StatsLoaded (both sides): the stats entries of every entry used before.
 function M.MakeUsed()
@@ -306,21 +309,14 @@ function M.MakeUsed()
     Ext.Log.Print(string.format("WOW-BG3 inventory: %d used item stats in %d ms (%s)", n, M.UsedMs, client and "client" or "server"))
 end
 
-function M.MakeAll(again)
-    if made and not again then return end
+function M.MakeAll()
+    if made then return end
     made = true
+    loadUsed()
     local t0, n = Ext.Utils.MonotonicTime(), 0
-    for _, row in pairs(M.Items()) do
-        if pcall(M.MakeStrings, row) then n = n + 1 end
-    end
-    -- Every suffix an item can roll: the client has no other way to learn the strings (handles are cheap).
-    local pools = {}
-    for _, p in ipairs(M.Pools or {}) do pools[p.id] = p.p end
-    for _, row in pairs(M.Items()) do
-        for _, rand in ipairs(pools[row.rp or -1] or {}) do
-            local v = M.Variant(row, rand)
-            if v ~= row and pcall(M.MakeStrings, v) then n = n + 1 end
-        end
+    for e in pairs(M.Used) do
+        local row = M.Item(e)
+        if row and pcall(M.MakeStrings, row) then n = n + 1 end
     end
     M.MadeMs = Ext.Utils.MonotonicTime() - t0
     Ext.Log.Print(string.format("WOW-BG3 inventory: %d item names in %d ms (%s)", n, M.MadeMs, client and "client" or "server"))
@@ -392,6 +388,7 @@ function M.Redress()
             entry = type(sid) == "string" and tonumber(sid:match("^" .. PREFIX_STATS .. "(%d+)$"))
         end
         local row = entry and M.Item(entry)
+        if row then pcall(M.MakeStrings, row) end
         if row and M.OldThrown(row, q(function() return e.Vars[BASE_VAR] end)) then
             broken[#broken + 1] = {u, entry}
         elseif row and M.Dress(u, row) then n = n + 1 end
@@ -406,6 +403,22 @@ function M.Redress()
 end
 
 M.Fresh = {}
+-- A new item is dressed again 10 ticks on. Why was never shown: "components settle" dates from the first version,
+-- when the blank names this may have been written for had another cause (M.MakeAll's note). So it says what it
+-- finds: if every line in a session of buying and looting says "as dressed", this goes, M.Fresh with it.
+function M.DressFresh(u, row)
+    local e = Ext.Entity.Get(u)
+    local name = row.NameKey or M.NameHandle(row.e)
+    local function read(f) local ok, v = pcall(f); return ok and tostring(v) or "none" end
+    local shown = read(function() return e.DisplayName.Name.Handle.Handle end)
+    local listed = read(function() return e.ServerDisplayNameList.Names[1].NameKey.Handle.Handle end)
+    local icon = read(function() return e.Icon.Icon end)
+    local want = M.IconName(row)
+    local same = shown == name and listed == name and (not want or icon == want)
+    Ext.Log.Print(string.format("WOW-BG3 inventory: fresh item %s: %s (name %s, list %s, icon %s, want %s, %s)", tostring(u),
+        same and "as dressed" or "had changed", shown, listed, icon, name, tostring(want)))
+    return M.Dress(u, row)
+end
 -- A new BG3 item for WoW entry `entry` (count for stacks) in `holder`'s inventory; tag = WowBg3Item.
 function M.Create(entry, holder, count, tag, rand)
     local row = M.Variant(assert(M.Item(entry), "no item " .. tostring(entry)), rand)
@@ -425,7 +438,7 @@ function M.Create(entry, holder, count, tag, rand)
     dress(e, row)
     M.Dress(u, row)
     setValue(e, M.ValueOf(row, tostring(tag):sub(1, 1) == "V"))
-    M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (components settle)
+    M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (see M.DressFresh)
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
     e.Vars[BASE_VAR] = row.b
@@ -772,7 +785,9 @@ local function reconcileMember(uuid, m, have)
         if u and row and not pendingItem[u] and not landed then
             if it.Rand and M.Props and M.Props[it.Rand] and suffixed[u] ~= it.Rand then
                 suffixed[u] = it.Rand -- a bought or looted item learns its suffix here; after a load too
-                pcall(M.Dress, u, M.Variant(row, it.Rand))
+                local v = M.Variant(row, it.Rand)
+                pcall(M.MakeStrings, v)
+                pcall(M.Dress, u, v)
             end
             if holderOf(u) ~= uuid and not equipped(u) then
                 M.Suppress(u)
@@ -1532,9 +1547,6 @@ function M.Start(id)
     Ext.Events.StatsLoaded:Subscribe(function() pcall(M.MakeUsed) end)
     Ext.Events.SessionLoaded:Subscribe(function() M.MakeAll() end)
     if client then return end
-    -- Client and server share BG3's string table and both fill it at SessionLoaded; many strings are
-    -- lost there (harness: 3172 names and 47809 suffix names of 85386 empty), so once more on one side.
-    Ext.Osiris.RegisterListener("LevelGameplayStarted", 2, "after", function() M.MakeAll(true) end)
     Ext.Osiris.RegisterListener("Equipped", 2, "after", function(item, char) onEquipped(item, char, true) end)
     Ext.Osiris.RegisterListener("Unequipped", 2, "after", function(item, char) onEquipped(item, char, false) end)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)
@@ -1629,7 +1641,7 @@ function M.Start(id)
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
         for u, f in pairs(M.Fresh) do
-            if tick - f.Tick >= 10 then M.Fresh[u] = nil; pcall(M.Dress, u, f.Row) end
+            if tick - f.Tick >= 10 then M.Fresh[u] = nil; pcall(M.DressFresh, u, f.Row) end
         end
         if tick % 20 == 0 then
             pcall(M.NotePieces)
