@@ -320,6 +320,8 @@ pub struct Fight {
     pub joins_done: u32,
     /// Server requests raised and not yet taken by the loop, in order.
     pub handoff: VecDeque<Handoff>,
+    /// The server refused `begin`: it holds no encounter, so nothing more is sent to it.
+    pub refused: bool,
     ended: bool,
     strike: Option<Strike>,
     next_enemy: u32,
@@ -362,6 +364,7 @@ impl Fight {
             joins_sent: 0,
             joins_done: 0,
             handoff: VecDeque::new(),
+            refused: false,
             ended: false,
             strike: None,
             crowded: HashSet::new(),
@@ -600,8 +603,10 @@ impl Fight {
         }
     }
     /// One `WOWBG3 ...` line from the server about this encounter: an end by timeout or by
-    /// the player (dead, offline, away) ends the BG3 side too (Cleanup, returned); refusals and
-    /// releases are logged.
+    /// the player (dead, offline, away) ends the BG3 side too (Cleanup, returned), and so does a
+    /// refused `begin`: the server holds nothing (begin is all or none), so its mobs would keep their
+    /// own AI under a BG3 fight. BG3 takes a Cleanup only once it is set up, so one refused before
+    /// Ready goes out at Ready. Other refusals and releases are logged.
     pub fn server_event(&mut self, line: &str) -> Option<Message> {
         let w: Vec<&str> = line.split_whitespace().collect();
         if w.first() != Some(&"WOWBG3") || w.get(2) != Some(&self.server_enc.as_str()) {
@@ -634,7 +639,22 @@ impl Fight {
                 );
                 self.say(line);
             }
-            (Some(verb @ ("begin" | "join" | "hp")), Some(_)) if w.contains(&"refused") => {
+            (Some("begin"), Some("refused")) => {
+                let reason = w.get(4).copied().unwrap_or("?");
+                self.say(format!("The server refused this fight: {}", refusal_text(reason)));
+                self.refused = true;
+                self.ended = true;
+                self.seq += 1;
+                if self.state == "active" {
+                    self.state = "cleaning";
+                    self.turn_actor = None;
+                    return Some(Message::Cleanup {
+                        encounter: self.encounter.clone(),
+                    });
+                }
+                return None;
+            }
+            (Some(verb @ ("join" | "hp")), Some(_)) if w.contains(&"refused") => {
                 let reason = w
                     .iter()
                     .skip_while(|x| **x != "refused")
@@ -663,6 +683,12 @@ impl Fight {
         }
         let mut reply = None;
         match m {
+            Message::Ready { .. } if self.refused => {
+                self.state = "cleaning";
+                reply = Some(Message::Cleanup {
+                    encounter: self.encounter.clone(),
+                });
+            }
             Message::Ready { .. } => {
                 self.state = "active";
                 self.say("BG3: the fight is set up".into());
@@ -1012,6 +1038,17 @@ impl Fight {
     }
 }
 
+/// What a refused `begin` means to the player (server patch 0001, Claim and CheckPlayer).
+fn refusal_text(reason: &str) -> String {
+    match reason {
+        "dead" => "your WoW character is dead".into(),
+        "offline" => "your WoW character is not in the world".into(),
+        "taxi" => "your WoW character is on a flight".into(),
+        "busy" => "another fight still runs on the server".into(),
+        other => format!("it answered `{other}`"),
+    }
+}
+
 /// BG3's first hit points for a stand-in are damage only below the WoW mob's own fraction of the
 /// BG3 max rounded down (the least BG3 can show for it): a stand-in keeps its template's HP
 /// (a Young Wolf 11), which cannot show every WoW percent. For an unhurt mob
@@ -1241,6 +1278,9 @@ fn write_standins(
 /// Hand the fight's server requests to the handoff, in order.
 fn drain(f: &mut Fight, server: &mut dyn ServerHandoff) -> Result<(), Error> {
     while let Some(h) = f.handoff.pop_front() {
+        if f.refused {
+            continue;
+        }
         println!("handoff: {}", h.describe());
         server.send(&h)?;
     }

@@ -423,6 +423,58 @@ fn tav_hit_points_go_to_the_server_and_server_ends_end_the_fight() {
     );
 }
 #[test]
+fn a_refused_begin_ends_the_fight_on_bg3s_side() {
+    // Refused before BG3 is set up: BG3 takes the Cleanup only at Ready.
+    let mut f = fight();
+    f.handoff.clear();
+    assert!(
+        f.server_event("WOWBG3 begin pull-9 refused dead -").is_none(),
+        "another encounter"
+    );
+    assert!(!f.refused);
+    let seq = f.seq;
+    assert!(f.server_event("WOWBG3 begin pull-1 refused dead -").is_none());
+    assert!(f.seq > seq, "the player's line reaches fight.txt");
+    assert_eq!(f.state, "starting");
+    assert!(
+        f.log
+            .iter()
+            .any(|l| l == "The server refused this fight: your WoW character is dead")
+    );
+    assert!(matches!(
+        f.apply(&Message::Ready { encounter: e() }).unwrap(),
+        Some(Message::Cleanup { .. })
+    ));
+    assert_eq!(f.state, "cleaning");
+    f.apply(&Message::Cleaned { encounter: e() }).unwrap();
+    assert_eq!(f.state, "done");
+    assert!(
+        !f.handoff.iter().any(|h| matches!(h, Handoff::End { .. })),
+        "the server holds no encounter to end"
+    );
+
+    // Refused once it runs: Cleanup at once, whatever the reason.
+    let mut f = fight();
+    f.apply(&Message::Ready { encounter: e() }).unwrap();
+    assert_eq!(f.state, "active");
+    assert!(matches!(
+        f.server_event("WOWBG3 begin pull-1 refused busy pull-0"),
+        Some(Message::Cleanup { .. })
+    ));
+    assert_eq!(f.state, "cleaning");
+
+    // An accepted begin and a refused join change nothing.
+    let mut f = fight();
+    f.apply(&Message::Ready { encounter: e() }).unwrap();
+    assert!(
+        f.server_event("WOWBG3 begin pull-1 ok 1 76 76").is_none()
+            && f.server_event("WOWBG3 join pull-1 refused dead -")
+                .is_none()
+    );
+    assert_eq!(f.state, "active");
+    assert!(!f.refused);
+}
+#[test]
 fn casts_aim_at_the_named_or_nearest_living_enemy() {
     let mut f = fight_with(vec![
         wolf(1, Point(-8930., -132.49, 83.53)),
