@@ -1,6 +1,6 @@
 # WOW-BG3 Passthrough
 
-https://github.com/sebastianlofi/wow-bg3-passthrough
+WOW-BG3 0.1.0: https://github.com/sebastianlofi/wow-bg3-passthrough
 
 Play vanilla World of Warcraft (1.12.1) as the world of a new Baldur's Gate 3 game.
 Your BG3 characters walk WoW's world; fights against WoW's mobs are BG3 fights;
@@ -156,6 +156,6 @@ bundles keep their own licences: the WoW server (vmangos, GPL-2.0), its database
 its Script Extender part is MIT with the Commons Clause, so it may not be sold),
 Python with its packages, and the libraries they use. `THIRD-PARTY-NOTICES.md` says
 which is which; the full texts are in `WOW-BG3/LICENSES/`. The source of every GPL,
-LGPL and MPL part is in `WOW-BG3-<version>-sources.tar.gz` next to this download.
+LGPL and MPL part is in `WOW-BG3-0.1.0-sources.tar.gz` next to this download.
 World of Warcraft and Baldur's Gate 3 belong to their owners; this mod is not made
 or endorsed by Blizzard or Larian.

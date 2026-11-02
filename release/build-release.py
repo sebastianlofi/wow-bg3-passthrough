@@ -12,11 +12,13 @@ Output in OUT/WOW-BG3-VERSION/ and OUT/WOW-BG3-VERSION.zip:
   README.md       for players (release/README-player.md)
   THIRD-PARTY-NOTICES.md, MANIFEST.txt (sha256 of every file)
 
-  build-release.py --version 0.1.0 --out DIR [--launcher SO] [--plugin SO] [--render SO ...]
+  build-release.py [--version 0.1.0] --out DIR [--launcher SO] [--plugin SO] [--render SO ...]
                    [--server DIR] [--benilla BIN] [--fight-bridge BIN] [--allow-missing]
   The coordinator and its tools come from this tree's tools/ (TOOLS); --benilla is the player build's
   binary, the addon comes from wow-addon/; the server's wowbg3-server.sh is this tree's, over the
   packed copy. Defaults for the built parts are under WOWBG3_BUILD (release/build-env.sh).
+  --version defaults to WOWBG3_VERSION, else RELEASE_VERSION (0.1.0, the public release); a test build
+  can pass its own N.N.N.N build number.
   --source NAME=DIR (repeatable): DIR goes into OUT/WOW-BG3-VERSION-sources.tar.gz as NAME/, the
       corresponding source of the GPL parts; patches/ and the build scripts are always added.
 
@@ -37,6 +39,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+RELEASE_VERSION = "0.1.0"  # the public release; README.md, docs/ and README-player.md name it
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import lspk  # noqa: E402
@@ -115,7 +118,7 @@ def copy_tree(src: Path, dst: Path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--version")
+    ap.add_argument("--version", default=os.environ.get("WOWBG3_VERSION") or RELEASE_VERSION)
     ap.add_argument("--out")
     ap.add_argument("--launcher", default=str(BUILD / "wowbg3-launcher" / LAUNCHER))
     ap.add_argument("--plugin", default=str(BUILD / "wowbg3-plugin" / PLUGIN))
@@ -141,9 +144,9 @@ def main():
         a.render = [str(BUILD / "wowbg3-render/wowbg3_render.so")]
 
     if not a.version or not a.out:
-        ap.error("--version and --out are required")
+        ap.error("--out is required")
     if not re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?", a.version):
-        ap.error("version is N.N.N")
+        ap.error("version is N.N.N or N.N.N.N")
 
     missing = []
     out = Path(a.out).resolve()
@@ -260,7 +263,10 @@ def main():
     else:
         missing.append("LICENSES (release/licences/collect.py texts)")
 
-    shutil.copy2(HERE / "README-player.md", dist / "README.md")
+    # The player README names the release version; a test build's zip says its own.
+    (dist / "README.md").write_text((HERE / "README-player.md").read_text(encoding="utf-8")
+                                    .replace(f"WOW-BG3-{RELEASE_VERSION}", f"WOW-BG3-{a.version}")
+                                    .replace(f"WOW-BG3 {RELEASE_VERSION}", f"WOW-BG3 {a.version}"), encoding="utf-8")
     shutil.copy2(ROOT / "THIRD-PARTY-NOTICES.md", dist / "THIRD-PARTY-NOTICES.md")
 
     import tarfile

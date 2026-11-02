@@ -28,6 +28,7 @@ environment to change it:
 | `MARIADB_TAR` | `$WOWBG3_BUILD/dl/mariadb-11.4.8-...tar.gz` | the pinned MariaDB bintar |
 | `WOWBG3_SERVER_BUILD` | `$WOWBG3_BUILD/portable-build` | the server build and pack (`server/pins.sh`) |
 | `CARGO_BUILD_JOBS` | 2 | parallel rustc jobs (one can use 7 GB) |
+| `WOWBG3_VERSION` | `0.1.0` | the release version `build-all.sh` and `build-release.py` use when none is given |
 
 Missing upstream checkouts are cloned at the pinned commits; existing ones are checked against them.
 
@@ -38,7 +39,8 @@ release/build-all.sh 0.1.0
 ```
 
 It runs the steps below in order, skipping heavy parts that already exist (`REBUILD=1` redoes them),
-and writes `$WOWBG3_BUILD/dist/WOW-BG3-0.1.0.zip` and `WOW-BG3-0.1.0-sources.tar.gz`. Publish both:
+and writes `$WOWBG3_BUILD/dist/WOW-BG3-0.1.0.zip` and `WOW-BG3-0.1.0-sources.tar.gz` (without a version it
+builds 0.1.0, `WOWBG3_VERSION`). Publish both:
 the sources archive carries the source of every GPL, LGPL and MPL part in the zip.
 
 ## The steps

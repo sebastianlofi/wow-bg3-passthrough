@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# build-all.sh VERSION: every part of the release from source, then the zip and its sources archive
+# build-all.sh [VERSION]: every part of the release from source, then the zip and its sources archive
 # (docs/build.md). Steps already done are skipped where the part exists; set REBUILD=1 to redo them.
-# Output: $WOWBG3_BUILD/dist/WOW-BG3-VERSION.zip and WOW-BG3-VERSION-sources.tar.gz.
+# Output: $WOWBG3_BUILD/dist/WOW-BG3-VERSION.zip and WOW-BG3-VERSION-sources.tar.gz. VERSION defaults to
+# WOWBG3_VERSION (release/build-env.sh: 0.1.0).
 set -euo pipefail
 source "$(dirname "$0")/build-env.sh"
-v="${1:?VERSION, e.g. 0.1.0}"
+v="${1:-$WOWBG3_VERSION}"
 B="$WOWBG3_BUILD"
 R="$WOWBG3_REPO"
 step() { echo; echo "== $*"; }

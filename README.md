@@ -216,7 +216,7 @@ Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.c
 
 ## Install
 
-Download `WOW-BG3-<version>.zip` from this repository's [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases); the README in it has every
+Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases); the README in it has every
 step. In short:
 
 1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
@@ -380,7 +380,7 @@ WOW-BG3 stands on [vmangos](https://github.com/vmangos/core) (the WoW server),
 ## Build from source
 
 Every part of the release zip is built from this repository plus pinned upstream sources:
-`release/build-all.sh VERSION`. What it needs and what each step does:
+`release/build-all.sh` (version 0.1.0 unless given). What it needs and what each step does:
 [docs/build.md](docs/build.md).
 
 ## How it works

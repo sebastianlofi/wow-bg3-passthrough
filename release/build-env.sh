@@ -7,6 +7,7 @@
 #   BENILLA_SRC    benilla's source at the pinned commit, with patches/benilla applied
 #   CARGO_HOME, RUSTUP_HOME   the Rust toolchain used for benilla and the fight bridge
 #   MARIADB_TAR    the pinned MariaDB bintar (server/pins.sh)
+#   WOWBG3_VERSION the release version build-all.sh and build-release.py default to (0.1.0)
 WOWBG3_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${WOWBG3_BUILD:=$WOWBG3_REPO/build}"
 : "${WOWBG3_SNIPER:=$WOWBG3_BUILD/bg3le-sniper}"
@@ -15,7 +16,8 @@ WOWBG3_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${CARGO_HOME:=$WOWBG3_BUILD/cargo-home}"
 : "${RUSTUP_HOME:=$WOWBG3_BUILD/rustup-home}"
 : "${MARIADB_TAR:=$WOWBG3_BUILD/dl/mariadb-11.4.8-linux-systemd-x86_64.tar.gz}"
-export WOWBG3_REPO WOWBG3_BUILD WOWBG3_SNIPER BG3LE_SRC BENILLA_SRC CARGO_HOME RUSTUP_HOME MARIADB_TAR
+: "${WOWBG3_VERSION:=0.1.0}"
+export WOWBG3_REPO WOWBG3_BUILD WOWBG3_SNIPER BG3LE_SRC BENILLA_SRC CARGO_HOME RUSTUP_HOME MARIADB_TAR WOWBG3_VERSION
 
 # Pinned upstream sources and toolchains.
 BG3LE_URL=https://github.com/lenonk/bg3le.git
