@@ -1,7 +1,7 @@
 Rust crates in wow-bg3-link
 ===========================
 
-cargo tree -e normal of link/, rustc 1.98.1. The Rust standard library is MIT OR Apache-2.0.
+cargo tree -e normal of bridge/, rustc 1.98.1. The Rust standard library is MIT OR Apache-2.0.
 
 Crate | declared licence (SPDX) | its licence texts below, by id
 

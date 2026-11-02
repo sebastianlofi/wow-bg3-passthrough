@@ -2,7 +2,7 @@ Rust crates in benilla's player build
 =====================================
 
 cargo tree -p benilla --no-default-features -e normal, rustc 1.98.1, benilla d3ac9f75 with WOW-BG3's
-patches (link/benilla/). The Rust standard library (rustc 1.98.1) is MIT OR Apache-2.0. Lua 5.1.5
+patches (patches/benilla/). The Rust standard library (rustc 1.98.1) is MIT OR Apache-2.0. Lua 5.1.5
 is compiled in through benilla's lua-src fork (third_party/lua-src, MIT). Where a crate offers a
 choice of licences, WOW-BG3 distributes it under the permissive one; self_cell (Apache-2.0 OR
 GPL-2.0-only) under Apache-2.0. The MPL-2.0 crates' source is in the sources archive

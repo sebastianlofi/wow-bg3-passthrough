@@ -128,8 +128,8 @@ and to add new spells for those new levels. That is still to come.
   commands of `/wowbg3` in WoW's chat). Read when BG3 starts.
   This beta ships `debug_commands = 1`, so every `/wowbg3` command typed in
   WoW's chat works, the test ones included: `refill`, `tp`, `where`, `find`,
-  `faction`, `level`, `xprate`, `learn` and `unlearn`. Set it to 0 to leave only `help`, the party
-  commands (`list`, `add`, `remove`, `pool`, `respec`) and `chat`.
+  `faction`, `time`, `level`, `xprate`, `learn` and `unlearn`. Set it to 0 to leave only `help`, the party
+  commands (`list`, `add`, `remove`, `pool`, `respec`), `waypoint` and `chat`.
 
 ## Remove
 

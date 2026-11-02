@@ -9,7 +9,7 @@ coordinator starts it with the WoW side; on the PC harness by hand), no argument
   python3 link/tools/wowbg3-chatcmd.py
 
 Environment: WOWBG3_LINK (benilla's link dir), WOWBG3_IO, WOW_CHAR, WOW_BG3_SERVER and
-WOWBG3_SERVER_VAR (wowbg3cmd.py); WOWBG3_DEBUG_COMMANDS=1 allows the test commands (tp, where, find, faction,
+WOWBG3_SERVER_VAR (wowbg3cmd.py); WOWBG3_DEBUG_COMMANDS=1 allows the test commands (tp, where, find, faction, time,
 level, xprate, refill, learn, unlearn), else `debug_commands = 1` in $WOWBG3_HOME/settings.conf; on in the beta.
 Files (one line each, tab separated):
   request  `WCC1 <pid>`, then `<seq> <unix time> <WoW character> <text>`        (benilla's)

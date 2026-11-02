@@ -32,7 +32,7 @@ with WOW-BG3's patches and build scripts (see the `README.md` inside it).
   G3D (BSD), gSOAP (GPL-2.0 option), nlohmann/json (MIT), utf8cpp (BSL-1.0) and others:
   `LICENSES/vmangos/BUNDLED-LIBRARIES.txt`.
 - Source: https://github.com/vmangos/core at commit 53d24d5c748bef5e0cde7b1155bcb3d979af614c
-  with WOW-BG3's patches 0001 to 0015 (`server/patches/`), built in the Steam Runtime 3
+  with WOW-BG3's patches 0001 to 0023 (`patches/vmangos/` in the WOW-BG3 repository), built in the Steam Runtime 3
   SDK. The exact tree, patches and build script are in the sources archive.
 - `server/sql/world.sql` is vmangos' world database (the 14 June 2021 release, as the
   image ghcr.io/mserajnik/vmangos-database ships it). It describes WoW's world (creatures,
@@ -65,7 +65,7 @@ From the Steam Runtime 3 (sniper) SDK the server was built in (Debian 11 package
 - Files: `benilla/benilla`.
 - Licence: MIT OR Apache-2.0 (`LICENSES/benilla/`).
 - Source: https://github.com/samwhosung/benilla at commit
-  d3ac9f75bf946bf9896a01deceb1b6dd539ace64 with WOW-BG3's patches (`link/benilla/` in the
+  d3ac9f75bf946bf9896a01deceb1b6dd539ace64 with WOW-BG3's patches (`patches/benilla/` in the
   WOW-BG3 repository, also in the sources archive).
 - Built from 443 Rust crates, each under its own licence; every crate, its declared licence
   and its licence texts are in `LICENSES/benilla/RUST-CRATES.txt`. Most are MIT and/or
@@ -95,8 +95,8 @@ From the Steam Runtime 3 (sniper) SDK the server was built in (Debian 11 package
   (BSD-3-Clause), Vulkan-Headers (Apache-2.0 OR MIT), LZ4 (BSD-2-Clause), Zstandard
   (BSD-3-Clause) and Lua 5.4 (MIT): `LICENSES/bg3le/`.
 - Source: https://github.com/lenonk/bg3le at commit 5c729b72296defd4a09556ee723b12b76a0d445d
-  with WOW-BG3's patches (`bg3/patches/`; the patch list and the library's sha256 are in
-  `bg3/build.lock.json`), both also in the sources archive.
+  with WOW-BG3's patches (`patches/bg3le/`; the patch list and the library's sha256 are in
+  `patches/bg3le/build.lock.json`), both also in the sources archive.
 
 ## Python, for WOW-BG3's tools
 
@@ -118,5 +118,5 @@ From the Steam Runtime 3 (sniper) SDK the server was built in (Debian 11 package
 
 ## FastLZ
 
-- Files: `tools/link/tools/libfastlz.so`, built from `link/tools/fastlz/` in the WOW-BG3
+- Files: `tools/link/tools/libfastlz.so`, built from `tools/fastlz/` in the WOW-BG3
   repository. Licence: MIT, by Ariya Hidayat (`LICENSES/fastlz/LICENSE`).

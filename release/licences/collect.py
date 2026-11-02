@@ -366,7 +366,7 @@ def texts():
     # wow-bg3-link (tools/bin/wow-bg3-link): our crate and its dependencies.
     put(out / "wow-bg3-link/RUST-CRATES.txt", rust_notice(
         "Rust crates in wow-bg3-link", [r for r in cargo_tree(ROOT / "bridge", []) if r[0] != "wow-bg3-link"],
-        ROOT / "bridge", f"cargo tree -e normal of link/, rustc {RUSTC}. The Rust standard library is MIT OR "
+        ROOT / "bridge", f"cargo tree -e normal of bridge/, rustc {RUSTC}. The Rust standard library is MIT OR "
                        "Apache-2.0."))
 
     # bg3le (libbg3le.so with WOW-BG3's patches, patches/bg3le): what it compiles in (its package.sh).

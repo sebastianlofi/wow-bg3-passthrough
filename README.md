@@ -48,7 +48,11 @@ version is mostly complete.
   NPCs, mobs, day and night. WoW's chat, quest log and quest tracker sit beside BG3's interface.
 - **Fighting.** Walk into a WoW mob (or attack one) and a BG3 fight starts: the mob is held on the
   WoW server and fights as a BG3 creature, turn by turn, with BG3's rules. When the fight ends the
-  result goes back to WoW as real damage, XP, loot and quest credit.
+  result goes back to WoW as real damage, XP, loot and quest credit. Neutral (yellow) WoW mobs are BG3
+  enemies that leave you alone until you attack them.
+- **Clicking WoW's models.** Every BG3 action aimed at a character (attack, spell, shove, throw, talk)
+  works on the WoW model under the pointer: BG3 aims it at that mob's or NPC's BG3 stand-in. A left
+  click on a mob attacks it.
 - **Looting.** A WoW corpse opens BG3's own loot window with that mob's WoW loot and gold.
 - **Questing and NPCs.** Talking to a quest giver, or to any NPC with WoW dialog, opens WoW's own
   quest and gossip windows, as in vanilla: accept, decline and hand in there. Vendors open BG3's
@@ -57,17 +61,24 @@ version is mostly complete.
   no Talk. A robbed NPC and its neighbours search around where you stood before going back to their
   posts.
 - **Money.** WoW's copper is BG3's gold: 1 copper = 1 gold, so 1 silver = 100 gold and 1 WoW gold
-  = 10,000 gold. Prices and corpse money use the same rule. Merchants show food and arrows as the stacks WoW sells, and you can split a
+  = 10,000 gold. Prices and corpse money use the same rule. Merchants show food and drink as the stacks WoW sells, and you can split a
   stack to buy or sell just part of it. With no discount on the barter screen, a merchant charges WoW's
   buy price and pays WoW's sell price, on every difficulty. BG3's attitude and Persuasion move both from
   there, and the price the screen shows is the price you pay: WoW's money follows. BG3's item values are whole
   numbers, so a buy price can show up to 1 copper off WoW's (a 1 copper item shows 3 on Balanced); sell prices
-  are exact. A merchant shows 4,000,000 gold during a trade, since WoW's vendors never run out. Inside an opened bag,
+  are exact. Inside an opened bag,
   such as the Camp Supply Sack, BG3's tooltip shows the item's plain value, not the trade price; the sale still pays
   the right price. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
+- **Vendors restock at the long rest.** As BG3's traders do, a vendor has a limited stock and a purse: what you buy
+  or steal stays gone and the gold it pays you stays spent until your next long rest. A WoW vendor of arrows and
+  bullets sells BG3's special arrows instead (fire, ice, acid, slaying and more; the stronger ones as you level).
+- **Thrown weapons.** WoW's throwing knives and axes are BG3's throwable dagger: one dagger stands for the whole WoW
+  stack, a throw spends nothing, and you pick the dagger up where it landed.
 - **Waypoints.** The WoW flight points you have discovered are BG3's waypoints: click one in BG3's waypoint panel or
   its pin on the map, or `/wowbg3 waypoint go NAME`. Free, no flight master needed, on either continent; Ironforge
   and Undercity too. Not in a fight, on a flight, dead, or at camp. `waypoints = 0` in `settings.conf` turns it off.
+  A move (a waypoint or `tp`) is covered by BG3's own screen fade, which lifts once WoW's world is there: about
+  10 seconds on the same continent, longer to the other one.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
@@ -236,9 +247,12 @@ What works is listed above; this is what does not, or has not been tried:
 - **Balance and pacing are a first guess.** The numbers that map WoW's mobs, health, damage, levels
   and XP onto BG3's were set by hand to make things playable, not tuned. A BG3 level 1 character
   out-damages a level 4 WoW human today, and the 1 to 60 pace is unknown.
-- **Most of the play so far was in Elwynn Forest.** Dungeons have not been tested at all, nor has a
-  party spread across zones or continents; the other start zones and the Horde side have had little
-  or no testing.
+- **Most of the play so far was in Elwynn Forest.** Dungeons have not been tested at all; the other
+  start zones and the Horde side have had little or no testing.
+- **A party spread far apart** is partly built. Switching to a party member far from the one you
+  controlled keeps BG3's fade until WoW's world there is loaded, and party members stay in the game
+  when your hero travels to the other continent. Still to come: a member on another continent than
+  the hero, a flight point moving the whole group, and fights far from the hero.
 - **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
   Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
   says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and
