@@ -86,6 +86,56 @@ class Rule(unittest.TestCase):
         self.assertEqual(self.count('BREAD', 117), 3)
         self.assertEqual(self.L.eval('S.PurseOf(l, "f1", 30)'), self.L.eval('S.Purse(30)'))
 
+    def test_arrows_and_bullets_are_not_sold(self):
+        self.L.execute('rows[2512].t = 24')
+        self.assertIsNone(self.count('{{Idx = 0, Entry = 2512, Price = 9, Stock = -1, Max = 0}}', 2512))
+        self.assertTrue(self.L.eval('S.HasAmmo({{Entry = 2512}}, lotOf)'))
+        self.assertFalse(self.L.eval('S.HasAmmo({{Entry = 117}}, lotOf)'))
+
+    def arrows(self, level, hero=60, guid='f1'):
+        self.L.execute('a = {}; for k, n in pairs(S.Arrows(S.New(), "%s", %d, %d)) do a[k] = n end' % (guid, level, hero))
+        return dict(self.L.eval('a').items())
+
+    def test_the_strong_arrows_come_late(self):
+        names = lambda lv: set().union(*(self.arrows(lv, guid='g%d' % g) for g in range(60)))  # noqa: E731
+        low = names(5)
+        self.assertEqual(low, {'OBJ_ArrowOfAcid', 'OBJ_ArrowOfFire', 'OBJ_ArrowOfIce', 'OBJ_ArrowOfLightning'})
+        mid = names(20)
+        self.assertIn('OBJ_ArrowOfDarkness', mid)
+        self.assertNotIn('OBJ_ArrowOfTeleportation', mid)
+        self.assertNotIn('OBJ_ArrowOfRicochet', mid)
+        late = names(30)
+        self.assertIn('OBJ_ArrowOfTeleportation', late)
+        self.assertIn('OBJ_ArrowOfRicochet', late)
+        self.assertNotIn('OBJ_ArrowOfDragonSlaying', late)
+        self.assertIn('OBJ_ArrowOfDragonSlaying', names(45))
+        self.assertIn('OBJ_ArrowOfSmokepowder', names(45))
+
+    def test_a_high_vendor_in_a_low_hero_s_town(self):
+        self.assertTrue(all(a[2] <= 3 for a in [self.L.eval('S.ARROWS["%s"]' % k) for k in self.arrows(55, hero=5)]))
+
+    def test_how_many_as_bg3_s_traders(self):
+        self.assertEqual(sum(self.arrows(5).values()), 12)
+        self.assertEqual(sum(self.arrows(30).values()), 25)
+        self.assertEqual(sum(self.arrows(40).values()), 35)
+        self.assertEqual(sum(self.arrows(60).values()), 52)  # 50 and 2 Smokepowder
+
+    def test_rolled_once_and_new_after_a_rest(self):
+        self.L.execute('''
+          b = S.New(); one = S.Arrows(b, "f1", 30, 60); two = S.Arrows(b, "f1", 30, 60); same = one == two
+          S.SetArrows(b, "f1", {OBJ_ArrowOfFire = 1}); kept = S.Arrows(b, "f1", 30, 60).OBJ_ArrowOfFire
+          S.Rest(b); fresh = S.Arrows(b, "f1", 30, 60)
+        ''')
+        self.assertTrue(self.L.eval('same'))
+        self.assertEqual(self.L.eval('kept'), 1)
+        self.assertEqual(self.L.eval('b.R'), 1)
+        self.assertEqual(sum(self.L.eval('fresh').values()), 25)
+
+    def test_the_arrow_prices(self):
+        V = lambda n: self.L.eval('S.ArrowValue("OBJ_ArrowOf%s")' % n)  # noqa: E731
+        self.assertEqual((V('Fire'), V('Darkness'), V('Teleportation'), V('DragonSlaying')), (114, 788, 2409, 4993))
+        self.assertIsNone(self.L.eval('S.ArrowValue("OBJ_Bone")'))
+
     def test_a_pocket_keeps_its_own_count(self):
         self.L.execute('S.Bought(l, "f1", 117, 5)')
         self.assertEqual(self.count('{{Idx = 0, Entry = 117, Price = 0, Stock = -1, Count = 2}}', 117), 2)
@@ -244,6 +294,85 @@ class Game(unittest.TestCase):
         ''')
         self.assertEqual([self.L.eval(x + '.Wow') for x in 'acde'], [300, 600, 50, 15])
         self.assertEqual((self.L.eval('M.Barter.tav.Money'), self.L.eval('M.Barter.tav.S'), self.L.eval('M.Barter.tav.T')), (1000, 900, 65))
+
+
+class ArrowTrade(unittest.TestCase):
+    """Inventory.lua: BG3's arrows in a merchant's bag; WoW's money follows, no WoW item moves."""
+
+    def setUp(self):
+        self.L = L = rt()
+        L.execute(FAKE + r'''
+          reqs, added, gonei, bag, stats, amt = {}, {}, {}, {}, {}, {}
+          Ext.IO = {LoadFile = function() return '{"Level": 5}' end}
+          function Ext.Json.Parse(s) return {Level = 5} end
+          function saveLedger() end
+          lastInv.Members = {tav = {Money = 100}}
+          lastInv.Vendors.f1 = {{Idx = 0, Entry = 2512, Price = 9, Max = 0, Level = 30}}
+          Hero = {Uuid = function() return "tav" end}
+          M.Item = function(e) return ({[2512] = {t = 24}, [117] = {k = "object", st = 20}})[e] end
+          function buying() return true end
+          function eachHeld(h, f) for _, it in ipairs(bag[h] or {}) do f(it) end end
+          function levelOf(w) return w[1].Level end
+          Ext.Entity.Get = function(u) if u == "gone" then return nil end return {Data = {StatsId = stats[u]}} end
+          Osi.GetStackAmount = function(u) return amt[u] end
+          Osi.TemplateAddTo = function(root, h, n) added[#added + 1] = {root, h, n} end
+          Osi.RequestDelete = function(u) gonei[#gonei + 1] = u end
+          function setValue(e, v) priced = v end
+        ''')
+        L.globals().Stock = L.execute((LUA / 'Stock.lua').read_text())
+        L.execute('ledger = Stock.New()')
+        text = (LUA / 'Inventory.lua').read_text()
+        L.execute(section(text, 'local arrowsIn', 'local function fillVendors').replace('local function', 'function')
+                  .replace('local arrowsIn', 'arrowsIn'))
+        L.execute('trading.farley = 1; putArrows("farley", "f1", lastInv.Vendors.f1)')
+
+    def fill(self):
+        self.L.execute('''
+          bag.farley = {}
+          for name, n in pairs(Stock.Arrows(ledger, "f1")) do
+            local u = "it" .. name; bag.farley[#bag.farley + 1] = u; stats[u] = name; amt[u] = n
+          end
+          tick = tick + 40
+        ''')
+
+    def test_the_bag_gets_them_at_the_hero_s_power(self):
+        self.assertGreater(self.L.eval('#added'), 0)
+        self.assertEqual(sum(self.L.eval('Stock.Arrows(ledger, "f1")').values()), 12)
+
+    def test_nothing_read_before_they_are_in(self):
+        self.L.execute('lookArrows()')
+        self.assertIsNone(self.L.eval('M.Barter.tav'))
+
+    def test_a_purchase_opens_a_barter_and_sends_no_wow_buy(self):
+        self.fill()
+        self.L.execute('lookArrows()')
+        self.assertIsNone(self.L.eval('M.Barter.tav'))
+        self.L.execute('local u = bag.farley[1]; amt[u] = amt[u] - 1; lookArrows()')
+        self.assertEqual(self.L.eval('M.Barter.tav.At'), self.L.eval('tick'))
+        self.assertEqual(self.L.eval('#reqs'), 0)
+        self.assertEqual(sum(self.L.eval('Stock.Arrows(ledger, "f1")').values()), 11)
+
+    def test_the_last_of_a_kind_gone_counts(self):
+        self.fill()
+        self.L.execute('local u = table.remove(bag.farley); lookArrows()')
+        self.assertLess(sum(self.L.eval('Stock.Arrows(ledger, "f1")').values()), 12)
+
+    def test_the_trade_ends_they_leave_the_bag_and_the_count_stays(self):
+        self.fill()
+        self.L.execute('trading.farley = nil; lookArrows()')
+        self.assertEqual(self.L.eval('#gonei'), self.L.eval('#bag.farley'))
+        self.assertIsNone(self.L.eval('arrowsIn.farley'))
+        self.assertEqual(sum(self.L.eval('Stock.Arrows(ledger, "f1")').values()), 12)
+
+    def test_a_vendor_with_no_ammunition_has_none(self):
+        self.L.execute('added = {}; arrowsIn = {}; putArrows("farley", "f1", {{Entry = 117}})')
+        self.assertEqual(self.L.eval('#added'), 0)
+
+    def test_the_sync_does_not_know_them(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.assertIn('if not tagOf(it) and (entryOf(it) or bare(it)) then', text)
+        self.assertIn('return type(sid) == "string" and tonumber(sid:match("^" .. PREFIX_STATS .. "(%d+)$")) or nil', text)
+        self.assertNotIn('e.Vars[VAR]', section(text, 'local arrowsIn', 'local function fillVendors'))
 
 
 class SellMoney(unittest.TestCase):

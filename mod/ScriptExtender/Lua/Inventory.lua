@@ -1175,6 +1175,69 @@ local function lookPurses()
     saveLedger()
 end
 M.LookPurses = lookPurses
+
+-- BG3's special arrows in place of WoW's arrows and bullets (Stock.lua). BG3's own items in the merchant's bag during its
+-- trade, like the purse: no tag and no WoW entry, so the inventory sync does not see them (M.Reconcile, sweepStrays) and
+-- BG3's save holds what the party bought. What the bag holds at each look is the stock, so a sale back counts by itself;
+-- no WoW item changes hands, and a change opens a barter so WoW's money follows BG3's gold.
+local arrowsIn = {} -- stand-in -> the tick they went in
+local function heroLevel()
+    local ok, t = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/wow-level.json") or "")
+    return ok and type(t) == "table" and tonumber(t.Level) or nil
+end
+local function heldArrows(standin)
+    local out = {}
+    eachHeld(standin, function(it)
+        local e = q(Ext.Entity.Get, it)
+        local name = e and q(function() return e.Data.StatsId end)
+        if Stock.ARROWS[name] then out[name] = (out[name] or 0) + (q(Osi.GetStackAmount, it) or 1) end
+    end)
+    return out
+end
+local function putArrows(standin, guid, wares)
+    if arrowsIn[standin] or not buying(standin) or not Stock.HasAmmo(wares, M.Item) then return end
+    arrowsIn[standin] = tick
+    for name, n in pairs(Stock.Arrows(ledger, guid, levelOf(wares), heroLevel())) do
+        pcall(Osi.TemplateAddTo, Stock.ARROWS[name][1], standin, n, 0)
+    end
+    saveLedger()
+end
+local function lookArrows()
+    for standin, at in pairs(arrowsIn) do
+        local guid = vendorOf[standin]
+        if guid and q(Ext.Entity.Get, standin) and tick - at >= 30 then -- BG3 has them in the bag by then
+            local now, was, changed = heldArrows(standin), Stock.Arrows(ledger, guid), false
+            for name, n in pairs(now) do changed = changed or was[name] ~= n end
+            for name, n in pairs(was) do changed = changed or (n > 0 and not now[name]) end
+            if changed then
+                Stock.SetArrows(ledger, guid, now)
+                local hero = Hero.Uuid()
+                if hero then M.Barter[hero] = M.Barter[hero] or {At = tick} end
+            end
+        end
+        if not trading[standin] then
+            arrowsIn[standin] = nil
+            eachHeld(standin, function(it)
+                local e = q(Ext.Entity.Get, it)
+                if Stock.ARROWS[e and q(function() return e.Data.StatsId end)] then pcall(Osi.RequestDelete, it) end
+            end)
+        end
+    end
+    saveLedger()
+end
+M.LookArrows = lookArrows
+-- Every special arrow the party or a merchant holds is worth its value: a load gives them BG3's own again.
+local function priceArrows()
+    local function look(it)
+        local e = q(Ext.Entity.Get, it)
+        local v = Stock.ArrowValue(e and q(function() return e.Data.StatsId end))
+        if v then setValue(e, v) end
+    end
+    local function all(holder) eachHeld(holder, function(it) look(it); eachHeld(it, look) end) end
+    for uuid in pairs((lastInv or {}).Members or {}) do all(uuid) end
+    for standin in pairs(arrowsIn) do all(standin) end
+end
+M.PriceArrows = priceArrows
 -- What WoW refused of a deal goes off the member's gold (the Gold part of reconcileMember). The merchant's purse goes the
 -- other way, or a refused buy (a full bag) would fill it for nothing.
 function M.Refunded(guid, delta)
@@ -1209,6 +1272,7 @@ local function fillVendors(inv)
         local wares = (inv.Vendors or {})[guid]
         if wares then
             fillHolder(standin, "V" .. guid .. ":", Stock.Wares(ledger, guid, wares, M.Item))
+            if trading[standin] then putArrows(standin, guid, wares) end
         end
     end
     for standin, guid in pairs(corpseOf) do
@@ -1437,7 +1501,7 @@ function M.Start(id)
     pcall(Ext.Osiris.RegisterListener, "PROC_LongRest", 0, "after", function() M.Restock() end)
     -- A load in this same Lua state: that save's counts (Hero.lua makes a new token, WowSave.lua starts over the same way).
     Ext.Events.GameStateChanged:Subscribe(function(e)
-        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded = nil, {}, {} end
+        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded, arrowsIn = nil, {}, {}, {} end
     end)
     -- A WoW mob's stand-in dying in BG3: its WoW loot goes on the BG3 corpse. The server makes the
     -- WoW corpse lootable a moment after the kill reaches it, so it is asked from 15 ticks on and every
@@ -1517,6 +1581,7 @@ function M.Start(id)
         if not made then M.MakeAll() end
         pcall(settleWares)
         ledger = ledger or readLedger()
+        pcall(lookArrows)
         pcall(lookPurses)
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
@@ -1526,6 +1591,7 @@ function M.Start(id)
         if tick % 20 == 0 then
             pcall(M.NotePieces)
             pcall(M.SetPrices)
+            pcall(M.PriceArrows)
         end
         for u, t in pairs(pendingItem) do if tick - t > 1800 then pendingItem[u] = nil end end
         for u, d in pairs(M.CorpseDue) do
