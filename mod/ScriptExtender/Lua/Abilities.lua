@@ -2,7 +2,7 @@
 -- in settings.conf, the launcher's wow-bg3/mob-abilities.json {On}; off, nothing here runs and stand-ins keep
 -- their template's actions.
 --
--- Data, tools/wow_abilities.py, made on the player's machine from the release's seed or the server's database and
+-- Data, tools/wow_abilities.py, made on the player's machine from its seed of the server's database (and the rules) and
 -- BG3's stats files: wow-bg3/link/abilities.json: Mobs, creature entry -> copies; Spells, copy -> {B, the BG3 spell
 -- it copies; Wn, the WoW spell, for the log}; Names, string handle -> WoW's name. abilities-stats.txt: the copies as
 -- BG3 stats text. A copy has no slot cost or class requirement, its own damage and save DC, how often it may fire,

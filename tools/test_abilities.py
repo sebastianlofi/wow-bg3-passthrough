@@ -57,6 +57,81 @@ def test_stats_text():
     assert 'SavingThrow(Ability.Dexterity, SourceSpellDC())' in w.stats_text(copies, '', 'SourceSpellDC()')
 
 
+RULES = w.load_rules(w.HERE / 'wow_abilities_rules.json')
+
+
+def spell(e, name, **k):
+    s = {c: 0 for c in w.SPELL}
+    s.update(entry=e, name=name, nameSubtext='', description='', **k)
+    return s
+
+
+SPELLS = {100: spell(100, 'Fireball', school=2, effect1=2, effectBasePoints1=20, effectDieSides1=5, rangeIndex=4, castingTimeIndex=4),
+          300: spell(300, 'Frost Nova', school=4, effect1=6, effectApplyAuraName1=26, mechanic=7)}
+
+
+def mob(entry=42, casts=(100,)):
+    return {'entry': entry, 'name': 'Test mob', 'level_min': 20, 'level_max': 20, 'type': 7, 'pet_family': 0, 'rank': 0, 'unit_class': 1,
+            'damage_school': 0, 'events': [], 'auras': '', 'spawn_spell_id': 0, 'spawns': 3, 'faction': 14,
+            'list': [{'spellId': c, 'probability': 100, 'castTarget': 1, 'delayRepeatMin': 5, 'delayRepeatMax': 8} for c in casts]}
+
+
+def given(rules, m=None):
+    return sorted(r['b'] for r in w.map_mob(m or mob(), SPELLS, rules)[1])
+
+
+def test_overlay_merges_over_the_rules():
+    over = {'_comment': 'a mod pack', 'power': {'dc_boss': 9}, 'picks': [{'w': ['Fireball'], 'tiers': [[1, 'Projectile_RayOfFrost']]}],
+            'overrides': {'mobs': {'42': {'_name': 'Test mob', 'spells': {'100': None}}}}}
+    r = w.merge_rules(RULES, over)
+    assert r['power']['dc_boss'] == 9 and r['power']['level_cap'] == RULES['power']['level_cap']
+    assert r['picks'][0]['tiers'][0][1] == 'Projectile_RayOfFrost' and len(r['picks']) == len(RULES['picks']) + 1
+    assert '_comment' not in r and r['overrides']['mobs']['42']['spells'] == {'100': None}
+    assert RULES['overrides']['mobs'] == {}, 'the shipped rules stay as they are'
+    # A broken overlay is left out, not fatal.
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.json') as f:
+        f.write('{not json')
+        f.flush()
+        assert w.load_rules(w.HERE / 'wow_abilities_rules.json', [f.name]) == RULES
+
+
+def test_overrides_by_entry_and_spell_id():
+    assert given(RULES) == ['Projectile_FireBolt']
+    ov = lambda o: w.merge_rules(RULES, {'overrides': o})
+    # Removed for this mob only; every other mob keeps it.
+    r = ov({'mobs': {'42': {'spells': {'100': None}}}})
+    assert given(r) == [] and given(r, mob(43)) == ['Projectile_FireBolt']
+    # Another BG3 spell, with a rung's options; for every mob by spell id.
+    r = ov({'spells': {'100': {'b': 'Projectile_RayOfFrost', 'every': 'fight'}}})
+    rows = w.map_mob(mob(), SPELLS, r)[1]
+    assert [(x['b'], x['src'], x['every']) for x in rows] == [('Projectile_RayOfFrost', 'override', 'fight')]
+    # The mob's own entry wins over every mob's; true hands it back to the rules.
+    r = ov({'spells': {'100': None}, 'mobs': {'42': {'spells': {'100': True}}}})
+    assert given(r) == ['Projectile_FireBolt'] and given(r, mob(43)) == []
+    # Given a spell it does not cast in WoW (a boss fight's extra), past the ability limit.
+    r = ov({'mobs': {'42': {'spells': {'300': 'Target_Shove'}}}})
+    assert given(r) == ['Projectile_FireBolt', 'Target_Shove']
+    lim = w.merge_rules(r, {'power': {'abilities': {k: 0 for k in RULES['power']['abilities']}, 'abilities_low': 0}})
+    assert given(lim) == ['Target_Shove']
+    # Names are comments only: a name key does nothing.
+    assert given(ov({'mobs': {'Test mob': {'spells': {'100': None}}}, 'spells': {'Fireball': None}})) == ['Projectile_FireBolt']
+
+
+def test_local_seed_keeps_every_spell():
+    import gzip, json, tempfile
+    world = {'mobs': {'42': dict(mob(), places=[[0, 1, 2]], subname=''), '7': dict(mob(7, ()), places=[], subname='')},
+             'spells': {str(k): v for k, v in SPELLS.items()}}
+    with tempfile.TemporaryDirectory() as d:
+        w.seed(world, d + '/s.gz')
+        small = json.load(gzip.open(d + '/s.gz', 'rt'))
+        w.seed(world, d + '/f.gz', full=True)
+        full = json.load(gzip.open(d + '/f.gz', 'rt'))
+    assert set(small['spells']) == {'100'} and set(small['mobs']) == {'42'}
+    assert set(full['spells']) == {'100', '300'} and set(full['mobs']) == {'42', '7'} and full['SeedFormat'] == w.SEED_FORMAT
+    assert 'places' not in full['mobs']['42'] and 'description' not in full['spells']['100']
+
+
 if __name__ == '__main__':
     for name, fn in list(globals().items()):
         if name.startswith('test_'):

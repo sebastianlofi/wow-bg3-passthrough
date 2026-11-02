@@ -147,7 +147,7 @@ function M.Start(runId)
         status()
     end)
     local ticks = 0
-    local crashTold = nil
+    local crashTold, serverTold = nil, nil
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
         if ticks % 30 ~= 0 then return end
@@ -186,6 +186,15 @@ function M.Start(runId)
                 local host = q(Osi.GetHostCharacter)
                 if host then
                     pcall(Osi.OpenMessageBox, host, "WOW-BG3's WoW side crashed. To help fix it, send this one file on GitHub:\n" .. c.Path)
+                end
+            end
+            -- The WoW server's first start failed (no internet for its database download, say): wowbg3-coord.py says why.
+            local e = readJson("wow-bg3/server-error.json")
+            if e and e.RunId == runId and type(e.Text) == "string" and e.Text ~= serverTold then
+                serverTold = e.Text
+                local host = q(Osi.GetHostCharacter)
+                if host then
+                    pcall(Osi.OpenMessageBox, host, "WOW-BG3's WoW server could not start:\n" .. e.Text)
                 end
             end
         end

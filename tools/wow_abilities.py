@@ -3,27 +3,37 @@
 
   wow_abilities.py export OUT.json [--db CMD]    read the server's database (read-only selects) and the
                                                  client's DBCs into one world file
-  wow_abilities.py seed WORLD.json OUT.json.gz   the part of a world file the table needs, for the release
-  wow_abilities.py make OUT.json --bg3 D --seed F   build from a seed, no database: what a first start runs
-  wow_abilities.py make OUT.json --data D --bg3 D [--db CMD]    export and build, when no seed shipped
+  wow_abilities.py seed WORLD.json OUT.json.gz   the part of a world file the table needs (--full: every spawned
+                                                 mob and every spell, so a rules overlay can give any spell)
+  wow_abilities.py localseed OUT.json.gz --data D [--db CMD]   export, then a full seed: the player's PC makes it
+                                                 once the server's database is there (wowbg3-coord.py --datagen)
+  wow_abilities.py make OUT.json --bg3 D --seed F [--key K]   build from a seed, no database: what every start
+                                                 runs when the rules or the database changed (K goes in OUT.key)
+  wow_abilities.py make OUT.json --data D --bg3 D [--db CMD]    export and build
   wow_abilities.py build WORLD.json --out FILE --bg3 D|STATS.json [--rules FILE]
                                                  the table the mod reads (link/abilities.json)
   wow_abilities.py show WORLD.json NAME|ENTRY    one mob's rows, for tuning the rules
   wow_abilities.py stats WORLD.json              coverage and the most common unmapped spells
+  --overlay FILE (repeatable, every command that reads rules): rules merged over --rules, later files winning
 
 Three layers, later ones winning (rules in wow_abilities_rules.json next to this file):
   1. meaning: every WoW spell record gets a tag from its effects, auras, mechanic, dispel type and
      school (stun, root, poison, nuke:fire ...); a ladder per tag says which BG3 spell a mob of that level
      uses. Nothing per creature, so every mob with a WoW spell gets something.
   2. picks: by WoW spell name, the choices a player should recognise.
-  3. overrides: by creature entry or name, rulings from a review of the table.
+  3. overrides: by WoW spell id for every mob, and by creature entry and WoW spell id for one mob (a boss
+     fight): the spell becomes the BG3 spell given, gives nothing (null), or follows the rules (true); a mob gets a
+     spell it does not cast in WoW the same way. Names only as comments ("_name"). A player's or mod pack's
+     overlay (--overlay; wowbg3-coord.py reads ~/.local/share/wow-bg3/abilities-rules.json and
+     abilities-rules.d/*.json) merges over the shipped rules: objects key by key, its picks before ours, any
+     other value replaces ours (merge_rules).
 Power is decided here, not in BG3's data: see ladder floors, dc(), recharge() and dice() below.
 
 Sources: creature_template, creature_spells, creature_ai_events and creature_ai_scripts (spell lists and
 EventAI), spell_template, and the player's own DBCs. The world file and the table hold names and numbers from
 the player's own server and client; both are generated on the player's machine, neither is ever committed.
-The seed holds the same server's numbers and spell names, goes in the release beside the server's own SQL, and
-is not committed either.
+The seed holds the same server's numbers and spell names: made on the player's PC from the database the first
+start imported (localseed), never shipped and never committed.
 
 The copies themselves go in stats files (abilities-stats.txt, -scaled.txt with SourceSpellDC()): BG3's own loader
 reads them through Ext.IO.AddPathOverride on a small file of its own, whose text they start with. Abilities.lua."""
@@ -374,6 +384,58 @@ def when_ok(when, mob):
     return True
 
 
+def merge_rules(base, over):
+    """An overlay on the rules: objects merge key by key, the overlay's picks come before ours (the first pick that
+    fits wins), any other value replaces ours; keys starting with _ are comments."""
+    out = dict(base)
+    for k, v in over.items():
+        if str(k).startswith('_'):
+            continue
+        if k == 'picks' and isinstance(v, list):
+            out[k] = v + list(base.get(k) or [])
+        elif isinstance(v, dict) and isinstance(base.get(k), dict):
+            out[k] = merge_rules(base[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_rules(path, overlays=()):
+    rules = json.load(open(path))
+    for o in overlays:
+        try:
+            rules = merge_rules(rules, json.load(open(o)))
+        except (OSError, ValueError) as e:
+            print('rules overlay %s left out: %s' % (o, e), file=sys.stderr)
+    return rules
+
+
+RULES = object()  # no override: the rules decide
+
+
+def overrides_of(mob, rules):
+    """(every mob's, this mob's) overrides: WoW spell id (a string) -> BG3 spell, {b: spell, options}, None or true."""
+    ov = rules.get('overrides') or {}
+    every = {str(k): v for k, v in (ov.get('spells') or {}).items() if not str(k).startswith('_')}
+    mine = (ov.get('mobs') or {}).get(str(mob.get('entry'))) or {}
+    return every, {str(k): v for k, v in (mine.get('spells') or {}).items() if not str(k).startswith('_')}
+
+
+def overridden(id_, every, mine):
+    """(BG3 spell, options, source, why) from the overrides, or RULES."""
+    k = str(id_)
+    v = mine[k] if k in mine else every.get(k, RULES)
+    if v is RULES or v is True:
+        return RULES
+    if v is None or v is False:
+        return None, {}, 'removed', 'rules overrides: removed'
+    if isinstance(v, str):
+        return v, {}, 'override', 'rules overrides'
+    if isinstance(v, dict) and isinstance(v.get('b'), str):
+        return v['b'], {k2: x for k2, x in v.items() if k2 != 'b' and not k2.startswith('_')}, 'override', v.get('why') or 'rules overrides'
+    return None, {}, 'removed', 'rules overrides: not understood (%r)' % (v,)
+
+
 def rung(tiers, lvl):
     got = None
     for t in tiers:
@@ -456,19 +518,28 @@ def map_mob(mob, spells, rules):
     power = rules['power']
     eff, lvl, rank = effective_level(mob, power)
     rows, seen = [], set()
-    for id_, how in mob_casts(mob).items():
+    every, mine = overrides_of(mob, rules)
+    casts = mob_casts(mob)
+    # A spell the overrides give this mob that it does not cast in WoW.
+    for k, v in mine.items():
+        if k.isdigit() and v is not None and v is not False and int(k) not in casts:
+            casts[int(k)] = {'repeat': 0, 'cond': None, 'when': 'rules'}
+    for id_, how in casts.items():
         sp = spells.get(id_) or spells.get(str(id_))
         if not sp:
             rows.append({'w': id_, 'wn': '#%d' % id_, 'tag': 'missing', 'src': 'unmapped', 'when': how['when']})
             continue
         tag = tag_spell(sp, spells)
-        b, opt, src, why = resolve(sp, tag, mob, rules, eff)
+        got = overridden(id_, every, mine)
+        b, opt, src, why = resolve(sp, tag, mob, rules, eff) if got is RULES else got
         row = {'w': id_, 'wn': sp['name'], 'tag': tag, 'src': src, 'when': how['when']}
-        if how['when'] == 'death':
+        if src == 'override':
+            pass  # what the rules' author asked for, as asked
+        elif how['when'] == 'death':
             row.update(src='later', why='WoW casts this as it dies; BG3 has death bursts, a later step.', b=None)
             rows.append(row)
             continue
-        if b in power['off_spells']:
+        if b in power['off_spells'] and src != 'override':
             row.update(src='later', why='Summons and reactions wait: no WoW model for what they bring.', b=None)
             rows.append(row)
             continue
@@ -497,12 +568,18 @@ def map_mob(mob, spells, rules):
             row['doubt'] = row.get('doubt') or 'a weapon action on a stand-in with no weapon: the hit falls back to its unarmed damage'
         rows.append(row)
     # At most so many abilities, the memorable first, one hard control; one per BG3 spell.
-    order = {'star': 0, 'pick': 1, 'rule': 2, 'soft': 3}
+    # An override is given first and past the limits; it still counts against them.
+    order = {'override': -1, 'star': 0, 'pick': 1, 'rule': 2, 'soft': 3}
     chosen, hard_used = [], False
     limit = power['abilities_low'] if eff <= 5 else power['abilities'][rank]
     for row in sorted((r for r in rows if r.get('b')), key=lambda r: order.get(r['src'], 9)):
         if row['b'] in seen:
             row['dropped'] = 'same BG3 ability as another of its spells'
+            continue
+        if row['src'] == 'override':
+            seen.add(row['b'])
+            hard_used = hard_used or bool(row.get('hard'))
+            chosen.append(row)
             continue
         if row.get('hard') and hard_used and power['only_one_hard']:
             row['dropped'] = 'one hard control per mob'
@@ -871,31 +948,45 @@ def write_table(world, rules, bg3, out, carrier=''):
     print('%d mobs with abilities, %d spell copies, %d names -> %s' % (len(t['Mobs']), len(t['Spells']), len(t['Names']), out))
 
 
-def seed(world, out):
-    """What table() reads of a world file: fightable mobs with something to cast and the spells they can reach."""
+SEED_FORMAT = 2  # wowbg3-coord.py exports the seed again when this changes
+
+
+def seed(world, out, full=False):
+    """What table() reads of a world file: fightable mobs with something to cast and the spells they can reach;
+    full: every spawned mob and every spell (an overlay may give any mob any spell)."""
     sp = world['spells']
     mobs = {e: {k: v for k, v in m.items() if k not in ('places', 'subname')} for e, m in world['mobs'].items()
-            if m['spawns'] and (m['list'] or m['events'] or m['auras'] or m['spawn_spell_id'])}
+            if m['spawns'] and (full or m['list'] or m['events'] or m['auras'] or m['spawn_spell_id'])}
     todo = []
     for m in mobs.values():
         todo += [x['spellId'] for x in m['list']] + [x['spell'] for x in m['events']] + [m['spawn_spell_id']]
         todo += re.findall(r'\d+', str(m['auras'] or ''))
-    seen = set()
-    while todo:
+    seen = set(sp) if full else set()
+    while todo and not full:
         s = str(todo.pop())
         if s in seen or s not in sp:
             continue
         seen.add(s)
         todo += [sp[s].get('effectTriggerSpell%d' % i) or 0 for i in (1, 2, 3)]
-    body = {'mobs': mobs, 'spells': {s: {k: v for k, v in sp[s].items() if k not in ('description', 'nameSubtext')} for s in seen}}
-    with gzip.open(out, 'wt') as f:
+    body = {'mobs': mobs, 'spells': {s: {k: v for k, v in sp[s].items() if k not in ('description', 'nameSubtext')} for s in seen},
+            'SeedFormat': SEED_FORMAT}
+    tmp = str(out) + '.tmp'
+    with gzip.open(tmp, 'wt') as f:
         json.dump(body, f, separators=(',', ':'))
+    os.replace(tmp, out)
     print('%d mobs, %d spells -> %s' % (len(mobs), len(seen), out))
+
+
+def write_key(out, key):
+    """OUT.key: what OUT was made from (wowbg3-coord.py makes it again when its key differs). Written last."""
+    if key:
+        Path(str(out) + '.key.tmp').write_text(key + '\n')
+        os.replace(str(out) + '.key.tmp', str(out) + '.key')
 
 
 def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    a.add_argument('cmd', choices=('make', 'export', 'seed', 'build', 'show', 'stats'))
+    a.add_argument('cmd', choices=('make', 'export', 'seed', 'localseed', 'build', 'show', 'stats'))
     a.add_argument('world')
     a.add_argument('mob', nargs='?')
     a.add_argument('--db', help='database command reading SQL on stdin (default: the server wowserver.py finds)')
@@ -904,10 +995,13 @@ def main():
     a.add_argument('--rules', default=str(HERE / 'wow_abilities_rules.json'))
     a.add_argument('--bg3', help="BG3's Data folder, or a JSON of its spells (build, make)")
     a.add_argument('--seed', help='a seed from `seed` (make: no database needed)')
+    a.add_argument('--overlay', action='append', default=[], help='rules merged over --rules (repeatable, later wins)')
+    a.add_argument('--key', help='make, localseed: written to OUT.key once OUT is made (wowbg3-coord.py: rules, database)')
+    a.add_argument('--full', action='store_true', help='seed: every spawned mob and every spell')
     args = a.parse_args()
     db = ['sh', '-c', args.db] if args.db else None
     if args.cmd == 'make':
-        # First run: from the release's seed, or from the database with the world file next to the table.
+        # From this PC's seed (wowbg3-coord.py), or from the database with the world file next to the table.
         if not (args.bg3 and (args.seed or args.data)):
             sys.exit('make needs --bg3 and --seed or --data')
         if args.seed:
@@ -916,15 +1010,23 @@ def main():
             world_file = str(args.world) + '.world'
             export(world_file, db, args.data)
             world = json.load(open(world_file))
-        return write_table(world, json.load(open(args.rules)), load_bg3(args.bg3), args.world, carrier_text(args.bg3))
+        write_table(world, load_rules(args.rules, args.overlay), load_bg3(args.bg3), args.world, carrier_text(args.bg3))
+        return write_key(args.world, args.key)
+    if args.cmd == 'localseed':
+        if not args.data:
+            sys.exit('localseed needs --data')
+        world_file = str(args.world) + '.world'
+        export(world_file, db, args.data)
+        seed(json.load(open(world_file)), args.world, full=True)
+        return write_key(args.world, args.key)
     if args.cmd == 'export':
         if not args.data:
             sys.exit('export needs --data')
         return export(args.world, db, args.data)
     world = json.load(open(args.world))
     if args.cmd == 'seed':
-        return seed(world, args.mob)
-    rules = json.load(open(args.rules))
+        return seed(world, args.mob, args.full)
+    rules = load_rules(args.rules, args.overlay)
     spells = {int(k): v for k, v in world['spells'].items()}
     if args.cmd == 'build':
         if not (args.out and args.bg3):

@@ -6,7 +6,9 @@ Run by the wowbg3-launcher plugin as BG3's child inside Steam's runtime containe
 release what the PC launchers (link/tools/world-headless.sh, play-world.sh) and their systemd units do
 in the harness:
 
-  * first start: waits for the portable server (launcher.conf [server], wowbg3-server.sh run), makes
+  * first start: waits for the portable server (launcher.conf [server], wowbg3-server.sh run: it downloads the
+    database SQL and imports it; its step goes in run/coord.json Detail, why it failed in Error and, for the
+    player, wow-bg3/server-error.json, which WowSave.lua shows in a message box), makes
     the default WoW account (account.env, mode 600) and the fight bridge's creature numbers;
     wow-bg3/host.json (the host level) and window.json (BG3's window size, for the mod's cursor);
   * runs link/tools/lifecycle.py's watcher (Life) in this process: every BG3 load, save, new game and
@@ -22,7 +24,7 @@ Folders come from the launcher's environment (relenv.py). Logs: one line per ste
 launcher writes to ~/.local/share/wow-bg3/logs/coord.log; every child logs to logs/NAME.log.
 Settings: WOW-BG3/settings.conf (`key = value`, see the shipped file).
 """
-import argparse, ctypes, json, os, re, secrets, signal, struct, subprocess, sys, threading, time
+import argparse, ctypes, hashlib, importlib.util, json, os, re, secrets, signal, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 HOME = Path(os.environ.get('WOWBG3_HOME') or Path(__file__).resolve().parents[1])
@@ -174,8 +176,16 @@ def server_state():
     return st
 
 
+def server_note(name):
+    """wowbg3-server.sh's one line in var/run/progress (the first start's step) or var/run/error."""
+    try:
+        return (VAR / 'run' / name).read_text().strip()
+    except OSError:
+        return ''
+
+
 def wait_server(stop):
-    last = None
+    last, said, said_at, told = None, None, 0.0, None
     while not stop['now']:
         st = server_state()
         if st != last:
@@ -183,7 +193,22 @@ def wait_server(stop):
             last = st
         if st == 'running':
             return True
-        status('server-' + st, Busy=st in ('none', 'init', 'starting'))
+        extra = {}
+        detail = server_note('progress') if st == 'init' else ''
+        if detail:
+            extra['Detail'] = detail
+            # The log: each step once, and how far it is every 15 s.
+            if detail.split(':')[0] != (said or '').split(':')[0] or time.time() - said_at > 15:
+                log('server: %s' % detail)
+                said, said_at = detail, time.time()
+        if st == 'failed':
+            err = server_note('error') or 'the WoW server did not start (see logs/server.log)'
+            extra['Error'] = err
+            if err != told:
+                log('server failed: %s' % err)
+                write_json(IO / 'server-error.json', {'RunId': os.environ.get('WOW_BG3_RUN_ID'), 'Text': err})
+                told = err
+        status('server-' + st, Busy=st in ('none', 'init', 'starting'), **extra)
         time.sleep(1.0)
     return False
 
@@ -549,10 +574,68 @@ def items_current():
 
 
 ABILITIES_CARRIER = 'Public/GustavX/Stats/Generated/Data/Spell_Wall.txt'  # wow_abilities.py CARRIER
+# The mobs' abilities are made on this PC, never shipped: the seed (the server's creatures and spells, wow_abilities.py
+# localseed) once the server's first start imported its database, then the table from the seed and the rules. Both
+# are keyed: the seed by the database and its format, the table by the rules (ours and the player's overlays, below),
+# the tool and the database, so a changed rules file is a new table at the next start, before BG3 loads its stats.
+ABILITIES_SEED = DATA / 'abilities-seed.json.gz'
+# A player's or mod pack's rules, merged over tools/wow_abilities_rules.json (README: Changing mob abilities).
+ABILITIES_OVERLAY, ABILITIES_OVERLAYS = DATA / 'abilities-rules.json', DATA / 'abilities-rules.d'
 
 
-def abilities_current():
-    """The mobs' abilities are there and of this version's schema (wow_abilities.py SCHEMA)."""
+def rule_overlays():
+    out = [ABILITIES_OVERLAY] if ABILITIES_OVERLAY.is_file() else []
+    try:
+        out += sorted(p for p in ABILITIES_OVERLAYS.iterdir() if p.suffix == '.json' and p.is_file())
+    except OSError:
+        pass
+    return out
+
+
+def db_version():
+    """Which SQL the server's database holds (wowbg3-server.sh init writes var/sql.version); an install made before
+    that imported the same SQL this release's sql.lock pins."""
+    try:
+        return (VAR / 'sql.version').read_text().strip()
+    except OSError:
+        pass
+    try:
+        spec = importlib.util.spec_from_file_location('fetch_sql', str(Path(os.environ['WOW_BG3_SERVER']) / 'fetch-sql.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.version(mod.pins(mod.LOCK))
+    except Exception:
+        return 'unknown'
+
+
+def _key_of(path):
+    try:
+        return Path(str(path) + '.key').read_text().strip()
+    except OSError:
+        return None
+
+
+def seed_key():
+    m = re.search(r'^SEED_FORMAT = (\d+)', (TOOLS / 'wow_abilities.py').read_text(), re.M)
+    return 'db %s seed %s' % (db_version(), m.group(1) if m else '?')
+
+
+def seed_current():
+    return ABILITIES_SEED.is_file() and _key_of(ABILITIES_SEED) == seed_key()
+
+
+def abilities_key():
+    h = hashlib.sha256(db_version().encode())
+    for f in [TOOLS / 'wow_abilities.py', TOOLS / 'wow_abilities_rules.json'] + rule_overlays():
+        try:
+            h.update(b'\0%s\0' % f.name.encode() + f.read_bytes())
+        except OSError:
+            h.update(b'\0missing %s' % f.name.encode())
+    return h.hexdigest()[:20]
+
+
+def abilities_ready():
+    """A table is there, of this version's schema (wow_abilities.py SCHEMA), with its stats files."""
     try:
         with open(LINK / 'abilities.json') as f:
             m = re.match(r'\{"Schema":\s*(\d+)', f.read(40))
@@ -561,20 +644,41 @@ def abilities_current():
     return bool(m) and int(m.group(1)) >= 3 and (LINK / 'abilities-stats.txt').is_file()
 
 
+def abilities_current():
+    """The table is there and made from today's rules, tool and database."""
+    return abilities_ready() and _key_of(LINK / 'abilities.json') == abilities_key()
+
+
+def abilities_make():
+    """argv: the table from this PC's seed and the rules with their overlays."""
+    argv = ['make', LINK / 'abilities.json', '--seed', ABILITIES_SEED, '--bg3', game_data(), '--key', abilities_key()]
+    for o in rule_overlays():
+        argv += ['--overlay', o]
+    return py('wow_abilities', *argv)
+
+
 def abilities_first():
-    """The table from the release's seed, needing no server, as soon as BG3 starts, and the override that has BG3's
-    own loader read the copies from a stats file in place of a small game file whose text they start with."""
+    """The table from this PC's seed when the rules or the database changed, needing no server, as soon as BG3
+    starts, and the override that has BG3's own loader read the copies from a stats file in place of a small game
+    file whose text they start with. BG3 loads its stats once a start: a table made later (the first start's, from
+    the server's new database) is BG3's from its next start."""
     on = S.get('mob_abilities') == '1'
     if on and not abilities_current():
-        seed, rc, t0 = TOOLS / 'abilities-seed.json.gz', 1, time.time()
-        if seed.is_file() and game_data():
-            rc = subprocess.run(py('wow_abilities', 'make', LINK / 'abilities.json', '--seed', seed, '--bg3', game_data()),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
-        log('abilities: table from the seed, exit %d in %.1f s' % (rc, time.time() - t0))
+        t0 = time.time()
+        if seed_current() and game_data():
+            LOGS.mkdir(parents=True, exist_ok=True)
+            with open(str(LOGS / 'abilities.log'), 'a') as f:
+                rc = subprocess.run([str(a) for a in abilities_make()], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT).returncode
+            log('abilities: table made again from this PC\'s seed (rules, overlays %d, or database changed), exit %d in %.1f s'
+                % (len(rule_overlays()), rc, time.time() - t0))
+        elif abilities_ready():
+            log('abilities: the rules changed, the seed is not of this database yet: last table kept, a new one after the server starts')
+        else:
+            log('abilities: none yet; made from the server\'s database once it runs, BG3 has them from its next start')
     # bg3le patch 0006 reads this as BG3 starts on its stats. Every start: it waits for this start's.
     stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
     tmp = IO.parent / 'boot-path-overrides.tmp'
-    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_current() else '')
+    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_ready() else '')
     os.replace(tmp, IO.parent / 'boot-path-overrides.txt')
 
 
@@ -594,8 +698,10 @@ def datagen():
         steps.append(('items', py('wow_items', 'build', '--out', LINK / 'items.json', '--data', WOW / 'Data',
                                   '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
     if not abilities_current() and game_data():
-        steps.append(('abilities', py('wow_abilities', 'make', LINK / 'abilities.json', '--data', WOW / 'Data', '--bg3', game_data(),
-                                      '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
+        if not seed_current():
+            steps.append(('abilities-seed', py('wow_abilities', 'localseed', ABILITIES_SEED, '--data', WOW / 'Data', '--key', seed_key(),
+                                               '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos')))
+        steps.append(('abilities', abilities_make()))
     if not (LINK / 'spells.json').is_file():
         steps.append(('spells', py('wow_spells', '--data', WOW / 'Data', '--out', LINK / 'spells.json')))
     if not (IO / 'gui/wow-icons.json').is_file() and game_data():
