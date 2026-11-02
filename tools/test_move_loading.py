@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """test_move_loading.py: when MoveLoading.lua calls BG3's screen fade, without a game: the real Lua text under a
 fake Osiris (needs the `lupa` module). What BG3 then draws is for a game to show."""
+import json
+import struct
 from pathlib import Path
 
 import lupa
@@ -93,7 +95,107 @@ def main():
     g.files[F] = '5\n'
     g.run(20)
     assert calls(g) == []
+    switches()
     print('test_move_loading: ok')
+
+
+C = 'wow-bg3/link/camera.bin'
+W = 'wow-bg3/link/world.json'
+HERO, AST = (-2600.0, 120.0, -1000.0), (-1900.0, 121.0, -1000.0)   # t58: Astarion 700 m east of the hero
+
+
+def wow_of(p):
+    # world.json's mapping below: WoW (-9460, 60) at the centre.
+    return -9460.0 - (p[2] + 1000.0) / 0.9144, 60.0 + (p[0] + 2600.0) / 0.9144
+
+
+def camera(at, flags, seq=1):
+    x, y = wow_of(at)
+    raw = bytearray(96)
+    raw[0:4] = b'WBC1'
+    struct.pack_into('<I3f', raw, 4, seq, x, y, 70.0)
+    struct.pack_into('<I', raw, 64, seq)
+    struct.pack_into('<3fII', raw, 72, x, y, 60.0, 0, flags)
+    return bytes(raw)
+
+
+def switch_world(active=True):
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.execute(FAKE)
+    g = L.globals()
+    worlds = {}
+
+    def parse(text):
+        v = worlds.get(text)
+        return None if v is None else L.table_from({'Active': v['Active'], 'WowOrigin': L.table_from(v['WowOrigin']),
+                                                    'Centre': L.table_from(v['Centre'])})
+    g.Ext.Json = L.table_from({'Parse': parse})
+    text = json.dumps({'Active': active, 'WowOrigin': [-9460.0, 60.0, 56.0], 'Centre': list(HERO)})
+    worlds[text] = json.loads(text)
+    g.files[W] = text
+    g.hosts = L.table_from({'HERO': L.table_from(HERO), 'AST': L.table_from(AST),
+                            'NEAR': L.table_from((HERO[0] + 40, HERO[1], HERO[2]))})
+    L.execute('host = "HERO"\n'
+              'Osi.GetHostCharacter = function() return host end\n'
+              'Osi.GetPosition = function(c) local p = hosts[c]; return p[1], p[2], p[3] end')
+    g.files[C] = camera(HERO, 1 | 4)
+    L.execute(LUA.read_text()).StartServer()
+    g.run(5)
+    return g
+
+
+def switches():
+    # t58's far switch: covered at once, through the eye still at the hero (loaded there), the eye at Astarion
+    # with the view out but nothing loaded, until benilla says the world round the eye is loaded there.
+    g = switch_world()
+    g.host = 'AST'
+    g.run(5)
+    assert calls(g) == ['to WOWBG3_Move_1 0.2'], calls(g)
+    g.run(20)
+    g.files[C] = camera(AST, 1 | 2, 2)
+    g.run(20)
+    assert calls(g) == ['to WOWBG3_Move_1 0.2'], calls(g)
+    g.files[C] = camera(AST, 1 | 2 | 4, 3)
+    g.run(5)
+    assert calls(g) == ['to WOWBG3_Move_1 0.2', 'clear WOWBG3_Move_1'], calls(g)
+    # A torn camera record (seq and seq again differ) counts as nothing.
+    g = switch_world()
+    g.host = 'AST'
+    g.run(5)
+    raw = bytearray(camera(AST, 1 | 2 | 4, 5))
+    struct.pack_into('<I', raw, 64, 4)
+    g.files[C] = bytes(raw)
+    g.run(10)
+    assert calls(g) == ['to WOWBG3_Move_1 0.2'], calls(g)
+    # A near switch, or one with world mode off: no cover.
+    g = switch_world()
+    g.host = 'NEAR'
+    g.run(10)
+    assert calls(g) == [], calls(g)
+    g = switch_world(active=False)
+    g.host = 'AST'
+    g.run(10)
+    assert calls(g) == [], calls(g)
+    # No world from benilla: renewed every 5 s like a move's, then 20 s at most.
+    g = switch_world()
+    g.host = 'AST'
+    g.run(5)
+    g.run(230)
+    c = calls(g)
+    assert [x for x in c if x.startswith('to ')] == ['to WOWBG3_Move_1 0.2'] + ['to WOWBG3_Move_%d 0.1' % i for i in (2, 3, 4, 5)], c
+    assert [x for x in c if x.startswith('clear ')] == ['clear WOWBG3_Move_%d' % i for i in (1, 2, 3, 4, 5)], c
+    # A move and a switch share the cover: the switch's end leaves the move's black, the move's end clears it.
+    g = switch_world()
+    g.files[F] = '8\n'
+    g.run(5)
+    g.host = 'AST'
+    g.run(5)
+    g.files[C] = camera(AST, 1 | 2 | 4, 2)
+    g.run(10)
+    assert calls(g) == ['to WOWBG3_Move_1 0.5'], calls(g)
+    g.files[F] = None
+    g.run(5)
+    assert calls(g) == ['to WOWBG3_Move_1 0.5', 'clear WOWBG3_Move_1'], calls(g)
 
 
 main()

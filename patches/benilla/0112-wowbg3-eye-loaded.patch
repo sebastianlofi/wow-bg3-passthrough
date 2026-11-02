@@ -1,0 +1,137 @@
+WOW-BG3 benilla patch 0112: camera.bin says whether WoW's world round the eye is loaded.
+A far switch to a party member (AI Context/multi-world-design.md phase 2) moved BG3's camera, and benilla's with it, to
+a place whose world streams only once the server's Far Sight is out on that member's bot; BG3's own short fade ended over
+void (0.1.3013.58). camera.bin's player flags gain bit 1 (the view is out on another character, patch 0040) and bit 2
+(the world round the eye is loaded: the stream's focus is the eye, or the body within 100 yd of it, the load facts are
+about that focus's tile, and its tile, neighbours and their placements are up and drawable). MoveLoading.lua keeps BG3's
+fade over the switch until bit 2 holds with the eye at the new member.
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -9,6 +9,11 @@
+ //! then the player: position[3] f32 (WoW world), map u32 (u32::MAX unknown), flags u32
+ //! (bit 0: the server has placed us), pad u32. Readers that know only the first 72 bytes
+ //! (the camera) keep working.
++//!
++//! Patch 0112 (a far switch's cover, AI Context/multi-world-design.md phase 2) adds two flag bits:
++//! bit 1, the view is out on another character (Far Sight, patch 0040); bit 2, the world round the
++//! eye is loaded ([`eye_ready`]). BG3's `MoveLoading.lua` keeps its screen fade over a switch to a
++//! party member far away until bit 2 holds with the eye at that member.
+ 
+ use std::fs::{File, OpenOptions};
+ use std::path::PathBuf;
+@@ -109,11 +114,49 @@ pub(crate) fn camera_record(
+     r
+ }
+ 
++/// Patch 0112: the eye this far (yd, flat) from the body still has the body's world round it.
++const EYE_NEAR_BODY_YD: f32 = 100.0;
++
++/// The ADT tile of a WoW point, as `benilla_wdt::world_to_tile` gives it (tile x from world y).
++fn wow_tile(wow: [f32; 3]) -> (i32, i32) {
++    const TILE_YARDS: f32 = 533.333_3;
++    let offset = 32.0 * TILE_YARDS;
++    let t = |v: f32| (((offset - v) / TILE_YARDS) as i32).clamp(0, 63);
++    (t(wow[1]), t(wow[0]))
++}
++
++/// Patch 0112: the world round the eye is loaded. The stream's focus is the eye while the view is
++/// out (patch 0040 streams detached, round the camera), else the body, which counts only within
++/// [`EYE_NEAR_BODY_YD`] of the eye. The load facts must be about that focus's tile (they lag the
++/// focus by a frame after a jump) and say its tile, the 8 round it and their placements are up and
++/// drawable: what benilla's own loading cover waits for.
++fn eye_ready(
++    eye: [f32; 3],
++    body: Option<[f32; 3]>,
++    view_out: bool,
++    progress: &benilla_world::terrain_stream::WorldLoadProgress,
++) -> bool {
++    let focus = if view_out {
++        eye
++    } else {
++        match body {
++            Some(b) if (b[0] - eye[0]).hypot(b[1] - eye[1]) <= EYE_NEAR_BODY_YD => b,
++            _ => return false,
++        }
++    };
++    progress.focus_tile == Some(wow_tile(focus))
++        && progress.focus_resident
++        && progress.scene_ready
++        && progress.presentable()
++}
++
+ fn stream_camera(
+     mut s: ResMut<CameraStream>,
+     cam: Query<(&GlobalTransform, &Projection), With<WorldCamera>>,
+     player: Option<Res<Player>>,
+     map: Option<Res<CurrentMap>>,
++    subject: Option<Res<crate::player::ViewSubject>>,
++    progress: Option<Res<benilla_world::terrain_stream::WorldLoadProgress>>,
+ ) {
+     let Ok((g, proj)) = cam.single() else {
+         return;
+@@ -144,9 +187,18 @@ fn stream_camera(
+         _ => (0.0, 0.0),
+     };
+     s.seq = s.seq.wrapping_add(1).max(1);
++    let eye = bevy_to_wow(g.translation());
++    let body = player.as_ref().filter(|p| p.active).map(|p| bevy_to_wow(p.pos));
++    let view_out = subject.as_deref().is_some_and(|v| v.remote.is_some());
++    let ready = progress
++        .as_deref()
++        .is_some_and(|p| eye_ready(eye, body, view_out, p));
++    let flags = player.as_ref().map_or(0, |p| p.active as u32)
++        | if view_out { 2 } else { 0 }
++        | if ready { 4 } else { 0 };
+     let rec = camera_record(
+         s.seq,
+-        bevy_to_wow(g.translation()),
++        eye,
+         bevy_to_wow(*g.forward()),
+         bevy_to_wow(*g.up()),
+         fovy,
+@@ -154,7 +206,7 @@ fn stream_camera(
+         s.start.elapsed().as_secs_f64(),
+         player.as_ref().map_or([0.0; 3], |p| bevy_to_wow(p.pos)),
+         map.as_ref().map_or(u32::MAX, |m| m.0 as u32),
+-        player.as_ref().map_or(0, |p| p.active as u32),
++        flags,
+     );
+     #[cfg(unix)]
+     {
+@@ -183,4 +235,35 @@ mod tests {
+         assert_eq!(f32::from_le_bytes(r[80..84].try_into().unwrap()), 6.0);
+         assert_eq!(u32::from_le_bytes(r[88..92].try_into().unwrap()), 1);
+     }
++
++    #[test]
++    fn eye_ready_is_about_the_eye() {
++        use benilla_world::terrain_stream::WorldLoadProgress;
++        // Goldshire, and a point 760 yd east of it on another tile (t58's far switch).
++        let gold = [-9460.0, 60.0, 56.0];
++        let far = [-9460.0, -700.0, 56.0];
++        assert_ne!(wow_tile(gold), wow_tile(far));
++        let loaded = |at: [f32; 3]| WorldLoadProgress {
++            focus_tile: Some(wow_tile(at)),
++            focus_resident: true,
++            scene_ready: true,
++            ..Default::default()
++        };
++        // At home: the body's world is the eye's.
++        assert!(eye_ready([-9455.0, 65.0, 70.0], Some(gold), false, &loaded(gold)));
++        // Switched 760 yd away, Far Sight not out yet: the body's world says nothing of the eye.
++        assert!(!eye_ready(far, Some(gold), false, &loaded(gold)));
++        // The view out, the stream still about the body's tile (a frame behind): not yet.
++        assert!(!eye_ready(far, Some(gold), true, &loaded(gold)));
++        // The eye's tile loaded but its neighbours' placements still coming: not yet.
++        let mut part = loaded(far);
++        part.scene_ready = false;
++        assert!(!eye_ready(far, Some(gold), true, &part));
++        // Loaded round the eye: ready.
++        assert!(eye_ready(far, Some(gold), true, &loaded(far)));
++        // Drawable too: spawned geometry the retained pass cannot draw yet is a hole.
++        let mut gx = loaded(far);
++        gx.gx_pending = 3;
++        assert!(!eye_ready(far, Some(gold), true, &gx));
++    }
+ }
