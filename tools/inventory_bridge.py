@@ -7,7 +7,7 @@ Carries BG3's inventory requests to the WoW server and the WoW characters' inven
   BG3 (Inventory.lua) -> wow-bg3/link/inventory-req.json  {RunId, Reqs: [{Seq, Op, Member, ...}]}
   bridge -> BG3          wow-bg3/link/inventory.json      {Seq, Time, Members: {UUID: {Char, Money,
                          Items: [{Guid, Entry, Count, Bag, Slot, Rand}]}}, Vendors: {GUID: [{Idx, Entry, Price,
-                         Stock}]}, Loot: {GUID: {Money, Items: [{Idx, Entry, Count}]}}, Replies: [...]}
+                         Stock, Max, Level}]}, Loot: {GUID: {Money, Items: [{Idx, Entry, Count}]}}, Replies: [...]}
 inventory.json's For is the RunId of the requests read: Inventory.lua takes only a file meant for it.
 Ops: list, equip, unequip, move, give, add, del, money, vendor (list wares), buy, sell, loot (list),
 take. Every reply is {Seq, Op, Ok, Why, ...}; the inventory itself always comes from the server
@@ -320,6 +320,8 @@ class Server:
         for w in self.call('vendor', 'list', name, npc):
             if len(w) >= 9 and w[1] == 'vendor' and w[4] == 'item':
                 out.append({'Idx': int(w[5]), 'Entry': int(w[6]), 'Price': int(w[7]), 'Stock': int(w[8])})
+                if len(w) >= 12:  # patch 0021: what a limited ware starts with after a long rest, the purse's level
+                    out[-1].update(Max=int(w[10]), Level=int(w[11]))
         return out
 
     def buy(self, name, npc, entry, count):

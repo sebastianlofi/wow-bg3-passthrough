@@ -505,6 +505,8 @@ function M.Start(runId)
         for _, u in ipairs(party) do before[u] = {Low = low(u), Hp = member(u, hero).Hp} end
         local okr, err = pcall(Osi.RestoreParty, hero)
         assert(okr, "RestoreParty failed: " .. tostring(err))
+        -- With camp off this stands in for a long rest (settings.conf), so vendors restock on it.
+        if WOWBG3Inventory and not Ext.Require("Camp.lua").On() then pcall(WOWBG3Inventory.Restock) end
         wait(10)
         local out = {}
         for _, u in ipairs(party) do
