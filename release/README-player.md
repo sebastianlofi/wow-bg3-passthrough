@@ -71,12 +71,12 @@ Extender, and whether it works on the Linux Script Extender in this download is 
 | Half-Elf | Shadowheart | Human | Alliance | Northshire (Elwynn Forest) |
 | Halfling | | Human | Alliance | Northshire (Elwynn Forest) |
 | Elf | Astarion | Night Elf | Alliance | Shadowglen (Teldrassil) |
-| Drow | | Night Elf | Alliance | Shadowglen (Teldrassil) |
 | Dwarf | | Dwarf | Alliance | Coldridge Valley (Dun Morogh) |
 | Gnome | | Gnome | Alliance | Coldridge Valley (Dun Morogh) |
 | Half-Orc | | Orc | Horde | Valley of Trials (Durotar) |
 | Githyanki | Lae'zel | Troll | Horde | Valley of Trials (Durotar) |
 | Tiefling | Karlach | Undead | Horde | Deathknell (Tirisfal Glades) |
+| Drow | | Undead | Horde | Deathknell (Tirisfal Glades) |
 | Dragonborn | | Tauren | Horde | Camp Narache (Mulgore) |
 
 The Dark Urge goes by the race you pick for them.

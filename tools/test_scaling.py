@@ -78,6 +78,11 @@ class Scaling(unittest.TestCase):
         neutral = lua.table_from({'Hostile': False, 'Pos': lua.table_from([1, 0, 0])})
         self.assertEqual(self.M.CampOf(me, lua.table_from([me, near, chained, far, neutral])), 3)
 
+    def test_hp_stops_at_about_a_hits_worth(self):
+        # Solo against a big camp of mobs well under the player: every cut together must not make a 1 HP mob.
+        n = self.mob(6, 137, 7.2, w=12, n=1, camp=20, party=1)
+        self.assertGreaterEqual(n['MaxHp'], 4)
+
     def test_camps_of_any_size(self):
         self.assertIsNone(self.M.PullCap)
         hp = [self.mob(40, 1865, 66.7, camp=k)['MaxHp'] for k in (1, 2, 3, 4, 6, 8, 10, 14, 18, 24, 30, 45)]

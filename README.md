@@ -81,12 +81,12 @@ come from your BG3 race:
 | BG3 race | WoW race | Faction | Start zone |
 |---|---|---|---|
 | Human, Half-Elf, Halfling | Human | Alliance | Northshire (Elwynn Forest) |
-| Elf, Drow | Night Elf | Alliance | Shadowglen (Teldrassil) |
+| Elf | Night Elf | Alliance | Shadowglen (Teldrassil) |
 | Dwarf | Dwarf | Alliance | Coldridge Valley (Dun Morogh) |
 | Gnome | Gnome | Alliance | Coldridge Valley (Dun Morogh) |
 | Half-Orc | Orc | Horde | Valley of Trials (Durotar) |
 | Githyanki | Troll | Horde | Valley of Trials (Durotar) |
-| Tiefling | Undead | Horde | Deathknell (Tirisfal Glades) |
+| Tiefling, Drow | Undead | Horde | Deathknell (Tirisfal Glades) |
 | Dragonborn | Tauren | Horde | Camp Narache (Mulgore) |
 
 An origin character goes by the same table, through their race:

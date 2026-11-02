@@ -57,6 +57,7 @@ M.SIZE_DAMAGE = {0.4, 0.65, 0.85, 1}
 M.CAMP_HP = {1, 0.75, 0.62, 0.55, 0.5, 0.46, 0.43, 0.4}
 M.CAMP_DAMAGE = {1, 0.85, 0.72, 0.65, 0.6, 0.55, 0.5, 0.46}
 M.CAMP_LEVEL, M.CAMP_LEVELS = 0.6, 3
+M.MIN_HP = 0.6
 local function between(t, k)
     k = math.max(1, k)
     local a = math.floor(k)
@@ -141,7 +142,8 @@ function M.Compute(c)
         hp = math.min(hp, 0.6 * lerp(M.DPR, M.Effective(c.WowLevel, cap) + gap))
     end
     local Es = math.max(1, E - math.min(M.CAMP_LEVELS, M.CAMP_LEVEL * (math.max(1, camp) - 1)))
-    return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(1, round(hp)), Damage = damage,
+    -- Whatever cut it (a camp, a small party, a low level): at least about a hit's worth, 60% of a member's turn.
+    return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(round(M.MIN_HP * lerp(M.DPR, E)), round(hp)), Damage = damage,
         AC = math.max(12, round(10.7 + 0.5 * Es)) + r.AC + steps,
         ToHit = math.max(3, round(2.2 + 0.57 * Es)) + r.Hit + d.Hit + steps - round(M.MISS * math.max(0, 1 - damage)),
         DC = round(8.4 + 0.63 * Es) + r.DC + d.DC,
