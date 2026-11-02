@@ -9,8 +9,6 @@ turns and spells. BG3 saves keep the WoW side too.
 Linux only, with the native Linux build of BG3 from Steam. It needs your own WoW 1.12.1 client:
 this project contains no Blizzard or Larian files.
 
-The mod itself is called WOW-BG3: that is the name in BG3's mod manager, and in its files and folders.
-
 > **State: very much a work in progress.** 0.1.0 is a first playable beta. You can make a character,
 > walk Elwynn Forest, fight its mobs, quest, loot, trade, level up and recruit companions, but a lot
 > is untested, unbalanced or not built yet. [What is work in progress](#work-in-progress) lists it
@@ -42,7 +40,7 @@ version is mostly complete.
 
 ## How it plays
 
-- **Starting.** Enable WOW-BG3 in BG3's mod manager and start a New Game. Make or pick your
+- **Starting.** Enable WOW-BG3 Passthrough in BG3's mod manager and start a New Game. Make or pick your
   character in BG3's character creation; you land in the WoW start zone of your character's race.
 - **Exploring.** BG3's camera, controls and interface; WoW's world under your feet, with WoW's
   NPCs, mobs, day and night. WoW's chat, quest log and quest tracker sit beside BG3's interface.
@@ -58,8 +56,7 @@ version is mostly complete.
   quest and gossip windows, as in vanilla: accept, decline and hand in there. Vendors open BG3's
   trade screen with the vendor's WoW wares. A left click on a friendly NPC talks to it while you
   walk and pickpockets it while you sneak; NPCs with nothing to say in WoW (guards, villagers) offer
-  no Talk. A robbed NPC and its neighbours search around where you stood before going back to their
-  posts.
+  no Talk. A robbed NPC reacts the way BG3's NPCs do.
 - **Money.** WoW's copper is BG3's gold: 1 copper = 1 gold, so 1 silver = 100 gold and 1 WoW gold
   = 10,000 gold. Prices and corpse money use the same rule. Merchants show food and drink as the stacks WoW sells, and you can split a
   stack to buy or sell just part of it. With no discount on the barter screen, a merchant charges WoW's
@@ -228,7 +225,7 @@ step. In short:
    `python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py"`.
    It installs the Linux Script Extender (bg3le) with WOW-BG3's patches and sets BG3's Steam launch
    option. It still runs your other Script Extender mods; `--uninstall` undoes it.
-5. Start BG3, enable WOW-BG3 in the mod manager, start a New Game.
+5. Start BG3, enable WOW-BG3 Passthrough in the mod manager, start a New Game.
 
 The first start takes a few minutes: the local WoW server builds its data from your WoW files while
 BG3's loading screen waits. Later starts and loads take under a minute. Switching WOW-BG3 off in the
@@ -350,7 +347,7 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   tested alone. Mods that change levels, XP, rests or the party size are the likeliest to clash.
 - **Your saves.** Saves made without WOW-BG3 stay plain BG3 games and stay loadable; back them up
   before you try a beta anyway.
-- **Uninstall.** Switch WOW-BG3 off in the mod manager (the WoW side then stops at once), run the
+- **Uninstall.** Switch WOW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
   installer with `--uninstall` to take the Script Extender back out of BG3's launch options, and
   remove `Mods/WOW-BG3.pak`, `Mods/WOW-BG3/` and `~/.local/share/wow-bg3/`.
 - **When something goes wrong.** The logs are in `~/.local/share/wow-bg3/logs/` (the WoW side) and
