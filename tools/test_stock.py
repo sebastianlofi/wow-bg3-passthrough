@@ -86,6 +86,14 @@ class Rule(unittest.TestCase):
         self.assertEqual(self.count('BREAD', 117), 3)
         self.assertEqual(self.L.eval('S.PurseOf(l, "f1", 30)'), self.L.eval('S.Purse(30)'))
 
+    def test_a_due_rest_changes_nothing_until_it_is_done(self):
+        self.L.execute('S.Bought(l, "f1", 117, 3); S.Due(l); S.Due(l)')
+        self.assertIsNone(self.count('BREAD', 117))
+        self.assertTrue(self.L.eval('l.D'))
+        self.L.execute('S.Rest(l)')
+        self.assertEqual(self.count('BREAD', 117), 3)
+        self.assertEqual((self.L.eval('l.D'), self.L.eval('l.R')), (None, 1))
+
     def test_arrows_and_bullets_are_not_sold(self):
         self.L.execute('rows[2512].t = 24')
         self.assertIsNone(self.count('{{Idx = 0, Entry = 2512, Price = 9, Stock = -1, Max = 0}}', 2512))
@@ -259,6 +267,36 @@ class Game(unittest.TestCase):
         self.assertEqual(self.L.eval('next(ledger.V)'), None)
         self.assertEqual(json.loads(self.L.eval('vars.tavWowBg3Stock'))['V'], {})
         self.assertEqual(self.L.eval('state.Restocks'), 1)
+
+    def test_a_long_rest_in_an_open_trade_waits_for_it_to_close(self):
+        # In game: PROC_LongRest with a trade open (13100, 4 spent); the trade's next look wrote 13096 into the new day.
+        self.open()
+        self.L.execute('fundMerchant("farley"); gold.farley = 38796; lookPurses(); M.Restock(); lookPurses(); M.SettleRest()')
+        self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 38796)  # the open trade keeps its day
+        self.assertEqual(self.L.eval('state.Restocks'), None)
+        self.L.execute('gold.farley = 38700; lookPurses(); trading.farley = nil; lookPurses(); M.SettleRest()')
+        self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 38800)
+        self.assertEqual(self.L.eval('state.Restocks'), 1)
+        self.L.execute('gold.farley = 0; tick = tick + 100')
+        self.open()
+        self.assertEqual(self.L.eval('gold.farley'), 38800)
+
+    def test_a_due_rest_goes_in_the_save(self):
+        self.open()
+        self.L.execute('noteSold({Op = "buy", Npc = "f1", Entry = 117, Count = 1}); M.Restock()')
+        self.L.execute('trading = {}; placed = {}; ledger = readLedger(); M.SettleRest()')
+        self.assertEqual(self.L.eval('next(ledger.V)'), None)
+        self.assertEqual(self.L.eval('ledger.R'), 1)
+
+    def test_a_stand_in_gone_holds_no_rest_back(self):
+        self.L.execute('trading.gone = 1000; placed.gone = true; Stock.SetPurse(ledger, "f1", 5); M.Restock()')
+        self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 38800)
+
+    def test_the_restock_follows_bg3_s_traders(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.assertIn('"PROC_LongRest", 0, "after", function() M.Restock() end', text)
+        self.assertNotIn('M.Restock', text[text.index('"LongRestFinished"'):].split('\n')[0])
+        self.assertIn('pcall(lookPurses)\n        pcall(settleRest)', text)
 
     def test_a_stolen_ware_is_gone_too_and_a_conjuring_is_nobody_s_stock(self):
         self.L.execute('noteSold({Op = "add", Npc = "f1", Entry = 117, Count = 5})')

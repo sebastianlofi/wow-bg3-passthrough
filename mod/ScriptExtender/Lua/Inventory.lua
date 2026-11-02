@@ -1030,14 +1030,6 @@ local function saveLedger()
         if e then pcall(function() e.Vars[STOCK_VAR] = raw end) end
     end
 end
--- BG3's long rest: PROC_LongRest is its traders' own rule (_Trade.txt), LongRestFinished the event this mod has seen run.
-function M.Restock()
-    if ledger then
-        Stock.Rest(ledger)
-        saveLedger()
-        state.Restocks = (state.Restocks or 0) + 1
-    end
-end
 local STOCK_OPS = {buy = true, buypart = true, add = true}
 local function noteSold(r)
     if not (ledger and STOCK_OPS[r.Op] and r.Npc and r.Entry) then return end
@@ -1332,6 +1324,31 @@ function M.Refunded(guid, delta)
     saveLedger()
 end
 
+-- The long rest: BG3's traders restock at PROC_LongRest (_Trade.txt), which BG3's long rest runs when the party wakes
+-- (GLO_Camp, PROC_Camp_EveryoneAwake), and camp off's refill (Party.lua) stands in for it. It is done once no vendor's
+-- trade is open (Stock.Due): a stand-in still in its trade would write its old purse and arrows into the new day.
+local function tradeOpen()
+    for _, t in ipairs({trading, placed, arrowsIn}) do
+        for standin in pairs(t) do
+            if q(Ext.Entity.Get, standin) then return true end
+        end
+    end
+    return false
+end
+local function settleRest()
+    if not (ledger and ledger.D) or tradeOpen() then return end
+    Stock.Rest(ledger)
+    saveLedger()
+    state.Restocks = (state.Restocks or 0) + 1
+end
+M.SettleRest = settleRest
+function M.Restock()
+    if not ledger then return end
+    Stock.Due(ledger)
+    settleRest()
+    saveLedger()
+end
+
 
 local function fillVendors(inv)
     if not ledger then return end
@@ -1574,11 +1591,13 @@ function M.Start(id)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)
     Ext.Osiris.RegisterListener("RemovedFrom", 2, "after", function(item, holder) onRemovedFrom(item, holder) end)
     pcall(Ext.Osiris.RegisterListener, "LongRestStarted", 0, "after", function() restGuard = tick + REST_START end)
-    pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER; M.Restock() end)
+    pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER end)
+    -- The restock follows BG3's own traders: one per long rest (it ran on LongRestFinished as well, so twice).
     pcall(Ext.Osiris.RegisterListener, "PROC_LongRest", 0, "after", function() M.Restock() end)
     -- A load in this same Lua state: that save's counts (Hero.lua makes a new token, WowSave.lua starts over the same way).
     Ext.Events.GameStateChanged:Subscribe(function(e)
-        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded, arrowsIn, purseSeen = nil, {}, {}, {}, {} end
+        -- No trade is open after a load either: one left open would hold a due long rest back (settleRest).
+        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded, arrowsIn, purseSeen, trading = nil, {}, {}, {}, {}, {} end
     end)
     -- A WoW mob's stand-in dying in BG3: its WoW loot goes on the BG3 corpse. The server makes the
     -- WoW corpse lootable a moment after the kill reaches it, so it is asked from 15 ticks on and every
@@ -1660,6 +1679,7 @@ function M.Start(id)
         ledger = ledger or readLedger()
         pcall(lookArrows)
         pcall(lookPurses)
+        pcall(settleRest) -- after the looks: a trade that closed has written its last into its own day
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
         for u, f in pairs(M.Fresh) do

@@ -3,7 +3,7 @@
 -- BG3's rule (Shared.pak, Story/RawFiles/Goals/_Trade.txt): a trader's goods and gold are generated once and stay
 -- as they are until PROC_LongRest allows the next generation. So what is bought stays gone and the purse stays spent.
 -- The ledger is this: per vendor since the last long rest, the units bought and the gold it holds.
---   {N = writes, V = {g<wow guid> = {B = {e<entry> = units}, P = purse once touched}}}
+--   {N = writes, R = long rests, D = a long rest not yet done, V = {g<wow guid> = {B = {e<entry> = units}, P = purse once touched}}}
 -- It lives in BG3's save (Inventory.lua), so a load brings back that save's counts by itself, and a long rest empties it.
 local M = {}
 
@@ -22,7 +22,13 @@ local function vendor(l, guid)
     return v
 end
 
-function M.Rest(l) l.V = {}; l.N = l.N + 1; l.R = (l.R or 0) + 1 end
+-- A long rest is due at PROC_LongRest, and done when no trade is open (Inventory.lua): BG3's rule restocks a trader at its
+-- next generation, so a trade open across it (a rest from outside, camp off's refill) keeps what it showed, and its last
+-- looks belong to the day before. Done at once, those looks wrote the old purse into the new day.
+function M.Due(l)
+    if not l.D then l.D = true; l.N = l.N + 1 end
+end
+function M.Rest(l) l.V = {}; l.D = nil; l.N = l.N + 1; l.R = (l.R or 0) + 1 end
 function M.Bought(l, guid, entry, units)
     local b = vendor(l, guid).B
     b[key(entry)] = (b[key(entry)] or 0) + units
