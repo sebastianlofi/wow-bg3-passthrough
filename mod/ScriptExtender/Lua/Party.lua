@@ -16,9 +16,9 @@
 --                     BG3's party limit), next to the hero and chained to the hero's group
 --                     (AttachToPartyGroup), so BG3's own party following moves them
 --   Remove {Name}     BG3's dismiss: the tutorial's own PROC_TUT_Misc_TutorialCompanion_RemoveCompanion for
---                     a tutorial companion in the tutorial level (its goals run only there), else
---                     PROC_GLO_PartyMembers_Remove (force, gold to the hero); if that does not take within
---                     the wait, BG3's own plain calls (UnregisterAsCompanion, MakeNPC, its faction back);
+--                     a tutorial companion while the goal holding it (TUT_Misc) runs, else
+--                     PROC_GLO_PartyMembers_Remove (force, gold to the hero). Nothing is done by hand: when
+--                     BG3's story would refuse, Remove refuses too and says why;
 --                     then back where Add found it (wow-bg3/party-home.json): same level by
 --                     TeleportToPosition, another level through a companion standing there (TeleportTo),
 --                     else off stage where it stands
@@ -295,6 +295,25 @@ function M.Start(runId)
         return {Added = nameOf(u), Uuid = u, Steps = steps, Party = M.Snapshot(), MaxPartySize = q(Osi.GetMaxPartySize)}
     end
 
+    -- Whether a story goal runs (Osiris SysIsActive, as BG3's own savegame patches ask).
+    local function goalRunning(name)
+        local v = q(Osi.SysIsActive, name)
+        return v == true or v == 1
+    end
+    -- What in BG3's story would stop its forced dismiss, before anything of it runs (it hands over the
+    -- gold and detaches first, then PROC_GLO_PartyMembers_MakeNPC needs these rows; _GLO_Shared_PartyMembers.txt).
+    -- An avatar (another player's character) takes the story's own avatar rules: not judged here.
+    local function dismissRefusal(u)
+        local function has(db, n)
+            for _, r in ipairs(rows(db, n)) do if uuidOf(r[1]) == u then return true end end
+            return false
+        end
+        if has("DB_Avatars", 1) then return nil end
+        if not has("DB_GLO_PartyMembers_OriginalAlignment", 2) then return "no DB_GLO_PartyMembers_OriginalAlignment row" end
+        if not has("DB_PartyMembers", 1) then return "no DB_PartyMembers row" end
+        return nil
+    end
+
     local function remove(c)
         local hero = heroOrFail()
         local who = resolve(c.Name)
@@ -307,43 +326,22 @@ function M.Start(runId)
         for _, r in ipairs(rows("DB_TUT_Misc_TutorialCompanion_OldFaction", 2)) do
             if uuidOf(r[1]) == u then tut = true end
         end
-        -- The tutorial's own dismiss only works where the tutorial's goals run: in another host level it
-        -- does nothing and the companion stays in the party. Pick by the level the companion is in, and
-        -- when the first call does not take, use BG3's own dismiss and then its plain calls.
-        local inTut = q(Osi.GetRegion, u) == TUT_REGION
+        -- Which dismiss (both BG3's own). The tutorial's proc is a rule of goal TUT_Misc: with that goal
+        -- not running (it starts on loading TUT_Avernus_C and ends with the tutorial) the proc has no
+        -- rules and does nothing, which is what "BG3 did not dismiss Shadowheart" was in BGO_Main_A.
         local function gone() return not inDbPlayers(u) end
-        if tut and inTut then
+        if tut and goalRunning("TUT_Misc") then
             Osi.PROC_TUT_Misc_TutorialCompanion_RemoveCompanion(u, "Dismissed", "WOWBG3")
             steps[#steps + 1] = "dismissed (PROC_TUT_Misc_TutorialCompanion_RemoveCompanion)"
         else
+            local why = dismissRefusal(u)
+            if why then error(string.format("BG3 would not dismiss %s: %s", nameOf(u), why), 0) end
             Osi.PROC_GLO_PartyMembers_Remove(u, hero, 1, 0)
-            steps[#steps + 1] = "dismissed (PROC_GLO_PartyMembers_Remove" .. (tut and ", a tutorial companion outside the tutorial level" or "") .. ")"
+            steps[#steps + 1] = "dismissed (PROC_GLO_PartyMembers_Remove" .. (tut and ", a tutorial companion with TUT_Misc not running" or "") .. ")"
         end
         if not pcall(waitFor, gone, 60, "") then
-            if tut and inTut then
-                pcall(Osi.PROC_GLO_PartyMembers_Remove, u, hero, 1, 0)
-                steps[#steps + 1] = "the tutorial's dismiss did not take: PROC_GLO_PartyMembers_Remove"
-                pcall(waitFor, gone, 60, "")
-            end
-            if not gone() then
-                -- What BG3's own dismiss ends with: out of the hero's party group, no longer a companion,
-                -- an NPC with its own faction again and free of the party's following.
-                pcall(Osi.DetachFromPartyGroup, u)
-                pcall(Osi.UnregisterAsCompanion, u)
-                pcall(Osi.MakeNPC, u)
-                for _, r in ipairs(rows("DB_GLO_PartyMembers_DefaultFaction", 2)) do
-                    if uuidOf(r[1]) == u then pcall(Osi.SetFaction, u, r[2]) end
-                end
-                pcall(Osi.SetNoFollowFlag, u, 1)
-                steps[#steps + 1] = "BG3's dismiss did not take: UnregisterAsCompanion, MakeNPC, its own faction back"
-                pcall(waitFor, gone, 60, "")
-            end
-        end
-        if not gone() and q(Osi.IsInPartyWith, u, hero) == 1 then
             error(string.format("BG3 did not dismiss %s (tried: %s)", nameOf(u), table.concat(steps, "; ")), 0)
         end
-        if not gone() then steps[#steps + 1] = "out of the hero's party, still in BG3's DB_Players" end
-        pcall(Osi.DetachFromPartyGroup, u)
         cacheTick = -1
         wait(2)
         if Prog.CampOn() then
