@@ -627,13 +627,14 @@ function M.Start(runId)
             end
             if c.Action == "PlaceCheck" then
                 -- Whether this side would take each cell's pool subgrid now: Place refuses one that
-                -- something stands on (an entity registered on its tiles or attached to it). WorldMode asks
-                -- both sides before a Place, so a square moves on both or on neither.
+                -- something stands on (an entity registered on its tiles or attached to it), unless the cell
+                -- is the spot it already holds (retiled in place). WorldMode asks both sides before a Place,
+                -- so a square moves on both or on neither.
                 assert(type(c.Cells) == "table" and #c.Cells >= 1 and #c.Cells <= 12, "Cells (1 to 12) required")
                 local busy, seen = {}, {}
                 for _, cell in ipairs(c.Cells) do
                     local k = assert(math.tointeger(cell[1]), "a cell is {K, MinX, MinZ, BaseY, Serial}")
-                    local out = N.Must(N.Op.PoolFree, k)
+                    local out = N.Must(N.Op.PoolFree, k, assert(tonumber(cell[2]), "a cell's MinX"), assert(tonumber(cell[3]), "a cell's MinZ"))
                     if out.R[1] ~= 1 then
                         busy[#busy + 1] = k
                         seen[#seen + 1] = {K = k, Tiles = out.R[2], Attached = out.R[3], Entities = out.R[4],

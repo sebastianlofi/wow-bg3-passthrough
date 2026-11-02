@@ -10,6 +10,7 @@
 --          ground (the treadmill: pool subgrids placed as 64 m squares of WoW ground, the files
 --          wow-bg3/section-<K>.bin and arena-triangles.bin written by the WoW side) + teleport + lead
 --   Stream {Cells, Rays}                  Tav walked on: move those pool subgrids, swap the triangles
+--   Reorigin {WowOrigin, Cells}           a move on the same continent: the session stays, the mapping changes
 --   Stop   {}                             Tav back, party back, ground and camera restored
 -- The party: the hero's companions come along (Party.lua Gather at Start, with its
 -- upkeep; back next to the hero at Stop) and WoW draws them like the hero (TavPlan.lua figures).
@@ -643,6 +644,61 @@ function M.Start(runId)
             arena({Action = "Rays", Void = true, Mask = 2096, SkipContexts = 0, Seconds = MAX_SECONDS})
         end
     end
+    -- A move on the same continent (world_bridge.py World.move): BG3's Centre stays, so the hero only has to
+    -- come back to it, and the WoW place it stands for changes. What a session set up once stays set up (the pool,
+    -- the level's bounds, the picking map, the spatial grid, the music, the banner, Tav's plan, whose lines carry the
+    -- mapping); Stop and Start would take all of it down and build it again, 8 s of the 22 s a move took. A
+    -- refusal leaves Started false and the old squares where they were: the bridge goes on with Stop and Start.
+    local function reorigin(c)
+        assert(state, "world mode not started")
+        local w = c.WowOrigin
+        assert(type(w) == "table" and #w == 3 and type(w[1]) == "number" and type(w[2]) == "number" and type(w[3]) == "number"
+            and type(c.Cells) == "table" and #c.Cells >= 1, "WowOrigin and Cells required")
+        -- The hero Stop brings back is the one Start teleported: another hero is a new session's.
+        assert(state.Hero == Hero.Uuid(), "another hero than at Start")
+        -- First: nothing is published in the old mapping's name while the mapping changes.
+        state.Started = false
+        state.WowOrigin = w
+        camp.Last, camp.Hold = nil, nil -- the teleport below is no trip
+        sendErrand({Go = false, Stop = true, Why = "move"})
+        -- Every stand-in stands for a mob of the old place; the bridge's mirrors bring the new place's.
+        standIn({Action = "Clear", Centre = state.Centre})
+        -- As in stream: a square moves on both sides or on neither. A Place holds 12 squares.
+        for first = 1, #c.Cells, 12 do
+            local part = {}
+            for i = first, math.min(first + 11, #c.Cells) do part[#part + 1] = c.Cells[i] end
+            local okc, why, got = pcall(arena, {Action = "PlaceCheck", Cells = part, Seconds = MAX_SECONDS})
+            if not okc then error("place check: " .. tostring(why), 0) end
+            local busy, list = {}, {}
+            for _, r in pairs(got) do
+                for _, k in ipairs(type(r.Value) == "table" and type(r.Value.Busy) == "table" and r.Value.Busy or {}) do
+                    if not busy[k] then busy[k] = true; list[#list + 1] = k end
+                end
+            end
+            if #list > 0 then
+                table.sort(list)
+                error("Place refused: something stands on pool " .. table.concat(list, " "), 0)
+            end
+        end
+        placed = {}
+        for first = 1, #c.Cells, 12 do
+            local part = {}
+            for i = first, math.min(first + 11, #c.Cells) do part[#part + 1] = c.Cells[i] end
+            arena({Action = "Place", Cells = part, Seconds = MAX_SECONDS})
+            notePlaced(part)
+        end
+        arena({Action = "Rays", Void = true, Mask = 2096, SkipContexts = 0, Seconds = MAX_SECONDS})
+        local C = state.Centre
+        standIn({Action = "Teleport", Target = state.Hero, Position = {C[1], C[2] + 1, C[3]}})
+        wait(30)
+        pcall(standIn, {Action = "ClearSurfaces", Target = state.Hero})
+        local okParty, errParty = pcall(party, {Action = "Gather", Upkeep = true, Position = {C[1], C[2] + 1, C[3]}})
+        if not okParty then Ext.Log.Print("WOW-BG3 world: party not gathered: " .. tostring(errParty)) end
+        -- BG3's camera is on the hero again: benilla's follows it from the new basis.
+        arena({Action = "Lead", Wow = w, Bg3 = C, Seconds = MAX_SECONDS})
+        state.Started = true
+        Ext.Log.Print("WOW-BG3 world: moved to " .. Ext.Json.Stringify(w))
+    end
     local function stop()
         if not state then return end
         -- Stop publishing first: Tav is sent back to her BG3 position below, and benilla would
@@ -763,7 +819,7 @@ function M.Start(runId)
         local c = readJson("world-command.json")
         if not c or c.RunId ~= runId or math.type(c.Sequence) ~= "integer" or c.Sequence <= sequence then return end
         sequence = c.Sequence
-        local fn = ({Start = start, Stream = stream, Stop = stop, Research = research})[c.Action]
+        local fn = ({Start = start, Stream = stream, Reorigin = reorigin, Stop = stop, Research = research})[c.Action]
         if not fn then writeStatus({Last = tostring(c.Action), OK = false, Error = "unknown action"}); return end
         jobs[#jobs + 1] = {name = c.Action, seq = c.Sequence, co = coroutine.create(function() return fn(c) end)}
     end)
