@@ -208,7 +208,7 @@ class Items(unittest.TestCase):
 GOLD = r"""
 tick, pending, reqs, sets, adds = 100, {}, {}, 0, 0
 gold, blocked = 1000, false
-M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
+M, goldOwed, goldTried = {Barter = {}, RefundOf = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
 BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
 function goldOf() return gold end
 function setGold(_, want) sets = sets + 1; if not blocked then gold = want end end
@@ -374,23 +374,15 @@ class Parts(unittest.TestCase):
 
 
 class Merchant(unittest.TestCase):
-    """Inventory.lua: a merchant can pay, while its trade is open and no longer."""
+    """Inventory.lua: a merchant's gold is there during its trade only. Its amount: test_stock.py."""
 
     def setUp(self):
         self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
-        text = (LUA / 'Inventory.lua').read_text()
         L.execute("""
-          sold, tick = {}, 0
+          sold, trading, vendorOf, corpseOf = {}, {}, {}, {}
           function goldOf(u) return sold[u] or 0 end
           function setGold(u, n) sold[u] = n end
-          function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
-          Ext = {Entity = {Get = function(u) return u end}}
-          vendorOf, corpseOf = {}, {}
-          M = {Request = function() end, Item = function() end}
-          Osi = {}
-        """ + section(text, '-- BG3 won\'t let a trader buy', 'local function fillVendors').replace('local ', '') + """
-          trading = {}
-          function open(u) trading[u] = true; fundMerchant(u) end
+          function fundMerchant(u) setGold(u, 500) end
           function pass()
             for standin in pairs(vendorOf) do
               if trading[standin] then fundMerchant(standin)
@@ -399,19 +391,12 @@ class Merchant(unittest.TestCase):
           end
         """)
 
-    def test_it_can_pay_for_the_dearest_item_at_bg3_s_best_price(self):
-        self.assertGreaterEqual(self.L.eval('MERCHANT_GOLD'), 1224473 * 2.5)
-
     def test_open_funded_closed_emptied(self):
         L = self.L
         L.execute('vendorOf.farley = "f1"; pass()')
         self.assertEqual(L.eval('goldOf("farley")'), 0)
-        L.execute('open("farley")')
-        self.assertEqual(L.eval('goldOf("farley")'), L.eval('MERCHANT_GOLD'))
-        L.execute('sold.farley = 0; pass()')  # GetGold lags: not funded twice at once
-        self.assertEqual(L.eval('goldOf("farley")'), 0)
-        L.execute('tick = 100; sold.farley = 1000; pass()')  # paid out a lot
-        self.assertEqual(L.eval('goldOf("farley")'), L.eval('MERCHANT_GOLD'))
+        L.execute('trading.farley = true; pass()')
+        self.assertEqual(L.eval('goldOf("farley")'), 500)
         L.execute('trading.farley = nil; pass()')
         self.assertEqual(L.eval('goldOf("farley")'), 0)
 

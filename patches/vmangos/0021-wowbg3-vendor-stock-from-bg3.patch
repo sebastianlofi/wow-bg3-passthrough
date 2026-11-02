@@ -1,0 +1,42 @@
+WOW-BG3 vmangos patch 0021: a vendor's stock is BG3's, until the next long rest.
+
+`vendor list` adds MAXCOUNT and the vendor's level to each ware line. `vendor buy` first clears WoW's timed
+counts of limited wares: BG3's save holds what was bought since the last long rest (Stock.lua), and WoW's
+count, kept in memory with its own timer, would refuse a buy after a load or a restart.
+
+diff --git a/src/game/Objects/Creature.h b/src/game/Objects/Creature.h
+index 32f4465..dc15106 100644
+--- a/src/game/Objects/Creature.h
++++ b/src/game/Objects/Creature.h
+@@ -259,6 +259,7 @@ class Creature : public Unit
+         VendorItemData const* GetVendorTemplateItems() const;
+         uint32 GetVendorItemCurrentCount(VendorItem const* vItem);
+         uint32 UpdateVendorItemCurrentCount(VendorItem const* vItem, uint32 used_count);
++        void ForgetVendorItemCounts() { m_vendorItemCounts.clear(); } // 0021: limited wares back to their maxcount
+ 
+         TrainerSpellData const* GetTrainerTemplateSpells() const;
+         TrainerSpellData const* GetTrainerSpells() const;
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index 632e75d..7e58462 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -947,7 +947,8 @@ namespace
+                     uint32 const price = uint32(std::floor(p->BuyPrice * m->GetReputationPriceDiscount(v)));
+                     int32 const stock = vi->maxcount ? int32(v->GetVendorItemCurrentCount(vi)) : -1;
+                     wares.push_back(head + "item " + std::to_string(idx++) + " " + std::to_string(vi->item) + " " +
+-                        std::to_string(price) + " " + std::to_string(stock) + " " + std::to_string(p->BuyCount ? p->BuyCount : 1));
++                        std::to_string(price) + " " + std::to_string(stock) + " " + std::to_string(p->BuyCount ? p->BuyCount : 1) +
++                        " " + std::to_string(vi->maxcount) + " " + std::to_string(v->GetLevel()));
+                 }
+             }
+             out.Add(head + "begin " + std::to_string(wares.size()));
+@@ -962,6 +963,9 @@ namespace
+                 return out.Add(head + "buy refused usage");
+             auto const before = Snapshot(m);
+             uint32 const money = m->GetMoney();
++            // 0021: BG3's save holds what has been bought since the last long rest (Stock.lua); WoW's own timed
++            // count of a limited ware would only disagree with it after a load or a restart.
++            v->ForgetVendorItemCounts();
+             m->BuyItemFromVendor(v->GetObjectGuid(), entry, uint8(lots), NULL_BAG, NULL_SLOT);
+             if (m->GetMoney() == money)
+                 return out.Add(head + "buy " + std::to_string(entry) + " refused failed");

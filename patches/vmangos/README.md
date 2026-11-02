@@ -26,6 +26,7 @@ fights, party members and the merged inventory.
 | 0018 vendor-list-from-afar | `vendor list` answers for a vendor within 100 yd, so BG3 holds its wares before the trade screen opens |
 | 0019 any-proficiency | an equip from BG3 first learns the weapon or armour proficiency the item needs, so any item can be worn (for now) |
 | 0020 forced-reaction-interact | a forced reaction counts when talking to an NPC, so `faction alliance` or `faction horde` opens that side's merchants |
+| 0021 vendor-stock-from-bg3 | `vendor list` adds a ware's maxcount and the vendor's level; `vendor buy` clears WoW's timed counts, since BG3's save holds what was bought since the long rest |
 
 Upstream `Unit.cpp` uses CRLF line endings, so some hunks are CRLF: never convert line endings in
 these files.

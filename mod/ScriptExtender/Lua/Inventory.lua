@@ -33,6 +33,7 @@ local tick = 0 -- server ticks since Start (all timing below counts these)
 -- Hero.lua (the controlled character); a stand-in when loaded outside bootstrap (harness research).
 local Camp = Ext.Require("Camp.lua") -- the switch `camp`
 local Prices = Ext.Require("Prices.lua")
+local Stock = Ext.Require("Stock.lua")
 local okHero, Hero = pcall(Ext.Require, "Hero.lua")
 if not okHero or type(Hero) ~= "table" then
     Hero = {Uuid = function()
@@ -434,6 +435,7 @@ local pending = {} -- Seq -> {Op, Item, Member, ...}
 local pendingItem = {} -- uuid -> tick asked
 -- A barter that went through: member -> {At, Target = its BG3 gold after it} until WoW's money is that (reconcile).
 M.Barter = {}
+M.RefundOf = {} -- member -> the vendor of a deal WoW refused: BG3's gold is about to go back as WoW has it
 local BARTER_OPS = {buy = true, buypart = true, sell = true}
 local BARTER_WAIT = 600
 function M.Request(r)
@@ -786,6 +788,7 @@ local function reconcileMember(uuid, m, have)
             if b then want = have_g end
         else
             goldOwed[uuid] = want - have_g
+            if M.RefundOf[uuid] then M.Refunded(uuid, want - have_g) end
         end
         if want ~= have_g then
             M.SuppressGold = tick + 20
@@ -896,6 +899,60 @@ local function tellRefused(r, rep)
     state.LastRefusal = {Text = text, Shown = ok}
 end
 
+-- ---- what each vendor has left since the last long rest (the rule: Stock.lua) ----
+-- In BG3's save, on every player (WowSave.lua's way): a load brings back that save's counts with nothing to keep in
+-- step, and it needs no word from WoW, whose vendors are not in a WoW snapshot and whose counts live in memory.
+local STOCK_VAR = "WowBg3Stock"
+pcall(Ext.Vars.RegisterUserVariable, STOCK_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+local ledger, ledgerSaved = nil, nil -- nil until the party is there to read it from
+local function players()
+    local out = {}
+    for _, row in ipairs(q(function() return Osi.DB_Players:Get(nil) end) or {}) do
+        local u = uuidOf(row[1])
+        if u then out[#out + 1] = u end
+    end
+    return out
+end
+local function readLedger()
+    local list, best = players(), nil
+    for _, u in ipairs(list) do
+        local e = q(Ext.Entity.Get, u)
+        local raw = e and q(function() return e.Vars[STOCK_VAR] end)
+        local ok, l = pcall(Ext.Json.Parse, type(raw) == "string" and raw or "")
+        if ok and type(l) == "table" and type(l.V) == "table" and (not best or (l.N or 0) > (best.N or 0)) then best = l end
+    end
+    if #list == 0 then return nil end
+    best = best or Stock.New()
+    best.N = best.N or 0
+    ledgerSaved = best.N
+    return best
+end
+local function saveLedger()
+    if not ledger or ledger.N == ledgerSaved then return end
+    ledgerSaved = ledger.N
+    local raw = Ext.Json.Stringify(ledger)
+    for _, u in ipairs(players()) do
+        local e = q(Ext.Entity.Get, u)
+        if e then pcall(function() e.Vars[STOCK_VAR] = raw end) end
+    end
+end
+-- BG3's long rest: PROC_LongRest is its traders' own rule (_Trade.txt), LongRestFinished the event this mod has seen run.
+function M.Restock()
+    if ledger then
+        Stock.Rest(ledger)
+        saveLedger()
+        state.Restocks = (state.Restocks or 0) + 1
+    end
+end
+local STOCK_OPS = {buy = true, buypart = true, add = true}
+local function noteSold(r)
+    if not (ledger and STOCK_OPS[r.Op] and r.Npc and r.Entry) then return end
+    local units = r.Count or 1
+    if r.Op == "buy" then units = units * ((M.Item(r.Entry) or {}).bc or 1) end
+    Stock.Bought(ledger, tostring(r.Npc), r.Entry, units)
+    saveLedger()
+end
+
 -- Replies that name a new WoW item for a BG3 item we already made (bought, looted, given): retag it.
 local function onReplies(inv)
     for _, rep in ipairs(inv.Replies or {}) do
@@ -904,6 +961,7 @@ local function onReplies(inv)
             pending[rep.Seq] = nil
             if r.Item then pendingItem[r.Item] = nil end
             state.LastReply = rep
+            if rep.Ok then noteSold(r) end
             local row = r.Item and M.Item(entryOf(r.Item) or -1)
             if rep.Ok and r.Item and rep.Guid and row and row.k ~= "object" then
                 local e = q(Ext.Entity.Get, r.Item)
@@ -911,7 +969,10 @@ local function onReplies(inv)
             end
             if not rep.Ok then
                 if r.Item and (r.Op == "buy" or r.Op == "buypart" or r.Op == "take") then M.Refused[r.Item] = true end
-                if BARTER_OPS[r.Op] and r.Member then M.Barter[r.Member] = nil end
+                if BARTER_OPS[r.Op] and r.Member then
+                    M.Barter[r.Member] = nil
+                    if r.Npc then M.RefundOf[r.Member] = tostring(r.Npc) end
+                end
                 pcall(tellRefused, r, rep)
                 note(string.format("%s refused: %s", tostring(r.Op), tostring(rep.Why)))
             end
@@ -1017,7 +1078,7 @@ local function fillHolder(standin, prefix, list)
         if not have[tag] and old and not deleted[old] and not q(Ext.Entity.Get, old) then
             if buying(standin) then askFor(old, tag, sideCount[tag]) else deleted[old] = true end
         end
-        if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) then
+        if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) and not (old and pendingItem[old]) then
             local n = w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1
             local ok, made = pcall(M.Create, w.Entry, standin, n, tag)
             if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = n else note(made) end
@@ -1026,8 +1087,12 @@ local function fillHolder(standin, prefix, list)
     for tag, u in pairs(have) do
         if tag:sub(1, #prefix) == prefix then
             if not want[tag] then
-                deleted[u] = true
-                M.Suppress(u); pcall(Osi.RequestDelete, u)
+                -- Sold out, or no longer sold. A ware just bought is the buyer's now (M.Reconcile makes it WoW's).
+                local at = holderOf(u)
+                if prefix:sub(1, 1) ~= "V" or not at or at == standin then
+                    deleted[u] = true
+                    M.Suppress(u); pcall(Osi.RequestDelete, u)
+                end
             elseif M.Refused[u] and holderOf(u) ~= standin then
                 -- WoW said no (money, bags full): back where it came from.
                 M.Refused[u], asked[u] = nil, nil
@@ -1045,19 +1110,58 @@ local function fillHolder(standin, prefix, list)
     end
 end
 local corpseGold = {} -- corpse stand-in -> the gold we put there
--- BG3 won't let a trader buy what it has no gold for ("Insufficient Gold") and WoW's vendors never run out, so a
--- merchant holds enough for WoW's dearest item at BG3's best price (sp 1,224,473, value times 2.5) while its trade
--- is open, and nothing after: gold in a stand-in's pockets could be stolen and would become WoW's money.
-local MERCHANT_GOLD = 4000000
-local funded = {} -- stand-in -> tick funded: GetGold lags, so it is not asked again at once
+-- BG3 won't let a trader buy what it has no gold for ("Insufficient Gold"), and so a merchant holds its purse (Stock.lua)
+-- while its trade is open, and nothing after: gold in a stand-in's pockets could be stolen and would become WoW's money.
+-- From then on BG3's own barter spends and fills it; the look below keeps what it shows, and WoW's money follows BG3's gold
+-- after each deal (the Gold part of reconcileMember), so a purse short of a sale's price pays WoW's money no more than that.
+local funded, placed = {}, {} -- stand-in -> the tick of the last try; true once it holds its purse (not set again)
+local function levelOf(wares)
+    for _, w in ipairs(wares) do
+        if w.Level then return w.Level end
+    end
+end
 local function fundMerchant(standin)
-    if tick - (funded[standin] or -1000) < 60 or goldOf(standin) >= MERCHANT_GOLD / 2 then return end
+    local guid = vendorOf[standin]
+    local wares = guid and ledger and ((lastInv or {}).Vendors or {})[guid]
+    if not wares or placed[standin] then return end
+    local want, have = Stock.PurseOf(ledger, guid, levelOf(wares)), goldOf(standin)
+    if have == want then placed[standin] = true; return end
+    if tick - (funded[standin] or -1000) < 60 then return end -- GetGold lags, so it is not asked again at once
     funded[standin] = tick
-    setGold(standin, MERCHANT_GOLD)
+    -- A trade can leave a second pile (trade-prices.md), and setGold sets the first.
+    local it = q(Osi.GetItemByTemplateInInventory, GOLD, standin)
+    setGold(standin, (it and q(Osi.GetStackAmount, it) or have) + want - have)
+end
+local function lookPurses()
+    for standin in pairs(placed) do
+        local guid = vendorOf[standin]
+        if guid and q(Ext.Entity.Get, standin) then Stock.SetPurse(ledger, guid, goldOf(standin)) end
+        if not trading[standin] then placed[standin], funded[standin] = nil, nil end
+    end
+    saveLedger()
+end
+M.LookPurses = lookPurses
+-- A deal WoW refused: BG3 gives the member's gold back as WoW has it (the Gold part of reconcileMember). The merchant's
+-- purse goes the other way, or a refused buy (a full bag) would fill it for nothing.
+function M.Refunded(member, delta)
+    local guid = M.RefundOf[member]
+    M.RefundOf[member] = nil
+    if delta == 0 or not ledger then return end
+    for standin in pairs(placed) do
+        if vendorOf[standin] == guid then
+            setGold(standin, math.max(0, goldOf(standin) - delta))
+            return
+        end
+    end
+    local wares = ((lastInv or {}).Vendors or {})[guid] or {}
+    Stock.SetPurse(ledger, guid, math.max(0, Stock.PurseOf(ledger, guid, levelOf(wares)) - delta))
+    saveLedger()
 end
 
 
+local function lotOf(entry) return (M.Item(entry) or {}).bc or 1 end
 local function fillVendors(inv)
+    if not ledger then return end
     -- Every vendor's stand-in whose wares the bridge listed ahead (it lists every friendly NPC with a
     -- stand-in, server patch 0018) holds them before its trade screen opens.
     for standin, guid in pairs(WOWBG3MirrorOwned or {}) do
@@ -1073,7 +1177,7 @@ local function fillVendors(inv)
     for standin, guid in pairs(vendorOf) do
         local wares = (inv.Vendors or {})[guid]
         if wares then
-            fillHolder(standin, "V" .. guid .. ":", wares)
+            fillHolder(standin, "V" .. guid .. ":", Stock.Wares(ledger, guid, wares, lotOf))
         end
     end
     for standin, guid in pairs(corpseOf) do
@@ -1101,8 +1205,8 @@ function M.OpenVendor(standin, wowGuid, member)
     vendorOf[standin] = tostring(wowGuid)
     pcall(M.NotePieces) -- before the trade counts as open: its strays go
     trading[standin] = tick + TRADE_SETTLE
-    fundMerchant(standin)
     pcall(Osi.ClearTradeGeneratedItems, standin)
+    fundMerchant(standin)
     M.Request({Op = "vendor", Npc = tostring(wowGuid), Member = member})
 end
 -- A WoW corpse BG3 lets the player loot (a dead stand-in): asks WoW for its loot.
@@ -1298,7 +1402,12 @@ function M.Start(id)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)
     Ext.Osiris.RegisterListener("RemovedFrom", 2, "after", function(item, holder) onRemovedFrom(item, holder) end)
     pcall(Ext.Osiris.RegisterListener, "LongRestStarted", 0, "after", function() restGuard = tick + REST_START end)
-    pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER end)
+    pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER; M.Restock() end)
+    pcall(Ext.Osiris.RegisterListener, "PROC_LongRest", 0, "after", function() M.Restock() end)
+    -- A load in this same Lua state: that save's counts (Hero.lua makes a new token, WowSave.lua starts over the same way).
+    Ext.Events.GameStateChanged:Subscribe(function(e)
+        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded = nil, {}, {} end
+    end)
     -- A WoW mob's stand-in dying in BG3: its WoW loot goes on the BG3 corpse. The server makes the
     -- WoW corpse lootable a moment after the kill reaches it, so it is asked from 15 ticks on and every
     -- 30 ticks until WoW's answer has the loot (CORPSE_ASKS at most). It was asked at 30 and 120 ticks:
@@ -1376,6 +1485,8 @@ function M.Start(id)
         if tick % 10 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         if not made then M.MakeAll() end
         pcall(settleWares)
+        ledger = ledger or readLedger()
+        pcall(lookPurses)
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
         for u, f in pairs(M.Fresh) do
