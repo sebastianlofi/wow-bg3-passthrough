@@ -11,6 +11,7 @@ One verb each, no domain word in front:
   wowbg3cmd.py refill           HP, spell slots, rage... back to full (test helper)
   wowbg3cmd.py level N          the hero's WoW level (test helper, 1 to 60, also down)
   wowbg3cmd.py xprate [N]       the server's XP rate (kill, elite kill, quest, exploration); no N: show
+  wowbg3cmd.py learn SPELL | unlearn SPELL   give the hero a BG3 spell or take it back (test helper)
   wowbg3cmd.py waypoint [list] | waypoint go NAME   fast travel between known flight points (wow_waypoints.py)
   wowbg3cmd.py help
   --json on any party verb: the mod's whole answer
@@ -243,6 +244,24 @@ def party_usage():
     return '\n'.join(PARTY_HELP + ['refill - HP, spell slots, rage... back to full (test command)'])
 
 
+def live_run(ctx, action):
+    """BG3's RunId, refused when no game with the mod would answer a command."""
+    io = ctx.io
+    try:
+        run = json.load(open(io / 'm3-server.json'))['RunId']
+    except (OSError, ValueError, KeyError):
+        raise CmdError('%s: no BG3 run with the mod (wow-bg3/m3-server.json)' % action)
+    # Party.lua rewrites party.json at least every 300 ticks while a game runs: without a fresh one for
+    # this run, BG3 is not running (or sits in its menu, or is loading), and nothing would answer.
+    try:
+        live = json.load(open(io / 'party.json')).get('RunId') == run and time.time() - os.stat(io / 'party.json').st_mtime < 40
+    except (OSError, ValueError):
+        live = False
+    if not live:
+        raise CmdError('%s: BG3 is not running a game with the mod (no fresh wow-bg3/party.json)' % action)
+    return run
+
+
 def party(ctx, args, as_json=False):
     action = args[0].lower() if args else ''
     if action not in PARTY_ACTIONS:
@@ -261,18 +280,7 @@ def party(ctx, args, as_json=False):
         except Exception:  # noqa: BLE001
             pass
     io = ctx.io
-    try:
-        run = json.load(open(io / 'm3-server.json'))['RunId']
-    except (OSError, ValueError, KeyError):
-        raise CmdError('%s: no BG3 run with the mod (wow-bg3/m3-server.json)' % action)
-    # Party.lua rewrites party.json at least every 300 ticks while a game runs: without a fresh one for
-    # this run, BG3 is not running (or sits in its menu, or is loading), and nothing would answer.
-    try:
-        live = json.load(open(io / 'party.json')).get('RunId') == run and time.time() - os.stat(io / 'party.json').st_mtime < 40
-    except (OSError, ValueError):
-        live = False
-    if not live:
-        raise CmdError('%s: BG3 is not running a game with the mod (no fresh wow-bg3/party.json)' % action)
+    run = live_run(ctx, action)
     path = io / 'party-command.json'
     try:
         old = json.load(open(path))
@@ -858,11 +866,52 @@ def xp(ctx, args):
     ctx.say('XP rate now %sx (kill, elite kill, quest, exploration)' % n)
 
 
+# ---------------------------------------------------------------- learn, unlearn (test helper, Learn.lua)
+
+LEARN_ACTIONS = {'learn': 'Learn', 'unlearn': 'Unlearn'}
+
+
+def learn(ctx, verb, args):
+    """Through learn-command.json, its own files: party-command and stand-in-command are one job at a time and
+    the fight sends its own through them, so this one cannot disturb a fight."""
+    if len(args) != 1 or not re.fullmatch(r'\w{1,128}', args[0], re.A):
+        raise Usage('%s SPELL: the name in BG3\'s stats, e.g. %s Target_Grease' % (verb, verb))
+    spell = args[0]
+    run = live_run(ctx, verb)
+    path = ctx.io / 'learn-command.json'
+    try:
+        old = json.load(open(path))
+        seq = old.get('Sequence', 0) if old.get('RunId') == run else 0
+    except (OSError, ValueError):
+        seq = 0
+    seq += 1
+    atomic_write(path, json.dumps({'RunId': run, 'Sequence': seq, 'Action': LEARN_ACTIONS[verb], 'Spell': spell}))
+    for _ in range(80):
+        time.sleep(0.25)
+        try:
+            r = json.load(open(ctx.io / 'learn-result.json'))
+        except (OSError, ValueError):
+            continue
+        if r.get('RunId') == run and r.get('Sequence') == seq:
+            break
+    else:
+        raise CmdError('%s: no answer from the mod in 20 s (is BG3 running a game with the mod?)' % verb)
+    if not r.get('OK'):
+        raise CmdError('%s: %s' % (verb, r.get('Value')))
+    if verb == 'unlearn':
+        ctx.say('the hero no longer has %s' % spell)
+    elif (r.get('Value') or {}).get('Already'):
+        ctx.say('the hero already has %s' % spell)
+    else:
+        ctx.say('the hero now has %s; saving the game keeps it' % spell)
+
+
 # ---------------------------------------------------------------- chat dispatch
 
 # One verb each, no domain word in front and no second name for anything.
-VERBS = tuple(PARTY_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate', 'waypoint', 'report')
-TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate')
+VERBS = tuple(PARTY_ACTIONS) + tuple(LEARN_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate',
+                                                       'waypoint', 'report')
+TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate') + tuple(LEARN_ACTIONS)
 
 
 def verb_of(words):
@@ -896,6 +945,8 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
         waypoint(ctx, args)
     elif verb == 'level':
         level(ctx, args, wow_bg3_only=wow_bg3_only)
+    elif verb in LEARN_ACTIONS:
+        learn(ctx, verb, args)
     else:
         xp(ctx, args)
 
@@ -915,9 +966,10 @@ def help_lines(debug):
                 '/wowbg3 report - one file with the logs, to send when something is wrong',
                 '/wowbg3 time day | night | dawn | dusk | HH:MM | now - hold the light, for recording (now: this device\'s time)',
                 '/wowbg3 level N - set your WoW level, 1 to 60 (WoW, not BG3: it fills the pool)',
-                '/wowbg3 xprate N - the server\'s XP rate (1 normal); xprate: show']
+                '/wowbg3 xprate N - the server\'s XP rate (1 normal); xprate: show',
+                '/wowbg3 learn SPELL | unlearn SPELL - give the hero a BG3 spell by its stats name (Target_Grease), or take it back']
     else:
-        out.append('test commands (tp, where, find, faction, time, refill, level, xprate) are off: %s turns '
+        out.append('test commands (tp, where, find, faction, time, refill, level, xprate, learn, unlearn) are off: %s turns '
                    'them on' % SETTINGS_HINT)
     out.append(LEVEL_HINT)
     return out

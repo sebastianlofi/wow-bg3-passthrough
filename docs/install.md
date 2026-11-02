@@ -49,7 +49,7 @@ three minutes behind the loading screen). Later starts and loads take under a mi
   saves (snapshots), logs (`logs/`) and status files (`run/launcher.json`, `run/coord.json`).
 - Settings: `Mods/WOW-BG3/settings.conf` (WoW's sound, view distance, test chat commands). Read when
   BG3 starts. This beta ships `debug_commands = 1`, so every `/wowbg3` command typed in WoW's chat
-  works, the test ones included (`refill`, `tp`, `where`, `find`, `faction`, `level`, `xprate`); `0`
+  works, the test ones included (`refill`, `tp`, `where`, `find`, `faction`, `level`, `xprate`, `learn`, `unlearn`); `0`
   leaves only `help`, the party commands (`list`, `add`, `remove`, `pool`, `respec`) and `chat`.
 
 ## Saves

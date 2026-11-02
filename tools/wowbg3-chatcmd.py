@@ -2,7 +2,7 @@
 """wowbg3-chatcmd.py: answers `/wowbg3 ...` typed in WoW's chat.
 
 benilla (patch 0053) writes each command to LINK/chatcmd-request.txt; this helper runs it with the same
-code as the PC tools (wowbg3cmd.py: the party verbs, tp, where, find, faction, level, xprate, help) and writes the answer lines
+code as the PC tools (wowbg3cmd.py: the party verbs, tp, where, find, faction, level, xprate, learn, unlearn, help) and writes the answer lines
 to LINK/chatcmd-reply.txt, which benilla prints in WoW's chat. Run beside benilla (the release's
 coordinator starts it with the WoW side; on the PC harness by hand), no arguments:
 
@@ -10,7 +10,7 @@ coordinator starts it with the WoW side; on the PC harness by hand), no argument
 
 Environment: WOWBG3_LINK (benilla's link dir), WOWBG3_IO, WOW_CHAR, WOW_BG3_SERVER and
 WOWBG3_SERVER_VAR (wowbg3cmd.py); WOWBG3_DEBUG_COMMANDS=1 allows the test commands (tp, where, find, faction,
-level, xprate, refill), else `debug_commands = 1` in $WOWBG3_HOME/settings.conf; on in the beta.
+level, xprate, refill, learn, unlearn), else `debug_commands = 1` in $WOWBG3_HOME/settings.conf; on in the beta.
 Files (one line each, tab separated):
   request  `WCC1 <pid>`, then `<seq> <unix time> <WoW character> <text>`        (benilla's)
   reply    `<seq> <kind> <text>`, kind + a line, ! an error line, . the answer is complete   (ours)
@@ -82,9 +82,9 @@ def read_requests(path):
     return out
 
 
-# One command of a kind at a time (party-command.json, world-move.json and the server console each take
+# One command of a kind at a time (party-command.json, learn-command.json, world-move.json and the server console each take
 # one job); different kinds run side by side, so a long teleport never holds up a party list.
-LOCKS = {k: threading.Lock() for k in ('party', 'tele', 'server', 'other')}
+LOCKS = {k: threading.Lock() for k in ('party', 'learn', 'tele', 'server', 'other')}
 
 
 def kind_of(text):
@@ -99,6 +99,8 @@ def kind_of(text):
         return 'tele'
     if verb in ('level', 'xprate'):
         return 'server'
+    if verb in W.LEARN_ACTIONS:
+        return 'learn'
     return 'other'
 
 

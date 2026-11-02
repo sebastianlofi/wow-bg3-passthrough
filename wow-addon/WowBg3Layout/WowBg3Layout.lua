@@ -420,7 +420,7 @@ SlashCmdList["WOWBG3LAYOUT"] = function(msg)
     else
         -- Every other line goes to benilla (patch 0053), which passes it to the WOW-BG3 command
         -- helper and prints its answer here: list, add, remove, pool, levelup, catchup, respec, tp,
-        -- where, find, faction, refill, level, xprate, help.
+        -- where, find, faction, refill, level, xprate, learn, unlearn, help.
         if word == "" or word == "help" then
             DEFAULT_CHAT_FRAME:AddMessage("WOW-BG3: /wowbg3 chat on | off - hide or show WoW's chat (\"/wowbg3 chat\" alone toggles)")
         end

@@ -129,6 +129,9 @@ function Probe.Start(context)
         local okWs, errWs = pcall(function() Ext.Require("WowSave.lua").Start(report.RunId) end)
         if not okWs then Ext.Log.Print("WOW-BG3 wowsave unavailable: " .. tostring(errWs)) end
         if not okParty then Ext.Log.Print("WOW-BG3 party: " .. tostring(errParty)) end
+        -- /wowbg3 learn, unlearn: a BG3 spell for the hero (test command, files of its own).
+        local okLearn, errLearn = pcall(function() Ext.Require("Learn.lua").Start(report.RunId) end)
+        if not okLearn then Ext.Log.Print("WOW-BG3 learn: " .. tostring(errLearn)) end
         -- WoW portraits (BG3's custom-icon component) and WoW levels (display only) on stand-ins.
         local okPortraits, errPortraits = pcall(function() Ext.Require("Portraits.lua").Start(report.RunId, "server") end)
         if not okPortraits then Ext.Log.Print("WOW-BG3 portraits: " .. tostring(errPortraits)) end

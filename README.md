@@ -201,6 +201,7 @@ Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.c
 | `/wowbg3 time day`, `night`, `dawn`, `dusk`, `HH:MM`, `now` | Hold the world's light at that time, for recording, until `now` or the next start of the game. The server's clock does not change |
 | `/wowbg3 level N` | Set your WoW level, 1 to 60 (it fills the pool: BG3's Level Up shows on the party) |
 | `/wowbg3 xprate N` | The server's XP rate (1 is normal) |
+| `/wowbg3 learn SPELL`, `unlearn SPELL` | Give your hero a BG3 spell by its stats name (`Target_Grease`), or take it back |
 
 ## Install
 
