@@ -414,6 +414,42 @@ class ArenaWait(unittest.TestCase):
         self.assertEqual(self.run_arena('Place', ['client', 'server']), (True, 'server'))
 
 
+@unittest.skipIf(lupa is None, 'needs the lupa module')
+class StatusReport(unittest.TestCase):
+    """WorldMode.lua's world-status.json: a job of the mod's own (extend) ending after a command's job keeps the
+    command's Seq there, so the bridge's wait_done still sees it (0.1.3013.61: a move's Reorigin report lost)."""
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        L.execute(r'''
+          saved = nil
+          Ext = {IO = {SaveFile = function(n, v) saved = v end}, Json = {Stringify = function(t) return t end}}
+          M, runId, ticks, jobs, clicks, rclicks, state = {}, "run", 0, {}, 0, 0, nil
+        ''')
+        text = (LUA / 'WorldMode.lua').read_text()
+        body = text[text.index('    -- report: how the bridge'):text.index("    -- BG3's own mute")]
+        L.execute('function make()\n' + body + '\nreturn jobDone, writeStatus, function() return lastExtra end end\n'
+                  'jobDone, writeStatus = make()')
+
+    def status(self):
+        s = self.L.globals().saved
+        return {k: s[k] for k in ('Last', 'Seq', 'OK', 'Error')}, s['Chore']
+
+    def test_an_extend_after_a_reorigin_keeps_its_seq(self):
+        self.L.execute('jobDone({name = "Reorigin", seq = 7}, true)')
+        self.L.execute('jobDone({name = "extend"}, false, "Extend: no result")')
+        report, chore = self.status()
+        self.assertEqual(report, {'Last': 'Reorigin', 'Seq': 7, 'OK': True, 'Error': None})
+        self.assertEqual((chore['Name'], chore['OK'], chore['Error']), ('extend', False, 'Extend: no result'))
+        self.L.execute('writeStatus()')  # the 600-tick status too
+        self.assertEqual(self.status()[0]['Seq'], 7)
+
+    def test_the_next_command_replaces_the_report(self):
+        self.L.execute('jobDone({name = "extend"}, true); jobDone({name = "Stream", seq = 8}, false, "Place refused")')
+        report, chore = self.status()
+        self.assertEqual(report, {'Last': 'Stream', 'Seq': 8, 'OK': False, 'Error': 'Place refused'})
+        self.assertIsNone(chore)
+
+
 FAKE_ARENA = """import sys, pathlib
 out = pathlib.Path(sys.argv[1])
 if '--fail' in sys.argv:

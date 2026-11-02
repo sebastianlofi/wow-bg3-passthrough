@@ -426,10 +426,20 @@ function M.Start(runId)
                 -- World mode stops (a hearthstone, a graveyard port, /wowbg3 tp): BG3's surfaces stay at
                 -- their BG3 coordinates while the WoW point those coordinates stand for changes, so a
                 -- Grease patch would show up on the new place's ground (its inn's floor).
+                -- The void's ground is the placed pool subgrids alone: the plugin's op 60 hands every tile of them that
+                -- holds a ground or cloud surface to BG3's own cell removal (as Place does before it moves one).
+                -- It was Osi.RemoveSurfaceLayer round the hero, 130 m: BG3 makes that a removal action over every
+                -- tile in the circle, surface or not, and adds each to the SurfaceManager's changed cells after a
+                -- linear search of that list (bg3+0x389b290 from the action's Update bg3+0x389ac70), so n tiles
+                -- cost n * n / 2 compares: the server ran no tick for 1 to 7 s after each Start, move and Stop
+                -- (0.1.3013.61's stall trace: every stack there, every stall within 0.6 s of this call).
                 local u = c.Target  -- the hero, not one of the stand-ins live() is for
                 assert(type(u) == "string", "ClearSurfaces needs a Target")
-                for _, layer in ipairs({"Ground", "Cloud"}) do Osi.RemoveSurfaceLayer(u, layer, tonumber(c.Radius) or 130.0) end
-                return {Cleared = u}
+                local N = Ext.Require("WowNative.lua")
+                local out = N.Call(N.Op.PoolSurfaces, -1, 1)
+                if out.Err == 61 then return {Cleared = u, Pool = false} end -- no pool out: no void ground to clear
+                if out.Err ~= 0 then error("wowbg3: " .. tostring(out.Why or out.Err), 0) end
+                return {Cleared = u, Ground = out.R[1], Cloud = out.R[2], Subgrids = out.R[3]}
             elseif c.Action == "Teleport" or c.Action == "Return" then
                 local uuid = (c.Target == Hero.Uuid() or (c.Action == "Return" and type(c.Target) == "string" and home[c.Target]))
                     and c.Target or live(c.Target)

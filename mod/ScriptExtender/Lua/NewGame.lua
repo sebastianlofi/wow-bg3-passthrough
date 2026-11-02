@@ -216,7 +216,7 @@ local function startServer(runId)
         for _, row in ipairs(q(function() return Osi.DB_DialogSpeakers:Get(nil, nil, nil) end) or {}) do
             if hero and tostring(row[2]):find(hero, 1, true) and #status.Stopped < 8 then
                 local ok, err = pcall(Osi.DialogRequestStop, hero)
-                status.Stopped[#status.Stopped + 1] = {Instance = row[1], OK = ok, Error = ok and nil or tostring(err)}
+                status.Stopped[#status.Stopped + 1] = {Instance = row[1], OK = ok, Error = (not ok) and tostring(err) or nil}
                 note("a dialog ran on the hero (instance " .. tostring(row[1]) .. "): DialogRequestStop " .. (ok and "sent" or tostring(err)))
                 save()
                 break

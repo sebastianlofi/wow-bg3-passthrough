@@ -1152,6 +1152,8 @@ bool pool_same_spot(PoolSub const& s, float minX, float minZ) {
 // standable spot (the flood bg3+0x349d6a0, capped at 30000 tiles by BG3's FindValidPosition and 15 other
 // callers) found the tiles round her blocked as well and could run to its cap; BG3's server ran no tick for
 // 7 to 13.5 s after such re-origins (0.1.3013.59). Out of every patch the storey competes for no column.
+// The stall trace of 0.1.3013.61 found no flood: the stalls left were BG3's surface removal round the hero
+// (StandIns.lua ClearSurfaces, now op 60).
 bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::vector<unsigned char> const& raw,
                 int* counts, char const** why) {
     auto& p = g_pool[client ? 1 : 0];

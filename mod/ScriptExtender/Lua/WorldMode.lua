@@ -189,15 +189,30 @@ function M.Start(runId)
     M.Running = function() return state ~= nil and state.Started == true end
     M.IsActive = function() return M.Running() and not M.InCamp() end
 
-    local lastExtra = {}
-    local function writeStatus(extra)
-        if extra then lastExtra = extra end
+    -- report: how the bridge's last command ended (Last, Seq, OK, Error); the bridge waits for its command's Seq.
+    -- lastExtra: the mod's own numbers since then. A job of the mod's own (extend, the camp trips) has no Seq and
+    -- reports in Chore, beside the command's report: it used to write {Last = "extend"} over it. In the 0.1.3013.61
+    -- test the session's Extend (every 14400 ticks) fell due as a Reorigin ended, the bridge's 0.2 s poll never
+    -- saw the Reorigin's Seq, and a move that had worked went on to Stop and Start after 45 s.
+    local lastExtra, report = {}, {}
+    local function writeStatus(r)
+        if r then report, lastExtra = r, {} end
         local s = {RunId = runId, Tick = ticks, Active = state ~= nil, Jobs = #jobs, PointerHook = M.InputHook,
             PointerEvents = M.InputEvents or 0, Clicks = clicks, RightClicks = rclicks,
             WindowClicks = M.WindowClicks or 0, LastWindow = M.LastWindow}
         for k, v in pairs(lastExtra) do s[k] = v end
+        for k, v in pairs(report) do s[k] = v end
         s.LevelBounds = M.LevelBounds
         Ext.IO.SaveFile("wow-bg3/world-status.json", Ext.Json.Stringify(s))
+    end
+    local function jobDone(job, ok, err)
+        local why = (not ok) and tostring(err) or nil  -- `ok and nil or x` is always x
+        if job.seq then
+            writeStatus({Last = job.name, Seq = job.seq, OK = ok, Error = why})
+        else
+            lastExtra.Chore = {Name = job.name, OK = ok, Error = why}
+            writeStatus()
+        end
     end
 
     -- BG3's own mute: BG3's master volume RTPC is RTPC_Volume_MAIN (the name in BG3's
@@ -719,8 +734,7 @@ function M.Start(runId)
             local ok, err = coroutine.resume(job.co)
             if not ok or coroutine.status(job.co) == "dead" then
                 table.remove(jobs, 1)
-                -- Seq: the bridge waits for its command's report before sending the next one.
-                writeStatus({Last = job.name, Seq = job.seq, OK = ok, Error = ok and nil or tostring(err)})
+                jobDone(job, ok, err)
                 if not ok then Ext.Log.Print("WOW-BG3 world " .. job.name .. " failed: " .. tostring(err)) end
             end
         end
@@ -768,7 +782,7 @@ function M.Start(runId)
         if not c or c.RunId ~= runId or math.type(c.Sequence) ~= "integer" or c.Sequence <= sequence then return end
         sequence = c.Sequence
         local fn = ({Start = start, Stream = stream, Reorigin = reorigin, Stop = stop, Research = research})[c.Action]
-        if not fn then writeStatus({Last = tostring(c.Action), OK = false, Error = "unknown action"}); return end
+        if not fn then writeStatus({Last = tostring(c.Action), Seq = c.Sequence, OK = false, Error = "unknown action"}); return end
         jobs[#jobs + 1] = {name = c.Action, seq = c.Sequence, co = coroutine.create(function() return fn(c) end)}
     end)
 end
