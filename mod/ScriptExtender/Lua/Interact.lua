@@ -20,11 +20,8 @@
 --         story does (PROC_StartTrade) and asks inventory for the wares.
 --   Examine, Attack...: BG3's own (Examine: the WoW name and level, Names.lua, Portraits.lua).
 -- Left clicks on a friendly NPC (WowCursor.lua decides, WorldMode.lua sends; client): the client
--- writes link/friendlyclick.txt, "<seq> talk|pickpocket <guid hex> <stand-in uuid>", and this module
--- runs it: talk as BG3's Talk does (below), pickpocket as BG3's own (Osiris RequestPickpocket, which
--- opens BG3's pickpocket window on the stand-in) once the hero stands within PICK_REACH m of it: one
--- further away (up to PICK_FAR m) is walked to first (Osiris CharacterMoveToPosition, as errands are),
--- as BG3's own click on the stand-in would.
+-- writes link/friendlyclick.txt, "<seq> talk <guid hex> <stand-in uuid>", and this module runs it as
+-- BG3's Talk does (below). A pickpocket is BG3's own click (WorldMode.lua).
 -- The request goes to benilla through link/wowuse.bin (BG3 -> WoW, little endian, 24 bytes):
 --   "WUS1", seq u32, the creature's WoW guid lo u32, hi u32, verb u32 (1 talk; 2 reserved), seq again.
 -- benilla runs its own dispatcher on that guid as a right-click on it would.
@@ -180,39 +177,6 @@ local function syncTalk()
         end
     end
 end
--- A pickpocket waiting for the hero to reach its NPC (see the header).
-local PICK_REACH, PICK_FAR, PICK_WAIT = 2.2, 12.0, 300
-local pendingPick = nil -- {Uuid, Until, Moved}
-local function posOf(uuid)
-    local ok, x, y, z = pcall(Osi.GetPosition, uuid)
-    return ok and x and {x, y, z} or nil
-end
-local function stepPick()
-    local p = pendingPick
-    if not p then return end
-    local hero = Hero.Uuid()
-    local hp, tp = posOf(hero), posOf(p.Uuid)
-    if ticks > p.Until or not (hp and tp) then
-        pendingPick = nil
-        note("click", {"pickpocket", p.Uuid}, "not reached")
-        return
-    end
-    local dx, dz = hp[1] - tp[1], hp[3] - tp[3]
-    local d = math.sqrt(dx * dx + dz * dz)
-    if d <= PICK_REACH then
-        pendingPick = nil
-        local ok, err = pcall(Osi.RequestPickpocket, hero, p.Uuid)
-        M.Stats.Pickpockets = (M.Stats.Pickpockets or 0) + 1
-        note("click", {"pickpocket", p.Uuid}, ok and "BG3's pickpocket" or tostring(err))
-    elseif d > PICK_FAR then
-        pendingPick = nil
-        note("click", {"pickpocket", p.Uuid}, "too far")
-    elseif not p.Moved then
-        p.Moved = true
-        local k = (PICK_REACH - 0.6) / d
-        pcall(Osi.CharacterMoveToPosition, hero, tp[1] + dx * k, tp[2], tp[3] + dz * k, "Walk", "", 1)
-    end
-end
 -- The client's left clicks on friendly NPCs (see the header); the record there at the first look is
 -- from before this session.
 local clickSeq = nil
@@ -228,9 +192,6 @@ local function readClick()
     if verb == "talk" then
         M.Stats.Clicks = (M.Stats.Clicks or 0) + 1
         M.Use(USE_TALK, s.Guid, "left click")
-    elseif verb == "pickpocket" then
-        pendingPick = {Uuid = uuid:sub(-36), Until = ticks + PICK_WAIT}
-        stepPick()
     end
 end
 function M.Start(runId)
@@ -250,7 +211,6 @@ function M.Start(runId)
         ticks = ticks + 1
         if ticks % 5 == 2 then pcall(readTrade) end
         pcall(readClick)
-        if pendingPick and ticks % 3 == 0 then pcall(stepPick) end
         if ticks % 15 ~= 7 then return end
         pcall(syncTalk)
         local c = readJson("wow-bg3/interact-command.json")

@@ -42,7 +42,7 @@
 -- the unit, benilla 0067), and the click does the same either way (WOWBG3FriendlyClick, read by
 -- WorldMode.lua):
 --   sneaking (the hero has eoc::sneak::IsSneakingComponent): pickpocket, BG3's PickPocket cursor; BG3's
---     own click when BG3 picks that stand-in, else Interact.lua's RequestPickpocket;
+--     own click, aimed at the stand-in by WorldMode.lua when BG3 picks it elsewhere than this pixel;
 --   walking, an NPC WoW has something for (a service in UNIT_NPC_FLAGS, benilla's wowbody/<guid>.txt): talk,
 --     WoW's cursor for it (Talk, the merchant or quest cursor) and WoW's interact (Interact.lua);
 --   walking, an NPC with nothing to say: no Talk cursor, BG3's plain click (Tav walks there).
