@@ -39,7 +39,7 @@ class Scaling(unittest.TestCase):
         n = self.mob(60, 4059, 120.9)
         self.assertEqual(n['Rank'], 'normal')
         self.assertEqual(n['E'], 18)
-        self.assertEqual(n['MaxHp'], 184)     # (6 + 1.37 x 18) x 6
+        self.assertEqual(n['MaxHp'], 166)
         self.assertEqual(n['AC'], 20)
         self.assertEqual(n['ToHit'], 12)
         self.assertAlmostEqual(n['Damage'], 0.30 * 0.65 * 147, places=0)
@@ -58,6 +58,14 @@ class Scaling(unittest.TestCase):
             other = self.mob(40, 1865, 66.7, **party)
             for k in ('E', 'MaxHp', 'Damage', 'AC', 'ToHit', 'DC', 'Save'):
                 self.assertEqual(other[k], base[k], (k, party))
+
+    def test_a_solo_level_one_mob(self):
+        n = self.mob(1, 42, 2.1)
+        self.assertEqual(n['MaxHp'], 10)
+        self.assertLess(n['Damage'], 2.2)
+
+    def test_slots_at_the_first_levels(self):
+        self.assertEqual([self.mob(w, self.M.NORMAL_HP[w], self.M.NORMAL_HIT[w])['MaxHp'] for w in (2, 3, 4)], [20, 28, 37])
 
     def test_normal_hp_only_rises_with_level(self):
         hp = [self.mob(w, self.M.NORMAL_HP[w], self.M.NORMAL_HIT[w])['MaxHp'] for w in range(1, 61)]

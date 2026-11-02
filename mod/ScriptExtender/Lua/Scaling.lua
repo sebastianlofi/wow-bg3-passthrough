@@ -15,7 +15,7 @@
 -- From the WoW mob only its level, max HP, hit and the map are read. Rank comes from its HP against a
 -- normal mob of its level (a rare is a normal; vmangos' rank is not in the mirror plan).
 --
--- HP = party damage a member-turn at E x member-turns of the rank x (mob's WoW HP / its rank's usual) ^ 0.5
+-- HP = M.NORMAL_BG3_HP at the mob's level x member-turns of the rank against a normal's x (mob's WoW HP / its rank's usual) ^ 0.5.
 -- Each mob's numbers are set when it first appears and never change.
 -- AC, to-hit, DC and saves: BG3's Combatant curve at E, plus the rank's. Damage: a share of a member's HP
 -- at E. One attack a turn: the boss's extra attacks and area ability of the research are in that one hit.
@@ -23,7 +23,21 @@
 local M = {}
 
 -- A Fighter, Cleric, Rogue, Wizard party, levels 1 to 18:
-M.DPR_AT, M.DPR_PER = 6.0, 1.37 -- at-will damage per member-turn: a straight line through the simulator's levels, so HP only rises
+-- A normal mob's BG3 HP by WoW level, solved offline against the party a player has at that level (the slots at WoW 1 to 4,
+-- then four; tools/balance-sim): one mob for a solo mage about 3 rounds; from WoW 4, four against 2 comfortable, 4 a bit of a
+-- challenge, 6 harder but doable. It only rises. Pairs of level, HP; straight between them.
+M.NORMAL_BG3_HP = {1, 10, 2, 20, 3, 28, 4, 37, 5, 38, 8, 39, 10, 41, 13, 50, 15, 63, 18, 82, 20, 88, 23, 90, 25, 91, 28, 100, 30, 108,
+    35, 133, 40, 143, 45, 151, 50, 156, 55, 161, 60, 166}
+function M.NormalHp(level)
+    local t = M.NORMAL_BG3_HP
+    if level >= t[#t - 1] then return t[#t] + (level - t[#t - 1]) end
+    for i = 1, #t - 2, 2 do
+        if level <= t[i + 2] then return t[i + 1] + (t[i + 3] - t[i + 1]) * (level - t[i]) / (t[i + 2] - t[i]) end
+    end
+end
+M.NORMAL_TURNS = 6
+-- A level 1 mage has about 8 HP and fights alone: a lighter hit at WoW 1, so a single mob is seldom the end of it.
+M.FIRST_LEVEL_DAMAGE = 0.67
 M.MEMBER_HP = {10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 99, 107, 115, 123, 131, 139, 147}
 -- WoW: spawn-weighted median HP and hit of normal open-world mobs for levels 1 to 63 (vmangos), spikes
 -- from a few odd mobs taken out.
@@ -96,10 +110,9 @@ function M.Compute(c)
     local rank = M.RankOf(rel, c.Map)
     local r = M.RANKS[rank]
     local turns = math.min(M.TURNS_CAP, r.Turns * (rel / r.Rel) ^ 0.5)
-    local dpr = M.DPR_AT + M.DPR_PER * E
-    local hp = dpr * turns * d.HP
+    local hp = M.NormalHp(c.Level) * turns / M.NORMAL_TURNS * d.HP
     local share = math.max(r.Low, math.min(r.High, 0.30 * (1 - 0.035 * math.max(0, E - 8)) * math.max(reld, 0.01) ^ 0.35))
-    local damage = share * lerp(M.MEMBER_HP, E) * d.Damage
+    local damage = share * lerp(M.MEMBER_HP, E) * d.Damage * (c.Level <= 1 and M.FIRST_LEVEL_DAMAGE or 1)
     return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(1, round(hp)), Damage = damage,
         AC = math.max(12, round(10.7 + 0.5 * E)) + r.AC,
         ToHit = math.max(3, round(2.2 + 0.57 * E)) + r.Hit + d.Hit - round(M.MISS * math.max(0, 1 - damage)),
