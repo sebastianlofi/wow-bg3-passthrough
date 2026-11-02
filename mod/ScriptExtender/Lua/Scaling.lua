@@ -22,9 +22,8 @@
 -- All BG3 boosts, all applied by Mirrors.lua.
 local M = {}
 
--- At-will damage per member-turn against BG3's AC of that level, and a member's HP, for levels 1 to 18:
--- a Fighter, Cleric, Rogue, Wizard party, from the simulator.
-M.DPR = {7.5, 7.3, 7.8, 8.3, 15.7, 14.6, 15.7, 16.0, 19.5, 20.6, 24.5, 23.1, 25.7, 26.5, 27.1, 25.6, 28.6, 26.8}
+-- A Fighter, Cleric, Rogue, Wizard party, levels 1 to 18:
+M.DPR_AT, M.DPR_PER = 6.0, 1.37 -- at-will damage per member-turn: a straight line through the simulator's levels, so HP only rises
 M.MEMBER_HP = {10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 99, 107, 115, 123, 131, 139, 147}
 -- WoW: spawn-weighted median HP and hit of normal open-world mobs for levels 1 to 63 (vmangos), spikes
 -- from a few odd mobs taken out.
@@ -97,7 +96,8 @@ function M.Compute(c)
     local rank = M.RankOf(rel, c.Map)
     local r = M.RANKS[rank]
     local turns = math.min(M.TURNS_CAP, r.Turns * (rel / r.Rel) ^ 0.5)
-    local hp = lerp(M.DPR, E) * turns * d.HP
+    local dpr = M.DPR_AT + M.DPR_PER * E
+    local hp = dpr * turns * d.HP
     local share = math.max(r.Low, math.min(r.High, 0.30 * (1 - 0.035 * math.max(0, E - 8)) * math.max(reld, 0.01) ^ 0.35))
     local damage = share * lerp(M.MEMBER_HP, E) * d.Damage
     return {E = E, Rank = rank, Rel = rel, MaxHp = math.max(1, round(hp)), Damage = damage,
