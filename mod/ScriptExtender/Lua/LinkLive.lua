@@ -132,9 +132,11 @@ end
 -- party can help her up), so the hero's HP reads 1 for the WoW side until then; the hero dead, or
 -- every companion down too, is the WoW death as before (ActionMonitor's Party). Now any
 -- standing companion counts, in BG3's combat or not (one just revived by a scroll is not flagged in
--- combat yet; BG3 itself shows no game over while anyone stands).
+-- combat yet; BG3 itself shows no game over while anyone stands). Down is BG3's verdict, not the HP: 0 HP
+-- alone can be the moment before Relentless Endurance puts a half-orc at 1, and that moment gave a false defeat
+-- that killed the WoW character (playtest feedback: "randomly ended after going down to 1 health").
 local function standing(m)
-    return type(m) == "table" and m.Dead ~= true and m.Downed ~= true and (tonumber(m.Hp) or 0) > 0
+    return type(m) == "table" and m.Dead ~= true and m.Downed ~= true
 end
 local function partyHolds(r)
     if type(r) ~= "table" or type(r.Party) ~= "table" then return false end
@@ -146,6 +148,14 @@ local function partyHolds(r)
         end
     end
     return stands and not heroDead
+end
+-- The hero at 0 HP whom BG3 has not put down or dead (see `standing`).
+local function heroNotDownYet(r)
+    if type(r) ~= "table" or type(r.Party) ~= "table" then return false end
+    for _, m in ipairs(r.Party) do
+        if type(m) == "table" and m.Hero == true then return standing(m) end
+    end
+    return false
 end
 -- Whether any party member stands (nil: the monitor has no party yet).
 local function partyStands(r)
@@ -163,7 +173,7 @@ local function health(uuid)
         local r = monitor()
         local hp = r and r.State and r.State.Hp
         if type(hp) == "table" and math.type(hp[1]) == "integer" then
-            if hp[1] <= 0 and partyHolds(r) then return 1, hp[2] end
+            if hp[1] <= 0 and (partyHolds(r) or heroNotDownYet(r)) then return 1, hp[2] end
             return hp[1], hp[2]
         end
     end
