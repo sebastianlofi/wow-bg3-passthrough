@@ -287,6 +287,15 @@ function M.Start(runId)
     -- The WoW HP fraction to give her once BG3's resurrection has landed (it restores full HP a
     -- moment after the Resurrect call, over a SetHitpointsPercentage made right after it).
     local reviveFrac, reviveAt = nil, 0
+    -- BG3's non-lethal hit: WoW has no knocked out, so it is a kill. Dying here gives WoW's own corpse, loot, XP and respawn.
+    pcall(Ext.Osiris.RegisterListener, "StatusApplied", 4, "after", function(o, status)
+        if status ~= "KNOCKED_OUT" then return end
+        local u = uuidOf(o)
+        if u and (M.Owned[u] or (WOWBG3FightSpawned and WOWBG3FightSpawned[u])) then
+            pcall(Osi.RemoveStatus, u, status, "")
+            pcall(Osi.Die, u, 0, "NULL_00000000-0000-0000-0000-000000000000", 0, 0)
+        end
+    end)
     pcall(Ext.Osiris.RegisterListener, "Resurrected", 1, "after", function(c)
         if reviveFrac and Hero.Is(tostring(c)) then
             pcall(Osi.SetHitpointsPercentage, Hero.Uuid(), 100.0 * reviveFrac)
