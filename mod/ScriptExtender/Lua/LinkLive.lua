@@ -62,6 +62,7 @@ local Probe = Ext.Require("ActionProbe.lua")
 local World = Ext.Require("WorldMode.lua")
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
 local TurnQueue = Ext.Require("TurnQueue.lua") -- which turn WoW hears next (BG3's turn events and flag)
+local JoinWatch = Ext.Require("JoinWatch.lua") -- a failed join's stand-in: in BG3's fight anyway?
 -- standins.bin's seq, rising across fights; mod-wide (client), as MirrorsClient.lua writes the file
 -- too for robbed NPCs searching outside a fight. WOWBG3SinAt: when this file wrote it last.
 WOWBG3SinSeq = WOWBG3SinSeq or 0
@@ -379,17 +380,36 @@ local function newBackend(actors, void, runId, session)
     end
     -- Mirrors.lua's report (link/mirror-status.json): a mirrored mob's stand-in, Tav's combat.
     local function mirrorStatus() return readJson("link/mirror-status.json") end
+    -- A mirrored mob's living stand-in by the server's word (Mirrors.lua lists only stand-ins BG3 has):
+    -- the record; false for none (no mirrors this run); nil while the file does not parse (caught
+    -- mid-write). Not this context's entity: the client can hold nothing of a stand-in BG3's server runs
+    -- (memberReading), and a second stand-in spawned for such a mob would leave the first one in BG3's
+    -- combat with WoW knowing nothing of it.
     local function mirrorOf(guid)
-        local st = mirrorStatus()
-        local m = st and type(st.Mobs) == "table" and st.Mobs[guid]
-        if type(m) == "table" and type(m.Uuid) == "string" and m.Dead ~= true and Ext.Entity.Get(m.Uuid) then return m end
+        local raw = Ext.IO.LoadFile("wow-bg3/link/mirror-status.json")
+        if not raw then return false end
+        local okp, st = pcall(Ext.Json.Parse, raw)
+        if not (okp and type(st) == "table") then return nil end
+        if st.RunId ~= runId or type(st.Mobs) ~= "table" then return false end
+        local m = st.Mobs[guid]
+        if type(m) == "table" and type(m.Uuid) == "string" and m.Dead ~= true then return m end
+        return false
     end
     -- Spawn, scale and (unless setup joins later) join one stand-in for a protocol actor; in world
-    -- mode a mirrored mob's existing stand-in is adopted instead.
-    local function addStandIn(a, joinCombat)
-        local mirror = inWorld and mirrorOf(a.wow_guid)
+    -- mode a mirrored mob's existing stand-in is adopted instead. got (optional) learns the stand-in
+    -- as soon as there is one (Uuid, Mirror), so a join that fails later knows what BG3 may hold.
+    local function addStandIn(a, joinCombat, got)
+        got = got or {}
+        local mirror = false
+        if inWorld then
+            waitFor(function()
+                mirror = mirrorOf(a.wow_guid)
+                return mirror ~= nil
+            end, 60, "mirror-status.json does not read")
+        end
         if mirror then
             local uuid = mirror.Uuid
+            got.Uuid, got.Mirror = uuid, true
             actors[a.id], byUuid[uuid], guids[a.id] = uuid, a.id, a.wow_guid
             adopted[uuid] = mirror.InCombat == true and "in combat" or "joins"
             scaled[a.id] = {Adopted = uuid, Kind = specs[a.id] and specs[a.id].Kind, Name = specs[a.id] and specs[a.id].Name,
@@ -422,6 +442,7 @@ local function newBackend(actors, void, runId, session)
             Guid = a.wow_guid,
             Percent = percent and percent < 100 and percent or nil})
         local uuid = assert(v.Created, "spawn returned no stand-in")
+        got.Uuid, got.Mirror = uuid, false
         made[#made + 1], actors[a.id], byUuid[uuid], guids[a.id] = uuid, uuid, a.id, a.wow_guid
         wait(30)
         scaleStandIn(a.id, uuid)
@@ -539,6 +560,58 @@ local function newBackend(actors, void, runId, session)
         add("hero", Hero.Uuid())
         for _, a in ipairs(enemies) do add(a.id, actors[a.id], a) end
         return list
+    end
+    -- Joins that failed with a stand-in there (logs: two kobolds left out of the roster while another
+    -- writer used stand-in-command.json, as BG3 had their mirrors in its combat; BG3 killed them and WoW
+    -- never heard). Such a stand-in is a member once BG3 has it in its fight or killed it
+    -- (JoinWatch.lua); one this fight spawned and BG3 does not have goes again, so it never wanders in
+    -- unknown. Mirrors stay Mirrors.lua's and are watched for the rest of the fight.
+    local outside = {} -- actor id -> {Actor, Uuid, Mirror}
+    local function member(a, uuid)
+        actors[a.id], byUuid[uuid], guids[a.id] = uuid, a.id, a.wow_guid
+        rest[a.id] = positionOf(uuid)
+        enemies[#enemies + 1] = a
+    end
+    local function serverWord()
+        if serverStatusAt ~= ticks then serverStatus, serverStatusAt = mirrorStatus(), ticks end
+        return serverStatus
+    end
+    -- The outside stand-ins BG3 has in its fight become members; true when one did (a Roster is due).
+    local function adoptOutside()
+        if not next(outside) then return false end
+        local st, any = serverWord(), false
+        for id, o in pairs(outside) do
+            if JoinWatch.Member(st, o.Actor.wow_guid, o.Uuid, o.Mirror) then
+                outside[id] = nil
+                member(o.Actor, o.Uuid)
+                scaled[id] = scaled[id] or {}
+                scaled[id].JoinedLate = true
+                Ext.Utils.Print("WOW-BG3 join: " .. id .. " " .. tostring(o.Actor.wow_guid) .. " is in BG3's fight after all: a member")
+                any = true
+            end
+        end
+        return any
+    end
+    -- A Join that failed (in the join coroutine: it may wait on commands). Logged, with the stand-in it
+    -- left; that one is watched (adoptOutside), and one this fight spawned goes at once unless BG3 has it.
+    local function joinFailed(a, got, err)
+        scaled[a.id] = scaled[a.id] or {}
+        scaled[a.id].JoinFailed = tostring(err)
+        local uuid = got.Uuid
+        Ext.Utils.Print("WOW-BG3 join: " .. a.id .. " " .. tostring(a.wow_guid) .. " failed: " .. tostring(err)
+            .. (uuid and (" (stand-in " .. uuid .. (got.Mirror and ", its mirror)" or ", spawned)")) or " (no stand-in)"))
+        if uuid and actors[a.id] == uuid then actors[a.id] = nil end
+        if uuid and byUuid[uuid] == a.id then byUuid[uuid] = nil end
+        if not uuid then return end
+        outside[a.id] = {Actor = a, Uuid = uuid, Mirror = got.Mirror}
+        if adoptOutside() or got.Mirror then return end
+        local ok, errr = pcall(standIn, {Action = "Remove", Target = uuid})
+        if ok then
+            outside[a.id] = nil
+            for i, u in ipairs(made) do if u == uuid then table.remove(made, i); break end end
+        else
+            Ext.Utils.Print("WOW-BG3 join: " .. a.id .. " stand-in not removed: " .. tostring(errr))
+        end
     end
     -- BG3's own camera for hero actions: its cursor picking ignores an imposed rotation.
     local holdSince = 0
@@ -737,7 +810,8 @@ local function newBackend(actors, void, runId, session)
 
     -- World fights: more enemies join the running encounter. Spawns run one Join at a time
     -- beside the turns (poll); Roster answers each with joins counted, and an actor missing from
-    -- it (spawn refused, stand-in limit) did not join.
+    -- it (spawn refused, stand-in limit) did not join, until BG3 has its stand-in after all (adoptOutside:
+    -- a later Roster lists it).
     function B.join(m)
         if not void then return nil, "joins need a void fight" end
         for _, a in ipairs(m.actors) do guids[a.id] = a.wow_guid end
@@ -1068,6 +1142,9 @@ local function newBackend(actors, void, runId, session)
             outcome = (hp and hp <= 0) and "defeat" or "victory"
         end
         if not over then return end
+        -- Never over while a failed join's stand-in is in BG3's fight: it is a member first (its HP,
+        -- its death), and BG3's fight goes on with it.
+        if inWorld and adoptOutside() then return ad:roster(joinsDone, rosterActors()) end
         -- The last blow may have come from a direct BG3 action (world mode): WoW hears every final
         -- HP (the kill gives the server's credit) before the fight is over.
         for id, uuid in pairs(actors) do
@@ -1240,11 +1317,9 @@ local function newBackend(actors, void, runId, session)
                         joining = coroutine.create(function(a)
                             loadSpecs()
                             for _, actor in ipairs(list) do
-                                local okj, errj = pcall(addStandIn, actor, true)
-                                if not okj then
-                                    scaled[actor.id] = scaled[actor.id] or {}
-                                    scaled[actor.id].JoinFailed = tostring(errj)
-                                end
+                                local got = {}
+                                local okj, errj = pcall(addStandIn, actor, true, got)
+                                if not okj then joinFailed(actor, got, errj) end
                             end
                             joinsDone = joinsDone + 1
                             return a:roster(joinsDone, rosterActors())
@@ -1255,11 +1330,16 @@ local function newBackend(actors, void, runId, session)
                         if not okc then joining = nil; error("join: " .. tostring(errc), 0) end
                         if coroutine.status(joining) == "dead" then joining = nil end
                     elseif ticks % 30 == 0 and not job and not npc and not ad.pending and ad.phase == "active" then
-                        -- HP that changed without an Effect (a direct BG3 action): Roster.
-                        for id, uuid in pairs(actors) do
-                            if hpChanged(id, uuid) then
-                                ad:roster(joinsDone, rosterActors())
-                                break
+                        -- A failed join's stand-in BG3 took in after all, or HP that changed without an
+                        -- Effect (a direct BG3 action): Roster.
+                        if adoptOutside() then
+                            ad:roster(joinsDone, rosterActors())
+                        else
+                            for id, uuid in pairs(actors) do
+                                if hpChanged(id, uuid) then
+                                    ad:roster(joinsDone, rosterActors())
+                                    break
+                                end
                             end
                         end
                     end

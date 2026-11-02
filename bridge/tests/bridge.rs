@@ -295,6 +295,31 @@ fn rosters_show_template_hp_and_joins_add_or_refuse_mobs() {
             "(release pull-1 f130000000012b03)"
         ]
     );
+    // Its join failed but BG3 had its stand-in in the fight and killed it (the mod lists it late):
+    // it is in, and the kill goes to WoW (the server still holds it: the release is only a note).
+    f.handoff.clear();
+    f.apply(&Message::Roster {
+        encounter: e(),
+        joins: 1,
+        actors: vec![
+            actor("hero", "0000000000000001", 14, 14),
+            actor("e1", "f130000000012b01", 11, 11),
+            actor("e2", "f130000000012b02", 11, 11),
+            actor("e3", "f130000000012b03", 0, 11),
+        ],
+    })
+    .unwrap();
+    assert_eq!(f.enemy("e3").unwrap().status, "dead");
+    assert!(f.guids().contains(&"f130000000012b03".to_string()));
+    let handoff: Vec<String> = f.handoff.iter().filter_map(Handoff::command).collect();
+    assert_eq!(handoff.len(), 2, "{handoff:?}");
+    assert!(handoff[0].starts_with(".wowbg3 pos pull-1 f130000000012b03 "));
+    assert_eq!(handoff[1], ".wowbg3 hp pull-1 f130000000012b03 0 11");
+    assert!(
+        f.log
+            .iter()
+            .any(|l| l == "Young Wolf (e3) is in the BG3 fight after all")
+    );
 }
 #[test]
 fn bg3_hit_points_go_to_the_server_as_levels_and_a_kill_once() {

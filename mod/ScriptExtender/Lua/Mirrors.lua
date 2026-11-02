@@ -1378,11 +1378,21 @@ function M.Start(runId)
             end)
         end
         -- Stand-ins a fight spawned with no mirror, for LinkLive.lua (which cannot read a far one itself).
-        local fightSpawned = {}
+        -- InCombat as for a mirror: in a party member's BG3 combat (JoinWatch.lua: a join that failed).
+        local fightSpawned, partyCombats = {}, nil
         for uuid in pairs(WOWBG3FightSpawned or {}) do
             if Ext.Entity.Get(uuid) then
+                if not partyCombats then
+                    partyCombats = {}
+                    for _, u in ipairs(Party.Party()) do
+                        local c = combatOf(u)
+                        if c then partyCombats[c] = true end
+                    end
+                end
                 local h = hp(uuid) or {0, 0}
+                local combat = combatOf(uuid)
                 fightSpawned[uuid] = {Hp = h[1], MaxHp = h[2], Pos = pos(uuid),
+                    InCombat = combat ~= nil and partyCombats[combat] == true,
                     Dead = q(Osi.IsDead, uuid) == 1 or M.KnockedOut[uuid] == true}
             end
         end
