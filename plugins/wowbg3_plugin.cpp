@@ -5408,7 +5408,8 @@ enum Op : std::uint32_t {
     kPoolSurfaces = 60, // server: ground surfaces on pool subgrid a.x (-1 every one); a.y 1: remove them the engine's
                         // way (only from a placed one; Place and PoolRestore do it themselves), 2: report; R0 tiles
                         // with a ground surface, R1 with a cloud, R2 subgrids looked at, R3 1 removed
-    kPoolFree = 61,     // a.x pool index, a.y a.z the square's min corner: R0 1 when Place would take it there now (the spot it holds, or nothing registered on its tiles,
+    kPoolFree = 61,     // a.x pool index, a.y a.z the square's min corner: R0 1 when Place would take it there now
+                        // (the spot it already holds, or nothing registered on its tiles,
                         // nothing attached), R1 tiles holding something, R2 attached objects, R3 entities seen;
                         // F0/F1 the first such tile (x, y); native-<side>-occupants.json lists them
     kCustomIcon = 40,  // a.x..a.z address pieces of an eoc::CustomIconComponent's Icon (ScratchBuffer), b.x the
