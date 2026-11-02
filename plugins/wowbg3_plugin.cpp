@@ -71,6 +71,7 @@
 #include <vector>
 
 #include "bg3le_plugin.h"
+#include "wowbg3_standin_aim.h"
 
 #define WOWBG3_VERSION "0.2.9"
 
@@ -1766,10 +1767,156 @@ bool hook_closest(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx
 // camera hid Tav from the cursor (0/9 at (-1399.8, 120.2, -350.3) and (-1333.6, 169.5,
 // -384.0), 2/9 at (-1401.8, 120.0, -352.8)). That query gets no WoW hits; every other query
 // (movement, the cursor's ground point, sight, casts) keeps them.
+// While WoW has a mirrored unit under the pointer and this query has no character first, it is cast again
+// toward that unit's stand-in (aim_at_stand_in below, wowbg3_standin_aim.h).
 bool cursor_character_query(bg3se::PhysicsType type, bg3se::PhysicsGroupFlags in, bg3se::PhysicsGroupFlags ex,
                             int context, glm::vec3 const& a, glm::vec3 const& b) {
     return context == 1 && (std::uint32_t)type == 15 && (std::uint32_t)in == 0x4ca20 && (std::uint32_t)ex == 0x210080
         && glm::length(b - a) > 100.0f;
+}
+
+// The void's BG3 level geometry inside WoW's squares out of hits[from..]: the arena is WoW's ground there.
+void drop_void_hits(ArenaRays const& r, phx_hits& hits, std::uint32_t from, SceneSwap& s) {
+    std::uint32_t w = from;
+    const std::uint32_t n = std::min({hits.Distances.size(), hits.Positions.size(), hits.Normals.size(),
+                                      hits.PhysicsGroup.size(), hits.PhysicsExtraFlags.size(), hits.Shapes.size()});
+    for (std::uint32_t i = from; i < n; ++i) {
+        if (inside_square(r, hits.Positions[i]) && ((std::uint32_t)hits.PhysicsGroup[i] & kKeepGroups) == 0) {
+            s.Stats.Voided[1].fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (w != i) {
+            hits.Distances[w] = hits.Distances[i];
+            hits.Positions[w] = hits.Positions[i];
+            hits.Normals[w] = hits.Normals[i];
+            hits.PhysicsGroup[w] = hits.PhysicsGroup[i];
+            hits.PhysicsExtraFlags[w] = hits.PhysicsExtraFlags[i];
+            hits.Shapes[w] = hits.Shapes[i];
+        }
+        ++w;
+    }
+    if (w < n) {
+        hits.Distances.resize(w);
+        hits.Positions.resize(w);
+        hits.Normals.resize(w);
+        hits.PhysicsGroup.resize(w);
+        hits.PhysicsExtraFlags.resize(w);
+        hits.Shapes.resize(w);
+    }
+}
+
+// ---- The stand-in under WoW's model (plugin op 32; wowbg3_standin_aim.h says why) ----
+// The client's Lua (StandInAim.lua) names the stand-in whose WoW model is under the pointer, every tick while it
+// is: its feet, held kAimHoldS so a stopped Lua leaves nothing behind. Read by BG3's picking job on its own thread.
+struct StandInAim {
+    std::mutex Lock;
+    bool On = false;
+    float Feet[3] = {};
+    double Until = 0;
+    std::atomic<std::uint32_t> Redirected{0}, Missed{0}, Already{0};
+    std::atomic<int> LastLift{-1};
+};
+StandInAim g_aim;
+constexpr double kAimHoldS = 0.5;
+
+std::vector<wowbg3_aim::Hit> aim_hits(phx_hits const& hits, std::uint32_t from) {
+    std::vector<wowbg3_aim::Hit> out;
+    const std::uint32_t n = std::min({hits.Distances.size(), hits.Positions.size(), hits.PhysicsGroup.size()});
+    for (std::uint32_t i = from; i < n; ++i) {
+        glm::vec3 const& p = hits.Positions[i];
+        out.push_back({{p.x, p.y, p.z}, hits.Distances[i], (std::uint32_t)hits.PhysicsGroup[i]});
+    }
+    return out;
+}
+
+// BG3's cursor character query (client) with no character first while a stand-in is named: cast toward the
+// stand-in's body; the first cast whose first hit is that stand-in replaces hits[before..]. True when it did.
+bool aim_at_stand_in(Hooked const& h, void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hits& hits,
+                     std::uint32_t before, bg3se::PhysicsType type, bg3se::PhysicsGroupFlags in,
+                     bg3se::PhysicsGroupFlags ex, int context, int index, int exIndex, ReadLock lock,
+                     ArenaRays const* r) {
+    if (h.K->Side != 1) return false;
+    float feet[3];
+    {
+        std::lock_guard<std::mutex> held(g_aim.Lock);
+        if (!g_aim.On || mono_seconds() > g_aim.Until) return false;
+        for (int k = 0; k < 3; ++k) feet[k] = g_aim.Feet[k];
+    }
+    {
+        const auto own = aim_hits(hits, before);
+        if (wowbg3_aim::picks_character(own.data(), (int)own.size())) {
+            g_aim.Already.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    if (!allocator_ready()) return false;
+    alignas(phx_hits) thread_local unsigned char raw[sizeof(phx_hits)];
+    thread_local bool made = false;
+    auto* cast = reinterpret_cast<phx_hits*>(raw);
+    if (!made) {
+        new (raw) phx_hits{};
+        made = true;
+    }
+    const float from[3] = {a.x, a.y, a.z}, to[3] = {b.x, b.y, b.z};
+    for (int l = 0; l < wowbg3_aim::kLiftCount; ++l) {
+        float e[3];
+        if (!wowbg3_aim::aim_end(from, to, feet, wowbg3_aim::kLifts[l], e)) break;
+        cast->Normals.clear();
+        cast->Positions.clear();
+        cast->Distances.clear();
+        cast->PhysicsGroup.clear();
+        cast->PhysicsExtraFlags.clear();
+        cast->Shapes.clear();
+        h.K->All(scene, a, glm::vec3{e[0], e[1], e[2]}, *cast, type, in, ex, context, index, exIndex, lock);
+        if (r != nullptr && r->Void) drop_void_hits(*r, *cast, 0, *h.S);
+        const auto got = aim_hits(*cast, 0);
+        if (!wowbg3_aim::hits_stand_in(got.data(), (int)got.size(), feet)) continue;
+        hits.Distances.resize(before);
+        hits.Positions.resize(before);
+        hits.Normals.resize(before);
+        hits.PhysicsGroup.resize(before);
+        hits.PhysicsExtraFlags.resize(before);
+        hits.Shapes.resize(before);
+        const std::uint32_t n = std::min({cast->Distances.size(), cast->Positions.size(), cast->Normals.size(),
+                                          cast->PhysicsGroup.size(), cast->PhysicsExtraFlags.size(), cast->Shapes.size()});
+        for (std::uint32_t i = 0; i < n; ++i) {
+            hits.Distances.push_back(cast->Distances[i]);
+            hits.Positions.push_back(cast->Positions[i]);
+            hits.Normals.push_back(cast->Normals[i]);
+            hits.PhysicsGroup.push_back(cast->PhysicsGroup[i]);
+            hits.PhysicsExtraFlags.push_back(cast->PhysicsExtraFlags[i]);
+            hits.Shapes.push_back(cast->Shapes[i]);
+        }
+        g_aim.Redirected.fetch_add(1, std::memory_order_relaxed);
+        g_aim.LastLift.store(l, std::memory_order_relaxed);
+        return true;
+    }
+    g_aim.Missed.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+// Op 32 (client): a.x 1 the stand-in's feet are a.y a.z b.x, 0 none, 2 report. R0 1 named now, R1 queries
+// redirected to it, R2 casts that did not hit it, R3 queries BG3 picked a character in already; F0 the last lift.
+bool standin_aim_op(Out& o, int mode, float x, float y, float z) {
+    {
+        std::lock_guard<std::mutex> held(g_aim.Lock);
+        if (mode == 1) {
+            g_aim.On = true;
+            g_aim.Feet[0] = x;
+            g_aim.Feet[1] = y;
+            g_aim.Feet[2] = z;
+            g_aim.Until = mono_seconds() + kAimHoldS;
+        } else if (mode == 0) {
+            g_aim.On = false;
+        }
+        o.R[0] = g_aim.On && mono_seconds() <= g_aim.Until ? 1 : 0;
+    }
+    o.R[1] = (std::int32_t)g_aim.Redirected.load(std::memory_order_relaxed);
+    o.R[2] = (std::int32_t)g_aim.Missed.load(std::memory_order_relaxed);
+    o.R[3] = (std::int32_t)g_aim.Already.load(std::memory_order_relaxed);
+    const int l = g_aim.LastLift.load(std::memory_order_relaxed);
+    o.F[0] = l >= 0 ? wowbg3_aim::kLifts[l] : -1.0f;
+    return true;
 }
 
 bool hook_all(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hits& hits, bg3se::PhysicsType type,
@@ -1786,44 +1933,20 @@ bool hook_all(void const* scene, glm::vec3 const& a, glm::vec3 const& b, phx_hit
         for (std::uint32_t i = before; i < hits.PhysicsGroup.size(); ++i) c += ((std::uint32_t)hits.PhysicsGroup[i] & 0x200) != 0;
         return c;
     };
+    const bool cursorChars = cursor_character_query(type, in, ex, context, a, b);
     if (r == nullptr || !segment_touches(*r, a, b)) {
+        const bool aimed = cursorChars && aim_at_stand_in(h, scene, a, b, hits, before, type, in, ex, context, index,
+                                                          exIndex, lock, r);
         // The cursor's queries (context 1) are noted even away from the arena (picking research).
         if (context == 1) note_query(*s, kRayAllSlot, type, in, ex, context, a, b, (int)(hits.Distances.size() - before), chars());
-        return got;
+        return got || aimed;
     }
     s->Stats.Touch[1].fetch_add(1, std::memory_order_relaxed);
-    if (r->Void) {
-        std::uint32_t w = before;
-        const std::uint32_t n = std::min({hits.Distances.size(), hits.Positions.size(), hits.Normals.size(),
-                                          hits.PhysicsGroup.size(), hits.PhysicsExtraFlags.size(),
-                                          hits.Shapes.size()});
-        for (std::uint32_t i = before; i < n; ++i) {
-            if (inside_square(*r, hits.Positions[i]) && ((std::uint32_t)hits.PhysicsGroup[i] & kKeepGroups) == 0) {
-                s->Stats.Voided[1].fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (w != i) {
-                hits.Distances[w] = hits.Distances[i];
-                hits.Positions[w] = hits.Positions[i];
-                hits.Normals[w] = hits.Normals[i];
-                hits.PhysicsGroup[w] = hits.PhysicsGroup[i];
-                hits.PhysicsExtraFlags[w] = hits.PhysicsExtraFlags[i];
-                hits.Shapes[w] = hits.Shapes[i];
-            }
-            ++w;
-        }
-        if (w < n) {
-            hits.Distances.resize(w);
-            hits.Positions.resize(w);
-            hits.Normals.resize(w);
-            hits.PhysicsGroup.resize(w);
-            hits.PhysicsExtraFlags.resize(w);
-            hits.Shapes.resize(w);
-        }
-    }
+    if (r->Void) drop_void_hits(*r, hits, before, *s);
+    if (cursorChars) aim_at_stand_in(h, scene, a, b, hits, before, type, in, ex, context, index, exIndex, lock, r);
     float t;
     glm::vec3 n;
-    if (!cursor_character_query(type, in, ex, context, a, b) && wants_wow(*r, type, in, ex)
+    if (!cursorChars && wants_wow(*r, type, in, ex)
         && wow_closest(*r, a, b, t, n, kKindAll, pick_filter(context))
         && allocator_ready()) {
         phx_hit wh{};
@@ -5780,6 +5903,10 @@ enum Op : std::uint32_t {
     kSpatialGrid = 30, // a.x..a.z address pieces of this side's spatial_grid::UpdateSystem, b.x 1: the engine rebuilds
                        // its spatial grid from the AI grid's bounds (world mode far from the level), 2: report;
                        // R0 flags (1 clear, 2 bounds, 4 reinsert), R1 1 set now; F0..F3 AI grid bounds (m)
+    kStandInAim = 32,  // client: a.x 1 the stand-in whose WoW model is under the pointer stands at a.y a.z b.x (BG3's
+                       // cursor character query is cast toward it when it picks no character), 0 none, 2 report;
+                       // R0 named now, R1 queries redirected, R2 casts that missed it, R3 BG3 had a character first
+                       // already; F0 the last lift (StandInAim.lua, wowbg3_standin_aim.h)
     kSightSync = 31,   // client: BG3's copies of where the pool subgrids are (AI grid visuals with their boxes,
                        // the sight overlay's records) follow them (Pool and PoolRestore do this themselves);
                        // a.x 1 move them (and rebuild the engine's box tree), 2 report; R0 visuals moved, R1 boxes
@@ -6171,6 +6298,11 @@ bool channel_op(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 const&
         o.F[4] = bounds_equal(now, computed_bounds(grid)) ? 1.0f : 0.0f;
         return true;
     }
+    case kStandInAim:
+        if (!client) return fail(o, 32, "the stand-in aim is client only");
+        if (a.x != 0.0f && a.x != 1.0f && a.x != 2.0f) return fail(o, 33, "mode is 0, 1 or 2");
+        if (a.x == 1.0f && !(std::isfinite(a.y) && std::isfinite(a.z) && std::isfinite(b.x))) return fail(o, 34, "feet not numbers");
+        return standin_aim_op(o, (int)a.x, a.y, a.z, b.x);
     case kPickRegion:
         if (!client) return fail(o, 32, "the picking region map is client only");
         if (a.x != 0.0f && a.x != 1.0f && a.x != 2.0f) return fail(o, 33, "mode is 0, 1 or 2");

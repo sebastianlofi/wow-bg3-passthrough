@@ -11,7 +11,10 @@
 -- (no stand-in yet). benilla now sets flag 4 for a mirrored mob under the pointer, with WoW's
 -- cursor kind and gray state for it: BG3 shows Melee (MeleeWarning when WoW's is grayed). BG3
 -- picking a stand-in counts too (WoW's model and the stand-in are not always under the same
--- pixel: the stand-in follows the mob 0.35 m at a time). Over a stand-in BG3 writes its own
+-- pixel: the stand-in follows the mob 0.35 m at a time, and is often smaller than WoW's model).
+-- Since 2026-11-02 BG3's pick finds the stand-in wherever WoW has its unit under the pointer
+-- (StandInAim.lua, plugin op 32): every BG3 action aimed at it (attack, spell, shove, throw, talk,
+-- pickpocket) is BG3's own, on WoW's model as on the stand-in. Over a stand-in BG3 writes its own
 -- RequestedCursor (Arrow for a neutral one) every frame after this module's tick (harness
 -- tests: RequestedCursor read back "Arrow", CursorName "CursorArrow"), so that case uses
 -- CursorOverrides, and only while BG3's own choice there is the plain Arrow: a spell or throw
@@ -41,8 +44,9 @@
 -- them picks one (WoW's first: the model is what the player sees; wowhover.bin's 48-byte form names
 -- the unit, benilla 0067), and the click does the same either way (WOWBG3FriendlyClick, read by
 -- WorldMode.lua):
---   sneaking (the hero has eoc::sneak::IsSneakingComponent): pickpocket, BG3's PickPocket cursor; BG3's
---     own click, aimed at the stand-in by WorldMode.lua when BG3 picks it elsewhere than this pixel;
+--   sneaking (the hero has eoc::sneak::IsSneakingComponent): pickpocket, BG3's PickPocket cursor and BG3's
+--     own click (BG3 picks the stand-in under WoW's model too, StandInAim.lua); where even that finds
+--     no stand-in (hidden from BG3's camera) the click does nothing;
 --   walking, an NPC WoW has something for (a service in UNIT_NPC_FLAGS, benilla's wowbody/<guid>.txt): talk,
 --     WoW's cursor for it (Talk, the merchant or quest cursor) and WoW's interact (Interact.lua);
 --   walking, an NPC with nothing to say: no Talk cursor, BG3's plain click (Tav walks there).
@@ -52,6 +56,8 @@
 local M = {}
 local World = Ext.Require("WorldMode.lua")
 local Hero = Ext.Require("Hero.lua")
+local Aim = Ext.Require("StandInAim.lua")
+local N = Ext.Require("WowNative.lua")
 -- benilla's CursorKind order (target/cursor_mode.rs).
 local KINDS = {[0] = "Point", "Attack", "Speak", "Pickup", "LootAll", "Interact", "Buy", "Inspect", "Trainer",
     "Taxi", "Skin", "Repair", "Mail", "Mine", "GatherHerbs", "PickLock", "Cast"}
@@ -89,23 +95,24 @@ local function cursorId(name)
 end
 
 -- Stand-ins of mirrored mobs (link/mirror-status.json, Mirrors.lua), read every 30 ticks; which of
--- them are friendly NPCs (uuid -> guid, and guid -> uuid).
-local standIns, friendlies, friendlyGuids, standInsAt = {}, {}, {}, nil
+-- them are friendly NPCs (uuid -> guid, and guid -> uuid); every living one by guid (StandInAim.lua).
+local standIns, friendlies, friendlyGuids, byGuid, standInsAt = {}, {}, {}, {}, nil
 local function refreshStandIns(ticks)
     if standInsAt and ticks - standInsAt < 30 then return end
     standInsAt = ticks
     local raw = Ext.IO.LoadFile("wow-bg3/link/mirror-status.json")
     local ok, st = pcall(Ext.Json.Parse, raw or "")
-    local set, fr, frg = {}, {}, {}
+    local set, fr, frg, all = {}, {}, {}, {}
     if ok and type(st) == "table" and type(st.Mobs) == "table" then
         for g, m in pairs(st.Mobs) do
             if type(m) == "table" and type(m.Uuid) == "string" and not m.Dead then
                 set[m.Uuid] = true
+                all[g:lower()] = m.Uuid
                 if m.Friendly == true then fr[m.Uuid] = g:lower(); frg[g:lower()] = m.Uuid end
             end
         end
     end
-    standIns, friendlies, friendlyGuids = set, fr, frg
+    standIns, friendlies, friendlyGuids, byGuid = set, fr, frg, all
 end
 -- WoW's UNIT_NPC_FLAGS of a mirrored unit (benilla's wowbody/<guid>.txt), cached; nil until written.
 local npcFlags = {}
@@ -304,6 +311,30 @@ WOWBG3FriendlyClick = nil
 -- The module for the harness's research chunks (Ext.Require does not resolve from them).
 WOWBG3Cursor = M
 
+-- The stand-in under WoW's model (StandInAim.lua): named to the plugin, so BG3's own pick finds it.
+local aimState, aimBroken = {}, nil
+local function feetOf(uuid)
+    local ok, p = pcall(function()
+        local t = Ext.Entity.Get(uuid).Transform.Transform.Translate
+        return {t[1], t[2], t[3]}
+    end)
+    return ok and p or nil
+end
+local function aimCall(mode, x, y, z)
+    if aimBroken then return nil end
+    local ok, out = pcall(N.Call, N.Op.StandInAim, mode, x, y, z)
+    if ok and out.Err == 0 then return out end
+    -- An older plugin without op 32, or no channel: BG3 picks as before; said once.
+    aimBroken = ok and tostring(out.Why or out.Err) or tostring(out)
+    Ext.Log.Print("WOW-BG3 cursor: stand-in aim unavailable: " .. aimBroken)
+    return nil
+end
+local function aimStep(target)
+    local line = Aim.Step(aimState, target, feetOf, aimCall)
+    M.Aim = {Uuid = aimState.Uuid, Out = aimState.Out and aimState.Out.R or nil, Broken = aimBroken}
+    if line then Ext.Log.Print("WOW-BG3 cursor: " .. line) end
+end
+
 function M.Start(runId)
     M.InstallQuestCursors()
     local ticks, overridden, written = 0, false, nil
@@ -313,6 +344,7 @@ function M.Start(runId)
         if not (World.IsActive and World.IsActive()) then
             if overridden then pcall(function() local c = Ext.UI.GetCursorControl(); c.CursorOverrides = {} end); overridden = false end
             M.FriendlyAttack = false
+            pcall(aimStep, nil)
             return
         end
         local ok, err = pcall(function()
@@ -322,6 +354,8 @@ function M.Start(runId)
             refreshStandIns(ticks)
             -- A BG3 window under the pointer's way (checked every 6 ticks): BG3's alone.
             if ticks % 6 == 0 then M.Window = World.Bg3WindowOpen and World.Bg3WindowOpen() or false end
+            -- WoW's model of a mob or NPC under the pointer: BG3's pick finds its stand-in (next frame's query).
+            aimStep(Aim.Target(flags, unit, M.Window, byGuid))
             local picked = flags and flags & 1 == 0 and pickedStandIn() or nil
             local friendlyPick = picked ~= nil and friendlies[picked] ~= nil
             local own = tostring(c.RequestedCursor)
