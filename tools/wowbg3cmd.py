@@ -593,7 +593,7 @@ def tele(ctx, args, at=None):
         body.update(Char=char, Via=via[0][0])
     atomic_write(path, json.dumps(body))
     # The screen answers the click at once; the world bridge takes the cover off when it is done.
-    flag = ctx.link / 'wowmove.flag'  # MoveLoading.lua: BG3's loading screen
+    flag = ctx.link / 'wowmove.flag'  # MoveLoading.lua: BG3's screen fade
     try:
         flag.write_text('%.3f\n' % time.time())
     except OSError:

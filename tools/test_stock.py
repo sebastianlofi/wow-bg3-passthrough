@@ -411,7 +411,8 @@ class FillHolder(unittest.TestCase):
         L.execute(r'''
           tick, pendingItem, deleted, sideUuid, sideCount, asked, made, gone = 1000, {}, {}, {}, {}, {}, {}, {}
           holders, stacks, ents, inv, nextId = {}, {}, {}, {}, 0
-          M = {Refused = {}, SideTag = {}, Suppress = function() end, Item = function(e) return ({[117] = {bc = 5}})[e] end}
+          M = {Refused = {}, SideTag = {}, Suppress = function() end, Item = function(e) return ({[117] = {bc = 5}})[e] end,
+               AmountOf = function(row, count) return row.s == "Thrown" and 1 or count end}
           M.Create = function(e, standin, n, tag)
             nextId = nextId + 1; local u = "u" .. nextId
             made[#made + 1] = {tag, n}; holders[u] = standin; stacks[u] = n; ents[u] = true; inv[tag] = u; return u
