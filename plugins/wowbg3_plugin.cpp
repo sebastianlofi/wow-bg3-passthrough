@@ -1116,6 +1116,14 @@ void pool_unsurface_before_move(PoolState& p, PoolSub& s, char const* what) {
     }
 }
 
+// A square retiled where it lies (a same-continent move, world_bridge.py: the lattice stays, the WoW ground
+// under it changes): whatever stands on it stands on the same tiles of the same subgrid before and after, and Place
+// writes neither MetaDataIndex nor the attached objects, so nothing it holds has to leave first. Server squares
+// keep their occupants long after the party has gone, which is what refused such a Place.
+bool pool_same_spot(PoolSub const& s, float minX, float minZ) {
+    return s.Moved && s.Xg == (int)lroundf(minX * 2) && s.Zg == (int)lroundf(minZ * 2);
+}
+
 // Place pool subgrid k with its min corner at (minX, minZ) and base height baseY; tiles from
 // section-<k>.bin, rows along +Z, 128 x 128 records of either
 //   <u8 walkable, f32 floor in BG3 metres>               (5 bytes: MinHeight = MaxHeight = floor), or
@@ -1161,7 +1169,7 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
     }
     PoolSub& s = p.Subs[k];
     bg3se::AiSubgrid* sg = s.Sg;
-    if (!tiles_free(sg) || sg->AttachedObjectRefCounts.size() != 0) {
+    if (!pool_same_spot(s, minX, minZ) && (!tiles_free(sg) || sg->AttachedObjectRefCounts.size() != 0)) {
         const Occupants occ = pool_occupants(p.Grid, sg);
         logf("pool (%s): subgrid %u not moved: %d tiles hold something, %d attached, entities %llx %llx (first tile %d %d)",
              client ? "client" : "server", (unsigned)s.Id, occ.Tiles, occ.Attached,
@@ -5400,7 +5408,7 @@ enum Op : std::uint32_t {
     kPoolSurfaces = 60, // server: ground surfaces on pool subgrid a.x (-1 every one); a.y 1: remove them the engine's
                         // way (only from a placed one; Place and PoolRestore do it themselves), 2: report; R0 tiles
                         // with a ground surface, R1 with a cloud, R2 subgrids looked at, R3 1 removed
-    kPoolFree = 61,     // a.x pool index: R0 1 when Place would take it now (nothing registered on its tiles,
+    kPoolFree = 61,     // a.x pool index, a.y a.z the square's min corner: R0 1 when Place would take it there now (the spot it holds, or nothing registered on its tiles,
                         // nothing attached), R1 tiles holding something, R2 attached objects, R3 entities seen;
                         // F0/F1 the first such tile (x, y); native-<side>-occupants.json lists them
     kCustomIcon = 40,  // a.x..a.z address pieces of an eoc::CustomIconComponent's Icon (ScratchBuffer), b.x the
@@ -5703,7 +5711,7 @@ bool channel_call(int side, std::uint32_t op, glm::vec3 const& a, glm::vec3 cons
         if (k < 0 || k >= (int)p.Subs.size()) return fail(o, 65, "pool index out of range");
         auto const& s = p.Subs[k];
         const Occupants occ = pool_occupants(p.Grid, s.Sg);
-        o.R[0] = occ.Tiles == 0 && occ.Attached == 0 ? 1 : 0;
+        o.R[0] = pool_same_spot(s, a.y, a.z) || (occ.Tiles == 0 && occ.Attached == 0) ? 1 : 0;
         o.R[1] = occ.Tiles;
         o.R[2] = occ.Attached;
         o.R[3] = (int)occ.Entities.size();
