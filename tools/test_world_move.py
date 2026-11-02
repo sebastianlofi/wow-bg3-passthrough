@@ -213,6 +213,62 @@ class Reorigin(Base):
         self.assertFalse(self.active())
 
 
+class SeenMoves(Base):
+    """main() starts counting moves from world-move.json's Seq only when the file is this BG3 run's."""
+    def write(self, body):
+        B.MOVE.write_text(json.dumps(body))
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(B, 'MOVE', self.tmp / 'world-move.json')
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_this_runs_request_was_done_before_the_load(self):
+        self.write({'RunId': 'r1', 'Seq': 4, 'Wow': list(TARGET)})
+        self.assertEqual(B.moves_done('r1'), 4)
+        self.assertIsNone(B.move_request('r1', B.moves_done('r1')))
+
+    def test_another_runs_request_says_nothing(self):
+        self.write({'RunId': 'old', 'Seq': 7, 'Wow': list(TARGET)})
+        self.assertEqual(B.moves_done('r1'), 0)
+        self.write({'RunId': 'r1', 'Seq': 1, 'Wow': list(TARGET)})  # a fresh BG3's first move
+        self.assertEqual(B.move_request('r1', 0)['Seq'], 1)
+
+    def test_no_file_or_a_broken_one(self):
+        self.assertEqual(B.moves_done('r1'), 0)
+        B.MOVE.write_text('{')
+        self.assertEqual(B.moves_done('r1'), 0)
+        self.write([1, 2])
+        self.assertEqual(B.moves_done('r1'), 0)
+
+
+class Cover(Base):
+    """After a move its cover stays until benilla's player stands at the new place (or COVER_WAIT_S)."""
+    def setUp(self):
+        super().setUp()
+        self.lifted = []
+        p = mock.patch.object(B, 'move_cover', lambda on: self.lifted.append(on))
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.origin = TARGET
+
+    def test_held_until_benilla_is_there(self):
+        now = time.time()
+        self.assertFalse(B.cover_done(self.w, now))  # no camera stream yet
+        self.camera(5000.0, 5000.0)
+        self.assertFalse(B.cover_done(self.w, now))
+        self.assertEqual(self.lifted, [])
+        self.camera(TARGET[0] + 3, TARGET[1] - 2)
+        self.assertTrue(B.cover_done(self.w, now))
+        self.assertEqual(self.lifted, [False])
+
+    def test_lifted_after_the_wait_without_benilla(self):
+        self.camera(5000.0, 5000.0)
+        self.assertTrue(B.cover_done(self.w, time.time() - B.COVER_WAIT_S - 1))
+        self.assertEqual(self.lifted, [False])
+
+
 class Move(Base):
     def request(self, **fields):
         return dict({'Seq': 3, 'Wow': list(TARGET), 'Map': 0}, **fields)

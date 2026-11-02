@@ -634,7 +634,11 @@ function M.Start(runId)
                 local busy, seen = {}, {}
                 for _, cell in ipairs(c.Cells) do
                     local k = assert(math.tointeger(cell[1]), "a cell is {K, MinX, MinZ, BaseY, Serial}")
-                    local out = N.Must(N.Op.PoolFree, k, assert(tonumber(cell[2]), "a cell's MinX"), assert(tonumber(cell[3]), "a cell's MinZ"))
+                    -- Bound first: assert returns its message too, so as the call's last argument it became
+                    -- argument 4 ("plugin argument 4 is not a number") and every check failed.
+                    local minX, minZ = tonumber(cell[2]), tonumber(cell[3])
+                    assert(minX and minZ, "a cell's MinX and MinZ are numbers")
+                    local out = N.Must(N.Op.PoolFree, k, minX, minZ)
                     if out.R[1] ~= 1 then
                         busy[#busy + 1] = k
                         seen[#seen + 1] = {K = k, Tiles = out.R[2], Attached = out.R[3], Entities = out.R[4],

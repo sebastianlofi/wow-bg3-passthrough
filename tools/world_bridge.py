@@ -75,6 +75,7 @@ CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cu
 CONTINENTS = {0: 'Eastern Kingdoms', 1: 'Kalimdor'}
 MOVE = IO / 'world-move.json'
 MOVE_RESULT = IO / 'world-move-result.json'
+COVER_WAIT_S = 30.0  # a move's cover waits at most so long after the move for benilla's player at the new place
 LANDED_YD = 100.0  # yards: benilla's player this near where it should be counts as having arrived (World.settle)
 AHEAD = 20.0     # metres from the window's node before squares are placed ahead of her
 # A placed square whose middle is this near a member keeps its WoW triangles (the cursor's ground and the
@@ -203,6 +204,20 @@ def move_cover(on):
         print('move: cover file:', e, flush=True)
 
 
+def cover_done(w, since):
+    """After a move (ended at `since`): True once its cover is lifted, when benilla's player stands at the new place
+    (World.arrived) or COVER_WAIT_S have passed without it."""
+    got = w.arrived()
+    if got is not None and got[0]:
+        move_cover(False)
+        return True
+    if time.time() - since > COVER_WAIT_S:
+        print('move: cover lifted after %.0f s without benilla\'s player at the new place' % COVER_WAIT_S, flush=True)
+        move_cover(False)
+        return True
+    return False
+
+
 def camp_compose(at_camp):
     """A trip to camp (Camp.lua): BG3's own picture with WoW's interface over it, and back. benilla draws
     its interface without the world while link/wowcamp.flag exists; the compositor takes the words at once
@@ -238,6 +253,20 @@ def move_request(run, done):
     if m.get('RunId') != run or not isinstance(m.get('Seq'), int) or m['Seq'] <= done:
         return None
     return m
+
+
+def moves_done(run):
+    """The last world-move.json Seq this BG3 run has already had: a request on disk from this run is the world
+    before this load's (one BG3 run keeps its RunId across loads, so a new bridge counting from 0 moved the party
+    there again after every reload); a request from another run is none of this one's, and its Seq says nothing
+    (a fresh BG3's first move is Seq 1 again: seeded from the old file it was dropped, 120 s of cover, no answer)."""
+    try:
+        m = json.loads(MOVE.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(m, dict) or m.get('RunId') != run or not isinstance(m.get('Seq'), int):
+        return 0
+    return m['Seq']
 
 
 def client_live(c):
@@ -966,19 +995,30 @@ class World:
         self.stale.discard(k)
         self.blocked.discard(k)
 
+    def arrived(self):
+        """benilla's player stands at this session's place: the server has placed it (camera.bin flag) within
+        LANDED_YD of the origin or of Tav's mapped point. None when it does not; else (x, y, where) as read."""
+        try:
+            x, y, _ = player_wow()
+        except (AssertionError, OSError, struct.error):
+            return None
+        t = tav(self.started + 1.0)
+        where = [self.origin] + ([t[0]] if t else [])  # she may have walked on since
+        if min(math.hypot(x - p[0], y - p[1]) for p in where) > LANDED_YD:
+            return False, (x, y, where)
+        return True, (x, y, where)
+
     def settle(self):
         """After a re-origin world.json stays Active false until benilla's player has followed the hero (about 2 s):
         with it Active the mirrors would map the mobs round the old place through the new mapping. A player that never
         follows says so and leaves world.json off: mobs mapped wrong would only hide that."""
         if self.landed is None:
             return
-        try:
-            x, y, _ = player_wow()
-        except (AssertionError, OSError, struct.error):
+        got = self.arrived()
+        if got is None:
             return
-        t = tav(self.started + 1.0)
-        where = [self.origin] + ([t[0]] if t else [])  # she may have walked on since
-        if min(math.hypot(x - p[0], y - p[1]) for p in where) > LANDED_YD:
+        ok, (x, y, where) = got
+        if not ok:
             if time.time() - self.landed > 30:
                 self.landed = time.time()
                 print('move: benilla\'s player is still at WoW %.1f %.1f, not at %s' % (x, y, where), flush=True)
@@ -1333,12 +1373,8 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
     w.start()
-    # A request already on disk is the world before this load's: one BG3 run keeps its RunId across loads, so a new
-    # bridge counting from 0 moved the party there again after every reload.
-    try:
-        moved = json.loads(MOVE.read_text()).get('Seq', 0) if MOVE.exists() else 0
-    except (OSError, json.JSONDecodeError):
-        moved = 0
+    moved = moves_done(w.run)
+    covered = None  # when the last move ended, while its cover waits for benilla's player there
     at_camp = False
     # A bridge that died at camp left benilla without its world.
     try:
@@ -1358,12 +1394,22 @@ def main():
                 moved = m['Seq']
                 try:
                     w = w.move(m)
-                finally:
+                except BaseException:
                     move_cover(False)
+                    raise
+                covered = time.time()
                 continue
+            # The cover stays until the party can play at the new place: Tav and the party are there (the move has
+            # answered) and benilla's player stands there too (the server placed it; WoW's own loading screen covers
+            # its streaming from then on). Lifted without it after COVER_WAIT_S: a player that never follows is
+            # settle's to report, not the cover's to hide.
+            if covered is not None and cover_done(w, covered):
+                covered = None
             w.follow()
         except Exception as e:  # keep following; the mod keeps the squares it has
             print('follow error:', e, flush=True)
+    if covered is not None:
+        move_cover(False)
     if at_camp:
         camp_compose(False)
     w.publish(False)
