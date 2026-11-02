@@ -232,9 +232,11 @@ def account_env():
     except OSError:
         pass
     user, pw = vals.get('WOW_USER'), vals.get('WOW_PASS')
+    # The row's second value: whether it has a password (wowsave.py rehome makes the row of a reinstall's
+    # character without one, before mangosd starts; the console sets it below).
     row = wowsave.sh('mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N realmd',
-                     "select id from account where username = '%s';" % (user or DEFAULT_ACCOUNT)).split()
-    if user and pw and row:
+                     "select id, ifnull(v, '') <> '' from account where username = '%s';" % (user or DEFAULT_ACCOUNT)).split()
+    if user and pw and row[1:] == ['1']:
         return user, pw
     user, pw = DEFAULT_ACCOUNT, secrets.token_hex(8)
     if row:

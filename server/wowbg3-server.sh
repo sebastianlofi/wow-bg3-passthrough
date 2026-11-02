@@ -195,6 +195,19 @@ init() {
     say "initialised; start with: $0 start"
 }
 
+# A BG3 save's WoW character the database lacks (a new database, BG3's saves and their snapshots kept: a
+# reinstall) is put back from its snapshot on its own account (wowsave.py rehome), here, before mangosd starts:
+# mangosd reads its highest guids and its character names only when it starts. The release only (its tools sit
+# beside server/, and the launcher gives the paths); a failure is logged and the server starts anyway.
+rehome() {
+    local t="$ROOT/../tools/link/tools/relenv.py"
+    [ -f "$t" ] && [ -n "${WOWBG3_HOME:-}" ] && [ -n "${WOWBG3_DATA:-}" ] && [ -n "${WOWBG3_IO:-}" ] || return 0
+    if ! WOWBG3_SERVER_VAR="$V" WOW_BG3_SERVER="$ROOT" "$PY" "$t" wowsave rehome; then
+        say "the snapshots' characters were not all put back (the lines above say why)"
+    fi
+    return 0
+}
+
 # `run` owns its children: they stay in this script's process group, so one signal to the group reaches
 # every one of them and nothing is left behind when the script is killed outright. mangosd and realmd both
 # shut down cleanly on SIGTERM, and stop() still does the saveall. `start` (a server meant to outlive the
@@ -220,6 +233,7 @@ start() {
         # No reuse of item guids: a gap in today's table can be an item a BG3 save's snapshot brings back, and a
         # new item then had the guid of a restored one (wowsave.py keeps the highest above any snapshot).
         set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0" "ReusableGuidPoolSize=0"
+        rehome
         rm -f "$RUN/console"; mkfifo -m 600 "$RUN/console"
         # The console reads the fifo; a holder keeps it open so mangosd never sees end of input.
         ( exec $sid sleep infinity > "$RUN/console" < /dev/null ) &

@@ -9,6 +9,7 @@ through `wowbg3-server.sh console`.
 
     db_sh(cmd, stdin=None, container='wow-bg3-database-1') -> subprocess.CompletedProcess (text)
     console(line, seconds=3, container='wow-bg3-mangosd-1') -> what the console printed
+    mangosd_running() -> whether the world server runs (wowsave.py rehome needs it stopped)
 """
 import os, select, socket, subprocess, time
 from pathlib import Path
@@ -31,6 +32,22 @@ def db_sh(cmd, stdin=None, container='wow-bg3-database-1'):
                LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_UNIX_PORT=str(var / 'run/mariadb.sock'),
                MARIADB_ROOT_PASSWORD=sec['ROOT_PASS'])
     return subprocess.run(['sh', '-c', cmd], input=stdin, capture_output=True, text=True, env=env)
+
+
+def mangosd_running(container='wow-bg3-mangosd-1'):
+    """Whether the world server runs (a portable one: its pid file names a live mangosd; Docker: the container
+    runs, or docker could not say)."""
+    p = portable()
+    if p is None:
+        r = subprocess.run(['sudo', '-n', 'docker', 'inspect', '-f', '{{.State.Running}}', container],
+                           capture_output=True, text=True)
+        return r.returncode != 0 or r.stdout.strip() == 'true'
+    var = Path(os.environ.get('WOWBG3_SERVER_VAR') or p / 'var')
+    try:
+        pid = int((var / 'run/mangosd.pid').read_text().strip())
+        return Path('/proc/%d/comm' % pid).read_text().strip() == 'mangosd'
+    except (OSError, ValueError):
+        return False
 
 
 def _receive(sock, seconds):

@@ -155,17 +155,23 @@ def password(user):
     return acc['Pass']
 
 
+def has_password(user):
+    """Whether the server's row of account `user` has a password (wowsave.py rehome makes rows without one)."""
+    return wowsave.sql("select ifnull(v, '') <> '' from realmd.account where username = '%s';" % user).split()[:1] == ['1']
+
+
 def ensure(user):
     """The account on the server with the registry's password: made if the server lacks it (a fresh
-    database), a new password through the console if the registry lost it. Returns user."""
+    database), a new password through the console if the registry lost it, the registry's password set if the
+    server's row has none (made by wowsave.py rehome before mangosd started). Returns user."""
     assert USER.fullmatch(user or ''), 'a playthrough account name (WB3P + 8)'
     acc = load()['Accounts'].get(user) or {}
     if not _sql_user_exists(user):
         pw = acc.get('Pass') or _pw()
         _register(user, Pass=pw, Made=acc.get('Made') or time.time())
         _create(user, pw)
-    elif not acc.get('Pass'):
-        pw = _pw()
+    elif not acc.get('Pass') or not has_password(user):
+        pw = acc.get('Pass') or _pw()
         out = _console('account set password %s %s %s' % (user, pw, pw), pw)
         if 'password' not in out.lower():
             raise RuntimeError('password of %s not set: %s' % (user, ' '.join(out.split())[-160:]))
