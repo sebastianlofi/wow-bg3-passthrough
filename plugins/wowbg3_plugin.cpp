@@ -1132,6 +1132,18 @@ bool pool_same_spot(PoolSub const& s, float minX, float minZ) {
 // In both, flags 4 and 8 make the tile a SubgridEdge and a SubgridIntersection: BG3's pathfinder steps
 // from one subgrid to another only on such tiles, so a storey stacked over a square (world_bridge.py)
 // joins the ground where its stairs meet it.
+//
+// A storey (off the lattice) without one walkable tile is registered in no patch: BG3 finds nothing of it.
+// world_bridge.py sends such a section for a stale storey over wanted ground, whose old upper floor must not
+// be found there. Blocked pool tiles carry WalkBlock and GenericBlock, not Blocker. A lookup of a tile by
+// position (the engine's ToTilePos, as bg3le copies it) takes the floor nearest the position's height among the
+// subgrids listed at its patch, skipping only Blocker tiles, the first of equals winning, and pool_storeys_first
+// lists storeys first; the engine's footprint check (bg3+0x26571c0) walks the same patch lists per column. A
+// blocked storey at the hero's floor (its base was the move's centre height, where the teleport puts her) so
+// made her own footprint blocked: the engine's validity check (bg3+0x2c6f940) failed and its search for a
+// standable spot (the flood bg3+0x349d6a0, capped at 30000 tiles by BG3's FindValidPosition and 15 other
+// callers) found the tiles round her blocked as well and could run to its cap; BG3's server ran no tick for
+// 7 to 13.5 s after such re-origins (0.1.3013.59). Out of every patch the storey competes for no column.
 bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::vector<unsigned char> const& raw,
                 int* counts, char const** why) {
     auto& p = g_pool[client ? 1 : 0];
@@ -1154,7 +1166,9 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
         return false;
     }
     std::vector<std::uint16_t> heights(kCellTiles * kCellTiles), tops(kCellTiles * kCellTiles);
+    bool anyWalk = false;
     for (int i = 0; i < kCellTiles * kCellTiles; ++i) {
+        anyWalk = anyWalk || (raw[i * rec] & 1) != 0;
         float f, top;
         std::memcpy(&f, raw.data() + i * rec + 1, 4);
         top = f;
@@ -1206,7 +1220,10 @@ bool pool_place(bool client, int k, float minX, float minZ, float baseY, std::ve
     }
     sg->Translate = glm::vec3{xg * 0.5f, baseY, zg * 0.5f};
     sg->WorldPos = bg3se::AiWorldPos{.Xglobal = xg, .Zglobal = zg, .Xlocal = 0.0f, .Zlocal = 0.0f, .Y = baseY};
-    const auto list = patches_of(xg, zg, kCellTiles, kCellTiles);
+    // A storey with no floor: in no patch (see above).
+    const bool noFloor = !anyWalk && (xg % kCellTiles != 0 || zg % kCellTiles != 0);
+    const auto list = noFloor ? std::vector<glm::ivec2>{} : patches_of(xg, zg, kCellTiles, kCellTiles);
+    if (noFloor) logf("pool (%s): storey subgrid %u has no floor: in no patch", client ? "client" : "server", (unsigned)s.Id);
     int added = 0;
     const auto left = s.Moved ? s.Live : s.Patches;
     for (auto q : list) {

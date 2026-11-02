@@ -127,24 +127,14 @@ class Moves(Base):
         self.assertEqual(len(raw), 5 * B.TILES * B.TILES)
         self.assertEqual(raw[::5], bytes(B.TILES * B.TILES))
         self.assertEqual(cells[1][1:3], list(w.cell_min((0, 0, 1))))
-        # Under every floor of the square it lies over, never at the centre's height (the hero's floor).
-        low = 90.0 - B.BLOCKED_UNDER_M
-        self.assertEqual(cells[1][3], low)
-        self.assertEqual({struct.unpack_from('<f', raw, i * 5 + 1)[0] for i in range(B.TILES * B.TILES)}, {low})
+        # Off the lattice and without one walkable tile: the plugin's Place registers it in no patch.
+        lo = w.cell_min((0, 0, 1))
+        self.assertTrue(round(lo[0] * 2) % B.TILES != 0 or round(lo[1] * 2) % B.TILES != 0)
+        self.assertEqual({struct.unpack_from('<f', raw, i * 5 + 1)[0] for i in range(B.TILES * B.TILES)}, {cells[1][3]})
         for k, ij in pairs:
             w.took(k, ij)
         self.assertEqual((w.stale, w.blocked), ({1}, {1}))
         self.assertEqual(w.moves([(0, 0)]), [])
-
-    def test_a_blocked_storey_lies_under_a_cave_storey_too(self):
-        w = self.w
-        w.storeys[(0, 0)] = 2
-        w.cut((0, 0))['storeys'][1]['base'] = 40.0  # a cave under the hill
-        w.pool = w.ground_pool = 2
-        w.placed = {0: (0, 0), 1: (0, 0, 1)}
-        w.stale = {0, 1}
-        cells = w.cells_for(w.moves([(0, 0)]))
-        self.assertEqual(cells[1][3], 40.0 - B.BLOCKED_UNDER_M)
 
     def test_a_blocked_storey_gets_ground_when_a_cut_wants_it(self):
         w = self.w

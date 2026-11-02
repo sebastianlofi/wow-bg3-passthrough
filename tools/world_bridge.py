@@ -64,9 +64,8 @@ HYST = 8.0       # metres past a square's middle before the window moves
 # the pool subgrids stay where they are, only the WoW point the centre stands for changes. The squares placed
 # then still hold the old place (stale): a wanted one is retiled where it lies, one nobody wants goes first when
 # a square needs a subgrid, and a stale storey over wanted ground gets tiles all blocked, or BG3 would keep finding the
-# old place's upper floor there; they lie well under every floor of that square (cells_for, BLOCKED_UNDER_M), where
-# no one stands. Only a refusal, or another continent, takes Stop and Start.
-BLOCKED_UNDER_M = 64.0
+# old place's upper floor there; the plugin registers such a storey in no patch (cells_for). Only a refusal, or another
+# continent, takes Stop and Start.
 CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cut_cache)
 # Kalimdor too: Map in the request picks the continent. Another continent than the
 # session's: Stop, a server teleport of the WoW character to the game_tele place Via names on that
@@ -842,17 +841,14 @@ class World:
         self.precut([ij[:2] for k, ij in pairs if k not in self.to_block])
         for k, ij in pairs:
             if k in self.to_block:
-                # Blocked tiles, BLOCKED_UNDER_M under the lowest floor of the square it lies over (its ground and
-                # storeys): BG3 takes the tile whose floor is nearest a position's height, so none of them is ever
-                # anyone's. They were at the centre's height, the hero's own floor after a move's teleport: in the
-                # 0.1.3013.59 test BG3's server stopped ticking (no fade renewal, no Osiris event, no answer) after
-                # each re-origin that blocked storeys there: 7 to 13.5 s from its Rays to the party's answer, 1.4 to
-                # 5.4 s in the re-origins without.
-                ground = self.cut(ij[:2])
-                low = min([ground['base']] + [st['base'] for st in ground.get('storeys') or ()]) - BLOCKED_UNDER_M
+                # No walkable tile: the plugin's Place takes a storey without a floor out of every patch, so BG3
+                # finds nothing of it at any height (wowbg3_plugin.cpp pool_place). Registered with blocked tiles at
+                # the centre's height it was the hero's own floor after a move's teleport, and BG3's server ran no
+                # tick for 7 to 13.5 s after such re-origins (0.1.3013.59).
                 self.serial = self.serial % SERIALS + 1
-                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), (b'\0' + struct.pack('<f', low)) * (TILES * TILES))
-                out.append([k, *self.cell_min(ij), low, self.serial])
+                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)),
+                             (b'\0' + struct.pack('<f', self.centre[1])) * (TILES * TILES))
+                out.append([k, *self.cell_min(ij), self.centre[1], self.serial])
                 continue
             cell = self.cut(ij[:2])
             if len(ij) == 3:
