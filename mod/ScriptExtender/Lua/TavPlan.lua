@@ -367,7 +367,21 @@ end
 -- buffers listed in wow-bg3/link/keep.txt ("KEEP 1", then one hex VkBuffer handle a line; "KEEP 0":
 -- the map is back). Listed: every level of detail of every character (anything with Health) within
 -- radius metres of centre, their attachments included, so Tav, her party and a fight's stand-ins stay.
-local function indexBuffers(e, out)
+-- Whose each listed buffer is, said once per buffer in bg3le.log ("WOW-BG3 hide:"): part 0 the body, others
+-- the attachments, a stand-in's sword and shield among them. The layer's "void:" lines name draws by buffer.
+local hideSaid = {}
+local function sayHidden(e, from, to, out, parts)
+    local ok, name = pcall(function() return e.ClientCharacter.Template.Name end)
+    name = ok and name or "?"
+    for i = from, to do
+        if not hideSaid[out[i]] then
+            hideSaid[out[i]] = true
+            Ext.Utils.Print(string.format("WOW-BG3 hide: %s part %d buffer %s", name, parts[i], out[i]))
+        end
+    end
+end
+local function indexBuffers(e, out, parts)
+    local part = 0
     local handle = tonumber(tostring(e):match("Entity %((%x+)%)"), 16)
     local root = handle and p64(I.FieldAddress(handle, "Visual", "Visual"))
     if not root then return end
@@ -378,7 +392,10 @@ local function indexBuffers(e, out)
             pcall(function()
                 local m = p64(A(p64(buf + j * 16), "AnimatableObject", "Model"))
                 local ib = m and handleOf(p64(A(m, "Model", "Attributes") + 24))
-                if ib then out[#out + 1] = string.format("%x", ib) end
+                if ib then
+                    out[#out + 1] = string.format("%x", ib)
+                    if parts then parts[#out] = part end
+                end
             end)
         end
     end
@@ -387,6 +404,7 @@ local function indexBuffers(e, out)
     local abuf, acount = p64(att), u32(att + 12)
     for i = 0, (acount or 0) - 1 do
         local v = p64(abuf + i * 48)
+        part = i + 1
         if v then pcall(visual, v) end
     end
 end
@@ -408,7 +426,7 @@ local lastKeep, lastHide = nil, nil
 -- inside that radius must be listed.
 M.HideRadius = 130
 function M.PublishKeep(centre, radius, party)
-    local ids, hide = {}, {}
+    local ids, hide, hideParts = {}, {}, {}
     local mine = {}
     for _, u in ipairs(type(party) == "table" and party or {}) do mine[u] = true end
     for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("Health")) do
@@ -421,7 +439,15 @@ function M.PublishKeep(centre, radius, party)
         if ok and p then
             local dx, dy, dz = p[1] - centre[1], p[2] - centre[2], p[3] - centre[3]
             local d2, r = dx * dx + dy * dy + dz * dz, kept and radius or math.max(radius, M.HideRadius)
-            if d2 < r * r then pcall(indexBuffers, e, kept and ids or hide) end
+            if d2 < r * r then
+                if kept then
+                    pcall(indexBuffers, e, ids)
+                else
+                    local from = #hide + 1
+                    pcall(indexBuffers, e, hide, hideParts)
+                    pcall(sayHidden, e, from, #hide, hide, hideParts)
+                end
+            end
         end
     end
     table.sort(ids)
@@ -441,6 +467,7 @@ end
 
 function M.ClearKeep()
     lastKeep, lastHide = nil, nil
+    hideSaid = {} -- a buffer's handle may be another mesh's after this
     Ext.IO.SaveFile("wow-bg3/link/keep.txt", "KEEP 0\n")
     Ext.IO.SaveFile("wow-bg3/link/hide.txt", "HIDE 0\n")
 end

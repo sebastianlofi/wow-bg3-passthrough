@@ -1013,6 +1013,7 @@ static int fxc_rows(const Recipe* r, uint32_t* bind, uint32_t* stride, uint32_t 
 #define FXC_RADIUS_VOID 120.0f
 static int g_keep_active;  // world mode's map-off state (defined with the void below)
 static int mesh_draw(uint32_t count, uint32_t first, int32_t vo);  // a character's or the level's mesh (with the void below)
+static int hide_has(uint64_t ib);  // a stand-in's or NPC's own index buffer (link/hide.txt, with the void below)
 static float fxc_radius(void) { return g_cc.void_ && g_keep_active ? FXC_RADIUS_VOID : FXC_RADIUS; }
 // Near BG3's camera counts too while the void is on: a
 // party member far from Tav (its own treadmill, hundreds of metres off) casts while BG3 shows that
@@ -1403,6 +1404,9 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
         // A character's or the level's mesh. A spell's solid piece shares its slice with the depth and
         // G-buffer passes BG3 draws it in as well, so this test is for the blended draws.
         if (!solid && indexed && t_ib_cb == cb && mesh_draw(count, first, vo)) return 'M';
+        // Skinning tells a spell's solid piece from a body, not from what a stand-in holds: a sword or a
+        // shield is rigid (unskinned) too. The hide list names those by their index buffers.
+        if (solid && indexed && t_ib_cb == cb && hide_has(t_ib)) return 'M';
         near = fxc_near_tav(r, fi);
         if (!near) { g_fxc.far++; return 'F'; }
         __atomic_store_n(&g_fx_seen_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
@@ -2853,6 +2857,36 @@ static int prop_near(const Recipe* r, uint32_t fi, uint32_t first, int32_t vo) {
     float dx = w[0] - g_tav_root[0], dy = w[1] - g_tav_root[1], dz = w[2] - g_tav_root[2], rad = fxc_radius();
     return dx * dx + dy * dy + dz * dz < rad * rad;  // NaN counts as far
 }
+// What the void lets through on a young or solid guess, one log line per slice, so a BG3 mesh seen in the
+// picture can be named afterwards: the buffer against the lines "WOW-BG3 hide:" in bg3le.log (TavPlan.lua:
+// whose it is), the time (CLOCK_MONOTONIC seconds, as bg3le.log's) against "WOW-BG3 dialog:". No recording
+// exists of the shine on a shield in a dialog (playtest feedback, 2026-11-01); this is what catches it next time.
+#define VOID_SAY_CAP 512u
+#define VOID_SAY_LINES 8u  // at most so many lines per 300 presents
+static uint64_t g_void_said[VOID_SAY_CAP], g_void_said_win, g_void_line_win;
+static uint32_t g_void_lines;
+static void void_say(const char* what, const Recipe* r, uint32_t count, uint32_t first, int32_t vo, uint32_t fi) {
+    uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    // Said again after a while: a slice kept now and one kept a minute ago are different events.
+    if (__atomic_exchange_n(&g_void_said_win, now / 3600, __ATOMIC_RELAXED) != now / 3600) memset(g_void_said, 0, sizeof g_void_said);
+    uint64_t k = ib_slice(t_ib, t_ibo, first, count, vo);
+    uint32_t i = hslot(k, VOID_SAY_CAP), n = 0;
+    for (; n < 16; n++, i = (i + 1) & (VOID_SAY_CAP - 1)) {
+        uint64_t zero = 0;
+        if (__atomic_compare_exchange_n(&g_void_said[i], &zero, k, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
+        if (zero == k) return;
+    }
+    if (n == 16) return;
+    if (__atomic_exchange_n(&g_void_line_win, now / 300, __ATOMIC_RELAXED) != now / 300) __atomic_store_n(&g_void_lines, 0, __ATOMIC_RELAXED);
+    if (__atomic_fetch_add(&g_void_lines, 1, __ATOMIC_RELAXED) >= VOID_SAY_LINES) return;
+    float at[3] = {0, 0, 0}, m[16];
+    int how = fxc_place(r, fi, at, m);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    logf_("void: %s: ib %llx count %u first %u vo %d nskin %u blend %u place %d at %.1f %.1f %.1f, Tav %.1f %.1f %.1f, party dialog %d, time %lld.%03ld",
+          what, (unsigned long long)t_ib, count, first, vo, (unsigned)r->nskin, (unsigned)(r->ncolor && r->blend[0][0]), how, at[0], at[1], at[2],
+          g_tav_root[0], g_tav_root[1], g_tav_root[2], (int)g_screen_dialog, (long long)ts.tv_sec, ts.tv_nsec / 1000000);
+}
 // An indexed draw in such a pass: skip it unless it is a character's or an effect near Tav.
 static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t first, int32_t vo) {
     t_prop_cb = VK_NULL_HANDLE;
@@ -2881,6 +2915,7 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
         if ((pr->have & 1) && g_tav_root_ok && prop_near(pr, fi, first, vo) == 1) {
             __atomic_add_fetch(&g_fxprops_kept, 1, __ATOMIC_RELAXED);
             t_prop_cb = cb;  // fxwhy shows it as decision Y
+            void_say("kept as a prop", pr, count, first, vo, fi);
             return 0;
         }
     }
@@ -2889,7 +2924,13 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
         Recipe* r = ri ? ri->r : NULL;
         if (r && (r->have & 1) && fxc_near_tav(r, fi)) {
             if (!mesh_draw(count, first, vo) && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite) return 0;
-            if (fxc_solid(r)) return 0;  // a spell's solid piece: fxc_draw records it for the replay
+            if (fxc_solid(r)) {
+                // Not a stand-in's own buffer (fxc_draw the same): its sword and shield are unskinned, so
+                // fxc_solid alone took them for a spell's piece whenever BG3 drew them in this pass.
+                if (hide_has(t_ib)) { void_say("a stand-in's solid draw, dropped", r, count, first, vo, fi); return 1; }
+                void_say("kept as a solid piece", r, count, first, vo, fi);
+                return 0;  // a spell's solid piece: fxc_draw records it for the replay
+            }
         }
     }
     return 1;
