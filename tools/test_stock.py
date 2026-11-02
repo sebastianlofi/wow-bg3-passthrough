@@ -32,8 +32,9 @@ class Rule(unittest.TestCase):
         self.L = rt()
         self.L.globals().S = self.L.execute((LUA / 'Stock.lua').read_text())
         self.L.execute('''
-          lots = {[117] = 5, [2512] = 200, [999] = 1}
-          function lotOf(e) return lots[e] or 1 end
+          rows = {[117] = {k = "object", st = 20, bc = 5}, [2512] = {k = "weapon", st = 200, bc = 200},
+                  [999] = {k = "weapon", st = 1}, [858] = {k = "object", st = 5}, [2553] = {k = "object", st = 1}}
+          function lotOf(e) return rows[e] end
           l = S.New()
           function left(wares)
             local out = {}
@@ -47,21 +48,32 @@ class Rule(unittest.TestCase):
     def count(self, wares, entry):
         return self.L.eval('left(%s)[%d]' % (wares, entry))
 
-    def test_an_unlimited_ware_starts_as_the_lot_the_screen_showed(self):
-        self.assertEqual(self.count('BREAD', 117), 5)
+    def unlimited(self, entry):
+        return self.count('{{Idx = 0, Entry = %d, Price = 9, Stock = -1, Max = 0}}' % entry, entry)
+
+    def test_a_consumable_starts_at_three_whatever_wow_s_lot(self):
+        self.assertEqual(self.unlimited(117), 3)  # WoW's lot of 5: part of it, at the price of one
+        self.assertEqual(self.unlimited(858), 3)
+
+    def test_gear_and_what_does_not_stack_is_one(self):
+        self.assertEqual(self.unlimited(999), 1)
+        self.assertEqual(self.unlimited(2553), 1)
+
+    def test_ammunition_is_one_of_wow_s_purchases(self):
+        self.assertEqual(self.unlimited(2512), 200)
 
     def test_a_limited_ware_starts_at_wow_s_maxcount(self):
         self.assertEqual(self.count('SWORD', 999), 3)
 
     def test_what_is_bought_stays_gone_and_the_rest_stays(self):
         self.L.execute('S.Bought(l, "f1", 117, 2)')
-        self.assertEqual(self.count('BREAD', 117), 3)
-        self.L.execute('S.Bought(l, "f1", 117, 3)')
+        self.assertEqual(self.count('BREAD', 117), 1)
+        self.L.execute('S.Bought(l, "f1", 117, 1)')
         self.assertIsNone(self.count('BREAD', 117))
 
     def test_one_vendor_s_sales_are_not_another_s(self):
-        self.L.execute('S.Bought(l, "f2", 117, 5)')
-        self.assertEqual(self.count('BREAD', 117), 5)
+        self.L.execute('S.Bought(l, "f2", 117, 3)')
+        self.assertEqual(self.count('BREAD', 117), 3)
 
     def test_wow_s_timed_stock_does_not_refill_a_limited_ware(self):
         self.L.execute('S.Bought(l, "f1", 999, 2)')
@@ -70,8 +82,8 @@ class Rule(unittest.TestCase):
         self.assertEqual(self.count('{{Idx = 1, Entry = 999, Price = 100, Stock = 1, Max = 3}}', 999), 1)
 
     def test_a_long_rest_brings_back_stock_and_purse(self):
-        self.L.execute('S.Bought(l, "f1", 117, 5); S.SetPurse(l, "f1", 7); S.Rest(l)')
-        self.assertEqual(self.count('BREAD', 117), 5)
+        self.L.execute('S.Bought(l, "f1", 117, 3); S.SetPurse(l, "f1", 7); S.Rest(l)')
+        self.assertEqual(self.count('BREAD', 117), 3)
         self.assertEqual(self.L.eval('S.PurseOf(l, "f1", 30)'), self.L.eval('S.Purse(30)'))
 
     def test_a_pocket_keeps_its_own_count(self):
@@ -114,7 +126,7 @@ Ext = {Entity = {Get = function(u) if u ~= "gone" then return {Vars = setmetatab
        Vars = {RegisterUserVariable = function() end}}
 Osi = {DB_Players = {Get = function() return {{"tav"}, {"gale"}} end},
        GetItemByTemplateInInventory = function() return nil end}
-M = {RefundOf = {}, Barter = {}, Item = function(e) return ({[117] = {bc = 5}, [999] = {bc = 1}})[e] end}
+M = {Barter = {}, Item = function(e) return ({[117] = {bc = 5}, [999] = {bc = 1}})[e] end}
 BARTER_OPS = {buy = true, buypart = true, sell = true}
 vendorOf, trading, lastInv = {farley = "f1"}, {}, {Vendors = {f1 = {{Idx = 0, Entry = 117, Price = 25, Max = 0, Level = 30}}}}
 '''
@@ -131,7 +143,7 @@ class Game(unittest.TestCase):
         L.globals().Stock = L.execute((LUA / 'Stock.lua').read_text())
         text = (LUA / 'Inventory.lua').read_text()
         ledger = section(text, 'local STOCK_VAR', '-- Replies that name a new WoW item')
-        fund = section(text, "local funded, placed", 'local function lotOf')
+        fund = section(text, "local funded, placed", 'local function fillVendors')
         L.execute((ledger + fund).replace('local function', 'function').replace('local ledger', 'ledger')
                   .replace('local funded', 'funded').replace('local STOCK', 'STOCK').replace('local STOCK_OPS', 'STOCK_OPS'))
         L.execute('ledger = readLedger()')
@@ -207,13 +219,31 @@ class Game(unittest.TestCase):
     def test_a_refused_buy_does_not_fill_the_purse(self):
         self.open()
         self.L.execute('fundMerchant("farley"); gold.farley = gold.farley + 900')  # BG3 took the price, WoW said full bag
-        self.L.execute('M.RefundOf.tav = "f1"; M.Refunded("tav", 900); lookPurses()')
+        self.L.execute('M.Refunded("f1", 900); lookPurses()')
         self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 38800)
 
     def test_a_refusal_after_the_trade_goes_on_the_ledger(self):
-        self.L.execute('Stock.SetPurse(ledger, "f1", 1000); M.RefundOf.tav = "f1"; M.Refunded("tav", 400)')
+        self.L.execute('Stock.SetPurse(ledger, "f1", 1000); M.Refunded("f1", 400)')
         self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 600)
-        self.assertIsNone(self.L.eval('M.RefundOf.tav'))
+
+    def test_a_refused_sale_gives_the_purse_back_its_pay(self):
+        self.L.execute('Stock.SetPurse(ledger, "f1", 1000); M.Refunded("f1", -40)')
+        self.assertEqual(self.L.eval('Stock.PurseOf(ledger, "f1", 30)'), 1040)
+
+    def test_a_barter_s_requests_carry_wow_s_prices(self):
+        text = (LUA / 'Inventory.lua').read_text()
+        self.L.execute(section(text, 'function M.NotePrice', '-- A character')
+                       + '''
+          M.Item = function(e) return ({[117] = {sp = 1, bc = 5}, [999] = {sp = 300}})[e] end
+          lastInv.Members = {tav = {Money = 1000, Items = {{Guid = "9A", Entry = 999, Count = 2}}}}
+          M.Barter.tav = {At = 1}
+          a = {Op = "sell", Member = "tav", Guid = "9A", Count = 1}; M.NotePrice(a)
+          c = {Op = "sell", Member = "tav", Guid = "9A"}; M.NotePrice(c)
+          d = {Op = "buy", Member = "tav", Npc = "f1", Entry = 117, Count = 2}; M.NotePrice(d)
+          e = {Op = "buypart", Member = "tav", Npc = "f1", Entry = 117, Count = 3, Lot = 5}; M.NotePrice(e)
+        ''')
+        self.assertEqual([self.L.eval(x + '.Wow') for x in 'acde'], [300, 600, 50, 15])
+        self.assertEqual((self.L.eval('M.Barter.tav.Money'), self.L.eval('M.Barter.tav.S'), self.L.eval('M.Barter.tav.T')), (1000, 900, 65))
 
 
 class SellMoney(unittest.TestCase):
@@ -224,7 +254,7 @@ class SellMoney(unittest.TestCase):
         L.execute(r'''
           tick, pending, reqs = 100, {}, {}
           gold = 1000
-          M, goldOwed, goldTried = {Barter = {}, RefundOf = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
+          M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
           BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
           function goldOf() return gold end
           function setGold(_, want) gold = want end

@@ -46,4 +46,16 @@ function M.Held(sp, bp, base)
     return math.max(1, M.Round(sp * base))
 end
 
+-- A deal WoW refused part of: what BG3 paid for that part. BG3 settled the whole deal, so its gold change there says what
+-- it paid against WoW's prices: sold S x, bought T / x, with x the same for all (value / P on a sale, with Held's and Ware's
+-- values), less on sales when the merchant's purse fell short. deal: BG3's gold change. rs, rt: the refused part of S and T.
+-- The result goes on the member's gold: a refused sale's pay comes off, a refused buy's price comes back.
+function M.Refused(deal, S, T, rs, rt)
+    local x
+    if S > 0 then x = (deal + math.sqrt(deal * deal + 4 * S * T)) / (2 * S)
+    elseif deal < 0 then x = -T / deal end
+    if not x then return 0 end
+    return M.Round((x > 0 and rt / x or 0) - rs * x)
+end
+
 return M

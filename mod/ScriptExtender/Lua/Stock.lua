@@ -7,8 +7,10 @@
 -- It lives in BG3's save (Inventory.lua), so a load brings back that save's counts by itself, and a long rest empties it.
 local M = {}
 
--- An unlimited ware (WoW's maxcount 0) starts at this many of WoW's purchases: one is what the screen always showed.
-M.UNLIMITED_LOTS = 1
+-- An unlimited ware (WoW's maxcount 0) starts with what a BG3 trader's table gives (Gustav's TreasureTable.txt, the tables
+-- with T_Gold_Trader): one of a piece of gear ("1,1"), and of a consumable commonly three (I_OBJ_Potion_Healing "3,1",
+-- the commonest fixed count of potions and kits there). Ammunition has a gear row and WoW sells it by the 200: one purchase.
+M.CONSUMABLES = 3
 
 function M.New() return {N = 0, V = {}} end
 -- Keys start with a letter so they stay strings through JSON.
@@ -26,20 +28,23 @@ function M.Bought(l, guid, entry, units)
     l.N = l.N + 1
 end
 
--- How many a ware starts with after a long rest: WoW's maxcount for a limited one, else its lot times UNLIMITED_LOTS.
-function M.Start(w, lot)
+-- How many a ware starts with after a long rest: WoW's maxcount for a limited one, else as above. row: its items.json row.
+-- Only what WoW stacks is a consumable here: a recipe or a bag (kind object, stack 1) is one, as in BG3.
+function M.Start(w, row)
     if (w.Max or 0) > 0 then return w.Max end
-    return (lot or 1) * M.UNLIMITED_LOTS
+    row = row or {}
+    if row.k == "object" then return math.min(M.CONSUMABLES, row.st or 1) end
+    return row.bc or 1
 end
 -- The wares to show: each with Count, what is left; what is sold out is not listed. A row with its own Count
 -- (a pocket: the bridge's, gone from its list when stolen) is not stock of this kind.
-function M.Wares(l, guid, wares, lotOf)
+function M.Wares(l, guid, wares, rowOf)
     local out, v = {}, l.V["g" .. guid]
     for _, w in ipairs(wares or {}) do
         if w.Count then
             out[#out + 1] = w
         else
-            local left = M.Start(w, lotOf(w.Entry)) - ((v and v.B[key(w.Entry)]) or 0)
+            local left = M.Start(w, rowOf(w.Entry)) - ((v and v.B[key(w.Entry)]) or 0)
             if left > 0 then
                 local r = {}
                 for k, x in pairs(w) do r[k] = x end

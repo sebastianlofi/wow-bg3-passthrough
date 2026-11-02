@@ -208,7 +208,8 @@ class Items(unittest.TestCase):
 GOLD = r"""
 tick, pending, reqs, sets, adds = 100, {}, {}, 0, 0
 gold, blocked = 1000, false
-M, goldOwed, goldTried = {Barter = {}, RefundOf = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end}, {}, {}
+M, goldOwed, goldTried = {Barter = {}, CopperPerGold = 1, Request = function(r) reqs[#reqs + 1] = r end,
+    Refunded = function(guid, adj) refunded = {guid, adj} end}, {}, {}
 BARTER_WAIT, BARTER_OPS = 600, {buy = true, buypart = true, sell = true}
 function goldOf() return gold end
 function setGold(_, want) sets = sets + 1; if not blocked then gold = want end end
@@ -222,6 +223,7 @@ class Gold(unittest.TestCase):
     def setUp(self):
         self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
         L.execute(GOLD)
+        L.globals().Prices = L.execute((LUA / 'Prices.lua').read_text())
         text = (LUA / 'Inventory.lua').read_text()
         L.execute('function look(uuid, m)\n' + section(text, "    -- Gold: WoW's money", 'function M.Reconcile(inv)'))
 
@@ -259,6 +261,35 @@ class Gold(unittest.TestCase):
         self.assertEqual((self.L.eval('gold'), self.L.eval('adds')), (1000, 72))
         self.look(1000)
         self.assertEqual(self.L.eval('adds'), 72)
+
+    def test_a_refusal_in_a_deal_leaves_the_rest_at_the_screen_s_price(self):
+        # Two sold at WoW's 300 and 200; the screen paid 120 and 80, then WoW refused the second.
+        self.L.execute('gold = 1200; M.Barter.hero = {At = 100, Money = 1000, S = 500, T = 0, RS = 200, RT = 0, Refused = "f1"}')
+        self.look(1300)
+        self.assertEqual(self.L.eval('reqs[1].Delta'), -180)  # 1120, not WoW's 1300
+        self.assertEqual((self.L.eval('refunded[1]'), self.L.eval('refunded[2]')), ('f1', -80))
+        self.look(1120)
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+        self.assertEqual(self.L.eval('gold'), 1120)
+
+    def test_a_refused_buy_alone_comes_back_whole(self):
+        self.L.execute('gold = 928; M.Barter.hero = {At = 100, Money = 1000, S = 0, T = 100, RS = 0, RT = 100, Refused = "f1"}')
+        self.look(1000)
+        self.assertEqual((self.L.eval('refunded[2]'), self.L.eval('#reqs')), (72, 0))
+        self.assertEqual(self.L.eval('M.Barter.hero'), None)
+
+    def test_a_refusal_counts_once(self):
+        self.L.execute('gold = 1200; M.Barter.hero = {At = 100, Money = 1000, S = 500, T = 0, RS = 200, RT = 0, Refused = "f1"}')
+        self.look(1300)
+        self.L.execute('refunded = nil')
+        self.look(1300)
+        self.assertEqual(self.L.eval('refunded'), None)
+
+    def test_the_share_with_buys_and_sales_in_one_deal(self):
+        P = self.L.globals().Prices
+        # P 2.0 against Balanced's 2.5: x = 1.25. Sold 400 pays 500, bought 200 costs 160.
+        self.assertEqual(P.Refused(340, 400, 200, 400, 0), -500)
+        self.assertEqual(P.Refused(340, 400, 200, 0, 200), 160)
 
     def test_a_set_that_works_gets_no_add_on_top(self):
         self.L.execute('gold = 928')

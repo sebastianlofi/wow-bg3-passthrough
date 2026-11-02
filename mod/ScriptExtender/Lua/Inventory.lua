@@ -435,13 +435,13 @@ local pending = {} -- Seq -> {Op, Item, Member, ...}
 local pendingItem = {} -- uuid -> tick asked
 -- A barter that went through: member -> {At, Target = its BG3 gold after it} until WoW's money is that (reconcile).
 M.Barter = {}
-M.RefundOf = {} -- member -> the vendor of a deal WoW refused: BG3's gold is about to go back as WoW has it
 local BARTER_OPS = {buy = true, buypart = true, sell = true}
 local BARTER_WAIT = 600
 function M.Request(r)
     reqSeq = reqSeq + 1
     r.Seq = reqSeq
     if r.Item then pendingItem[r.Item] = tick end
+    if M.NotePrice then M.NotePrice(r) end
     reqs[#reqs + 1] = r
     while #reqs > 64 do table.remove(reqs, 1) end
     pending[reqSeq] = r
@@ -492,6 +492,33 @@ local function note(err)
 end
 
 local function goldOf(u) return q(Osi.GetGold, u) or 0 end
+-- A barter's request: what WoW says it is worth, and WoW's money before the deal, for a refusal in it (the Gold part below).
+function M.NotePrice(r)
+    local b = M.Barter[r.Member]
+    if not (BARTER_OPS[r.Op] and b) then return end
+    local m = (lastInv.Members or {})[r.Member] or {}
+    if b.Target then -- a new deal right after a refusal was settled: it starts from there
+        b = {At = tick, Money = b.Target}
+        M.Barter[r.Member] = b
+    end
+    b.Money, b.S, b.T = b.Money or m.Money, b.S or 0, b.T or 0
+    if r.Op == "sell" then
+        for _, it in ipairs(type(m.Items) == "table" and m.Items or {}) do
+            if tostring(it.Guid) == tostring(r.Guid) then
+                r.Wow = ((M.Item(it.Entry) or {}).sp or 0) * ((r.Count or 0) > 0 and r.Count or it.Count or 1)
+            end
+        end
+        b.S = b.S + (r.Wow or 0)
+    else
+        for _, w in ipairs((lastInv.Vendors or {})[r.Npc] or {}) do
+            if w.Entry == r.Entry then
+                r.Wow = r.Op == "buy" and (w.Price or 0) * (r.Count or 1)
+                    or math.ceil((w.Price or 0) / math.max(1, r.Lot or 1)) * (r.Count or 1)
+            end
+        end
+        b.T = b.T + (r.Wow or 0)
+    end
+end
 -- A character's gold set to an amount through its own gold stack (BG3's LOOT_Gold_A item): AddGold
 -- ignores a negative amount and sometimes a small positive one, UserAddGold works on the whole
 -- party's gold (harness), the stack amount is exact and per inventory.
@@ -764,8 +791,8 @@ local function reconcileMember(uuid, m, have)
         local want = math.floor(m.Money / (M.CopperPerGold or 1))
         local have_g = goldOf(uuid)
         -- After a barter the price seen is the price paid: BG3's gold, with its attitude and Persuasion, is the
-        -- truth. WoW's buys and sells run first (its stock and refusals), then WoW's money is made BG3's.
-        -- A refusal drops this (onReplies), and WoW's word stands.
+        -- truth. WoW's buys and sells run first (its stock and refusals), then WoW's money is made BG3's. What WoW
+        -- refused (onReplies) is taken out at BG3's price, for the member and the merchant both; the rest stands.
         local b = M.Barter[uuid]
         if b and tick - b.At > BARTER_WAIT then
             M.Barter[uuid], b = nil, nil
@@ -777,7 +804,14 @@ local function reconcileMember(uuid, m, have)
             end
             if not busy then
                 -- What BG3 still owes from before (below) is no part of this barter's price.
-                local delta = math.floor((have_g + (goldOwed[uuid] or 0)) * (M.CopperPerGold or 1)) - m.Money
+                if b.Refused and not b.Target then
+                    local cpg = M.CopperPerGold or 1
+                    local adj = Prices.Refused((have_g + (goldOwed[uuid] or 0)) - (b.Money or m.Money) / cpg, (b.S or 0) / cpg,
+                        (b.T or 0) / cpg, (b.RS or 0) / cpg, (b.RT or 0) / cpg)
+                    b.Target = have_g + adj
+                    M.Refunded(b.Refused, adj)
+                end
+                local delta = math.floor(((b.Target or have_g) + (goldOwed[uuid] or 0)) * (M.CopperPerGold or 1)) - m.Money
                 if delta == 0 then
                     M.Barter[uuid], b = nil, nil
                 elseif b.Asked ~= delta then
@@ -785,10 +819,9 @@ local function reconcileMember(uuid, m, have)
                     M.Request({Op = "money", Member = uuid, Delta = delta})
                 end
             end
-            if b then want = have_g end
+            if b then want = b.Target or have_g end
         else
             goldOwed[uuid] = want - have_g
-            if M.RefundOf[uuid] then M.Refunded(uuid, want - have_g) end
         end
         if want ~= have_g then
             M.SuppressGold = tick + 20
@@ -969,9 +1002,10 @@ local function onReplies(inv)
             end
             if not rep.Ok then
                 if r.Item and (r.Op == "buy" or r.Op == "buypart" or r.Op == "take") then M.Refused[r.Item] = true end
-                if BARTER_OPS[r.Op] and r.Member then
-                    M.Barter[r.Member] = nil
-                    if r.Npc then M.RefundOf[r.Member] = tostring(r.Npc) end
+                local b = BARTER_OPS[r.Op] and M.Barter[r.Member]
+                if b then
+                    b.Refused = tostring(r.Npc)
+                    if r.Op == "sell" then b.RS = (b.RS or 0) + (r.Wow or 0) else b.RT = (b.RT or 0) + (r.Wow or 0) end
                 end
                 pcall(tellRefused, r, rep)
                 note(string.format("%s refused: %s", tostring(r.Op), tostring(rep.Why)))
@@ -1141,11 +1175,9 @@ local function lookPurses()
     saveLedger()
 end
 M.LookPurses = lookPurses
--- A deal WoW refused: BG3 gives the member's gold back as WoW has it (the Gold part of reconcileMember). The merchant's
--- purse goes the other way, or a refused buy (a full bag) would fill it for nothing.
-function M.Refunded(member, delta)
-    local guid = M.RefundOf[member]
-    M.RefundOf[member] = nil
+-- What WoW refused of a deal goes off the member's gold (the Gold part of reconcileMember). The merchant's purse goes the
+-- other way, or a refused buy (a full bag) would fill it for nothing.
+function M.Refunded(guid, delta)
     if delta == 0 or not ledger then return end
     for standin in pairs(placed) do
         if vendorOf[standin] == guid then
@@ -1159,7 +1191,6 @@ function M.Refunded(member, delta)
 end
 
 
-local function lotOf(entry) return (M.Item(entry) or {}).bc or 1 end
 local function fillVendors(inv)
     if not ledger then return end
     -- Every vendor's stand-in whose wares the bridge listed ahead (it lists every friendly NPC with a
@@ -1177,7 +1208,7 @@ local function fillVendors(inv)
     for standin, guid in pairs(vendorOf) do
         local wares = (inv.Vendors or {})[guid]
         if wares then
-            fillHolder(standin, "V" .. guid .. ":", Stock.Wares(ledger, guid, wares, lotOf))
+            fillHolder(standin, "V" .. guid .. ":", Stock.Wares(ledger, guid, wares, M.Item))
         end
     end
     for standin, guid in pairs(corpseOf) do
