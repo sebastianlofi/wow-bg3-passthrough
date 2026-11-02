@@ -700,14 +700,24 @@ impl Fight {
                 // dead player, so a mob that fell in the same report would keep its WoW HP.
                 let hero_id = self.hero.id.clone();
                 let (hero, mobs): (Vec<_>, Vec<_>) = actors.iter().partition(|a| a.id == hero_id);
+                // One that could not join and BG3 lists after all (the mod: its stand-in is in BG3's
+                // fight, or BG3 killed it) is in: the server holds it still (a release is only a
+                // note, `end` releases it), and its HP and death go to WoW like any member's.
+                let mut late = Vec::new();
                 for a in mobs {
                     let pos = self.basis.to_wow(a.position);
                     if let Some(c) = self.enemies.iter_mut().find(|c| c.id == a.id)
-                        && c.status == "joining"
+                        && matches!(c.status, "joining" | "refused")
                     {
+                        if c.status == "refused" {
+                            late.push(c.label());
+                        }
                         c.status = "in";
                     }
                     self.set_hp(&a.id, a.hp, a.max_hp, Some(pos));
+                }
+                for label in late {
+                    self.say(format!("{label} is in the BG3 fight after all"));
                 }
                 // A BG3 kill is a WoW kill: a member BG3 reported before and lists no more is out
                 // of its fight. The mod lists every member it can read, on the client or from the
