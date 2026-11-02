@@ -38,7 +38,7 @@ link/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs
 apart need no huge grid, and takes the pool from several out-of-bounds layers at once (--layer
 "-1.981,9.74").
 """
-import argparse, concurrent.futures, json, math, os, re, signal, struct, subprocess, sys, time
+import argparse, concurrent.futures, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
@@ -65,6 +65,7 @@ HYST = 8.0       # metres past a square's middle before the window moves
 # then still hold the old place (stale): a wanted one is retiled where it lies, one nobody wants goes first when
 # a square needs a subgrid, and a stale storey over wanted ground gets tiles all blocked, or BG3 would keep finding the
 # old place's upper floor there. Only a refusal, or another continent, takes Stop and Start.
+CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cut_cache)
 # Kalimdor too: Map in the request picks the continent. Another continent than the
 # session's: Stop, a server teleport of the WoW character to the game_tele place Via names on that
 # continent (server/tools/world-console.py tele CHAR VIA: a worldport, WoW's loading screen), wait for
@@ -298,6 +299,80 @@ def camera_wow():
     return eye if all(math.isfinite(v) for v in eye) else None
 
 
+def lattice_centre(c):
+    """The lattice is in tiles: the centre goes on the 0.5 m grid."""
+    return (round(c[0] * 2) / 2, c[1], round(c[2] * 2) / 2)
+
+
+def cut_args(terrain, map_id, centre, origin, ij):
+    """wow_arena.py's arguments (after the output folder) for square ij of a session: the same ones, the same cut."""
+    W, C = origin, centre
+    cx, cz = C[0] + CELL * ij[0] + CELL / 2, C[2] + CELL * ij[1] + CELL / 2
+    wx, wy = W[0] - (cz - C[2]) / YD, W[1] + (cx - C[0]) / YD
+    by = C[1] + (terrain.height(wx, wy) - W[2]) * YD
+    args = ['--wow', str(wx), str(wy), '--bg3', str(cx), str(by), str(cz), '--size', str(CELL), '--islands', 'border',
+            '--map', str(map_id), '--storeys', '1' if STOREYS else '0',
+            '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
+    if STOREYS and W[2] < terrain.height(W[0], W[1]) - wow_arena.UNDER_CLEAR:
+        args += ['--under', str(W[0]), str(W[1]), str(W[2])]
+    return args
+
+
+# Cuts made ahead (wow_waypoints.py prewarm): a square of a session whose origin is a flight point comes out the same
+# every time, as its arguments hold the map, the point and the square. On the player's machine only: they are
+# Blizzard-derived, never shipped, never in git (WOW_CUT_CACHE; the release keeps them in its data folder's cache). A folder per
+# version of the cutting code and of the settings it reads, so a new version cuts anew.
+def cut_cache():
+    root = Path(os.environ.get('WOW_CUT_CACHE') or Path(__file__).resolve().parents[2] / 'tmp' / 'cutcache')
+    h = hashlib.sha1()
+    for name in ('wow_arena.py', 'wow_stand.py', 'wow_vmap.py'):
+        h.update(Path(wow_arena.__file__).with_name(name).read_bytes())
+    for name in ('WOW_BG3_SLOPE_LIMIT', 'WOW_BG3_STEEP_POLYS', 'WOW_BG3_STOREY_LEVELS'):
+        h.update(repr(os.environ.get(name)).encode())
+    return root, h.hexdigest()[:16]
+
+
+def cut_key(args):
+    return hashlib.sha1(' '.join(args).encode()).hexdigest()
+
+
+def cached_cut(args):
+    """The folder of a cut made ahead with these arguments, or None. A cut goes there whole (store_cut)."""
+    global CUT_CACHE
+    if CUT_CACHE is None:
+        CUT_CACHE = cut_cache()
+    root, stamp = CUT_CACHE
+    out = root / stamp / cut_key(args)
+    return out if out.is_dir() else None
+
+
+def store_cut(args):
+    """Cuts a square ahead into the cache, unless it is there. False if wow_arena.py could not cut it."""
+    if cached_cut(args):
+        return True
+    root, stamp = CUT_CACHE
+    out = root / stamp / cut_key(args)
+    tmp = out.with_name(out.name + '.tmp')
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    r = subprocess.run([sys.executable, wow_arena.__file__, str(tmp)] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return False
+    os.replace(tmp, out)
+    return True
+
+
+def prune_cuts():
+    """An older version's cuts go: nothing reads them any more, and they are rebuilt by the same prewarm."""
+    cached_cut([])
+    root, stamp = CUT_CACHE
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.is_dir() and d.name != stamp and re.fullmatch('[0-9a-f]{16}', d.name):
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def face_under(tris, x, y, z):
     """The height of a WoW face within reach of a walker's feet at BG3 (x, y, z), or None. A square's tiles
     hold one floor, so in a cave they can name the hill over it; what the walker stands on is still a face."""
@@ -341,8 +416,7 @@ class World:
         self.map = map_id if map_id is not None else (player_map() or 0)
         assert self.map in CONTINENTS, 'world mode has ground for Eastern Kingdoms and Kalimdor only (map %s)' % self.map
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
-        # The lattice is in tiles: the centre goes on the 0.5 m grid.
-        self.centre = (round(a.centre[0] * 2) / 2, a.centre[1], round(a.centre[2] * 2) / 2)
+        self.centre = lattice_centre(a.centre)
         self.origin = None   # WoW point mapped onto self.centre for the whole session
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
@@ -405,30 +479,24 @@ class World:
 
     # ---- squares ----
     def cut_cmd(self, ij):
-        """The wow_arena.py command for square ij, and its output folder."""
-        minx, minz = self.cell_min(ij)
-        cx, cz = minx + CELL / 2, minz + CELL / 2
-        wx, wy = self.wow_xy(cx, cz)
-        by = self.centre[1] + (self.terrain.height(wx, wy) - self.origin[2]) * YD
+        """The wow_arena.py command for square ij, and its output folder; no command for one made ahead."""
+        args = cut_args(self.terrain, self.map, self.centre, self.origin, ij)
+        ahead = cached_cut(args)
+        if ahead:
+            return None, ahead
         out = CELLS / ('%d_%d' % ij)
         out.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, str(ROOT / 'link/tools/wow_arena.py'), str(out), '--wow', str(wx), str(wy),
-               '--bg3', str(cx), str(by), str(cz), '--size', str(CELL), '--islands', 'border',
-               '--map', str(self.map), '--storeys', '1' if STOREYS else '0',
-               '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
-        ox, oy, oz = self.origin
-        if STOREYS and oz < self.terrain.height(ox, oy) - wow_arena.UNDER_CLEAR:
-            cmd += ['--under', str(ox), str(oy), str(oz)]
-        return cmd, out
+        return [sys.executable, str(ROOT / 'link/tools/wow_arena.py'), str(out)] + args, out
 
     def precut(self, squares):
         """The squares a round needs, cut side by side: a city's takes 3 s, and a move waited for each in turn.
         Their movement tiles first, one at a time, so no two cuts build the same tile."""
         todo = [ij for ij in dict.fromkeys(squares) if ij not in self.cells and ij not in self.ready]
+        cmds = {ij: self.cut_cmd(ij) for ij in todo}
+        todo = [ij for ij in todo if cmds[ij][0]]
         if len(todo) < 2:
             return
         maps, mmaps = wow_stand.data_dir('WOW_BG3_MAPS', 'maps'), wow_stand.data_dir('WOW_BG3_MMAPS', 'mmaps')
-        cmds = {ij: self.cut_cmd(ij) for ij in todo}
         for ij in todo:
             minx, minz = self.cell_min(ij)
             wx, wy = self.wow_xy(minx + CELL / 2, minz + CELL / 2)
@@ -446,7 +514,7 @@ class World:
         cmd, out = self.cut_cmd(ij)
         if ij in self.ready:
             self.ready.discard(ij)
-        else:
+        elif cmd:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
         minx, minz = self.cell_min(ij)
         cx, cz = minx + CELL / 2, minz + CELL / 2
@@ -1260,11 +1328,12 @@ def main():
     # --party-floor is what every run does now: a treadmill per party member.
     a.floor = max(2, min(6, a.floor))
     wait_hero(a.wait_hero)
-    # The first trip to a flight point waits for nothing: its movement tiles are built ahead, at the lowest priority.
+    # The first trip to a flight point waits for nothing: its movement tiles and its squares are built ahead, at the lowest priority.
     if os.environ.get('WOW_BG3_SERVER') and os.environ.get('WOWBG3_SERVER_VAR'):
         try:
             subprocess.Popen(['nice', '-n', '19', sys.executable, str(Path(__file__).resolve().parent / 'wow_waypoints.py'), 'prewarm',
-                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')] + [str(v) for v in a.centre] + [str(a.floor)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             print('movement tiles ahead:', e, flush=True)
     w = World(a)

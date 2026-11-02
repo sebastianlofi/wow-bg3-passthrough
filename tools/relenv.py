@@ -55,6 +55,7 @@ def configure():
     e.setdefault('WOWBG3_SERVER_VAR', str(p['var']))
     e.setdefault('WOW_BG3_IO', str(p['io']))
     e.setdefault('WOW_VMAP_CACHE', str(p['cache'] / 'vmap'))
+    e.setdefault('WOW_CUT_CACHE', str(p['cache'] / 'cuts'))
     e.setdefault('WOW_BG3_MAPS', str(p['maps']))
     e.setdefault('WOW_BG3_VMAPS', str(p['vmaps']))
     e.setdefault('WOW_BG3_MMAPS', str(p['mmaps']))

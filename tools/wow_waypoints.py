@@ -24,7 +24,8 @@ The rules, one place:
 
   wow_waypoints.py table DBC_DIR                    every point by team (DBC_DIR holds TaxiNodes.dbc)
   wow_waypoints.py stand DBC_DIR                    each point's height and the floor it lands on
-  wow_waypoints.py prewarm DBC_DIR                  movement tiles round every point, ahead of the first trip
+  wow_waypoints.py prewarm DBC_DIR [X Y Z FLOOR]    movement tiles round every point, ahead of the first trip, and with
+                                                    world mode's centre and floor side the squares a move lands on
                                                     (needs the server's map data: WOW_BG3_MAPS, _MMAPS, _VMAPS)
 Python 3.9, standard library only, except `stand` (wow_stand.py's needs).
 """
@@ -193,26 +194,65 @@ def stand_z(map_id, x, y, z, terrain=None):
     return nearest_floor(best, drawn, wow_stand.SNAP_YD)
 
 
-def prewarm(dbc_dir):
+def square_order(floor):
+    """The squares round a point as a move wants them: the 2 x 2 the party lands on, then the rest of the block its
+    window keeps (world_bridge.py window, --floor), nearest first."""
+    core = [(-1, -1), (0, -1), (-1, 0), (0, 0)]
+    h = floor // 2
+    rest = [(i, j) for i in range(-h, floor - h) for j in range(-h, floor - h) if (i, j) not in core]
+    rest.sort(key=lambda ij: (ij[0] + 0.5) ** 2 + (ij[1] + 0.5) ** 2)
+    return core, rest
+
+
+def prewarm(dbc_dir, centre=None, floor=4):
     """Builds the movement tiles round every flight point ahead of the first trip there: a city's tile takes
-    the generator 45 s, which a move would otherwise wait for. Tiles are kept, so a later run only looks. Ends with
-    the process that started it."""
+    the generator 45 s, which a move would otherwise wait for. Tiles are kept, so a later run only looks. With
+    `centre` also the cuts of the squares a move there lands on, every point's 2 x 2 before any point's rest: a cut takes
+    up to 3 s, and a move would wait for 4 to 12 of them (world_bridge.py cut_cmd reads them; on this machine only).
+    Ends with the process that started it."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import wow_arena
     import wow_stand
     maps, mmaps = wow_stand.data_dir('WOW_BG3_MAPS', 'maps'), wow_stand.data_dir('WOW_BG3_MMAPS', 'mmaps')
     parent = os.getppid()
-    for n in nodes(dbc_dir):
+    points = [n for n in nodes(dbc_dir) if can_be_waypoint(n, ALLIANCE) or can_be_waypoint(n, HORDE)]
+    for n in points:
         if os.getppid() != parent:
             return 0
-        if can_be_waypoint(n, ALLIANCE) or can_be_waypoint(n, HORDE):
-            wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH)
+        wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH)
+    if centre is None:
+        return 0
+    import world_bridge as B
+    centre = B.lattice_centre(centre)
+    B.prune_cuts()
+    terrains, origins = {}, {}
+    for squares in square_order(floor):
+        for n in points:
+            for ij in squares:
+                if os.getppid() != parent:
+                    return 0
+                try:
+                    if n['map'] not in terrains:
+                        terrains[n['map']] = wow_arena.Terrain(maps, n['map'])
+                    terrain = terrains[n['map']]
+                    if n['id'] not in origins:
+                        try:  # as World.move: the floor nearest its height, or its own height
+                            origins[n['id']] = (n['x'], n['y'], float(stand_z(n['map'], n['x'], n['y'], n['z'], terrain)))
+                        except Exception:  # noqa: BLE001
+                            origins[n['id']] = (n['x'], n['y'], n['z'])
+                    wx, wy = origins[n['id']][0] - (B.CELL * ij[1] + B.CELL / 2) / B.YD, origins[n['id']][1] + (B.CELL * ij[0] + B.CELL / 2) / B.YD
+                    wow_arena.ensure_mmtiles(mmaps, maps, n['map'], wx, wy, B.CELL / 2 / B.YD + 3)
+                    B.store_cut(B.cut_args(terrain, n['map'], centre, origins[n['id']], ij))
+                except Exception:  # noqa: BLE001  a point off the height maps costs its move a cut, no more
+                    continue
     return 0
 
 
 def main(argv):
     if len(argv) == 2 and argv[0] == 'prewarm':
         return prewarm(argv[1])
+    if len(argv) == 6 and argv[0] == 'prewarm':
+        return prewarm(argv[1], (float(argv[2]), float(argv[3]), float(argv[4])), int(argv[5]))
     if len(argv) != 2 or argv[0] not in ('table', 'stand'):
         print(__doc__)
         return 2

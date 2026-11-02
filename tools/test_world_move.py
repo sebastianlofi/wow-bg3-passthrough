@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""test_world_move.py: a move on the same continent (world_bridge.py World.reorigin), without a game, a server or
+WoW's data: which pool subgrid goes where, what goes stale, when world.json turns Active, when Stop and Start
+take over; and the cuts made ahead (made-up wow_arena.py).
+
+  python3 tools/test_world_move.py
+"""
+import json
+import os
+import struct
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import world_bridge as B  # noqa: E402
+import wow_waypoints as W  # noqa: E402
+
+TARGET = (-8840.0, 489.0, 109.0)
+
+
+class Flat:
+    def height(self, x, y):
+        return 100.0
+
+
+class Fake(B.World):
+    """A World with no cuts and no mod: `answers` says how each mod command ends, `sent` keeps them."""
+    def __init__(self, tmp):
+        self.a = SimpleNamespace(pool=6, floor=2, layers=[-15.0], centre=(-1400.0, 120.0, -350.0), maps='maps')
+        with mock.patch.object(B, 'run_id', lambda: 'r1'), mock.patch.object(B, 'player_map', lambda: 0), \
+                mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()):
+            super().__init__(self.a)
+        self.origin = (0.0, 0.0, 100.0)
+        self.answers, self.sent = [], []
+        self.storeys = {}  # square -> how many storeys its cut has
+
+    def precut(self, squares):
+        pass
+
+    def cut(self, ij):
+        if ij not in self.cells:
+            n = self.storeys.get(ij, 0)
+            self.cells[ij] = {'ij': ij, 'min': self.cell_min(ij), 'base': 90.0, 'tiles': b'', 'section': b'new', 'tris': b'',
+                              'kinds': b'', 'storeys': [{'min': self.cell_min(ij + (k + 1,)), 'base': 95.0, 'section': b'up', 'tiles': 9,
+                                                         'floors': bytes(5 * B.TILES * B.TILES)} for k in range(n)] or None}
+        return self.cells[ij]
+
+    def command(self, action, **fields):
+        self.sent.append((action, fields))
+        return len(self.sent)
+
+    def wait_done(self, seq, timeout):
+        return self.answers.pop(0) if self.answers else (True, None)
+
+    def write_triangles(self, squares):
+        self.triangles = list(squares)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.tmp = Path(d.name)
+        (self.tmp / 'link').mkdir()
+        for name, v in (('IO', self.tmp), ('LINK', self.tmp / 'link'), ('MOVE_RESULT', self.tmp / 'result.json'), ('CELLS', self.tmp / 'cells')):
+            p = mock.patch.object(B, name, v)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(B, 'hero', lambda *_: {'Uuid': 'hero-1', 'Name': 'Tav'})
+        p.start()
+        self.addCleanup(p.stop)
+        self.w = Fake(self.tmp)
+
+    def camera(self, x, y):
+        raw = bytearray(96)
+        raw[:4] = b'WBC1'
+        struct.pack_into('<3f', raw, 72, x, y, 100.0)
+        struct.pack_into('<II', raw, 84, 0, 1)
+        (self.tmp / 'link/camera.bin').write_bytes(bytes(raw))
+
+    def active(self):
+        return json.loads((self.tmp / 'link/world.json').read_text())['Active']
+
+
+class Moves(Base):
+    def test_without_stale_squares_as_before(self):
+        w = self.w
+        w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0)}
+        w.members = [(None, (-1400.0, 120.0, -350.0), False)]
+        self.assertEqual(w.moves([(0, 0), (1, 0)]), [(4, (1, 0))])
+        self.assertEqual(w.to_block, set())
+
+    def test_stale_wanted_square_stays_on_its_subgrid(self):
+        w = self.w
+        w.placed = {0: (0, 0), 1: (5, 5)}
+        w.stale = {0, 1}
+        self.assertEqual(w.moves([(0, 0)]), [(0, (0, 0))])
+
+    def test_a_stale_subgrid_goes_first_for_a_new_square(self):
+        w = self.w
+        w.placed = {0: (5, 5), 1: (6, 6)}
+        w.stale = {1}
+        self.assertEqual(w.moves([(0, 0)])[0], (1, (0, 0)))
+
+    def test_a_pinned_stale_square_is_still_retiled(self):
+        w = self.w
+        w.placed = {0: (0, 0)}
+        w.stale = {0}
+        w.pinned = {0: time.time() + 15}
+        self.assertEqual(w.moves([(0, 0)]), [(0, (0, 0))])
+
+    def test_stale_storey_over_wanted_ground_goes_blocked_once(self):
+        w = self.w
+        w.pool = w.ground_pool = 2   # no other subgrid wants it: it stays and goes blocked
+        w.placed = {0: (0, 0), 1: (0, 0, 1)}
+        w.stale = {0, 1}
+        pairs = w.moves([(0, 0)])
+        self.assertEqual(pairs, [(0, (0, 0)), (1, (0, 0, 1))])
+        self.assertEqual(w.to_block, {1})
+        cells = w.cells_for(pairs)
+        raw = (self.tmp / ('section-1-%d.bin' % cells[1][4])).read_bytes()
+        self.assertEqual(len(raw), 5 * B.TILES * B.TILES)
+        self.assertEqual(raw[::5], bytes(B.TILES * B.TILES))
+        self.assertEqual(cells[1][1:3], list(w.cell_min((0, 0, 1))))
+        for k, ij in pairs:
+            w.took(k, ij)
+        self.assertEqual((w.stale, w.blocked), ({1}, {1}))
+        self.assertEqual(w.moves([(0, 0)]), [])
+
+    def test_a_blocked_storey_gets_ground_when_a_cut_wants_it(self):
+        w = self.w
+        w.placed = {1: (0, 0, 1)}
+        w.stale, w.blocked = {1}, {1}
+        pairs = w.moves([(0, 0, 1)])
+        self.assertEqual(pairs, [(1, (0, 0, 1))])
+        w.took(1, (0, 0, 1))
+        self.assertEqual((w.stale, w.blocked), (set(), set()))
+
+    def test_a_stale_square_has_no_floor_for_the_guard(self):
+        w = self.w
+        w.placed = {0: (0, 0)}
+        w.cut((0, 0))
+        w.cells[(0, 0)]['tiles'] = bytes(5 * B.TILES * B.TILES)
+        self.assertIsNotNone(w.floor_at(-1390.0, -340.0))
+        w.stale = {0}
+        self.assertIsNone(w.floor_at(-1390.0, -340.0))
+
+    def test_resync_forgets_stale_subgrids_no_longer_placed(self):
+        w = self.w
+        w.placed, w.stale, w.blocked = {0: (0, 0), 1: (1, 1)}, {0, 1}, {1}
+        at = {0: (0, 0)}
+        side = {**{k: None for k in range(8)}, **at}
+        with mock.patch.object(w, 'pool_files', lambda: (side, side)):
+            w.resync()
+        self.assertEqual((w.stale, w.blocked), ({0}, set()))
+
+
+class Reorigin(Base):
+    def placed_round_centre(self):
+        self.w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0), 4: (7, 7), 5: (8, 8)}
+        self.w.members = [(None, (-1400.0 + 7.5 * 64, 120.0, -350.0 + 7.5 * 64), False)]
+
+    def test_lands_where_the_squares_are(self):
+        self.placed_round_centre()
+        self.assertIsNone(self.w.reorigin(TARGET))
+        action, f = self.w.sent[0]
+        self.assertEqual(action, 'Reorigin')
+        self.assertEqual(f['WowOrigin'], list(TARGET))
+        self.assertEqual(sorted(c[0] for c in f['Cells']), [0, 1, 2, 3])
+        self.assertEqual(self.w.stale, {4, 5})
+        self.assertEqual(self.w.rays, sorted(self.w.triangles))
+        self.assertEqual(self.w.origin, TARGET)
+
+    def test_centre_squares_elsewhere_take_stale_subgrids(self):
+        self.w.placed = {k: (10 + k, 10) for k in range(6)}
+        self.w.members = [(None, (-1400.0 + 64 * 10, 120.0, -350.0 + 64 * 10), False)]
+        self.assertIsNone(self.w.reorigin(TARGET))
+        self.assertEqual(len(self.w.sent[0][1]['Cells']), 4)
+        self.assertEqual(len(self.w.stale), 2)
+
+    def test_busy_subgrid_waits_and_another_goes(self):
+        self.w.placed = {k: (10 + k, 10) for k in range(6)}
+        self.w.members = [(None, (-1400.0 + 64 * 10, 120.0, -350.0 + 64 * 10), False)]
+        far = max(range(6))  # farthest from the party: asked first
+        self.w.answers = [(False, 'Place refused: something stands on pool %d' % far)]
+        self.assertIsNone(self.w.reorigin(TARGET))
+        self.assertEqual(self.w.sent[0][0], self.w.sent[1][0])
+        self.assertIn(far, [c[0] for c in self.w.sent[0][1]['Cells']])
+        self.assertNotIn(far, [c[0] for c in self.w.sent[1][1]['Cells']])
+
+    def test_active_only_once_benilla_has_followed(self):
+        self.placed_round_centre()
+        self.w.publish(False)
+        self.assertIsNone(self.w.reorigin(TARGET))
+        self.camera(5000.0, 5000.0)
+        self.w.settle()
+        self.assertFalse(self.active())
+        self.camera(TARGET[0] + 3, TARGET[1] - 2)
+        self.w.settle()
+        self.assertTrue(self.active())
+        self.assertIsNone(self.w.landed)
+
+    def test_no_camera_stream_yet_is_no_error(self):
+        self.placed_round_centre()
+        self.w.publish(False)
+        self.assertIsNone(self.w.reorigin(TARGET))
+        self.w.settle()
+        self.assertFalse(self.active())
+
+
+class Move(Base):
+    def request(self, **fields):
+        return dict({'Seq': 3, 'Wow': list(TARGET), 'Map': 0}, **fields)
+
+    def run_move(self, m):
+        w = self.w
+        w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0)}
+        started = []
+        class New:
+            def __init__(self, a, map_id=None):
+                self.origin = None
+
+            def start(self, at):
+                self.origin = at
+                started.append(at)
+        with mock.patch.object(B, 'tav_flags', lambda *_: 0), mock.patch.object(B, 'camp_state', lambda *_: False), \
+                mock.patch.object(B, 'move_cover', lambda *_: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
+                mock.patch.object(B, 'World', New):
+            result = w.move(m)
+        return result, started, json.loads(B.MOVE_RESULT.read_text())
+
+    def test_same_continent_keeps_the_session(self):
+        result, started, answer = self.run_move(self.request())
+        self.assertIs(result, self.w)
+        self.assertEqual(started, [])
+        self.assertEqual(self.w.sent[0][0], 'Reorigin')
+        self.assertEqual(answer['Value'], {'Origin': list(TARGET), 'Map': 0})
+        self.assertFalse(self.active())
+
+    def test_a_refusal_goes_the_whole_way(self):
+        self.w.answers = [(False, 'Cell too far from the disposable character'), (True, None)]
+        result, started, answer = self.run_move(self.request())
+        self.assertIsNot(result, self.w)
+        self.assertEqual([a for a, _ in self.w.sent], ['Reorigin', 'Stop'])
+        self.assertEqual(started, [TARGET])
+        self.assertTrue(answer['OK'])
+
+    def test_another_continent_never_re_origins(self):
+        with mock.patch.object(self.w, 'arrive', lambda t: None):
+            result, started, answer = self.run_move(self.request(Map=1, Arrived=True))
+        self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
+        self.assertEqual(answer['Value']['Map'], 1)
+
+
+FAKE_ARENA = """import sys, pathlib
+out = pathlib.Path(sys.argv[1])
+if '--fail' in sys.argv:
+    sys.exit(3)
+(out / 'arena.json').write_text('{}')
+"""
+
+
+class Cache(Base):
+    def setUp(self):
+        super().setUp()
+        fake = self.tmp / 'fake'
+        fake.mkdir()
+        (fake / 'wow_arena.py').write_text(FAKE_ARENA)
+        (fake / 'wow_stand.py').write_text('')
+        (fake / 'wow_vmap.py').write_text('')
+        for p in (mock.patch.object(B.wow_arena, '__file__', str(fake / 'wow_arena.py')), mock.patch.object(B, 'CUT_CACHE', None),
+                  mock.patch.dict(os.environ, {'WOW_CUT_CACHE': str(self.tmp / 'cuts')})):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def args(self, ij=(0, 0), origin=TARGET):
+        return B.cut_args(Flat(), 0, self.w.centre, origin, ij)
+
+    def test_the_bridge_reads_what_prewarm_cut(self):
+        self.w.origin = TARGET
+        cmd, out = B.World.cut_cmd(self.w, (0, 0))
+        self.assertTrue(cmd)
+        self.assertEqual(out, B.CELLS / '0_0')
+        self.assertTrue(B.store_cut(self.args()))
+        cmd, out = B.World.cut_cmd(self.w, (0, 0))
+        self.assertIsNone(cmd)
+        self.assertTrue((out / 'arena.json').exists())
+
+    def test_another_square_or_point_is_another_cut(self):
+        B.store_cut(self.args())
+        self.assertIsNone(B.cached_cut(self.args((1, 0))))
+        self.assertIsNone(B.cached_cut(self.args(origin=(TARGET[0], TARGET[1] + 1, TARGET[2]))))
+
+    def test_a_failed_cut_leaves_nothing(self):
+        self.assertFalse(B.store_cut(self.args() + ['--fail']))
+        self.assertIsNone(B.cached_cut(self.args() + ['--fail']))
+        root, stamp = B.CUT_CACHE
+        self.assertEqual(list((root / stamp).iterdir()), [])
+
+    def test_new_cutting_code_prunes_the_old_cuts(self):
+        B.store_cut(self.args())
+        root, old = B.CUT_CACHE
+        (Path(B.wow_arena.__file__).with_name('wow_vmap.py')).write_text('# changed')
+        B.CUT_CACHE = None
+        self.assertIsNone(B.cached_cut(self.args()))
+        B.prune_cuts()
+        self.assertFalse((root / old).exists())
+
+    def test_prewarm_cuts_what_a_move_there_asks_for(self):
+        point = {'id': 2, 'map': 0, 'x': -8840.25, 'y': 489.5, 'z': 109.125, 'name': 'Stormwind', W.ALLIANCE: 541, W.HORDE: 0}
+        stored = []
+        with mock.patch.object(W, 'nodes', lambda _: [point]), mock.patch.object(W, 'stand_z', lambda m, x, y, z, t: 104.5), \
+                mock.patch.object(B.wow_arena, 'ensure_mmtiles', lambda *_: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
+                mock.patch.object(B, 'store_cut', stored.append):
+            self.assertEqual(W.prewarm('dbc', (-1400.2, 120.0, -350.0), 2), 0)
+        self.assertEqual(len(stored), 4)
+        self.w.centre = B.lattice_centre((-1400.2, 120.0, -350.0))
+        self.w.origin = (point['x'], point['y'], 104.5)
+        self.assertEqual(B.cut_args(Flat(), 0, self.w.centre, self.w.origin, (-1, -1)), stored[0])
+        B.store_cut(stored[0])
+        self.assertIsNone(B.World.cut_cmd(self.w, (-1, -1))[0])
+
+    def test_squares_as_the_window_wants_them(self):
+        core, rest = W.square_order(4)
+        self.w.a.floor = 4
+        h = self.w.walker('h', 'h')
+        h.node = (0, 0)
+        want, block = self.w.window(h, self.w.centre[0], self.w.centre[2])
+        self.assertEqual(sorted(core), sorted(want))
+        self.assertEqual(sorted(rest), sorted(block))
+        self.assertEqual(W.square_order(2)[1], [])
+
+
+if __name__ == '__main__':
+    unittest.main()
