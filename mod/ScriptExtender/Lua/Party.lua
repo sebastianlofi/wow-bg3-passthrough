@@ -46,8 +46,7 @@
 -- or more below where it last stood still, out of every fight) is put back where it stood. Checked every
 -- 30 ticks. While world_bridge.py's floor.json says MemberGuard (a treadmill and a fall guard per member,
 -- the default), the bridge rescues falls and this upkeep moves nobody.
--- Help (world mode): out of every fight, a downed member is helped up by the nearest standing companion
--- with BG3's own Help (Target_Help), as the player would after a fight won with the hero down.
+-- Help: a member down after a fight stays down until the player uses BG3's Help, as in BG3.
 -- Status: wow-bg3/party.json (on change within 10 ticks, else every 300): {RunId, Tick, Hero, Members =
 -- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Upkeep, Moved}.
 -- Read by TavPlan.lua/WorldMode.lua (the figures WoW draws), Mirrors.lua and ActionMonitor.lua (the
@@ -602,38 +601,6 @@ function M.Start(runId)
         end
     end
 
-    -- Help (world mode): once the party is out of every fight, a downed member (the hero too) is helped up
-    -- by the nearest companion still standing within 40 m, with BG3's own Help (Target_Help: it walks
-    -- there and the downed one stands at 1 HP), as the player does in BG3 after a fight. The hero never
-    -- helps by itself (WoW drives the hero; the player can still use BG3's Help). Retried every 300 ticks.
-    local helping = {}
-    local function helpUp()
-        local hero = Hero.Uuid()
-        local party = M.Party()
-        for _, u in ipairs(party) do if q(Osi.IsInCombat, u) == 1 then return end end
-        for _, u in ipairs(party) do
-            if q(Osi.HasActiveStatus, u, "DOWNED") == 1 and q(Osi.IsDead, u) ~= 1
-                and (not helping[u] or tick - helping[u] > 300) then
-                local at, best, bd = pos(u), nil, nil
-                for _, h in ipairs(party) do
-                    if h ~= hero and h ~= u and q(Osi.HasActiveStatus, h, "DOWNED") ~= 1 and q(Osi.IsDead, h) ~= 1 then
-                        local p = pos(h)
-                        if at and p then
-                            local d = math.sqrt((p[1] - at[1]) ^ 2 + (p[3] - at[3]) ^ 2)
-                            if d < 40 and (not bd or d < bd) then best, bd = h, d end
-                        end
-                    end
-                end
-                if best then
-                    helping[u] = tick
-                    local ok, err = pcall(Osi.UseSpell, best, "Target_Help", u)
-                    Ext.Utils.Print(string.format("WOW-BG3 party: %s helps %s up (BG3's Help, %.0f m)%s", nameOf(best),
-                        nameOf(u), bd, ok and "" or (": " .. tostring(err))))
-                end
-            end
-        end
-    end
-
     local function writeStatus(force)
         local snap = M.Snapshot()
         local key = Ext.Json.Stringify(snap)
@@ -670,7 +637,6 @@ function M.Start(runId)
         if upkeep and tick % 30 == 11 and not jobs[1] then
             if Ext.Require("Camp.lua").InTrip() then lastPos, steady = {}, {} else pcall(keepUp) end
         end
-        if upkeep and tick % 30 == 21 and not jobs[1] then pcall(helpUp) end
         if tick % 10 == 3 then pcall(writeStatus, false) end
         if tick % 90 == 31 and not jobs[1] then pcall(campStart) end
         if tick % 10 ~= 0 then return end
