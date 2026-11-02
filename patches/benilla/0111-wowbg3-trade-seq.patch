@@ -1,0 +1,47 @@
+WOW-BG3 benilla patch 0111: wowtrade.bin's seq goes on from the record already there.
+Every run started its seq at 1. Interact.lua takes the record it finds at its first look as history, so when the last
+run's record was 1 the new run's first vendor was ignored: in 0.1.3013.58 a left click on Flakk got WoW's merchant
+("wowbg3 trade: vendor ... to BG3's trade screen") and no BG3 trade; the next Talk, seq 2, opened it.
+BG3 -> WoW (wowuse.bin) already goes on from its file's seq (Interact.lua M.Use).
+diff --git a/crates/benilla-app/src/ui_merchant/mod.rs b/crates/benilla-app/src/ui_merchant/mod.rs
+--- a/crates/benilla-app/src/ui_merchant/mod.rs
++++ b/crates/benilla-app/src/ui_merchant/mod.rs
+@@ -137,6 +137,9 @@ impl Plugin for UiMerchantPlugin {
+ /// bytes, little endian: `WTR1`, seq u32, vendor guid lo u32, hi u32, seq again) names the vendor
+ /// (`Interact.lua` opens BG3's trade with its stand-in) and WoW's window is closed before it shows
+ /// (the vendor's list is cleared; a merchant has no close packet). Logs `wowbg3 trade: ...`.
++/// The seq goes on from the record already there (patch 0111): `Interact.lua` takes the record it
++/// finds at its first look as history, so a run that started again at 1 had its first vendor
++/// ignored when the last run's record was 1 too (0.1.3013.58: a left click on Flakk opened nothing).
+ fn hand_vendor_to_bg3(
+     mut open: ResMut<MerchantOpen>,
+     mut state: Local<Option<(std::path::PathBuf, u32)>>,
+@@ -144,7 +147,11 @@ fn hand_vendor_to_bg3(
+ ) {
+     if armed.is_none() {
+         let on = std::env::var_os("WOW_BG3_LEAD").is_some();
+-        *state = std::env::var_os("WOW_BG3_LINK_DIR").filter(|_| on).map(|d| (std::path::PathBuf::from(d).join("wowtrade.bin"), 0));
++        *state = std::env::var_os("WOW_BG3_LINK_DIR").filter(|_| on).map(|d| {
++            let path = std::path::PathBuf::from(d).join("wowtrade.bin");
++            let last = std::fs::read(&path).ok().and_then(|b| last_trade_seq(&b)).unwrap_or(0);
++            (path, last)
++        });
+         *armed = Some(state.is_some());
+     }
+     let (Some((path, seq)), Some(vendor)) = (state.as_mut(), open.vendor) else { return };
+@@ -167,6 +174,15 @@ fn hand_vendor_to_bg3(
+     open.clear();
+ }
+ 
++/// The seq of a whole `wowtrade.bin` record (`WTR1`, seq, lo, hi, seq again); `None` when torn or foreign.
++fn last_trade_seq(b: &[u8]) -> Option<u32> {
++    if b.len() < 20 || b.get(0..4)? != b"WTR1" {
++        return None;
++    }
++    let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
++    (u(4) == u(16)).then(|| u(4))
++}
++
+ /// The one `BuyResult` code the reference shows nothing for: `0x5dcde7`'s jump table sends 6 to
+ /// the handler's `ret`. vmangos never sends it.
+ const BUY_SILENT: u8 = 6;
