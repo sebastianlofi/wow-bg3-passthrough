@@ -127,10 +127,24 @@ class Moves(Base):
         self.assertEqual(len(raw), 5 * B.TILES * B.TILES)
         self.assertEqual(raw[::5], bytes(B.TILES * B.TILES))
         self.assertEqual(cells[1][1:3], list(w.cell_min((0, 0, 1))))
+        # Under every floor of the square it lies over, never at the centre's height (the hero's floor).
+        low = 90.0 - B.BLOCKED_UNDER_M
+        self.assertEqual(cells[1][3], low)
+        self.assertEqual({struct.unpack_from('<f', raw, i * 5 + 1)[0] for i in range(B.TILES * B.TILES)}, {low})
         for k, ij in pairs:
             w.took(k, ij)
         self.assertEqual((w.stale, w.blocked), ({1}, {1}))
         self.assertEqual(w.moves([(0, 0)]), [])
+
+    def test_a_blocked_storey_lies_under_a_cave_storey_too(self):
+        w = self.w
+        w.storeys[(0, 0)] = 2
+        w.cut((0, 0))['storeys'][1]['base'] = 40.0  # a cave under the hill
+        w.pool = w.ground_pool = 2
+        w.placed = {0: (0, 0), 1: (0, 0, 1)}
+        w.stale = {0, 1}
+        cells = w.cells_for(w.moves([(0, 0)]))
+        self.assertEqual(cells[1][3], 40.0 - B.BLOCKED_UNDER_M)
 
     def test_a_blocked_storey_gets_ground_when_a_cut_wants_it(self):
         w = self.w
@@ -269,6 +283,42 @@ class Cover(Base):
         self.assertEqual(self.lifted, [False])
 
 
+class CoverTime(Base):
+    """The move's cover is black about a second after its flag; the flag the player's command wrote counts."""
+    def test_the_commands_flag_counts(self):
+        flag = self.tmp / 'link/wowmove.flag'
+        t = time.time() - 0.7
+        flag.write_text('%.3f\n' % t)
+        self.assertAlmostEqual(B.move_cover(True), t + B.COVER_BLACK_S, places=2)
+        self.assertTrue(flag.exists())
+
+    def test_no_flag_or_an_old_one_starts_now(self):
+        flag = self.tmp / 'link/wowmove.flag'
+        now = time.time()
+        self.assertGreaterEqual(B.move_cover(True), now + B.COVER_BLACK_S)
+        flag.write_text('%.3f\n' % (now - 600))
+        self.assertGreaterEqual(B.move_cover(True), now + B.COVER_BLACK_S)
+        B.move_cover(False)
+        self.assertFalse(flag.exists())
+
+    def test_the_cuts_come_before_the_wait_and_the_mapping_goes_off_after_it(self):
+        w = self.w
+        w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0)}
+        w.publish(True)
+        order = []
+        cut = w.cut
+        w.cut = lambda ij: (order.append('cut'), cut(ij))[1]
+        def covered():
+            order.append('covered')
+            self.assertTrue(self.active())   # the old mapping holds until the cover is black
+            w.publish(False)
+        self.assertIsNone(w.reorigin(TARGET, covered))
+        self.assertEqual(order[-1], 'covered')
+        self.assertIn('cut', order)
+        self.assertEqual([a for a, _ in w.sent], ['Reorigin'])
+        self.assertFalse(self.active())
+
+
 class Move(Base):
     def request(self, **fields):
         return dict({'Seq': 3, 'Wow': list(TARGET), 'Map': 0}, **fields)
@@ -311,6 +361,66 @@ class Move(Base):
             result, started, answer = self.run_move(self.request(Map=1, Arrived=True))
         self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
         self.assertEqual(answer['Value']['Map'], 1)
+
+
+LUA = Path(__file__).resolve().parent.parent / 'mod/ScriptExtender/Lua'
+try:
+    import lupa
+except ImportError:
+    lupa = None
+
+
+@unittest.skipIf(lupa is None, 'needs the lupa module')
+class ArenaWait(unittest.TestCase):
+    """WorldMode.lua's arena(): an action only the client carries out (Arena.lua ClientOnly) waits for the client's
+    result alone; every other one for both. The real Lua text of both, under a fake file store."""
+    def setUp(self):
+        self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        L.execute(r'''
+          files, ticks, runId = {}, 0, "run"
+          Ext = {IO = {LoadFile = function(n) return files[n] end, SaveFile = function(n, v) files[n] = v end},
+                 Json = {Parse = function(v) return load("return " .. v)() end,
+                         Stringify = function(t) return string.format("{RunId = %q, Sequence = %d, Action = %q}",
+                             t.RunId, t.Sequence, t.Action) end},
+                 Require = function() return {} end, IsClient = function() return true end}
+          function readJson(name)
+            local raw = Ext.IO.LoadFile("wow-bg3/" .. name)
+            if not raw then return nil end
+            local ok, v = pcall(Ext.Json.Parse, raw)
+            return ok and type(v) == "table" and v or nil
+          end
+          function answer(side, seq) files["wow-bg3/arena-" .. side .. "-result.json"] =
+              string.format("{RunId = 'run', Sequence = %d, OK = true, Value = %q}", seq, side) end
+        ''')
+        arena_text = (LUA / 'Arena.lua').read_text()
+        i = arena_text.index('M.ClientOnly = ')
+        L.execute('Arena = {}; ' + arena_text[i:arena_text.index('\n\n', i)].replace('M.ClientOnly', 'Arena.ClientOnly'))
+        text = (LUA / 'WorldMode.lua').read_text()
+        body = text[text.index('    local function command(stem, c, results)'):text.index('    local function standIn(c)')]
+        L.execute('function make()\n' + body + '\nreturn arena end\narena = make()')
+
+    def run_arena(self, action, sides):
+        L = self.L
+        L.globals().action = action
+        L.execute('co = coroutine.create(function() return arena({Action = action}) end); ok, value = coroutine.resume(co)')
+        seq = L.eval('readJson("arena-command.json").Sequence')
+        for side in sides:
+            L.globals().answer(side, seq)
+        for _ in range(400):
+            if L.eval('coroutine.status(co)') == 'dead':
+                break
+            L.execute('ticks = ticks + 1; ok, value = coroutine.resume(co)')
+        return L.eval('ok'), L.eval('value')
+
+    def test_lead_waits_for_the_client_alone(self):
+        self.assertEqual(self.run_arena('Lead', ['client']), (True, 'client'))
+        self.assertEqual(self.run_arena('PickRegionOff', ['client']), (True, 'client'))
+
+    def test_place_still_waits_for_both(self):
+        ok, why = self.run_arena('Place', ['client'])
+        self.assertFalse(ok)
+        self.assertIn('no result', why)
+        self.assertEqual(self.run_arena('Place', ['client', 'server']), (True, 'server'))
 
 
 FAKE_ARENA = """import sys, pathlib

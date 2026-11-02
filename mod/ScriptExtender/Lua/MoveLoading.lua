@@ -10,6 +10,11 @@
 -- move was doing then (its Stop came 2 to 12 s in), and nothing of ours cleared it. BG3's own covers are
 -- short (fade, teleport, clear). A longer move asks for a new fade before the last one lapses (RENEW_MS): it
 -- starts black over a black screen, so nothing shows; at the end every one still standing is cleared.
+-- The renewals run on the server and BG3's client lifts a fade on its own clock: the lit frames of the
+-- 0.1.3013.59 test (17 to 25 s into the fallback moves) were no renewal showing through but the server running no
+-- tick for 8 to 13 s after a re-origin's teleport (no renewal, no Osiris event), so the last fade ran out
+-- (BG3 collapsed it 10.2 s after it was asked for) up to 3.6 s before the next renewal came. world_bridge.py's
+-- blocked storeys no longer lie on the hero's floor, after which those freezes followed (cells_for).
 -- ScreenFadeTo's arguments are (Character, Seconds, FadeStyle, FadeID) (the names BG3 registers for Osiris):
 -- the third is the style (0 black, 1 bright), not the wheel; ScreenFadeHasSpin is not one of its arguments.
 --
