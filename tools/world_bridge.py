@@ -1152,7 +1152,12 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
     w.start()
-    moved = 0
+    # A request already on disk is the world before this load's: one BG3 run keeps its RunId across loads, so a new
+    # bridge counting from 0 moved the party there again after every reload.
+    try:
+        moved = json.loads(MOVE.read_text()).get('Seq', 0) if MOVE.exists() else 0
+    except (OSError, json.JSONDecodeError):
+        moved = 0
     at_camp = False
     # A bridge that died at camp left benilla without its world.
     try:
