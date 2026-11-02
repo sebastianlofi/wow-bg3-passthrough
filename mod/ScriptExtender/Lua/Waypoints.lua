@@ -81,7 +81,8 @@ function M.Start()
                 if trigger and p.Known and not offered(p.Name, who) then
                     if not item then
                         local x, y, z = Osi.GetPosition(who)
-                        item = x and q(Osi.CreateAt, M.HELPER, x, y - 30, z, 1, 0, "") or nil
+                        -- Off the squares: an item on one keeps it from going home clean, and the pool loses it.
+                        item = x and q(Osi.CreateAt, M.HELPER, x, y - 30, z + 500, 1, 0, "") or nil
                     end
                     if item then
                         if not done[p.Name] then

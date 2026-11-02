@@ -537,6 +537,8 @@ function M.Start(runId)
         standIn({Action = "Teleport", Target = state.Hero, Position = {c.Centre[1], c.Centre[2] + 1, c.Centre[3]}})
         wait(30)
         pcall(standIn, {Action = "Away"})
+        -- A move keeps BG3's Centre: nothing left there comes along to the new WoW place.
+        pcall(standIn, {Action = "ClearSurfaces", Target = state.Hero})
         -- The hero's companions come along: next to the hero and chained, so BG3's own
         -- party following moves them on the treadmill; Party.lua's upkeep keeps stragglers on its ground.
         local okParty, errParty = pcall(party, {Action = "Gather", Upkeep = true,

@@ -1,0 +1,82 @@
+WOW-BG3 benilla patch 0104: a thrown attack plays WoW's throw.
+Playtest feedback: the guard's Shoot "looked just like a long range basic attack instead of a tossing of a javelin". BG3
+cast a javelin, and every stand-in attack played the melee swing. strikes.bin flag 32 (Mirrors.lua) names a thrown
+weapon, and the swing carries it in a hit_info bit WoW's packets do not use: AttackThrown (107), if the model has it.
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -148,6 +148,8 @@
+ const STRIKE_HIT: u32 = 1;
+ const STRIKE_WOUND: u32 = 2;
+ const STRIKE_LETHAL: u32 = 4;
++/// Patch 0104: the attack is a thrown weapon.
++const STRIKE_THROWN: u32 = 32;
+ /// Patch 0033 (the party): the stand-in's victim is one of the hero's BG3 companions, whom WoW draws
+ /// but the WoW server never hears of: the mob swings with BG3's own facing (toward the companion) and
+ /// no WoW victim (the hidden own body is not hit).
+@@ -312,7 +314,7 @@
+     walk_speed: f32,
+     /// Early strikes (`strikes.bin`) to play now: hit, damage, BG3's time of the strike (ms), and
+     /// (patch 0033) whether its victim is a companion.
+-    early: VecDeque<(bool, u32, f64, bool)>,
++    early: VecDeque<(bool, u32, f64, bool, bool)>,
+     /// When early strikes and early wounds were played (fight clock), until fight.txt's own
+     /// strike or HP drop for them arrives (that one is then skipped).
+     early_played: VecDeque<f32>,
+@@ -1747,7 +1749,7 @@
+                 impacts.write(flinch(me, entity, s.damage, play_seq.next()));
+             }
+         } else if let Some(h) = f.held.get_mut(&s.guid) {
+-            h.early.push_back((s.flags & STRIKE_HIT != 0, s.damage, s.t, s.flags & STRIKE_PARTY != 0));
++            h.early.push_back((s.flags & STRIKE_HIT != 0, s.damage, s.t, s.flags & STRIKE_PARTY != 0, s.flags & STRIKE_THROWN != 0));
+         } else {
+             info!("wowbg3 fight: early strike from guid {:#x}, not a held mob", s.guid);
+         }
+@@ -1842,8 +1844,10 @@
+             impacts.write(flinch(me, entity, damage, play_seq.next()));
+         }
+         let mut swing = None;
++        let mut swing_thrown = false;
+         if h.since >= EARLY_GAP {
+-            if let Some((hit, damage, t, party)) = h.early.pop_front() {
++            if let Some((hit, damage, t, party, thrown)) = h.early.pop_front() {
++                swing_thrown = thrown;
+                 h.early_played.push_back(clock);
+                 swing = Some((hit, damage, format!("early, {:.0} ms after BG3{}", now - t, if party { ", at a companion" } else { "" }), party));
+             }
+@@ -1861,7 +1865,7 @@
+             swings.write(SwingMessage {
+                 attacker: entity,
+                 victim: if party { None } else { victim },
+-                hit_info: if hit { HIT_NORMAL } else { HIT_MISS },
++                hit_info: (if hit { HIT_NORMAL } else { HIT_MISS }) | if swing_thrown { crate::creature_anim::HIT_THROWN } else { 0 },
+                 victim_state: hit as u32,
+                 damage,
+                 // BG3 shows its own numbers; WoW's floating text would repeat them.
+diff --git a/crates/benilla-app/src/creature_anim.rs b/crates/benilla-app/src/creature_anim.rs
+--- a/crates/benilla-app/src/creature_anim.rs
++++ b/crates/benilla-app/src/creature_anim.rs
+@@ -402,6 +402,9 @@
+ /// The grip overlay's weight over the unmasked base on the fingers, about 8:1 so they read closed.
+ pub(crate) const HAND_GRIP_WEIGHT: f32 = 8.0;
+ 
++/// Patch 0104: a bit of `SwingMessage::hit_info` no packet sets: a thrown weapon, AttackThrown.
++pub(crate) const HIT_THROWN: u32 = 0x4000_0000;
++
+ /// One melee swing (`SMSG_ATTACKERSTATEUPDATE`): one packet, one animation. `hit_info` `0x4` is
+ /// off-hand, `0x10000` suppresses the animation, `0x20` is an absorb (`0x6243e0`); the net bridge
+ /// rewrites a full block's `victim_state` first.
+diff --git a/crates/benilla-app/src/creature_anim/driver.rs b/crates/benilla-app/src/creature_anim/driver.rs
+--- a/crates/benilla-app/src/creature_anim/driver.rs
++++ b/crates/benilla-app/src/creature_anim/driver.rs
+@@ -787,7 +787,9 @@
+                             let w = wielded.copied().unwrap_or_default();
+                             // `0x6246a0` calls `GetWeapon(slot, 0)`: a disarmed attacker swings
+                             // AttackUnarmed(16) / AttackUnarmedOff(117), weapon still in hand.
+-                            let id = if hit_info & 0x4 != 0 {
++                            let id = if hit_info & super::HIT_THROWN != 0 && anims.find(107).is_some() {
++                                107
++                            } else if hit_info & 0x4 != 0 {
+                                 swing_anim_off(w.armed_off())
+                             } else {
+                                 swing_anim_main(w.armed_main())

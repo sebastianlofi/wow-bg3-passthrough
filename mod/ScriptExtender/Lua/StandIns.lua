@@ -397,7 +397,10 @@ function M.Start(runId)
                     for _, comp in ipairs({"ServerCharacter", "ServerItem"}) do
                         for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent(comp)) do
                             local okp, p = pcall(function() return vec(e.Transform.Transform.Translate) end)
-                            if okp and p and (p[1] - c.Centre[1]) ^ 2 + (p[3] - c.Centre[3]) ^ 2 < 200 * 200 and #near < 40 then
+                            -- A stand-in that walked off the old place's squares comes along too. The level's own
+                            -- people are over 2 km away.
+                            local reach = comp == "ServerCharacter" and 1000 or 200
+                            if okp and p and (p[1] - c.Centre[1]) ^ 2 + (p[3] - c.Centre[3]) ^ 2 < reach * reach and #near < 40 then
                                 local id = q(function() return e.Uuid.EntityUuid end)
                                 local row = {Kind = comp, Uuid = id, Pos = p,
                                     Name = id and q(function() return Osi.ResolveTranslatedString(Osi.GetDisplayName(id)) end),

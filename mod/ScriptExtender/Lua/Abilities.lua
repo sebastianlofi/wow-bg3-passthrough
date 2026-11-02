@@ -39,6 +39,11 @@ local state = {Grants = 0, Mobs = 0, Made = 0, Failed = {}, Casts = {}, Hits = {
 local granted = {} -- stand-in uuid -> creature entry
 local using = {} -- stand-in uuid -> the spell it is casting
 local tbl = nil
+-- The BG3 spell a copy copies; any other spell's own name.
+function M.BaseOf(spell)
+    local def = tbl and spell:sub(1, #PREFIX) == PREFIX and tbl.Spells[spell:sub(#PREFIX + 1)]
+    return def and def.B or spell
+end
 
 local function saveStatus()
     pcall(function() Ext.IO.SaveFile(STATUS, Ext.Json.Stringify(state)) end)

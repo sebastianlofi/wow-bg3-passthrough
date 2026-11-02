@@ -1,0 +1,46 @@
+WOW-BG3 benilla patch 0103: a canyon is no room, and ground in front of her stays.
+A playtest outside in Orgrimmar: "ground is see-through and buildings up above are all cut". Orgrimmar's open
+rock is MOGP-indoor groups, so 0091 and 0095 took two groups 110 x 97 yd as "the room she is in" and clipped
+everything over 2 yd above her feet: 41% of his frame in an offline replay. A room wider than a house is no room:
+no storey clip, no storeys taken. And 0090's floor rule fails on a ramp rising ahead of her: up-facing surfaces no
+higher than her chest stay, as 0098 keeps walkable terrain; a roof is above her chest and still goes.
+diff --git a/crates/benilla-world/src/wmo_portal/mod.rs b/crates/benilla-world/src/wmo_portal/mod.rs
+--- a/crates/benilla-world/src/wmo_portal/mod.rs
++++ b/crates/benilla-world/src/wmo_portal/mod.rs
+@@ -561,7 +561,11 @@
+                 let whole = boxes.iter().fold((lo, hi), |(l, h), b| (l.min(b.1), h.max(b.2)));
+                 let house = (whole.1.x - whole.0.x).max(whole.1.z - whole.0.z) <= CLIP_HOUSE_YD;
+                 let (flo, fhi) = if house { whole } else { (lo, hi) };
+-                see_rooms.0.push((entity, flo, fhi));
++                // Patch 0103: open rock flagged indoors, wider than any room.
++                let room_too_wide = !house && (hi.x - lo.x).max(hi.z - lo.z) > CLIP_HOUSE_YD;
++                if !room_too_wide {
++                    see_rooms.0.push((entity, flo, fhi));
++                }
+                 let over = |b: &(u32, Vec3, Vec3)| {
+                     b.1.x <= fhi.x + CLIP_REACH
+                         && b.2.x >= flo.x - CLIP_REACH
+@@ -584,7 +588,7 @@
+                         .any(|b| b.0 & MOGP_EXTERIOR != 0 && over(b))
+                         .then_some(anchor.y + CLIP_TOP_FLOOR)
+                 };
+-                if let (Some(y), None) = (y, clip_want) {
++                if let (Some(y), None, false) = (y, clip_want, room_too_wide) {
+                     clip_want = Some((
+                         y,
+                         Vec2::new(flo.x - CLIP_REACH, flo.z - CLIP_REACH),
+diff --git a/crates/benilla-world/src/shaders/static_gx.wgsl b/crates/benilla-world/src/shaders/static_gx.wgsl
+--- a/crates/benilla-world/src/shaders/static_gx.wgsl
++++ b/crates/benilla-world/src/shaders/static_gx.wgsl
+@@ -339,7 +339,10 @@
+     // alone, so the camera bumps the trunk and ends up under leaves; BG3 marks 163 of its 345 trees
+     // `SeeThrough` for the same picture.
+     // Patch 0097: record bit 20 is now a little piece (`phase_out::is_little`), never cut.
+-    if ((recs[in.word & 0xffffu].w & 1048576u) == 0u
++    // Patch 0103: a floor up to her chest stays, ramps too.
++    let cut_up = abs(normalize(cross(dpdx(in.world_position.xyz), dpdy(in.world_position.xyz))).y);
++    let cut_floor = cut_up > 0.64 && in.world_position.y <= wow_light.cut_a.y;
++    if ((recs[in.word & 0xffffu].w & 1048576u) == 0u && !cut_floor
+         && wow_cut(in.world_position.xyz, in.uv)) {
+         discard;
+     }

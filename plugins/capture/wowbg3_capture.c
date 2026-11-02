@@ -1502,7 +1502,7 @@ static float hdr_sum(VkFormat f, const uint8_t* p) {
 static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info) {
     if (g_move_cover) {
         VkSemaphore s = VK_NULL_HANDLE;
-        cover_gpu(q, c, index, info, &s);
+        cover_gpu(q, c, index, info, &s, 0);
         return s;
     }
     {  // the GPU compositor, unless it does not apply (wowbg3_compose_gpu.inc.c)
@@ -3472,6 +3472,7 @@ static char g_screen_path[512];
 // LoadLevel... and the PrepareRunning hold after it: BG3's own loading screen then. 1 Running (or no
 // file: as before), 0 anything else. Read at each present: one stat, and the file only when it changed.
 static int g_bg3_running = 1;
+static int g_bg3_holding;  // the launcher holds the client on BG3's loading screen ("Holding": 1)
 static void bg3_state_check(void) {
     static char path[1024];
     static struct timespec seen;
@@ -3497,6 +3498,9 @@ static void bg3_state_check(void) {
     if (running != g_bg3_running) logf_("bg3 client %s: WoW's picture %s", running ? "running" : "loading or held", running ? "composited" : "not composited");
     if (!running && g_bg3_running) wr_forget();  // the world before the load is gone (wowbg3_compose_gpu.inc.c)
     g_bg3_running = running;
+    const char* h = strstr(buf, "\"Holding\"");
+    const char* colon = h ? strchr(h, ':') : NULL;
+    g_bg3_holding = colon && atoi(colon + 1) == 1;
 }
 static void screen_check(void) {
     if (!g_screen_path[0]) {
@@ -3624,6 +3628,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
             pthread_mutex_unlock(&g_trace_lock);
         }
         bg3_state_check();
+        // BG3's loading screen, for a move (wowbg3_compose_gpu.inc.c, g_ls).
+        if (g_bg3_holding && !g_bg3_running && info->swapchainCount >= 1 && now_ns() - g_ls.last_ns >= LS_EVERY_NS) {
+            SwapchainData* c = chain_data(info->pSwapchains[0]);
+            if (c && info->pImageIndices[0] < c->count) {
+                g_ls.last_ns = now_ns();
+                VkSemaphore s = VK_NULL_HANDLE;
+                pthread_mutex_lock(&g_trace_lock);
+                cover_gpu(q, c, info->pImageIndices[0], info, &s, 1);
+                pthread_mutex_unlock(&g_trace_lock);
+                if (s != VK_NULL_HANDLE) {
+                    wait = s;
+                    copy.waitSemaphoreCount = 1;
+                    copy.pWaitSemaphores = &wait;
+                }
+            }
+        }
         if (g_cc.on && g_bg3_running && info->swapchainCount >= 1) {
             t = now_ns();
             SwapchainData* c = chain_data(info->pSwapchains[0]);

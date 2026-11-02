@@ -152,7 +152,7 @@ local AIM_GUARD = 150 -- ticks after Tav aimed at a stand-in before its HP is sy
 -- stand-in's mob), 4 lethal (the stand-in is at 0 HP), 8 miss reported at the cast's end
 -- (CastedSpell without an AttackedBy), 16 the victim is a companion, not the hero (benilla plays
 -- the swing with BG3's own facing, no victim). Without the wound bit the guid's stand-in attacked Tav or
--- (16) a companion. "Tav" in the wound bit is any party member.
+-- (16) a companion, 32 a thrown weapon (benilla plays its throw, not its swing). "Tav" in the wound bit is any party member.
 local STRIKES_KEEP = 16
 local MISS_DELAY = 6 -- ticks after CastedSpell before an attack with no AttackedBy counts as a miss
 -- Friendly NPCs (see the header): BG3's crime reaction tag for all but guards, and how long (ticks)
@@ -358,15 +358,7 @@ function M.Start(runId)
     M.QuietCrimes = {Sneaking = true}
     local searching = {} -- stand-in uuid -> {Last, Post, MovedAt, At, Returning, Home, StepAt, Steps, Turn}
     M.SearchMax, M.SearchHome, M.CrimeQuiet, M.CrimeIdle = 5400, 1.5, 600, 450
-    -- The search walk. Letting BG3 run the crime flow does not make it walk the stand-in: in the void
-    -- its reaction is a look and a bark, so the victim stood on its spot for the whole search and its
-    -- WoW model with it (playtest feedback: "the npc didnt move"; every search in the playtest's logs ended after 20 to
-    -- 25 s, which is what the timers do when nothing ever moves). The walk is given to the stand-in
-    -- here, never to the WoW mob, so where the body goes is still BG3's and benilla's held model
-    -- follows it (patch 0067). It steps only while BG3 leaves it standing (M.SearchStill) and only for
-    -- a crime worth searching (M.QuietCrimes are still left alone), for M.SearchWalk ticks from the
-    -- last crime; then the idle timers below walk it back to its post as before.
-    M.SearchStill, M.SearchStep, M.SearchWalk, M.SearchRadius = 90, 240, 900, 6.0
+    -- The search itself is BG3's crime flow: nothing here walks a searcher (AGENTS.md, no imitations). Mirrors only let go of it.
     M.CrimeKinds = {}
     local function search(uuid)
         if not friendlyOf(uuid) then return end
@@ -398,6 +390,16 @@ function M.Start(runId)
         local s = searching[m.Uuid]
         local at = s and pos(m.Uuid)
         if not at then return end
+        -- What the searcher knows, every 2 s or so: BG3's questioning needs her to see the thief.
+        if ticks % 60 == 0 then
+            local hero = Hero.Uuid()
+            local hp_ = pos(hero)
+            local okS, sneaking = pcall(Osi.HasActiveStatus, hero, "SNEAKING")
+            local okC, sees = pcall(Osi.CanSee, m.Uuid, hero)
+            Ext.Utils.Print(string.format("WOW-BG3 search: %s %.1f m from him, sees him %s, he sneaks %s, dialog %s, back %s, tick %d",
+                m.Uuid, hp_ and hdist(at, hp_) or -1, okC and tostring(sees) or "?", okS and tostring(sneaking) or "?",
+                tostring(inDialog(m.Uuid)), tostring(s.Returning == true), ticks))
+        end
         if inDialog(m.Uuid) then
             s.Last, s.MovedAt = ticks, ticks
             if s.Returning then
@@ -407,18 +409,6 @@ function M.Start(runId)
             return
         end
         if not s.At or hdist(at, s.At) > 0.3 then s.At, s.MovedAt = at, ticks end
-        -- A step of the search walk: a point round the crime's spot, a different way each time (the
-        -- golden angle spreads them without a pattern), only while the stand-in is standing still.
-        if not s.Returning and ticks - s.Last <= M.SearchWalk and ticks - s.MovedAt >= M.SearchStill
-            and ticks - (s.StepAt or -M.SearchStep) >= M.SearchStep then
-            s.StepAt = ticks
-            s.Steps = (s.Steps or 0) + 1
-            s.Turn = (s.Turn or 0) + 2.3999632297
-            local c = s.Post or at
-            local r = M.SearchRadius * (0.4 + 0.3 * (s.Steps % 3))
-            pcall(Osi.CharacterMoveToPosition, m.Uuid, c[1] + r * math.cos(s.Turn), c[2],
-                c[3] + r * math.sin(s.Turn), "Walk", "", 1)
-        end
         if not s.Returning and s.Post and ticks - s.Last > M.CrimeQuiet and ticks - s.MovedAt > M.CrimeIdle then
             s.Returning = true
             if hdist(at, s.Post) > M.SearchHome then
@@ -511,6 +501,15 @@ function M.Start(runId)
             M.Pickpockets = (M.Pickpockets or 0) + 1
         end)
     end
+    local okInv, errInv = pcall(Ext.Osiris.RegisterListener, "OnCrimeInvestigatorSwitchedState", 4, "after", function(crime, who, from, to)
+        Ext.Utils.Print(string.format("WOW-BG3 crime %s: %s, %s to %s, tick %d", tostring(crime), tostring(who), tostring(from), tostring(to), ticks))
+    end)
+    if not okInv then Ext.Utils.Print("WOW-BG3 crime: no investigator states in the log: " .. tostring(errInv)) end
+    for _, ev in ipairs({{"DialogStarted", 2}, {"DialogEnded", 2}, {"DialogRequestFailed", 2}}) do
+        pcall(Ext.Osiris.RegisterListener, ev[1], ev[2], "after", function(a, b)
+            Ext.Utils.Print(string.format("WOW-BG3 crime: %s %s %s, tick %d", ev[1], tostring(a), tostring(b), ticks))
+        end)
+    end
     -- The crime BG3 registers (victim, type, id, evidence, up to four criminals): a friendly victim and
     -- its friendly neighbours search (see `searching`).
     M.CrimeListener = select(2, pcall(Ext.Osiris.RegisterListener, "CrimeIsRegistered", 8, "after", function(victim, kind)
@@ -518,6 +517,12 @@ function M.Start(runId)
         if not (v and friendlyOf(v)) then return end
         M.LastCrime = {Victim = v, Kind = tostring(kind), Tick = ticks}
         M.CrimeKinds[tostring(kind)] = (M.CrimeKinds[tostring(kind)] or 0) + 1
+        -- BG3's guard questions only a thief she can see; the logs could not say why none ever came.
+        local hero = Hero.Uuid()
+        local okS, sneaking = pcall(Osi.HasActiveStatus, hero, "SNEAKING")
+        local okC, sees = pcall(Osi.CanSee, v, hero)
+        Ext.Utils.Print(string.format("WOW-BG3 crime: %s on %s, tick %d, thief sneaking %s, sees him %s", tostring(kind), v, ticks,
+            okS and tostring(sneaking) or "?", okC and tostring(sees) or "?"))
         if M.QuietCrimes[tostring(kind)] then return end
         search(v)
         provoke(v)
@@ -552,20 +557,23 @@ function M.Start(runId)
             local a = uuidOf(tostring(attacker))
             if not (a and M.Owned[a]) then a = uuidOf(tostring(owner)) end
             if a and M.Owned[a] then
+                local thrown = attacking[a] and attacking[a].Thrown and 32 or 0
                 if attacking[a] then attacking[a].Struck = true end
-                pcall(strike, a, (typed and 1 or 0) | (uuid ~= Hero.Uuid() and STRIKE_PARTY or 0), damage)
+                pcall(strike, a, (typed and 1 or 0) | (uuid ~= Hero.Uuid() and STRIKE_PARTY or 0) | thrown, damage)
             end
         end
     end)
     -- Before the action lands (attack, spell, Shove, Throw at it): it may join the combat.
-    pcall(Ext.Osiris.RegisterListener, "UsingSpellOnTarget", 6, "after", function(caster, target)
+    pcall(Ext.Osiris.RegisterListener, "UsingSpellOnTarget", 6, "after", function(caster, target, spell)
         local c, t = uuidOf(tostring(caster)), uuidOf(tostring(target))
         if c and Party.IsMember(c) then
             provoke(t)
             aimFriendly(t)
             if t and M.Owned[t] then aimed[t] = ticks end
         elseif c and M.Owned[c] and t and Party.IsMember(t) then
-            attacking[c] = {At = ticks, Struck = false, Party = t ~= Hero.Uuid()}
+            local okB, base = pcall(function() return Ext.Require("Abilities.lua").BaseOf(tostring(spell)) end)
+            local name = okB and base or tostring(spell)
+            attacking[c] = {At = ticks, Struck = false, Party = t ~= Hero.Uuid(), Thrown = name:find("Javelin") ~= nil or name:find("Throw") ~= nil}
         end
     end)
     -- The end of a stand-in's attack on Tav: with no AttackedBy it missed (sent MISS_DELAY ticks later).
@@ -608,7 +616,7 @@ function M.Start(runId)
                 attacking[c] = nil
             elseif a.Done and ticks - a.Done >= MISS_DELAY then
                 attacking[c] = nil
-                pcall(strike, c, 8 | (a.Party and STRIKE_PARTY or 0), 0)
+                pcall(strike, c, 8 | (a.Party and STRIKE_PARTY or 0) | (a.Thrown and 32 or 0), 0)
             end
         end
     end

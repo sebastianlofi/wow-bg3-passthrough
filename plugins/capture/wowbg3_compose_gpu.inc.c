@@ -588,11 +588,53 @@ static int gc_dark_frame(DeviceData* d, WowSlot* w) {
     return 1;
 }
 
-// During a move (g_move_cover): the frame cleared to black, no WoW frame or HUD. 1: the present must wait on *sem;
-// 0: frame left untouched.
-static int cover_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info, VkSemaphore* sem) {
+// BG3's own loading screen, kept from this session's last real load (the PrepareRunning hold), for a move: BG3 does
+// not load then, so it would show none, and nothing of BG3's ships with the mod. Two buffers, the one being written
+// and the last that was not dark: the hold's last frames may be a fade.
+static struct {
+    GBuf b[2];
+    int writing, written, good;   // good: the buffer to show, -1 none
+    VkFormat fmt;
+    VkExtent2D ext;
+    uint64_t last_ns;
+} g_ls = {.good = -1};
+#define LS_EVERY_NS 500000000ull
+static VkDeviceSize ls_size(const SwapchainData* c) {
+    return (VkDeviceSize)c->extent.width * c->extent.height * (c->format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4);
+}
+// The buffer written last, now finished: kept when it has a picture in it (RGB of 8-bit formats; any other counts).
+static void ls_settle(const SwapchainData* c) {
+    if (!g_ls.written || !g_ls.b[g_ls.writing].map) return;
+    g_ls.written = 0;
+    const uint8_t* m = g_ls.b[g_ls.writing].map;
+    uint64_t sum = 0, n = 0;
+    if (c->format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+        for (uint32_t y = c->extent.height / 40; y < c->extent.height; y += c->extent.height / 20 + 1)
+            for (uint32_t x = c->extent.width / 80; x < c->extent.width; x += c->extent.width / 40 + 1) {
+                const uint8_t* px = m + ((size_t)y * c->extent.width + x) * 4;
+                sum += px[0] + px[1] + px[2];
+                n += 3;
+            }
+    }
+    if (!n || sum / n > 8) {
+        if (g_ls.good < 0) logf_("compose: BG3's loading screen kept for moves (%ux%u)", c->extent.width, c->extent.height);
+        g_ls.good = g_ls.writing;
+        g_ls.fmt = c->format;
+        g_ls.ext = c->extent;
+        g_ls.writing = !g_ls.writing;
+    }
+}
+
+// During a move (g_move_cover): BG3's loading screen (g_ls), else black; no WoW frame or HUD. `keep`: instead, the
+// frame goes to g_ls and is presented as it is. 1: the present must wait on *sem; 0: frame left untouched.
+static int cover_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkPresentInfoKHR* info, VkSemaphore* sem, int keep) {
     DeviceData* d = q->dev;
     if (g_gc.failed || !d->CmdClearColorImage || !gc_init(d, q->family)) return 0;
+    ls_settle(c);
+    if (keep) {
+        // A size change, or nothing free: the buffer shown is never written.
+        if (g_ls.writing == g_ls.good || !gbuf_make(d, &g_ls.b[g_ls.writing], ls_size(c), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return 0;
+    }
     if (g_gc.queue && g_gc.queue != q->queue) gc_wait_all();
     g_gc.queue = q->queue;
     const uint32_t k = g_gc.k;
@@ -612,9 +654,20 @@ static int cover_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkPre
     VkImage img = c->images[index];
     VkClearColorValue black = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
     VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    d->CmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
-    barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    VkBufferImageCopy whole = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {c->extent.width, c->extent.height, 1}};
+    if (keep) {
+        barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ls.b[g_ls.writing].buf, 1, &whole);
+        barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        g_ls.written = 1;
+    } else {
+        barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        if (g_ls.good >= 0 && g_ls.fmt == c->format && g_ls.ext.width == c->extent.width && g_ls.ext.height == c->extent.height)
+            d->CmdCopyBufferToImage(cmd, g_ls.b[g_ls.good].buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+        else
+            d->CmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+        barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    }
     if (g_gc.qp) d->CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_gc.qp, 2 * k + 1);
     d->EndCommandBuffer(cmd);
     VkPipelineStageFlags stages[16];
