@@ -61,6 +61,7 @@ local Adapter = Ext.Require("LinkAdapter.lua")
 local Probe = Ext.Require("ActionProbe.lua")
 local World = Ext.Require("WorldMode.lua")
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
+local TurnQueue = Ext.Require("TurnQueue.lua") -- which turn WoW hears next (BG3's turn events and flag)
 -- standins.bin's seq, rising across fights; mod-wide (client), as MirrorsClient.lua writes the file
 -- too for robbed NPCs searching outside a fight. WOWBG3SinAt: when this file wrote it last.
 WOWBG3SinSeq = WOWBG3SinSeq or 0
@@ -215,10 +216,12 @@ end
 local function newBackend(actors, void, runId, session)
     local B, events, job, releases = {}, {}, nil, {}
     local ticks, started, lastTurn, origin, heroBridge = 0, false, false, nil, nil
-    local mode, seen, byUuid, passing, passed, pendingTurns = nil, 0, {}, false, {}, {}
+    local mode, seen, byUuid, passing, passed = nil, 0, {}, false, {}
+    local turns = TurnQueue.New()
+    local pendingTurns = turns.pending
     -- Void fights: setup/teardown coroutines, stand-ins made here, BG3-run turn being watched.
     local setup, teardown, made, npc, following, holding, finished = nil, nil, {}, nil, false, false, false
-    local rest, enemies, heroWait, heroShown, torn = {}, {}, 0, 0, false
+    local rest, enemies, heroShown, torn = {}, {}, 0, false
     -- World mode: each enemy's last BG3 combat event ({In, At}; none yet = in), and when the encounter
     -- was first seen active.
     local combatState, activeSince = {}, nil
@@ -515,14 +518,14 @@ local function newBackend(actors, void, runId, session)
         holdSince = ticks
         return ok, err
     end
-    -- The server's view of the host's turn (ActionMonitor snapshot). Void fights poll this
-    -- instead of the UI view model: reading Noesis view models while BG3 rebuilds them at a
-    -- turn change crashed the game once.
-    local function serverTurn()
-        local r = monitor()
+    -- The server's view of the host's turn (ActionMonitor snapshot). Void fights read this
+    -- instead of the UI view model: reading Noesis view models from the tick while BG3 rebuilds
+    -- them at a turn change crashed the game (s4 and s7).
+    local function reportTurn(r)
         local t = r and r.State and r.State.Turn
         return type(t) == "table" and t.Active == true
     end
+    local function serverTurn() return reportTurn(monitor()) end
     local function reject(action, reason, detail)
         job = nil
         later(function(ad) return ad:rejected(action, reason, string.sub(detail or "", 1, 256)) end)
@@ -592,6 +595,8 @@ local function newBackend(actors, void, runId, session)
                 end
                 if entered then seen = entered end
             end
+            Ext.Utils.Print(string.format("WOW-BG3 turns: fight begins, BG3 combat already running %s, hero entered at seq %s, reading from seq %d",
+                tostring(already), tostring(entered), seen))
             for _, uuid in ipairs(made) do standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
             for uuid, how in pairs(adopted) do
                 if how == "joins" then standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
@@ -605,18 +610,24 @@ local function newBackend(actors, void, runId, session)
             -- Combat has started once the engine reports a turn for a mapped combatant.
             if not already then waitFor(function()
                 if ticks % 15 ~= 0 then return false end
-                for _, e in ipairs((monitor() or {}).Events or {}) do
+                local r = monitor()
+                for _, e in ipairs((r or {}).Events or {}) do
                     if e.Seq > seen and e.Event == "TurnStarted" then
                         for uuid in pairs(byUuid) do
                             if tostring(e.Args[1]):find(uuid, 1, true) then return true end
                         end
                     end
                 end
-                return false
+                -- She entered BG3's combat after the status above was written: her TurnStarted can
+                -- be at or before seen, and no other turn comes until she ends hers.
+                local now = inWorld and mirrorStatus()
+                return now and now.Tav and now.Tav.InCombat == true and reportTurn(r) or false
             end, 600, "combat did not start") end
             -- The new combat's turns arrive as TurnStarted events (seen was taken before Join).
             mode, lastTurn = "combat", true
-            if not hostSelected() then selectCharacter(Hero.Uuid()) end
+            -- World mode: no selection here. The player keeps the character they control, this
+            -- runs as a turn starts (the view model's rebuild), and a WoW action selects for itself.
+            if not inWorld and not hostSelected() then selectCharacter(Hero.Uuid()) end
             if not ad:roster(0, rosterActors()) then return end
             return ad:ready()
         end)
@@ -1031,7 +1042,13 @@ local function newBackend(actors, void, runId, session)
         end
         if ticks % 10 ~= 0 or job then return end
         local report = monitor()
-        for _, e in ipairs((report and report.Events) or {}) do
+        local ring = (report and report.Events) or {}
+        -- The monitor keeps its last 128 events: this says if a fight ever outran them.
+        if ring[1] and ring[1].Seq > seen + 1 then
+            Ext.Utils.Print(string.format("WOW-BG3 turns: monitor events %d to %d were gone before they were read",
+                seen + 1, ring[1].Seq - 1))
+        end
+        for _, e in ipairs(ring) do
             if e.Seq > seen then
                 seen = e.Seq
                 -- World mode: which enemies BG3 still has in a combat (checkFinished).
@@ -1041,7 +1058,9 @@ local function newBackend(actors, void, runId, session)
                 end
                 if e.Event == "TurnStarted" then
                     local id = idOf(e.Args[1])
-                    if id then pendingTurns[#pendingTurns + 1] = id end
+                    if id then TurnQueue.Started(turns, id) end
+                elseif e.Event == "TurnEnded" and idOf(e.Args[1]) == "hero" then
+                    TurnQueue.Ended(turns, "hero")
                 elseif void and npc then
                     local caster = idOf(e.Args[1])
                     if e.Event == "TurnEnded" and caster == npc.id then
@@ -1062,18 +1081,32 @@ local function newBackend(actors, void, runId, session)
         end
         if void then checkFinished(ad) end
         if finished then return end
-        -- Fallback: the view model shows the host's turn but no TurnStarted came (90 ticks).
-        if void and not npc and not ad.pending and ad.turn_actor ~= "hero" and not pendingTurns[1] and serverTurn() then
-            heroWait = heroWait + 10
-            if heroWait >= 90 then pendingTurns[1], heroWait = "hero", 0 end
-        else
-            heroWait = 0
+        -- BG3's own flag says the hero's turn runs and WoW was not told (TurnQueue.lua has the
+        -- cases). No retained run shows one: the log line says which it was if it ever happens.
+        if void then
+            local why = TurnQueue.Unheard(turns, {Active = reportTurn(report), Tick = report and report.Tick,
+                TurnActor = ad.turn_actor, Busy = npc ~= nil or ad.pending ~= nil, Step = 10})
+            if why then
+                local startedAt, endedAt = nil, nil
+                for _, e in ipairs(ring) do
+                    if Hero.Is(tostring(e.Args[1])) then
+                        if e.Event == "TurnStarted" then startedAt = e.Seq elseif e.Event == "TurnEnded" then endedAt = e.Seq end
+                    end
+                end
+                Ext.Utils.Print(string.format(
+                    "WOW-BG3 turns: hero's turn from BG3's flag (%s): read to seq %d, ring %s to %s, her last TurnStarted %s, TurnEnded %s, tick %s",
+                    why, seen, tostring(ring[1] and ring[1].Seq), tostring(ring[#ring] and ring[#ring].Seq),
+                    tostring(startedAt), tostring(endedAt), tostring(report and report.Tick)))
+                pendingTurns[1] = "hero"
+            end
         end
         while pendingTurns[1] and not ad.pending and not npc do
-            -- TurnStarted for the host comes before its view model and hotbar are rebuilt for
-            -- the turn; touching them meanwhile crashed BG3 twice (Noesis, s4 and s7). Announce
-            -- the turn once the server has shown it for 2.5 s.
-            if pendingTurns[1] == "hero" and void then
+            -- Fights WoW plays by actions (outside world mode): an action reads the view model, so
+            -- WoW hears the turn only once the server has shown it for 2.5 s; without this, the
+            -- first action hit the view model's rebuild and crashed BG3 twice (Noesis, s4 and s7).
+            -- A timer, not a signal: BG3 gives Lua none, and nothing here has tested it gone.
+            -- World mode needs none: WoW sends no actions there and hearing a turn touches no view model.
+            if pendingTurns[1] == "hero" and void and not inWorld then
                 local now = Ext.Utils.MonotonicTime()
                 if not serverTurn() then heroShown = 0; return end
                 if heroShown == 0 then heroShown = now end
