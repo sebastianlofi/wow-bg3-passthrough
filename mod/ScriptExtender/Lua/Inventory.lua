@@ -850,6 +850,14 @@ local function reconcileMember(uuid, m, have)
         if b and tick - b.At > BARTER_WAIT then
             M.Barter[uuid], b = nil, nil
         end
+        -- Any deal in a WoW vendor's trade is a barter, whatever changed hands: BG3's own items (a scroll from the
+        -- save, a buyback, the special arrows) have no WoW item to sell or buy, and only the merchant's purse shows
+        -- the deal. Read in this same look as the member's gold, so WoW's money never comes back over it (0.1.3013.58:
+        -- a BG3 scroll sold for 40, the purse 13100 to 13060, and the next look put WoW's 0 back on Tav).
+        if M.Dealt(uuid) and not b then
+            b = {At = tick}
+            M.Barter[uuid] = b
+        end
         if b then
             local busy = false
             for _, r in pairs(pending) do
@@ -1224,20 +1232,35 @@ local function fundMerchant(standin)
     local it = q(Osi.GetItemByTemplateInInventory, GOLD, standin)
     setGold(standin, (it and q(Osi.GetStackAmount, it) or have) + want - have)
 end
+local purseSeen, traderOf = {}, {} -- stand-in in its trade -> its gold at the last look; the member trading with it
 local function lookPurses()
     for standin in pairs(placed) do
         local guid = vendorOf[standin]
         if guid and q(Ext.Entity.Get, standin) then Stock.SetPurse(ledger, guid, goldOf(standin)) end
-        if not trading[standin] then placed[standin], funded[standin] = nil, nil end
+        if not trading[standin] then placed[standin], funded[standin], purseSeen[standin] = nil, nil, nil end
     end
     saveLedger()
 end
 M.LookPurses = lookPurses
+-- Whether a deal went through since the last look in a trade of this member's: the purse of a merchant it trades with
+-- moved. Once the purse is placed, BG3's barter is all that moves it (a refusal's refund comes inside a barter already).
+-- Every look reads it, so what moved inside a barter is not read again after it.
+function M.Dealt(member)
+    local dealt = false
+    for standin in pairs(placed) do
+        if trading[standin] and (traderOf[standin] or Hero.Uuid()) == member then
+            local g = goldOf(standin)
+            if purseSeen[standin] and g ~= purseSeen[standin] then dealt = true end
+            purseSeen[standin] = g
+        end
+    end
+    return dealt
+end
 
 -- BG3's special arrows in place of WoW's arrows and bullets (Stock.lua). BG3's own items in the merchant's bag during its
 -- trade, like the purse: no tag and no WoW entry, so the inventory sync does not see them (M.Reconcile, sweepStrays) and
 -- BG3's save holds what the party bought. What the bag holds at each look is the stock, so a sale back counts by itself;
--- no WoW item changes hands, and a change opens a barter so WoW's money follows BG3's gold.
+-- no WoW item changes hands, and WoW's money follows BG3's gold as after any deal in the trade (M.Dealt).
 local arrowsIn = {} -- stand-in -> the tick they went in
 local function heroLevel()
     local ok, t = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/wow-level.json") or "")
@@ -1267,11 +1290,7 @@ local function lookArrows()
             local now, was, changed = heldArrows(standin), Stock.Arrows(ledger, guid), false
             for name, n in pairs(now) do changed = changed or was[name] ~= n end
             for name, n in pairs(was) do changed = changed or (n > 0 and not now[name]) end
-            if changed then
-                Stock.SetArrows(ledger, guid, now)
-                local hero = Hero.Uuid()
-                if hero then M.Barter[hero] = M.Barter[hero] or {At = tick} end
-            end
+            if changed then Stock.SetArrows(ledger, guid, now) end
         end
         if not trading[standin] then
             arrowsIn[standin] = nil
@@ -1302,7 +1321,9 @@ function M.Refunded(guid, delta)
     if delta == 0 or not ledger then return end
     for standin in pairs(placed) do
         if vendorOf[standin] == guid then
-            setGold(standin, math.max(0, goldOf(standin) - delta))
+            local g = math.max(0, goldOf(standin) - delta)
+            setGold(standin, g)
+            if purseSeen[standin] then purseSeen[standin] = g end -- ours, no deal (M.Dealt)
             return
         end
     end
@@ -1358,6 +1379,7 @@ function M.OpenVendor(standin, wowGuid, member)
     vendorOf[standin] = tostring(wowGuid)
     pcall(M.NotePieces) -- before the trade counts as open: its strays go
     trading[standin] = tick + TRADE_SETTLE
+    traderOf[standin], purseSeen[standin] = uuidOf(member) or member, nil
     pcall(Osi.ClearTradeGeneratedItems, standin)
     fundMerchant(standin)
     M.Request({Op = "vendor", Npc = tostring(wowGuid), Member = member})
@@ -1556,7 +1578,7 @@ function M.Start(id)
     pcall(Ext.Osiris.RegisterListener, "PROC_LongRest", 0, "after", function() M.Restock() end)
     -- A load in this same Lua state: that save's counts (Hero.lua makes a new token, WowSave.lua starts over the same way).
     Ext.Events.GameStateChanged:Subscribe(function(e)
-        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded, arrowsIn = nil, {}, {}, {} end
+        if tostring(e.ToState) == "LoadSession" then ledger, placed, funded, arrowsIn, purseSeen = nil, {}, {}, {}, {} end
     end)
     -- A WoW mob's stand-in dying in BG3: its WoW loot goes on the BG3 corpse. The server makes the
     -- WoW corpse lootable a moment after the kill reaches it, so it is asked from 15 ticks on and every
