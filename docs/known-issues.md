@@ -111,8 +111,9 @@ This is the first public version. What we know is missing or rough:
 
 - The zip is about 235 MB, most of it the WoW engine, Python and the Script Extender. The server's world
   database is not in it: the first start downloads it (about 48 MB) and needs the internet that once.
-- On a new install the mobs get their WoW abilities from the second start on: BG3 reads them when it
-  starts, and the first start makes them from the database it has just downloaded.
+- The first time WOW-BG3 runs, BG3 stays on its loading screen for about two minutes before the main
+  menu: it reads the mobs' abilities once a start, and waits while they are made from the database the
+  first start downloads (bg3le patch 0008, at most 20 minutes).
 
 ## Licences
 

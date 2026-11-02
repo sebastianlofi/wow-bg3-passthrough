@@ -657,29 +657,79 @@ def abilities_make():
     return py('wow_abilities', *argv)
 
 
+BOOT_OVERRIDES = IO.parent / 'boot-path-overrides.txt'   # bg3le patch 0006 reads it as BG3 loads its stats
+BOOT_WAIT = IO.parent / 'boot-path-overrides.wait'        # bg3le patch 0008 waits on while it is fresh
+BOOT = {'held': False}
+
+
+def boot_overrides():
+    """This start's overrides file: it ends bg3le's wait, and BG3's loader reads the copies through it."""
+    on = S.get('mob_abilities') == '1'
+    stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
+    tmp = IO.parent / 'boot-path-overrides.tmp'
+    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_ready() else '')
+    os.replace(tmp, BOOT_OVERRIDES)
+    BOOT['held'] = False
+
+
+def boot_hold():
+    """BG3's stats load waits (bg3le patch 0008) while BOOT_WAIT is younger than 10 s: written every 2 s until
+    boot_overrides(), or until the server's first start fails (then BG3 goes on without the copies)."""
+    BOOT['held'] = True
+
+    def refresh():
+        while BOOT['held']:
+            if server_state() == 'failed':
+                log('abilities: the server\'s first start failed; BG3 loads its stats without the mobs\' abilities')
+                boot_overrides()
+                break
+            try:
+                BOOT_WAIT.write_text('%d\n' % os.getpid())
+            except OSError as e:
+                log('abilities: %s not written (%s)' % (BOOT_WAIT, e))
+            time.sleep(2.0)
+    threading.Thread(target=refresh, daemon=True).start()
+
+
+def abilities_run(argv, env=None):
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(str(LOGS / 'abilities.log'), 'a') as f:
+        return subprocess.run([str(a) for a in argv], env=env, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT).returncode
+
+
 def abilities_first():
-    """The table from this PC's seed when the rules or the database changed, needing no server, as soon as BG3
-    starts, and the override that has BG3's own loader read the copies from a stats file in place of a small game
-    file whose text they start with. BG3 loads its stats once a start: a table made later (the first start's, from
-    the server's new database) is BG3's from its next start."""
+    """Before BG3 loads its stats (they are read once a start, and every copy must be there then): the table from
+    this PC's seed when the rules or the database changed, needing no server. With no table at all (a new
+    install's first start), BG3's stats load is held (boot_hold) while the server imports its database, and
+    abilities_seeded() makes the seed and the table before it is let go. True when held."""
     on = S.get('mob_abilities') == '1'
     if on and not abilities_current():
         t0 = time.time()
         if seed_current() and game_data():
-            LOGS.mkdir(parents=True, exist_ok=True)
-            with open(str(LOGS / 'abilities.log'), 'a') as f:
-                rc = subprocess.run([str(a) for a in abilities_make()], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT).returncode
+            rc = abilities_run(abilities_make())
             log('abilities: table made again from this PC\'s seed (rules, overlays %d, or database changed), exit %d in %.1f s'
                 % (len(rule_overlays()), rc, time.time() - t0))
         elif abilities_ready():
             log('abilities: the rules changed, the seed is not of this database yet: last table kept, a new one after the server starts')
+        elif game_data():
+            log('abilities: none yet: BG3 waits to load its stats until the server\'s database is in and they are made')
+            boot_hold()
+            return True
         else:
-            log('abilities: none yet; made from the server\'s database once it runs, BG3 has them from its next start')
-    # bg3le patch 0006 reads this as BG3 starts on its stats. Every start: it waits for this start's.
-    stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
-    tmp = IO.parent / 'boot-path-overrides.tmp'
-    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_ready() else '')
-    os.replace(tmp, IO.parent / 'boot-path-overrides.txt')
+            log('abilities: none, and no BG3 data folder to make them from')
+    boot_overrides()
+    return False
+
+
+def abilities_seeded():
+    """The held first start, once the server runs: the seed from its database, the table, then BG3's stats load."""
+    t0 = time.time()
+    rc = abilities_run(py('wow_abilities', 'localseed', ABILITIES_SEED, '--data', WOW / 'Data', '--key', seed_key(),
+                          '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos'), env=db_env())
+    if rc == 0:
+        rc = abilities_run(abilities_make())
+    log('abilities: seed and table of the new database, exit %d in %.1f s; BG3 loads its stats now' % (rc, time.time() - t0))
+    boot_overrides()
 
 
 def datagen_needed():
@@ -809,12 +859,17 @@ def main():
     (IO / 'camp.json').write_text(json.dumps({'On': S.get('camp') == '1'}))
     (IO / 'wow-spells.json').write_text(json.dumps({'On': S.get('wow_spells') == '1'}))
     (IO / 'scaling.json').write_text(json.dumps({'On': S.get('scaling') == '1', 'Difficulty': S.get('difficulty')}))
-    abilities_first()
+    held = abilities_first()
     REL = Release()
     log('window %dx%d, settings %s' % (REL.size + (S,)))
     if not wait_server(stop):
+        if BOOT['held']:
+            boot_overrides()
         status('stopped')
         return
+    if held and BOOT['held']:
+        status('abilities')
+        abilities_seeded()
     status('accounts')
     account_env()
     REL.tav_prepare()

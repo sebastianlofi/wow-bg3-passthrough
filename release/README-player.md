@@ -85,8 +85,10 @@ The first start takes a few minutes and needs the internet once: the WoW
 server's data and the first movement maps are built from your WoW files, and
 its world database is downloaded (about 48 MB, from vmangos' public sources:
 WOW-BG3 ships no game data), while BG3's loading screen waits. Offline, a
-message says so; start BG3 again once connected. Mobs use their WoW abilities
-from the second start on. Later starts and loads take under a minute.
+message says so; start BG3 again once connected. The first time, BG3 stays on
+its loading screen for about two minutes before the main menu: it waits for
+the mobs' abilities, made from that database. Later starts and loads take
+under a minute.
 
 To change which abilities a mob gets, see "Changing mob abilities" in the
 project's README: a file of yours in ~/.local/share/wow-bg3/abilities-rules.json.

@@ -33,6 +33,24 @@ def test_nothing_ships_the_sql_or_a_seed():
     assert 'sql.lock' in (ROOT / 'server/pins.sh').read_text()
 
 
+def test_first_start_stats_wait():
+    """bg3le patch 0008 follows 0006 on its file, and the coordinator writes the file it waits on."""
+    import hashlib, json
+    lock = json.loads((ROOT / 'patches/bg3le/build.lock.json').read_text())
+    after = {}
+    for p in lock['runtime_patches']:
+        f = ROOT / 'patches/bg3le' / Path(p['file']).name
+        assert hashlib.sha256(f.read_bytes()).hexdigest() == p['sha256'], p['file']
+        for t in p['targets']:
+            if t['path'] in after:
+                assert t['before_sha256'] == after[t['path']], (p['file'], t['path'])
+            after[t['path']] = t['after_sha256']
+    assert any('0008-first-start-stats-wait' in p['file'] for p in lock['runtime_patches'])
+    patch = (ROOT / 'patches/bg3le/0008-first-start-stats-wait.patch').read_text()
+    coord = (ROOT / 'tools/wowbg3-coord.py').read_text()
+    assert '".wait"' in patch and "'boot-path-overrides.wait'" in coord and 'ws.st_mtime < 10' in patch.replace('std::time(nullptr) - ', '')
+
+
 def test_usage_shows_the_whole_header():
     srv = (ROOT / 'server/wowbg3-server.sh').read_text().split('\n')
     end = next(i for i, l in enumerate(srv) if l.startswith('set -euo'))

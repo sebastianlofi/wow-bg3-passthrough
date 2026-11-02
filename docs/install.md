@@ -39,8 +39,9 @@ The very first start builds the server's data from your WoW files and the first 
 downloads the server's world database once (about 48 MB from vmangos' public sources, checked against the
 hashes in `server/sql.lock`; kept in `~/.local/share/wow-bg3/server/downloads`): about three minutes behind
 the loading screen. It needs the internet that once; offline it stops with a message, and the next start
-tries again. The mobs' abilities are made from that database and your WoW files on the same start, and BG3
-uses them from its next start. Later starts and loads take under a minute and need no internet.
+tries again. The mobs' abilities are made from that database and your WoW files before BG3 reads its stats
+(bg3le patch 0008), so the first time WOW-BG3 runs BG3 stays on its loading screen for about two minutes
+before the main menu. Later starts and loads take under a minute and need no internet.
 
 ## What happens on your machine
 

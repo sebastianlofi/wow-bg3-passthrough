@@ -1,0 +1,36 @@
+--- a/src/vendor/path_override.cpp
++++ b/src/vendor/path_override.cpp
+@@ -177,6 +177,9 @@
+ // <Script Extender folder>/boot-path-overrides.txt, one "game path<TAB>absolute file" a line, the game path as
+ // Ext.IO.AddPathOverride takes it. Under WOW-BG3's launcher (WOWBG3_SHM) its coordinator writes the file at every
+ // start, moments after BG3 starts: wait a little for this start's. Without it, or when late, whatever is there.
++// On a new install's first start the coordinator makes the stats this load reads (the mobs' abilities, from the WoW
++// server's database that start imports) and says so in boot-path-overrides.wait, written every 2 s: while that file
++// is this start's and fresh (under 10 s old), wait on, at most 20 minutes. Writing the overrides file ends the wait.
+ extern "C" void bg3le_path_overrides_boot() {
+     if (g_real == nullptr) return;
+     char const* xdg = std::getenv("XDG_DATA_HOME");
+@@ -185,10 +188,22 @@
+     const std::string file = ((xdg != nullptr && *xdg != 0) ? std::string(xdg) : std::string(home) + "/.local/share")
+                              + "/Larian Studios/Baldur's Gate 3/Script Extender/boot-path-overrides.txt";
+     if (std::getenv("WOWBG3_SHM") != nullptr) {
++        const std::string wait = file.substr(0, file.size() - 4) + ".wait";
++        const std::time_t asked = std::time(nullptr);
++        bool said = false;
+         struct stat st{};
+-        for (int i = 0; i < 150 && !(::stat(file.c_str(), &st) == 0 && st.st_mtime >= g_process_start); i++) {
++        for (int i = 0; i < 12000 && !(::stat(file.c_str(), &st) == 0 && st.st_mtime >= g_process_start); i++) {
++            struct stat ws{};
++            const bool held = ::stat(wait.c_str(), &ws) == 0 && ws.st_mtime >= g_process_start &&
++                              std::time(nullptr) - ws.st_mtime < 10;
++            if (i >= 150 && !held) break;
++            if (held && !said) {
++                bg3le::logf("io: the WoW side's first start makes this load's stats: waiting for %s", file.c_str());
++                said = true;
++            }
+             ::usleep(100000);
+         }
++        if (said) bg3le::logf("io: waited %ld s for the WoW side's first start", (long)(std::time(nullptr) - asked));
+     }
+     std::ifstream in(file);
+     std::string line;
