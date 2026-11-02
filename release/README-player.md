@@ -99,6 +99,9 @@ level, not your WoW level. WoW levels 2, 3 and 4 each open a party place; from W
 one BG3 level-up for one party member, and every 5th earns two. BG3's XP bar shows how far you are into your
 WoW level, and a notice at each new WoW level says the rest.
 
+Your characters do not all level together: one WoW level is one level-up for one character of your choice,
+not a level for the whole party. Going from BG3 level 3 to 4 across a party of four takes four level-ups.
+
 | WoW level | Level-ups earned | A party of four at BG3 level |
 |---|---|---|
 | 5 | 2 | 1 to 2 |
@@ -110,7 +113,9 @@ WoW level, and a notice at each new WoW level says the rest.
 | 57 | 64 | 17 |
 | 60 | 68 | 18 |
 
-BG3 stops at level 12 without a level mod (see "What you need").
+BG3 stops at level 12 without a level mod (see "What you need"), which a party of four reaches around WoW 40;
+later level-ups wait in the pool. The goal is to unlock the levels past 12 for all four, to match WoW up to 60,
+and to add new spells for those new levels. That is still to come.
 
 ## Where things are
 
