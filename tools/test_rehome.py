@@ -235,6 +235,25 @@ class Rehome(Base):
         self.assertEqual(sorted(r[0] for r in db.one('select guid from item_instance where owner_guid = 15')), [111, 112, 113])
         self.assertEqual(db.one('select id from character_pet'), [(4,)])
 
+    def test_a_renumbered_one_keeps_clear_of_the_numbers_of_those_still_to_come(self):
+        db = FakeDB()
+        self.use(db)
+        a = db.account('WB3PGALEAAAA')
+        db.db.execute("insert into characters values (1, ?, 'Gale', 1, 8, 0, 4, 0)", (a,))
+        db.db.execute("insert into item_instance values (1, 25, 1, 0, 0, 1, '', 0)")
+        db.db.execute("insert into characters values (2, ?, 'Galea', 1, 8, 0, 5, 0)", (a,))
+        db.db.execute("insert into item_instance values (2, 25, 2, 0, 0, 1, '', 0)")
+        wowsave.snapshot('g1', ['Gale'])
+        wowsave.snapshot('g2', ['Galea'])
+        db = FakeDB()
+        self.use(db)
+        db.db.execute("insert into characters values (1, ?, 'Stray', 1, 1, 0, 1, 0)", (db.account('WB3PSTRAYAAA'),))
+        db.db.execute("insert into item_instance values (1, 25, 1, 0, 0, 1, '', 0)")
+        self.assertEqual(wowsave.rehome(), 0)
+        self.assertEqual(db.one('select guid, name from characters order by guid'), [(1, 'Stray'), (2, 'Galea'), (3, 'Gale')])
+        self.assertEqual(db.one('select guid, owner_guid from item_instance where owner_guid > 0 order by guid'),
+                         [(1, 1), (2, 2), (3, 3)])
+
     def test_an_older_snapshot_finds_its_account_in_the_registry(self):
         self.old_database()
         for sid in ('s1', 's2'):

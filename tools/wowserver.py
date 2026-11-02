@@ -45,7 +45,7 @@ def mangosd_running(container='wow-bg3-mangosd-1'):
     var = Path(os.environ.get('WOWBG3_SERVER_VAR') or p / 'var')
     try:
         pid = int((var / 'run/mangosd.pid').read_text().strip())
-        return Path('/proc/%d/comm' % pid).read_text().strip() == 'mangosd'
+        return Path('/proc/%d/comm' % pid).read_text().startswith('mangosd')  # its main thread: mangosd-main
     except (OSError, ValueError):
         return False
 

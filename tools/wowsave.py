@@ -362,9 +362,10 @@ def account_id(user):
     return int(row[0]), True
 
 
-def rehome_one(name, newest, snaps, cols, bin_):
+def rehome_one(name, newest, snaps, cols, bin_, reserved):
     """`name` (missing from the database) inserted from its newest snapshot; returns the highest item guid its
-    snapshots hold now (the item guard goes above it)."""
+    snapshots hold now (the item guard goes above it). New numbers come above `reserved` too: what the snapshots of
+    the characters still to come hold, so a free number of theirs stays theirs."""
     assert NAME.fullmatch(name), 'a WoW character name: %r' % name
     _, sid, secs, meta = newest
     old, lines = secs[name]
@@ -379,11 +380,11 @@ def rehome_one(name, newest, snaps, cols, bin_):
     # Numbers another character, item, pet or corpse of this database has get the next free ones; the rest stay.
     m = {'account': acct, 'char': {}}
     if in_use('characters', 'guid', [old]):
-        m['char'][old] = max([highest('characters', 'guid')] + list(others)) + 1
+        m['char'][old] = max([highest('characters', 'guid')] + list(others) + list(reserved['char'])) + 1
     for kind, _, table, col in KINDS:
         m[kind] = {}
         taken = in_use(table, col, holds[kind]) if holds[kind] and table in cols else set()
-        nxt = max([highest(table, col)] + list(holds[kind])) if taken else 0
+        nxt = max([highest(table, col)] + list(holds[kind]) + list(reserved[kind])) if taken else 0
         for n in sorted(taken):
             nxt += 1
             m[kind][n] = nxt
@@ -459,11 +460,19 @@ def rehome():
         print('rehome: the database has every character of the %d snapshot(s)' % len(snaps))
         return 0
     cols = columns()
+    reserved = dict({kind: set() for kind, _, _, _ in KINDS}, char=set())
+    for name in missing:
+        old = newest[name][2][name][0]
+        reserved['char'].add(old)
+        for s in snaps:
+            if s[2].get(name, (None,))[0] == old:
+                for kind, nums in held(s[2][name][1], cols).items():
+                    reserved[kind] |= nums
     bin_ = ROOT / '#recycle_bin' / ('wowsave-rehomed-%s' % datetime.date.today().strftime('%Y%m%d'))
     failed, floor = [], 0
     for name in missing:
         try:
-            floor = max(floor, rehome_one(name, newest[name], snaps, cols, bin_))
+            floor = max(floor, rehome_one(name, newest[name], snaps, cols, bin_, reserved))
         except (RuntimeError, AssertionError, OSError) as e:
             failed.append(name)
             print('rehome %s FAILED: %s' % (name, e))
