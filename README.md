@@ -1,4 +1,4 @@
-# WOW-BG3 Passthrough
+# WOW-BG3 Passthrough Mod
 
 Play vanilla World of Warcraft (1.12.1) as the world of a Baldur's Gate 3 game.
 
@@ -40,7 +40,7 @@ version is mostly complete.
 
 ## How it plays
 
-- **Starting.** Enable WOW-BG3 Passthrough in BG3's mod manager and start a New Game. Make or pick your
+- **Starting.** Enable WoW-BG3 Passthrough in BG3's mod manager and start a New Game. Make or pick your
   character in BG3's character creation; you land in the WoW start zone of your character's race.
 - **Exploring.** BG3's camera, controls and interface; WoW's world under your feet, with WoW's
   NPCs, mobs, day and night. WoW's chat, quest log and quest tracker sit beside BG3's interface.
@@ -225,7 +225,7 @@ step. In short:
    `python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py"`.
    It installs the Linux Script Extender (bg3le) with WOW-BG3's patches and sets BG3's Steam launch
    option. It still runs your other Script Extender mods; `--uninstall` undoes it.
-5. Start BG3, enable WOW-BG3 Passthrough in the mod manager, start a New Game.
+5. Start BG3, enable WoW-BG3 Passthrough in the mod manager, start a New Game.
 
 The first start takes a few minutes: the local WoW server builds its data from your WoW files while
 BG3's loading screen waits. Later starts and loads take under a minute. Switching WOW-BG3 off in the
@@ -347,7 +347,7 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   tested alone. Mods that change levels, XP, rests or the party size are the likeliest to clash.
 - **Your saves.** Saves made without WOW-BG3 stay plain BG3 games and stay loadable; back them up
   before you try a beta anyway.
-- **Uninstall.** Switch WOW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
+- **Uninstall.** Switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
   installer with `--uninstall` to take the Script Extender back out of BG3's launch options, and
   remove `Mods/WOW-BG3.pak`, `Mods/WOW-BG3/` and `~/.local/share/wow-bg3/`.
 - **When something goes wrong.** The logs are in `~/.local/share/wow-bg3/logs/` (the WoW side) and
