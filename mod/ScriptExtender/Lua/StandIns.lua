@@ -91,6 +91,28 @@ local Names = Ext.Require("Names.lua")
 M.SelfHeal = false
 -- The music events world mode may play (Music action).
 local MUSIC_EVENTS = {Music_Off = true}
+-- BG3's normal fight themes (MUSIC.bnk's fight switch keys on one state, and these events set it), one drawn
+-- for each BG3 combat in world mode. Left out: the fights' own, bosses and set pieces (Ketheric, who shares
+-- Fight_Theme_1616_Dark_On, Myrkul, Gortash, Raphael, the Netherbrain, Moonrise, the Bhaalists, High Hall, the
+-- hag, the Goblin den, the tutorial's end, cinematics). World mode's Music_Off arms it.
+local FIGHT_THEMES = {
+    "Fight_Theme_03_On", "Fight_Theme_03_Dark_On", "Fight_Theme_04_12_On", "Fight_Theme_06_II_On",
+    "Fight_Theme_06_Dark_On", "Fight_Theme_1616_On", "Fight_Theme_916_On", "Fight_Theme_916_Dark_On",
+    "Fight_Theme_916_Quartet_On", "Fight_Theme_916_Quartet_Horror_On", "Fight_Theme_98_On",
+    "Fight_Theme_Percussive_On", "Fight_Theme_Percussive_02_On", "Fight_Theme_Uni_On", "Fight_Theme_WMPA_On",
+    "Fight_Theme_WMPA_Dark_On", "Set_02_Fight_On", "Set_06_Fight_On",
+}
+local fightThemesOn, lastFightTheme = false, nil
+local function drawFightTheme()
+    local i = math.random(#FIGHT_THEMES)
+    if FIGHT_THEMES[i] == lastFightTheme then i = i % #FIGHT_THEMES + 1 end
+    lastFightTheme = FIGHT_THEMES[i]
+    local ok, err = pcall(Osi.MusicPlayGeneral, lastFightTheme)
+    Ext.Utils.Print("WOW-BG3 fight music: " .. lastFightTheme .. (ok and "" or (" failed: " .. tostring(err))))
+end
+pcall(Ext.Osiris.RegisterListener, "CombatStarted", 1, "before", function()
+    if fightThemesOn then drawFightTheme() end
+end)
 -- Scale's Spells: the ones a stand-in may get (spiders).
 local SCALE_SPELLS = {Target_Web_Spider = true, Target_EtherealJaunt = true}
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
@@ -509,9 +531,12 @@ function M.Start(runId)
                 -- fight music by MUSIC_Type = fight, whose branch also holds for Music_Set None.
                 -- BG3's own event Music_Off sets Music_Set and every per-area set to None: no
                 -- exploration music, fight music as before; sound effects, voices and ambience are
-                -- other buses (from an analysis of BG3's sound banks).
+                -- other buses (from an analysis of BG3's sound banks). The fight switch itself keys on
+                -- no Music_Set, so FIGHT_THEMES above work with it off.
                 assert(MUSIC_EVENTS[c.Event], "Music: Event must be Music_Off")
                 Osi.MusicPlayGeneral(c.Event)
+                fightThemesOn = true
+                math.randomseed(math.floor(Ext.Utils.MonotonicTime()))
                 return {Event = c.Event}
             elseif c.Action == "Scale" then
                 local uuid = live(c.Target)

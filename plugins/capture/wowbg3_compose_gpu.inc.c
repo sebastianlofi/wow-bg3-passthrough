@@ -325,18 +325,20 @@ static void* wr_main(void* arg) {
             flash_last = mean;
         }
         pthread_mutex_lock(&g_wr.m);
+        // benilla restarted (its seq went back): frames of the old run are never newer. A torn frame counts
+        // too: the first frame of a new run read torn hid the restart, and the picture stayed on the old
+        // run's last frame until the new run's count passed it (a playtest: seq 70003, over 13 minutes).
+        if ((ok || torn) && g_wr.last_seq && (int32_t)(s[k] - g_wr.last_seq) < 0) {
+            g_wr.gen++;
+            for (int j = 0; j < WR_N; j++) if (g_wr.s[j].state == 2) g_wr.s[j].state = 0;
+            g_wr.latest = -1;
+        }
         if (!ok || torn) {
             w->state = 0;
             if (torn) g_wr.torn++; else g_wr.fails++;
             // a torn frame is gone for good (benilla moved on): do not try it again
             if (torn) { g_wr.prev_seq = g_wr.last_seq; g_wr.last_seq = s[k]; }
         } else {
-            // benilla restarted (its seq went back): frames of the old run are never newer
-            if (g_wr.last_seq && (int32_t)(s[k] - g_wr.last_seq) < 0) {
-                g_wr.gen++;
-                for (int j = 0; j < WR_N; j++) if (g_wr.s[j].state == 2) g_wr.s[j].state = 0;
-                g_wr.latest = -1;
-            }
             w->gen = g_wr.gen;
             w->seq = s[k]; w->ww = ww; w->wh = wh; w->code = code; w->cbpr = cbpr; w->dbpr = dbpr; w->wnear = wnear; w->wzoff = wzoff;
             w->packet = packet; w->cam = cam; w->wflags = wflags; w->wtime = wtime; w->ready_ns = t1;
@@ -385,9 +387,16 @@ static void wr_forget(void) {
 // wanted camera (the newest at or before it; the oldest after it when none is at or before).
 static int wr_pick(void) {
     int best = -1, newest = -1, have_cam = 1;
+    uint64_t last_read = 0;
+    for (int j = 0; j < WR_N; j++) {
+        WowSlot* w = &g_wr.s[j];
+        if ((w->state == 2 || (w->state == 3 && j == g_wr.cur)) && w->gen == g_wr.gen && w->ready_ns > last_read) last_read = w->ready_ns;
+    }
     for (int j = 0; j < WR_N; j++) {
         WowSlot* w = &g_wr.s[j];
         if (!(w->state == 2 || (w->state == 3 && j == g_wr.cur)) || w->gen != g_wr.gen) continue;
+        // Long before the last frame read: not the live run, whatever its seq says.
+        if (last_read - w->ready_ns > WR_STALE_NS) continue;
         if (newest < 0 || (int32_t)(w->seq - g_wr.s[newest].seq) > 0) newest = j;
         if (!w->cam) have_cam = 0;
     }
