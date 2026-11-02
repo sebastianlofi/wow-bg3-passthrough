@@ -510,6 +510,19 @@ function M.Start(runId)
             Ext.Utils.Print(string.format("WOW-BG3 crime: %s %s %s, tick %d", ev[1], tostring(a), tostring(b), ticks))
         end)
     end
+    -- A push on a stand-in is BG3's (a playtest shove: "skipped being pushed"): the live hold teleported it back
+    -- at once. BG3 registers a shove's crime only when the force ends, too late for `searching` to let go of it.
+    local forced = {}
+    pcall(Ext.Osiris.RegisterListener, "ForceMoveStarted", 3, "after", function(_, target)
+        local t = uuidOf(tostring(target))
+        if not (t and M.Owned[t]) then return end
+        forced[t] = true
+        if friendlyOf(t) then search(t) end
+    end)
+    pcall(Ext.Osiris.RegisterListener, "ForceMoveEnded", 3, "after", function(_, target)
+        local t = uuidOf(tostring(target))
+        if t then forced[t] = nil end
+    end)
     -- The crime BG3 registers (victim, type, id, evidence, up to four criminals): a friendly victim and
     -- its friendly neighbours search (see `searching`).
     M.CrimeListener = select(2, pcall(Ext.Osiris.RegisterListener, "CrimeIsRegistered", 8, "after", function(victim, kind)
@@ -913,7 +926,7 @@ function M.Start(runId)
                 if not m.InFight and not m.Dead and q(Osi.IsInCombat, m.Uuid) ~= 1 then searchStep(m) end
                 p = nil
             end
-            if p and not m.InFight and not m.Dead then
+            if p and not m.InFight and not m.Dead and not forced[m.Uuid] then
                 -- BG3 runs a stand-in in its combat: checked every tick, a fight can start any time.
                 if q(Osi.IsInCombat, m.Uuid) ~= 1 and q(Osi.IsDead, m.Uuid) ~= 1 then
                     local at = pos(m.Uuid)
