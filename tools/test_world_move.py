@@ -10,6 +10,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -490,6 +491,92 @@ class Cache(Base):
         self.assertEqual(sorted(core), sorted(want))
         self.assertEqual(sorted(rest), sorted(block))
         self.assertEqual(W.square_order(2)[1], [])
+
+
+class FarSight(Base):
+    """Far Sight follows the player's control on its own thread, whatever the ground's round waits for (0.1.3013.60: a
+    round building two movement tiles for 68 s held the F2 to Astarion 699 m off until after the F1 back)."""
+    AST = 'c7c13742-bacd-460a-8f65-f864fe41f255'
+
+    def setUp(self):
+        super().setUp()
+        self.party((-701.0, 121.0, -350.0))
+        self.control('hero-1')
+        self.sight = B.FarSight(self.w)
+
+    def party(self, pos):
+        (self.tmp / 'party.json').write_text(json.dumps({'RunId': 'r1', 'Members': [
+            {'Uuid': 'hero-1', 'Name': 'Tav', 'Hero': True, 'Pos': [-1400.0, 120.0, -350.0]},
+            {'Uuid': self.AST, 'Name': 'Astarion', 'Pos': list(pos)}]}))
+
+    def control(self, uuid):
+        (self.tmp / 'link/mirror-status.json').write_text(json.dumps({'Tav': {'Controlled': uuid}}))
+
+    def sent(self):
+        try:
+            return json.loads((self.tmp / 'link/farsight.json').read_text())
+        except FileNotFoundError:
+            return None
+
+    def test_on_the_member_and_back_on_the_hero(self):
+        self.sight.step()
+        self.assertIsNone(self.sent())
+        self.control(self.AST)
+        self.sight.step()
+        fs = self.sent()
+        self.assertEqual((fs['Seq'], fs['On'], fs['Uuid'], fs['Name'], fs['Map']), (1, True, self.AST, 'Astarion', 0))
+        wx, wy = self.w.wow_xy(-701.0, -350.0)
+        self.assertEqual(fs['Wow'][:2], [round(wx, 2), round(wy, 2)])
+        self.sight.step()
+        self.assertEqual(self.sent()['Seq'], 1)
+        self.control('hero-1')
+        self.sight.step()
+        self.assertEqual((self.sent()['Seq'], self.sent()['On']), (2, False))
+
+    def test_a_member_in_the_level_gets_none(self):
+        (self.tmp / 'world-status.json').write_text(json.dumps({'RunId': 'r1', 'LevelBounds': [-800, -500, 300, 100]}))
+        self.control(self.AST)
+        self.sight.step()
+        self.assertIsNone(self.sent())
+
+    def test_a_move_holds_it(self):
+        self.control(self.AST)
+        with self.sight.held:
+            self.sight.step()
+            self.assertIsNone(self.sent())
+        self.sight.step()
+        self.assertTrue(self.sent()['On'])
+
+    def test_a_round_waiting_for_its_cuts_does_not_hold_it(self):
+        raw = bytearray(44)
+        raw[:4] = b'TAV1'
+        struct.pack_into('<I7fII', raw, 4, 1, 0.0, 0.0, 100.0, -1400.0, 120.0, -350.0, 0.0, 0, 1)
+        (self.tmp / 'link/tav.bin').write_bytes(bytes(raw))
+        cutting, done = threading.Event(), threading.Event()
+
+        def precut(squares):  # the movement tiles of a place never visited: up to a minute
+            cutting.set()
+            done.wait(10)
+        self.w.precut = precut
+        round_ = threading.Thread(target=self.w.follow)
+        round_.start()
+        self.addCleanup(round_.join)
+        self.addCleanup(done.set)
+        self.assertTrue(cutting.wait(5))
+        self.sight.start()
+        self.addCleanup(self.sight.stop)
+        self.control(self.AST)   # F2 while the round cuts
+        end = time.time() + 2.0
+        while time.time() < end and not self.sent():
+            time.sleep(0.05)
+        self.assertTrue(round_.is_alive())
+        self.assertEqual(self.sent()['Uuid'], self.AST)
+
+    def test_stop_turns_it_off(self):
+        self.control(self.AST)
+        self.sight.step()
+        self.sight.stop()
+        self.assertFalse(self.sent()['On'])
 
 
 if __name__ == '__main__':

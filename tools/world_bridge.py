@@ -38,7 +38,7 @@ link/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs
 apart need no huge grid, and takes the pool from several out-of-bounds layers at once (--layer
 "-1.981,9.74").
 """
-import argparse, concurrent.futures, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, time
+import argparse, concurrent.futures, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, threading, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
@@ -1134,44 +1134,6 @@ class World:
         atomic_write(LINK / 'party-wow.json', json.dumps({'Format': 1, 'Map': self.map, 'Time': time.time(),
                                                           'Members': rows}).encode())
 
-    # ---- switching control (party-multiplayer-design.md "Far Sight") ----
-    def controlled(self):
-        """The member the player controls now (Mirrors.lua: mirror-status.json Tav.Controlled), or None."""
-        try:
-            st = json.loads((LINK / 'mirror-status.json').read_text())
-            c = (st.get('Tav') or {}).get('Controlled')
-            return c if isinstance(c, str) and c else None
-        except (FileNotFoundError, json.JSONDecodeError, AttributeError):
-            return None
-
-    def control(self):
-        """When the player controls another member, WoW's view goes there: Far Sight onto that member's
-        WoW character (its bot). The hero's own WoW character stays on the hero (tav.bin keeps the hero),
-        and every treadmill, mirror and fight keeps working for all members. Back on the hero: off."""
-        c = self.controlled()
-        hero_uuid = getattr(self, 'hero_walker', None) and self.hero_walker.uuid
-        target = self.walkers.get(c) if c and c != hero_uuid else None
-        key = target.uuid if target else None
-        if key == getattr(self, '_farsight', None):
-            return
-        self._farsight = key
-        self.farsight(target)
-
-    def farsight(self, w):
-        """The one place Far Sight is asked for. link/farsight.json (Format 1): {Seq, On, Uuid, Name,
-        Wow, Map}; the WoW backend (a server verb; benilla) turns the
-        viewpoint of the player's WoW character onto that member's WoW character, or back (On false)."""
-        self._farsight_seq = getattr(self, '_farsight_seq', 0) + 1
-        body = {'Format': 1, 'Seq': self._farsight_seq, 'On': w is not None, 'Map': self.map, 'Time': time.time()}
-        if w is not None:
-            p = next((p for m, p, _ in self.members if m is w), None)
-            body.update(Uuid=w.uuid, Name=w.name)
-            if p and self.origin:
-                wx, wy = self.wow_xy(p[0], p[2])
-                body['Wow'] = [round(wx, 2), round(wy, 2), round(self.origin[2] + (p[1] - self.centre[1]) / YD, 2)]
-        atomic_write(LINK / 'farsight.json', json.dumps(body).encode())
-        print(time.strftime('%H:%M:%S'), 'far sight', ('on ' + w.name) if w else 'off (the hero again)', flush=True)
-
     def move(self, m):
         """World mode at the requested WoW point. On this continent the session goes on there (reorigin). Another
         continent, or a refused re-origin: Stop (hero, party and squares home), then a new
@@ -1315,7 +1277,6 @@ class World:
             if not dead:
                 self.fall_alarm(w, p[0], p[1], p[2])
         self.publish_party()
-        self.control()
         want = self.wanted(members)
         # At most 8 squares a round, in `want` order (the square under every member first): each new
         # square is a wow_arena.py cut (about a second), so a member far off waits no longer than that.
@@ -1359,6 +1320,108 @@ class World:
                     if busy is None or k in busy:
                         self.pinned[k] = time.time() + 15.0
             self.resync()
+
+
+class FarSight:
+    """Switching control (party-multiplayer-design.md "Far Sight"): when the player controls another member, WoW's view
+    goes there, Far Sight onto that member's WoW character (its bot). The hero's own WoW character stays on the hero
+    (tav.bin keeps the hero), and every treadmill, mirror and fight keeps working for all members. Back on the hero: off.
+    Its own thread, every EVERY_S: a round of the ground waits for its cuts, and a square at a place never visited
+    builds its movement tiles first, up to a minute each (0.1.3013.60: Astarion 699 m off, one round built two tiles
+    for 68 s, the F2 to him came in that round and Far Sight never went out, so benilla never loaded his world and the
+    switch's cover ran its 20 s). A move holds it as it is (hold): the party is gathered and the mapping changes then."""
+    EVERY_S = 0.25
+
+    def __init__(self, world):
+        self.world = world      # the World now (main sets it after a move)
+        self.seq = 0
+        self.key = None         # the uuid Far Sight is on, None on the hero
+        self.held = threading.Lock()
+        self.halt = threading.Event()
+        self.thread = None
+
+    @staticmethod
+    def controlled():
+        """The member the player controls now (Mirrors.lua: mirror-status.json Tav.Controlled), or None."""
+        try:
+            st = json.loads((LINK / 'mirror-status.json').read_text())
+            c = (st.get('Tav') or {}).get('Controlled')
+            return c if isinstance(c, str) and c else None
+        except (FileNotFoundError, json.JSONDecodeError, AttributeError):
+            return None
+
+    def target(self, w):
+        """The controlled member as party.json (Party.lua) has it, when it is not the hero and stands in world mode's
+        void (as World.read_members takes members): {Uuid, Name, Pos}, or None."""
+        c = self.controlled()
+        h = hero(w.run)
+        if not c or c == (h or {}).get('Uuid'):
+            return None
+        try:
+            party = json.loads((IO / 'party.json').read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        if not isinstance(party, dict) or party.get('RunId') != w.run:
+            return None
+        for m in party.get('Members') or []:
+            if not isinstance(m, dict) or m.get('Uuid') != c or m.get('Hero') or m.get('OnStage') is False:
+                continue
+            p = m.get('Pos')
+            if not isinstance(p, list) or len(p) != 3 or not all(isinstance(v, (int, float)) for v in p):
+                return None
+            if abs(p[0] - w.centre[0]) > 20000 or abs(p[2] - w.centre[2]) > 20000 or w.in_level(p):
+                return None
+            return {'Uuid': c, 'Name': m.get('Name') or c[:8], 'Pos': tuple(p)}
+        return None
+
+    def write(self, w, t):
+        """The one place Far Sight is asked for. link/farsight.json (Format 1): {Seq, On, Uuid, Name,
+        Wow, Map}; the WoW backend (a server verb; benilla) turns the
+        viewpoint of the player's WoW character onto that member's WoW character, or back (On false)."""
+        self.seq += 1
+        body = {'Format': 1, 'Seq': self.seq, 'On': t is not None, 'Map': w.map, 'Time': time.time()}
+        if t is not None:
+            body.update(Uuid=t['Uuid'], Name=t['Name'])
+            p = t['Pos']
+            if w.origin:
+                wx, wy = w.wow_xy(p[0], p[2])
+                body['Wow'] = [round(wx, 2), round(wy, 2), round(w.origin[2] + (p[1] - w.centre[1]) / YD, 2)]
+        atomic_write(LINK / 'farsight.json', json.dumps(body).encode())
+        print(time.strftime('%H:%M:%S'), 'far sight', ('on ' + t['Name']) if t else 'off (the hero again)', flush=True)
+
+    def step(self):
+        """Far Sight where the player's control is, unless a move holds it."""
+        if not self.held.acquire(blocking=False):
+            return
+        try:
+            w = self.world
+            t = self.target(w)
+            key = t['Uuid'] if t else None
+            if key != self.key:
+                self.key = key
+                self.write(w, t)
+        finally:
+            self.held.release()
+
+    def run(self):
+        while not self.halt.wait(self.EVERY_S):
+            try:
+                self.step()
+            except Exception as e:  # noqa: BLE001  keep watching; the next look may read whole files
+                print('far sight error:', e, flush=True)
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, name='farsight', daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """The thread ends; Far Sight back on the hero if it was out."""
+        self.halt.set()
+        if self.thread:
+            self.thread.join(5)
+        if self.key is not None:
+            self.key = None
+            self.write(self.world, None)
 
 
 def main():
@@ -1406,6 +1469,8 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
     w.start()
+    sight = FarSight(w)
+    sight.start()
     moved = moves_done(w.run)
     covered = None  # when the last move ended, while its cover waits for benilla's player there
     at_camp = False
@@ -1426,7 +1491,9 @@ def main():
             if m:
                 moved = m['Seq']
                 try:
-                    w = w.move(m)
+                    with sight.held:
+                        w = w.move(m)
+                        sight.world = w
                 except BaseException:
                     move_cover(False)
                     raise
@@ -1446,8 +1513,7 @@ def main():
     if at_camp:
         camp_compose(False)
     w.publish(False)
-    if getattr(w, '_farsight', None):
-        w.farsight(None)
+    sight.stop()
     w.command('Stop')
 
 
