@@ -10,6 +10,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 LUA = (HERE.parent / 'mod/ScriptExtender/Lua/Inventory.lua').read_text()
 sys.path.insert(0, str(HERE))
+import inventory_bridge
 import wow_items
 try:
     import lupa
@@ -47,8 +48,11 @@ class Table(unittest.TestCase):
         self.assertIn('WeaponEnchantment(2)', row['bo'])
 
     def test_the_price_of_one_is_as_it_was(self):
-        row = thrown()  # the choice of what one BG3 dagger stands for is not made here
-        self.assertEqual((row['bp'], row['bc'], row['sp']), (1, 200, 0))
+        row = thrown()
+        self.assertEqual((row['bp'], row['bc'], row['sp'], row['lp']), (1, 200, 0, 15))
+
+    def test_no_lot_no_lot_price(self):
+        self.assertNotIn('lp', thrown('Silver Star', price=37, count=1, sell=9))
 
 
 FAKE = r'''
@@ -58,7 +62,8 @@ hands, entry_of, equips, suppressed_ = {}, {}, {}, {}
 M = {Item = function(e) return ENTRIES[e] end, Suppress = function(u) suppressed_[u] = true end, Props = nil,
      EffectBoosts = function() return {} end, Create = function() error("nothing is made here") end}
 state = {Created = 0}
-wowOwner, pendingItem, suffixed = {}, {}, {}
+wowOwner, pendingItem, suffixed, wowCount = {}, {}, {}, {}
+set_amount = {}
 function note() end
 function reconcileStacks() end
 function keepsOwn() return false end
@@ -67,10 +72,13 @@ function equipped(u) return hands.main == u or hands.off == u or hands.ranged ==
 function entryOf(u) return entry_of[u] end
 function uuidOf(s) return s end
 function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
+back, amount = {}, nil
 SLOT = {[1] = "main", [2] = "main", [3] = "ranged", [4] = "off"}
 Osi = {
   GetEquippedItem = function(_, s) return s == "MeleeMainHand" and hands.main or s == "MeleeOffHand" and hands.off or nil end,
-  GetStackAmount = function() return nil end,
+  GetStackAmount = function() return amount end,
+  SetStackAmount = function(u, n) set_amount[#set_amount + 1] = n end,
+  ToInventory = function(u) back[#back + 1] = u end,
   Equip = function(_, u) equips[#equips + 1] = u; hands[SLOT[entry_of[u]]] = u end,
   Unequip = function(_, u) for k, v in pairs(hands) do if v == u then hands[k] = nil end end end,
 }
@@ -78,14 +86,14 @@ Ext = {Entity = {Get = function(u) return {Vars = {}} end}}
 '''
 
 
-class Hands(unittest.TestCase):
-    """reconcileMember: one BG3 main hand for WoW's main hand and WoW's ranged slot."""
+class Member(unittest.TestCase):
+    """reconcileMember under the fake game."""
 
     def setUp(self):
         L = self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
         L.execute(FAKE)
         body = section('local function reconcileMember', '    reconcileStacks(uuid, stacks, have, m.Items)')
-        L.execute(section('function M.ThrownWaits', 'local function reconcileMember')
+        L.execute(section('function M.AmountOf', '\n') + '\n' + section('function M.ThrownWaits', 'local function reconcileMember')
                   + body.replace('local function reconcileMember', 'function reconcileMember') + '\nend')
         L.execute('entry_of = {sword = 1, knife = 2, bow = 3, shield = 4}')
 
@@ -97,6 +105,9 @@ class Hands(unittest.TestCase):
 
     def equips(self):
         return list(self.L.globals().equips.values())
+
+class Hands(Member):
+    """One BG3 main hand for WoW's main hand and WoW's ranged slot."""
 
     def test_wow_sword_and_knife_do_not_fight_for_the_hand(self):
         self.go([('sword', 1, 15), ('knife', 2, 17)], 5)
@@ -125,6 +136,128 @@ class Hands(unittest.TestCase):
     def test_a_bow_keeps_its_own_slot(self):
         self.go([('sword', 1, 15), ('bow', 3, 17)])
         self.assertEqual(sorted(self.equips()), ['bow', 'sword'])
+
+
+class Landed(Member):
+    """A throw spends nothing, and BG3 picks the dagger up: reconcile leaves it where it lies."""
+
+    def land(self):
+        self.L.execute('holderOf = function(u) if u == "knife" then return nil end return "hero" end')
+
+    def test_not_pulled_back_to_the_bag(self):
+        self.land()
+        self.go([('knife', 2, 30)])
+        self.assertEqual(len(self.L.globals().back), 0)
+
+    def test_not_pulled_back_to_the_hand(self):
+        self.land()
+        self.go([('knife', 2, 17)])
+        self.assertEqual(self.equips(), [])
+        self.assertIsNone(self.L.eval('hands.main'))
+
+    def test_picked_up_it_counts_again(self):
+        self.land()
+        self.go([('knife', 2, 17)])
+        self.L.execute('holderOf = function() return "hero" end')
+        self.go([('knife', 2, 17)])
+        self.assertEqual(self.L.eval('hands.main'), 'knife')
+
+    def test_a_sword_on_the_ground_still_comes_back(self):
+        self.L.execute('holderOf = function() return nil end')
+        self.go([('sword', 1, 30)], 1)
+        self.assertEqual(list(self.L.globals().back.values()), ['sword'])
+
+
+class Amount(Member):
+    def test_a_stack_of_200_stays_one_dagger(self):
+        self.L.execute('amount = 200')
+        self.L.execute('''reconcileMember("hero", {Items = {{Guid = "knife", Entry = 2, Count = 200, Bag = 0, Slot = 30}}},
+                          {knife = "knife"})''')
+        self.assertEqual(list(self.L.globals().set_amount.values()), [1])
+        self.assertEqual(self.L.eval('wowCount.knife'), 200)
+
+    def test_other_weapons_follow_wows_count(self):
+        self.L.execute('amount = 1')
+        self.L.execute('''reconcileMember("hero", {Items = {{Guid = "sword", Entry = 1, Count = 3, Bag = 0, Slot = 30}}},
+                          {sword = "sword"})''')
+        self.assertEqual(list(self.L.globals().set_amount.values()), [3])
+
+
+class Money(unittest.TestCase):
+    """The screen's price against what WoW does: M.ValueOf, Prices.lua and the bridge's sell."""
+
+    def setUp(self):
+        L = self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        L.globals().Prices = L.execute((HERE.parent / 'mod/ScriptExtender/Lua/Prices.lua').read_text())
+        L.execute('M = {CopperPerGold = 1}; tradeBase = 2.5')
+        L.execute(section('function M.ValueOf', 'local function setValue'))
+
+    def value(self, row, ware, count=None):
+        t = self.L.table_from(row)
+        return self.L.globals().M.ValueOf(t, ware, count)
+
+    def test_the_15c_lot_shows_15(self):
+        v = self.value(thrown(), True)
+        self.assertEqual(self.L.globals().Prices.Bought(v, 2.5), 15)
+
+    def test_a_ware_with_no_lot_shows_its_price(self):
+        v = self.value(thrown('Silver Star', price=37, count=1, sell=9), True)
+        self.assertIn(self.L.globals().Prices.Bought(v, 2.5), (35, 38))  # BG3's value is whole: 1 off at most
+
+    def test_selling_pays_what_wow_pays_for_the_stack(self):
+        row = thrown('Silver Star', price=37, count=1, sell=9)
+        for n, base in ((200, 2.5), (73, 2.5), (1, 2.5), (200, 3)):
+            self.L.globals().tradeBase = base
+            shown = self.L.globals().Prices.Sold(self.value(row, False, n), base)
+            be = inventory_bridge.Fake.__new__(inventory_bridge.Fake)
+            be.items, be.s = {2947: row}, {'chars': {'Tav': {'money': 0, 'items': {'g': {'entry': 2947, 'count': n, 'bag': 0, 'slot': 30}}}}}
+            ok, _, extra = be.sell('Tav', 'npc', 'g')  # the request names the guid and no count
+            self.assertTrue(ok)
+            self.assertEqual(shown, extra['Money'])
+            self.assertEqual(shown, 9 * n)
+
+    def test_no_sell_price_shows_nothing(self):
+        self.assertEqual(self.value(thrown(), False, 200), 0)
+
+    def test_other_rows_are_as_they_were(self):
+        self.assertEqual(self.value({'bp': 100, 'sp': 20}, True), 40)
+        self.assertEqual(self.value({'bp': 100, 'sp': 20}, False), 50)
+
+
+class Buying(unittest.TestCase):
+    """askFor: the dagger leaving the merchant is WoW's whole lot, bought or stolen."""
+
+    def setUp(self):
+        L = self.L = lupa.LuaRuntime(unpack_returned_tuples=True)
+        L.execute(r'''
+          reqs, asked = {}, {}
+          lastInv = {Vendors = {f00 = {{Idx = 5, Entry = 2947, Price = 15}, {Idx = 6, Entry = 4540, Price = 25}}}}
+          Hero = {Uuid = function() return "hero" end}
+          tick = 0
+          M = {Barter = {}, Request = function(r) reqs[#reqs + 1] = r end,
+               Item = function(e) if e == 2947 then return {s = "Thrown", bc = 200} end return {s = "Food", bc = 5} end}
+        ''')
+        L.execute(section('local function askFor', 'M.AskFor = askFor').replace('local function askFor', 'function askFor'))
+
+    def test_bought_one_purchase(self):
+        self.L.execute('askFor("u", "Vf00:5", 1)')
+        r = self.L.globals().reqs[1]
+        self.assertEqual((r['Op'], r['Count']), ('buy', 1))
+
+    def test_bg3_saying_200_changes_nothing(self):
+        self.L.execute('askFor("u", "Vf00:5", 200)')
+        r = self.L.globals().reqs[1]
+        self.assertEqual((r['Op'], r['Count']), ('buy', 1))
+
+    def test_stolen_the_lot(self):
+        self.L.execute('askFor("u", "Vf00:5", 1, "thief")')
+        r = self.L.globals().reqs[1]
+        self.assertEqual((r['Op'], r['Count'], r['Member']), ('add', 200, 'thief'))
+
+    def test_food_still_buys_a_part(self):
+        self.L.execute('askFor("u", "Vf00:6", 2)')
+        r = self.L.globals().reqs[1]
+        self.assertEqual((r['Op'], r['Count'], r['Lot']), ('buypart', 2, 5))
 
 
 class OldSave(unittest.TestCase):

@@ -44,7 +44,8 @@ COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 
         'dmg_min1', 'dmg_max1', 'dmg_type1', 'dmg_min2', 'dmg_max2', 'dmg_type2', 'armor', 'block',
         'holy_res', 'fire_res', 'nature_res', 'frost_res', 'shadow_res', 'arcane_res', 'spellcategory_1', 'spellid_1'] + \
        ['stat_type%d' % i for i in range(1, 11)] + ['stat_value%d' % i for i in range(1, 11)]
-ITEMS_SCHEMA = 6  # 6: thrown weapons are daggers. 2: bp is the price of one, bc added. 3: supply by price, water is water. 4: consumables by their spell, us added. 5: attack power by CharacterWeaponDamage. wowbg3-coord.py makes an older table again.
+THROWN = 16  # WoW's weapon subclass
+ITEMS_SCHEMA = 6  # 6: thrown weapons are daggers, lp added. 2: bp is the price of one, bc added. 3: supply by price, water is water. 4: consumables by their spell, us added. 5: attack power by CharacterWeaponDamage. wowbg3-coord.py makes an older table again.
 STAT_NAMES = {0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina'}
 DIES = [(4, 2.5), (6, 3.5), (8, 4.5), (10, 5.5), (12, 6.5)]
 SPELL_COLS = ['random_property'] + ['%s_%d' % (c, i) for i in range(1, 6) for c in ('spellid', 'spelltrigger')]
@@ -176,6 +177,8 @@ def map_item(rules, it, icons):
            'rl': it['required_level'], 'r': rules['rarity_by_quality'].get(str(q), 'Common')}
     if it['buy_count'] > 1:
         row['bc'] = it['buy_count']
+        if cls == 2 and sub == THROWN:
+            row['lp'] = it['buy_price']  # one BG3 dagger is WoW's whole lot, so it costs the lot (Inventory.lua)
     boosts = []
     if cls == 2 and str(sub) in rules['weapons']:
         w = rules['weapons'][str(sub)]
