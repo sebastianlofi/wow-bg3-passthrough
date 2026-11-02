@@ -27,16 +27,16 @@ class Faces(unittest.TestCase):
 
 class Fall(unittest.TestCase):
     def test_on_a_cave_floor_under_a_hill(self):
-        self.assertFalse(world_bridge.under_every_face(HILL + FLOOR, 2, 10.1, 2))
+        self.assertEqual(world_bridge.face_under(HILL + FLOOR, 2, 10.1, 2), 10.0)
 
     def test_in_the_air_over_a_floor_is_no_fall(self):
-        self.assertFalse(world_bridge.under_every_face(HILL + FLOOR, 2, 18.0, 2))
+        self.assertEqual(world_bridge.face_under(HILL + FLOOR, 2, 18.0, 2), 10.0)
 
     def test_under_every_face_is(self):
-        self.assertTrue(world_bridge.under_every_face(HILL + FLOOR, 2, 2.0, 2))
+        self.assertIsNone(world_bridge.face_under(HILL + FLOOR, 2, 2.0, 2))
 
     def test_nothing_in_the_column_is(self):
-        self.assertTrue(world_bridge.under_every_face(FLOOR, 9, 2.0, 9))
+        self.assertIsNone(world_bridge.face_under(FLOOR, 9, 2.0, 9))
 
 
 class Alarm(unittest.TestCase):

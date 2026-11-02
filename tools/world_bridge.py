@@ -295,6 +295,13 @@ def camera_wow():
     return eye if all(math.isfinite(v) for v in eye) else None
 
 
+def face_under(tris, x, y, z):
+    """The height of the nearest WoW face under a walker's feet at BG3 (x, y, z), or None: nothing of WoW's lies
+    under it, the only real fall. Anything else is standing, or in the air over what it will land on (a shove off
+    a cliff, a drop into a cave). A square's tiles hold one floor, in a cave the hill over it; the faces hold all."""
+    return max((h for h in faces_over(tris, x, z) if h < y + FALL_HEAD_M), default=None)
+
+
 def faces_over(tris, x, z):
     """The height of every WoW face over BG3 (x, z), walls left out by having no area seen from above. Also a
     hair to each side: a point on the line between two triangles lies on neither."""
@@ -315,12 +322,6 @@ def faces_over(tris, x, z):
                 out.append(u * ay + v * by + (1.0 - u - v) * cy)
                 break
     return out
-
-
-def under_every_face(tris, x, y, z):
-    """True when nothing of WoW's lies under a walker's feet at BG3 (x, y, z): the only real fall. Anything else
-    is standing, or in the air over something it will land on (a shove off a cliff, a drop into a cave)."""
-    return not any(h < y + FALL_HEAD_M for h in faces_over(tris, x, z))
 
 
 class Walker:
@@ -863,7 +864,7 @@ class World:
             return
         w.faces_read = now
         ij = (int(math.floor((bx - self.centre[0]) / CELL)), int(math.floor((bz - self.centre[2]) / CELL)))
-        if not under_every_face(self.cells[ij]['tris'], bx, by, bz) or now - w.fall_said < FALL_SAY_S:
+        if face_under(self.cells[ij]['tris'], bx, by, bz) is not None or now - w.fall_said < FALL_SAY_S:
             return
         w.fall_said = now
         print(time.strftime('%H:%M:%S'), 'fall alarm: %s at %.1f %.1f %.1f, under every WoW face of square %s, tile floor %.1f'
