@@ -1,0 +1,109 @@
+WOW-BG3 benilla patch 0110: a stand-in the party's attack misses plays WoW's dodge.
+Playtest feedback: "when an NPC dodges / I miss an attack, they should play their dodge animation." BG3 raises MissedBy for an
+attack roll that missed; strikes.bin flags 2|64 (Mirrors.lua) carry it. The model plays what WoW's client does with a
+dodged swing: DefenseAnim (the swing's $CPP) and a SwingImpact with HITINFO_MISS, victim state 2 and no floating text,
+both written directly because the own character is hidden and plays no clip with those keys. An older benilla drops the record (damage 0).
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -87,7 +87,7 @@
+ use benilla_protocol::messages::ObjectType;
+ use bevy::prelude::*;
+ 
+-use crate::creature_anim::{PlaySeq, SwingImpact, SwingMessage};
++use crate::creature_anim::{DefenseAnim, PlaySeq, SwingImpact, SwingMessage};
+ use crate::net::{ChatKind, ClientCommand, Guid, NetCommands, ObjectStore, Reputations, SelfPlayer};
+ use crate::player::{AutoMove, Player, UNIT_FLAG_IN_COMBAT};
+ use crate::target::{can_attack, ring_reaction, Factions};
+@@ -150,6 +150,10 @@
+ const STRIKE_LETHAL: u32 = 4;
+ /// Patch 0104: the attack is a thrown weapon.
+ const STRIKE_THROWN: u32 = 32;
++/// Patch 0110, with [`STRIKE_WOUND`]: the party's attack missed the stand-in (BG3's `MissedBy`).
++const STRIKE_DODGE: u32 = 64;
++/// `SwingMessage::victim_state` of a dodge.
++const VICTIM_DODGE: u32 = 2;
+ /// Patch 0033 (the party): the stand-in's victim is one of the hero's BG3 companions, whom WoW draws
+ /// but the WoW server never hears of: the mob swings with BG3's own facing (toward the companion) and
+ /// no WoW victim (the hidden own body is not hit).
+@@ -529,6 +533,32 @@
+     }
+ }
+ 
++/// A dodge by `victim`, what WoW's client does with a dodged swing: the defense clip the swing's
++/// `$CPP` key plays and the impact its attack-hit key fires, both written directly, as the own
++/// character (hidden in world mode) plays no clip with those keys. BG3 shows its own miss text.
++fn dodge(attacker: Entity, victim: Entity, seq: u64) -> (DefenseAnim, SwingImpact) {
++    (
++        DefenseAnim {
++            victim,
++            victim_state: VICTIM_DODGE,
++        },
++        SwingImpact {
++            swing: SwingMessage {
++                attacker,
++                victim: Some(victim),
++                hit_info: HIT_MISS,
++                victim_state: VICTIM_DODGE,
++                damage: 0,
++                displayed: false,
++                seq,
++            },
++            text_only: false,
++            natural: None,
++            pos: None,
++        },
++    )
++}
++
+ /// WoW orientation (Bevy yaw) of a horizontal Bevy direction: a unit at yaw `o` faces
+ /// (-sin o, 0, -cos o).
+ fn yaw_of(d: Vec3) -> f32 {
+@@ -1708,6 +1738,7 @@
+     mut units: Query<(Entity, &Guid, &mut Transform), Without<SelfPlayer>>,
+     mut swings: MessageWriter<SwingMessage>,
+     mut impacts: MessageWriter<SwingImpact>,
++    mut defenses: MessageWriter<DefenseAnim>,
+     mut play_seq: ResMut<PlaySeq>,
+     mut trace_t: Local<f32>,
+     mut commands: Commands,
+@@ -1728,7 +1759,19 @@
+         Vec::new()
+     };
+     for s in early {
+-        if s.flags & STRIKE_WOUND != 0 {
++        if s.flags & (STRIKE_WOUND | STRIKE_DODGE) == STRIKE_WOUND | STRIKE_DODGE {
++            // The party's attack missed a stand-in: its model dodges now.
++            if let (Some(me), Some((entity, _, _))) = (victim, units.iter().find(|u| u.1 .0 == s.guid)) {
++                info!(
++                    "wowbg3 fight: guid {:#x} (unit={entity}) dodges ({:.0} ms after BG3's miss)",
++                    s.guid,
++                    now - s.t
++                );
++                let (defense, impact) = dodge(me, entity, play_seq.next());
++                defenses.write(defense);
++                impacts.write(impact);
++            }
++        } else if s.flags & STRIKE_WOUND != 0 {
+             // Tav hit a stand-in: its model flinches now (a kill is the server's death instead).
+             if s.flags & STRIKE_LETHAL != 0 || s.damage == 0 {
+                 continue;
+@@ -2116,6 +2159,18 @@
+         assert!(decode_strikes(&b[..b.len() - 1]).is_none());
+     }
+ 
++    #[test]
++    fn a_dodge_is_wows_dodged_swing_without_text() {
++        let (attacker, victim) = (Entity::from_raw_u32(1).unwrap(), Entity::from_raw_u32(2).unwrap());
++        let (defense, impact) = dodge(attacker, victim, 7);
++        assert_eq!((defense.victim, defense.victim_state), (victim, 2));
++        let s = impact.swing;
++        assert_eq!((s.attacker, s.victim, s.seq), (attacker, Some(victim), 7));
++        // No flinch or blood (HitInfo 0x2), no damage, no floating text, no weapon impact.
++        assert_eq!((s.hit_info & HIT_NORMAL, s.hit_info & HIT_MISS, s.victim_state, s.damage), (0, HIT_MISS, 2, 0));
++        assert!(!s.displayed && !impact.text_only);
++    }
++
+     #[test]
+     fn yaw_matches_look_to() {
+         for o in [-2.5f32, -1.0, 0.0, 0.7, 3.0] {

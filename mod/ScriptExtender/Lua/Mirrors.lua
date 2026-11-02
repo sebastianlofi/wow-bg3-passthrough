@@ -152,7 +152,9 @@ local AIM_GUARD = 150 -- ticks after Tav aimed at a stand-in before its HP is sy
 -- stand-in's mob), 4 lethal (the stand-in is at 0 HP), 8 miss reported at the cast's end
 -- (CastedSpell without an AttackedBy), 16 the victim is a companion, not the hero (benilla plays
 -- the swing with BG3's own facing, no victim). Without the wound bit the guid's stand-in attacked Tav or
--- (16) a companion, 32 a thrown weapon (benilla plays its throw, not its swing). "Tav" in the wound bit is any party member.
+-- (16) a companion, 32 a thrown weapon (benilla plays its throw, not its swing), 64 with the wound bit: the party's attack
+-- missed the stand-in (BG3's MissedBy; benilla plays WoW's dodge). "Tav" in the wound bit is any party member.
+local STRIKE_WOUND, STRIKE_DODGE = 2, 64
 local STRIKES_KEEP = 16
 local MISS_DELAY = 6 -- ticks after CastedSpell before an attack with no AttackedBy counts as a miss
 -- Friendly NPCs (see the header): BG3's crime reaction tag for all but guards, and how long (ticks)
@@ -576,6 +578,16 @@ function M.Start(runId)
             end
         end
     end)
+    -- BG3's own event for an attack roll that missed (defender, attacker owner, attacker, story action; Larian's goals read it
+    -- so too, GLO_DaisyDreams_PostEA): a save or a resist does not raise it. The stand-in's WoW model dodges.
+    -- A miss on the party needs nothing here: every party member is drawn with BG3's own figure and BG3's reaction.
+    local okMiss, errMiss = pcall(Ext.Osiris.RegisterListener, "MissedBy", 4, "after", function(defender, owner, attacker)
+        local uuid = uuidOf(tostring(defender))
+        if uuid and M.Owned[uuid] and (Party.IsMember(tostring(owner)) or Party.IsMember(tostring(attacker))) then
+            pcall(strike, uuid, STRIKE_WOUND | STRIKE_DODGE, 0)
+        end
+    end)
+    if not okMiss then Ext.Utils.Print("WOW-BG3 strikes: no MissedBy, a miss plays no dodge: " .. tostring(errMiss)) end
     -- Before the action lands (attack, spell, Shove, Throw at it): it may join the combat.
     pcall(Ext.Osiris.RegisterListener, "UsingSpellOnTarget", 6, "after", function(caster, target, spell)
         local c, t = uuidOf(tostring(caster)), uuidOf(tostring(target))
