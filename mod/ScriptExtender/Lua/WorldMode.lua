@@ -53,6 +53,7 @@ local TavPlan = Ext.Require("TavPlan.lua")
 local Session = Ext.Require("Session.lua") -- held game states (a save): keep world mode (F5 fix)
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
 local Camp = Ext.Require("Camp.lua") -- the switch `camp` and a trip's numbers (the module runs on the server)
+local Arena = Ext.Require("Arena.lua") -- which arena actions only the client carries out (Arena.ClientOnly)
 local YD = 0.9144
 local MAX_SECONDS = 900
 
@@ -109,7 +110,12 @@ function M.Start(runId)
         end
         return got[results[1]].Value, got
     end
-    local function arena(c) return command("arena-command", c, {"arena-server-result.json", "arena-client-result.json"}) end
+    -- Both sides answer an arena command, except one only the client carries out (Arena.ClientOnly: Lead, the
+    -- picking map back): its result is the client's alone.
+    local function arena(c)
+        if Arena.ClientOnly[c.Action] then return command("arena-command", c, {"arena-client-result.json"}) end
+        return command("arena-command", c, {"arena-server-result.json", "arena-client-result.json"})
+    end
     local function standIn(c) return command("stand-in-command", c, {"stand-in-result.json"}) end
     -- The party (Party.lua on the server): companions next to the hero and chained.
     local function party(c) return command("party-command", c, {"party-result.json"}) end

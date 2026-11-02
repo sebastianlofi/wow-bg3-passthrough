@@ -40,6 +40,12 @@ local N = Ext.Require("WowNative.lua")
 local Hero = Ext.Require("Hero.lua")
 local REGION = Ext.Require("Hero.lua").REGION -- host level (Hero.lua, host.json)
 local MAX_SECONDS, RADIUS, VOID_RADIUS = 900, 25.0, 400.0
+-- The actions only the client carries out: the server answers "client only" before any check of its own, so a
+-- caller waits for the client's result alone (WorldMode.lua). Waiting for the server's word on them tied them to a
+-- server that can be busy for seconds: in the 0.1.3013.59 test the server ran no tick for 8 to 13 s after a
+-- move's teleport, the client had done Lead within 0.1 s, and the move failed "Lead: no result".
+M.ClientOnly = {Lead = true, PickRegionOff = true, CameraOff = true, CameraStats = true, CameraProbe = true,
+    CountOn = true, CountRead = true}
 
 local function now()
     local ok, ms = pcall(Ext.Utils.MonotonicTime)

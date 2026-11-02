@@ -64,7 +64,9 @@ HYST = 8.0       # metres past a square's middle before the window moves
 # the pool subgrids stay where they are, only the WoW point the centre stands for changes. The squares placed
 # then still hold the old place (stale): a wanted one is retiled where it lies, one nobody wants goes first when
 # a square needs a subgrid, and a stale storey over wanted ground gets tiles all blocked, or BG3 would keep finding the
-# old place's upper floor there. Only a refusal, or another continent, takes Stop and Start.
+# old place's upper floor there; they lie well under every floor of that square (cells_for, BLOCKED_UNDER_M), where
+# no one stands. Only a refusal, or another continent, takes Stop and Start.
+BLOCKED_UNDER_M = 64.0
 CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cut_cache)
 # Kalimdor too: Map in the request picks the continent. Another continent than the
 # session's: Stop, a server teleport of the WoW character to the game_tele place Via names on that
@@ -191,17 +193,35 @@ def camp_state(run):
 CAMP_WORDS = 'camp bg3tav'
 
 
+COVER_BLACK_S = 1.0  # from the flag to a black screen: the mod looks every 5 ticks, then BG3 fades for 0.5 s
+
+
 def move_cover(on):
-    """A move: BG3's own screen fade covers the party's stay in BG3's level (MoveLoading.lua)."""
+    """A move: BG3's own screen fade covers the party's stay in BG3's level (MoveLoading.lua). On: the time the screen
+    is black by, for cover_wait; the flag wowbg3cmd.py wrote at the player's command (a few seconds old) counts."""
     flag = LINK / 'wowmove.flag'
+    now = time.time()
     try:
         if on:
-            flag.write_text('%.3f\n' % time.time())
-            time.sleep(1.0)  # the mod looks every 5 ticks, then BG3 fades for 0.5 s
-        else:
-            flag.unlink(missing_ok=True)
+            since = now
+            try:
+                t = float(flag.read_text().split()[0])
+                if now - 30.0 < t <= now:
+                    since = t
+            except (OSError, ValueError, IndexError):
+                pass
+            flag.write_text('%.3f\n' % now)
+            return since + COVER_BLACK_S
+        flag.unlink(missing_ok=True)
     except OSError as e:
         print('move: cover file:', e, flush=True)
+    return now
+
+
+def cover_wait(black_at):
+    """Nothing of the party moves before the cover is black (move_cover); the cuts before it take that time anyway."""
+    if black_at:
+        time.sleep(max(0.0, black_at - time.time()))
 
 
 def cover_done(w, since):
@@ -822,9 +842,17 @@ class World:
         self.precut([ij[:2] for k, ij in pairs if k not in self.to_block])
         for k, ij in pairs:
             if k in self.to_block:
+                # Blocked tiles, BLOCKED_UNDER_M under the lowest floor of the square it lies over (its ground and
+                # storeys): BG3 takes the tile whose floor is nearest a position's height, so none of them is ever
+                # anyone's. They were at the centre's height, the hero's own floor after a move's teleport: in the
+                # 0.1.3013.59 test BG3's server stopped ticking (no fade renewal, no Osiris event, no answer) after
+                # each re-origin that blocked storeys there: 7 to 13.5 s from its Rays to the party's answer, 1.4 to
+                # 5.4 s in the re-origins without.
+                ground = self.cut(ij[:2])
+                low = min([ground['base']] + [st['base'] for st in ground.get('storeys') or ()]) - BLOCKED_UNDER_M
                 self.serial = self.serial % SERIALS + 1
-                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), (b'\0' + struct.pack('<f', self.centre[1])) * (TILES * TILES))
-                out.append([k, *self.cell_min(ij), self.centre[1], self.serial])
+                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)), (b'\0' + struct.pack('<f', low)) * (TILES * TILES))
+                out.append([k, *self.cell_min(ij), low, self.serial])
                 continue
             cell = self.cut(ij[:2])
             if len(ij) == 3:
@@ -946,9 +974,10 @@ class World:
         self.started = time.time()
         self.publish(True)
 
-    def reorigin(self, at):
+    def reorigin(self, at, covered=None):
         """This session at the WoW point `at` (see the notes at the top). None, or why not: then the caller goes on
-        with Stop and Start, which take everything home whatever this left (the mod may have stopped publishing)."""
+        with Stop and Start, which take everything home whatever this left (the mod may have stopped publishing).
+        `covered`: called once the cuts are made, before the mod's part (move: waits for the cover to be black)."""
         self.origin = tuple(at)
         self.cells.clear()
         self.ready.clear()
@@ -969,6 +998,9 @@ class World:
                 return why or 'no pool subgrid for %s' % sorted(short)
             cells = self.cells_for(pairs)
             self.write_triangles(want)
+            if covered:
+                covered()
+                covered = None
             seq = self.command('Reorigin', WowOrigin=list(self.origin), Cells=cells)
             ok, why = self.wait_done(seq, 45)
             if ok:
@@ -1194,17 +1226,22 @@ class World:
                 print('no floor for the waypoint, its own height:', e, flush=True)
         z = float(z)
         print(time.strftime('%H:%M:%S'), 'move to', m.get('What') or '', 'WoW %.1f %.1f %.1f map %d' % (x, y, z, target), flush=True)
-        move_cover(True)
-        self.publish(False)
+        black = move_cover(True)
+
+        def covered():
+            # Once the cover is black (the cuts of a re-origin take that time first): the old mapping is off.
+            cover_wait(black)
+            self.publish(False)
         if not cross:
             try:
-                why = self.reorigin((x, y, z))
+                why = self.reorigin((x, y, z), covered)
             except Exception as e:  # noqa: BLE001  Stop and Start cut again from nothing
                 why = e
             if why is None:
                 answer(True, {'Origin': list(self.origin), 'Map': target})
                 return self
             print('move: no re-origin (%s), Stop and Start' % why, flush=True)
+        covered()
         seq = self.command('Stop')
         ok, err = self.wait_done(seq, 60)
         if not ok:
