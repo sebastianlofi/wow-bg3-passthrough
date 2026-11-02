@@ -36,9 +36,9 @@
 --   and vision cones ran backwards. face() now turns -z to the mob's facing, forward() reads -z.
 --   M.FaceAxis = 1 (research knob) restores the old +z behaviour.
 -- - Tav's casts with the time (wow-bg3/link/casts.txt, the last CAST_KEEP lines, and the SE log),
---   so a problem the player sees at a time maps to the cast and to the other logs: wall clock (UTC),
---   CLOCK_MONOTONIC ms (the layer's and benilla's pacing clock), event (begins, aims, ends,
---   failed), spell, target.
+--   so a problem the player sees at a time maps to the cast and to the other logs: wall clock (the
+--   PC's local time), CLOCK_MONOTONIC ms (the layer's and benilla's pacing clock), event (begins, aims,
+--   ends, failed), spell, target, BG3's story action id (and for a failure her turn then).
 -- Further playtest fixes:
 -- - Issue 22 (out of combat the stand-ins trailed the WoW models by about 0.4 s and moved in jumps):
 --   positions came benilla mobs.txt (every 12 frames), the bridge's mirror.json (every 300 ms) and
@@ -613,20 +613,23 @@ function M.Start(runId)
     end)
     -- Tav's casts with the time (see the header).
     local castLog = {}
-    local function castNote(event, spell, target)
-        -- SE has no os library: Ext.Timer.ClockTime is the wall clock in UTC.
+    local function castNote(event, spell, target, action)
+        -- SE has no os library: Ext.Timer.ClockTime is the PC's local wall clock, not UTC (benilla's log is
+        -- UTC; the two differed by the PC's time zone in 0.1.3013.61).
         local okd, wall = pcall(function() return Ext.Timer.ClockTime() end)
         local okm, mono = pcall(Ext.Utils.MonotonicTime)
-        local line = string.format("%s UTC mono %.0f %s %s%s", okd and tostring(wall) or "?", okm and mono or -1, event,
-            tostring(spell or "-"), target and (" on " .. tostring(target)) or "")
+        local line = string.format("%s local mono %.0f %s %s%s%s", okd and tostring(wall) or "?", okm and mono or -1, event,
+            tostring(spell or "-"), target and (" on " .. tostring(target)) or "",
+            action ~= nil and (" (story action " .. tostring(action) .. ")") or "")
         castLog[#castLog + 1] = line
         if #castLog > CAST_KEEP then table.remove(castLog, 1) end
         Ext.IO.SaveFile(DIR .. "casts.txt", table.concat(castLog, "\n") .. "\n")
         Ext.Utils.Print("WOW-BG3 cast: " .. line)
     end
     local function isTav(c) return Hero.Is(tostring(c)) end
-    pcall(Ext.Osiris.RegisterListener, "UsingSpell", 5, "after", function(caster, spell)
-        if isTav(caster) then pcall(castNote, "begins", spell) end
+    -- UsingSpell, CastedSpell and CastSpellFailed: (caster, spell, spell type, element, story action id).
+    pcall(Ext.Osiris.RegisterListener, "UsingSpell", 5, "after", function(caster, spell, _, _, action)
+        if isTav(caster) then pcall(castNote, "begins", spell, nil, action) end
     end)
     pcall(Ext.Osiris.RegisterListener, "UsingSpellOnTarget", 6, "after", function(caster, target, spell)
         if isTav(caster) and not isTav(target) then pcall(castNote, "aims", spell, target) end
@@ -634,11 +637,26 @@ function M.Start(runId)
     pcall(Ext.Osiris.RegisterListener, "UsingSpellAtPosition", 8, "after", function(caster, x, y, z, spell)
         if isTav(caster) then pcall(castNote, "aims", spell, string.format("%.1f %.1f %.1f", x or 0, y or 0, z or 0)) end
     end)
-    pcall(Ext.Osiris.RegisterListener, "CastedSpell", 5, "after", function(caster, spell)
-        if isTav(caster) then pcall(castNote, "ends", spell) end
+    pcall(Ext.Osiris.RegisterListener, "CastedSpell", 5, "after", function(caster, spell, _, _, action)
+        if isTav(caster) then pcall(castNote, "ends", spell, nil, action) end
     end)
-    pcall(Ext.Osiris.RegisterListener, "CastSpellFailed", 5, "after", function(caster, spell)
-        if isTav(caster) then pcall(castNote, "failed", spell) end
+    -- A failed cast is not always a failed click: BG3 also fails Target_MainHandAttack by itself when the
+    -- hero's turn ends or starts (its default-attack preview dropped; m3-native-gate.md, story action 0).
+    -- 0.1.3013.61: all five "failed" lines of a test fell on turn changes and every attack click cast, but
+    -- the line could not say so. Now it carries the story action id and her turn then (yes, ending: she
+    -- asked to end it, no: not hers, -: she is in no fight).
+    local function turnNow()
+        if q(Osi.IsInCombat, Hero.Uuid()) ~= 1 then return "-" end
+        local ok, t = pcall(function() return Ext.Entity.Get(Hero.Uuid()).TurnBased end)
+        if not ok or not t then return "?" end
+        if not t.IsActiveCombatTurn then return "no" end
+        return t.RequestedEndTurn and "ending" or "yes"
+    end
+    pcall(Ext.Osiris.RegisterListener, "CastSpellFailed", 5, "after", function(caster, spell, _, _, action)
+        if isTav(caster) then
+            local okt, turn = pcall(turnNow)
+            pcall(castNote, "failed", spell, nil, tostring(action) .. ", her turn " .. (okt and turn or "?"))
+        end
     end)
     local function missedAttacks()
         for c, a in pairs(attacking) do
