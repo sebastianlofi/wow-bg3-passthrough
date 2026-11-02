@@ -16,9 +16,9 @@
 --                     BG3's party limit), next to the hero and chained to the hero's group
 --                     (AttachToPartyGroup), so BG3's own party following moves them
 --   Remove {Name}     BG3's dismiss: the tutorial's own PROC_TUT_Misc_TutorialCompanion_RemoveCompanion for
---                     a tutorial companion in the tutorial level (its goals run only there), else
---                     PROC_GLO_PartyMembers_Remove (force, gold to the hero); if that does not take within
---                     the wait, BG3's own plain calls (UnregisterAsCompanion, MakeNPC, its faction back);
+--                     a tutorial companion while the goal holding it (TUT_Misc) runs, else
+--                     PROC_GLO_PartyMembers_Remove (force, gold to the hero). Nothing is done by hand: when
+--                     BG3's story would refuse, Remove refuses too and says why;
 --                     then back where Add found it (wow-bg3/party-home.json): same level by
 --                     TeleportToPosition, another level through a companion standing there (TeleportTo),
 --                     else off stage where it stands
@@ -46,8 +46,7 @@
 -- or more below where it last stood still, out of every fight) is put back where it stood. Checked every
 -- 30 ticks. While world_bridge.py's floor.json says MemberGuard (a treadmill and a fall guard per member,
 -- the default), the bridge rescues falls and this upkeep moves nobody.
--- Help (world mode): out of every fight, a downed member is helped up by the nearest standing companion
--- with BG3's own Help (Target_Help), as the player would after a fight won with the hero down.
+-- Help: a member down after a fight stays down until the player uses BG3's Help, as in BG3.
 -- Status: wow-bg3/party.json (on change within 10 ticks, else every 300): {RunId, Tick, Hero, Members =
 -- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Upkeep, Moved}.
 -- Read by TavPlan.lua/WorldMode.lua (the figures WoW draws), Mirrors.lua and ActionMonitor.lua (the
@@ -295,6 +294,25 @@ function M.Start(runId)
         return {Added = nameOf(u), Uuid = u, Steps = steps, Party = M.Snapshot(), MaxPartySize = q(Osi.GetMaxPartySize)}
     end
 
+    -- Whether a story goal runs (Osiris SysIsActive, as BG3's own savegame patches ask).
+    local function goalRunning(name)
+        local v = q(Osi.SysIsActive, name)
+        return v == true or v == 1
+    end
+    -- What in BG3's story would stop its forced dismiss, before anything of it runs (it hands over the
+    -- gold and detaches first, then PROC_GLO_PartyMembers_MakeNPC needs these rows; _GLO_Shared_PartyMembers.txt).
+    -- An avatar (another player's character) takes the story's own avatar rules: not judged here.
+    local function dismissRefusal(u)
+        local function has(db, n)
+            for _, r in ipairs(rows(db, n)) do if uuidOf(r[1]) == u then return true end end
+            return false
+        end
+        if has("DB_Avatars", 1) then return nil end
+        if not has("DB_GLO_PartyMembers_OriginalAlignment", 2) then return "no DB_GLO_PartyMembers_OriginalAlignment row" end
+        if not has("DB_PartyMembers", 1) then return "no DB_PartyMembers row" end
+        return nil
+    end
+
     local function remove(c)
         local hero = heroOrFail()
         local who = resolve(c.Name)
@@ -307,43 +325,22 @@ function M.Start(runId)
         for _, r in ipairs(rows("DB_TUT_Misc_TutorialCompanion_OldFaction", 2)) do
             if uuidOf(r[1]) == u then tut = true end
         end
-        -- The tutorial's own dismiss only works where the tutorial's goals run: in another host level it
-        -- does nothing and the companion stays in the party. Pick by the level the companion is in, and
-        -- when the first call does not take, use BG3's own dismiss and then its plain calls.
-        local inTut = q(Osi.GetRegion, u) == TUT_REGION
+        -- Which dismiss (both BG3's own). The tutorial's proc is a rule of goal TUT_Misc: with that goal
+        -- not running (it starts on loading TUT_Avernus_C and ends with the tutorial) the proc has no
+        -- rules and does nothing, which is what "BG3 did not dismiss Shadowheart" was in BGO_Main_A.
         local function gone() return not inDbPlayers(u) end
-        if tut and inTut then
+        if tut and goalRunning("TUT_Misc") then
             Osi.PROC_TUT_Misc_TutorialCompanion_RemoveCompanion(u, "Dismissed", "WOWBG3")
             steps[#steps + 1] = "dismissed (PROC_TUT_Misc_TutorialCompanion_RemoveCompanion)"
         else
+            local why = dismissRefusal(u)
+            if why then error(string.format("BG3 would not dismiss %s: %s", nameOf(u), why), 0) end
             Osi.PROC_GLO_PartyMembers_Remove(u, hero, 1, 0)
-            steps[#steps + 1] = "dismissed (PROC_GLO_PartyMembers_Remove" .. (tut and ", a tutorial companion outside the tutorial level" or "") .. ")"
+            steps[#steps + 1] = "dismissed (PROC_GLO_PartyMembers_Remove" .. (tut and ", a tutorial companion with TUT_Misc not running" or "") .. ")"
         end
         if not pcall(waitFor, gone, 60, "") then
-            if tut and inTut then
-                pcall(Osi.PROC_GLO_PartyMembers_Remove, u, hero, 1, 0)
-                steps[#steps + 1] = "the tutorial's dismiss did not take: PROC_GLO_PartyMembers_Remove"
-                pcall(waitFor, gone, 60, "")
-            end
-            if not gone() then
-                -- What BG3's own dismiss ends with: out of the hero's party group, no longer a companion,
-                -- an NPC with its own faction again and free of the party's following.
-                pcall(Osi.DetachFromPartyGroup, u)
-                pcall(Osi.UnregisterAsCompanion, u)
-                pcall(Osi.MakeNPC, u)
-                for _, r in ipairs(rows("DB_GLO_PartyMembers_DefaultFaction", 2)) do
-                    if uuidOf(r[1]) == u then pcall(Osi.SetFaction, u, r[2]) end
-                end
-                pcall(Osi.SetNoFollowFlag, u, 1)
-                steps[#steps + 1] = "BG3's dismiss did not take: UnregisterAsCompanion, MakeNPC, its own faction back"
-                pcall(waitFor, gone, 60, "")
-            end
-        end
-        if not gone() and q(Osi.IsInPartyWith, u, hero) == 1 then
             error(string.format("BG3 did not dismiss %s (tried: %s)", nameOf(u), table.concat(steps, "; ")), 0)
         end
-        if not gone() then steps[#steps + 1] = "out of the hero's party, still in BG3's DB_Players" end
-        pcall(Osi.DetachFromPartyGroup, u)
         cacheTick = -1
         wait(2)
         if Prog.CampOn() then
@@ -604,38 +601,6 @@ function M.Start(runId)
         end
     end
 
-    -- Help (world mode): once the party is out of every fight, a downed member (the hero too) is helped up
-    -- by the nearest companion still standing within 40 m, with BG3's own Help (Target_Help: it walks
-    -- there and the downed one stands at 1 HP), as the player does in BG3 after a fight. The hero never
-    -- helps by itself (WoW drives the hero; the player can still use BG3's Help). Retried every 300 ticks.
-    local helping = {}
-    local function helpUp()
-        local hero = Hero.Uuid()
-        local party = M.Party()
-        for _, u in ipairs(party) do if q(Osi.IsInCombat, u) == 1 then return end end
-        for _, u in ipairs(party) do
-            if q(Osi.HasActiveStatus, u, "DOWNED") == 1 and q(Osi.IsDead, u) ~= 1
-                and (not helping[u] or tick - helping[u] > 300) then
-                local at, best, bd = pos(u), nil, nil
-                for _, h in ipairs(party) do
-                    if h ~= hero and h ~= u and q(Osi.HasActiveStatus, h, "DOWNED") ~= 1 and q(Osi.IsDead, h) ~= 1 then
-                        local p = pos(h)
-                        if at and p then
-                            local d = math.sqrt((p[1] - at[1]) ^ 2 + (p[3] - at[3]) ^ 2)
-                            if d < 40 and (not bd or d < bd) then best, bd = h, d end
-                        end
-                    end
-                end
-                if best then
-                    helping[u] = tick
-                    local ok, err = pcall(Osi.UseSpell, best, "Target_Help", u)
-                    Ext.Utils.Print(string.format("WOW-BG3 party: %s helps %s up (BG3's Help, %.0f m)%s", nameOf(best),
-                        nameOf(u), bd, ok and "" or (": " .. tostring(err))))
-                end
-            end
-        end
-    end
-
     local function writeStatus(force)
         local snap = M.Snapshot()
         local key = Ext.Json.Stringify(snap)
@@ -672,7 +637,6 @@ function M.Start(runId)
         if upkeep and tick % 30 == 11 and not jobs[1] then
             if Ext.Require("Camp.lua").InTrip() then lastPos, steady = {}, {} else pcall(keepUp) end
         end
-        if upkeep and tick % 30 == 21 and not jobs[1] then pcall(helpUp) end
         if tick % 10 == 3 then pcall(writeStatus, false) end
         if tick % 90 == 31 and not jobs[1] then pcall(campStart) end
         if tick % 10 ~= 0 then return end
