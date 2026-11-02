@@ -297,6 +297,7 @@ function M.Start(runId)
         if u and (M.Owned[u] or (WOWBG3FightSpawned and WOWBG3FightSpawned[u])) then
             M.KnockedOut[u] = true
             Ext.IO.SaveFile("wow-bg3/link/knocked-out.json", Ext.Json.Stringify(M.KnockedOut))
+            pcall(Osi.SetHitpointsPercentage, u, 0.1) -- rounds up to 1 HP, what LinkLive.lua looks for
         end
     end)
     pcall(Ext.Osiris.RegisterListener, "Resurrected", 1, "after", function(c)
