@@ -3,7 +3,7 @@
 The tools in link/tools name the development folders (the workspace, the private BG3
 profile, the Docker test server). In the release they ship unchanged in WOW-BG3/tools/link/tools/ and
 this module points them at the player's folders, from the environment the launcher plugin
-(wowbg3-launcher, bg3/plugin/launcher) gives every child:
+(wowbg3-launcher, plugins/launcher) gives every child:
 
   WOWBG3_HOME   the WOW-BG3 folder (Mods/WOW-BG3)       WOWBG3_DATA   ~/.local/share/wow-bg3
   WOWBG3_IO     BG3's Script Extender/wow-bg3 folder     WOWBG3_LINK   its link/ folder

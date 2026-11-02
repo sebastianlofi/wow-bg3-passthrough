@@ -6,7 +6,7 @@
   bg3pak.py cat PAK NAME OUT               extract one file
   bg3pak.py lsf FILE.lsf                   dump an LSF file as an indented tree
 
-Needs lz4 and zstandard (tmp/pyenv)."""
+Needs lz4 and zstandard (the release ships them in python/)."""
 import os, struct, sys, uuid
 
 import lz4.block

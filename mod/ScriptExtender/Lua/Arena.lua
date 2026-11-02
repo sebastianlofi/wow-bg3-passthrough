@@ -1,4 +1,4 @@
--- WoW arena in BG3 through the wowbg3 native plugin (bg3/plugin, replaces runtime patch
+-- WoW arena in BG3 through the wowbg3 native plugin (plugins, replaces runtime patch
 -- 0003; see the collision-hooks notes). Runs in both contexts; each acts on its own
 -- grid and physics scene. Driven by wow-bg3/arena-command.json (one command per
 -- sequence, never retried):

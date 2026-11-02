@@ -42,7 +42,7 @@ local okFlag, WorldFlag = pcall(Ext.Require, "WorldFlag.lua")  -- world mode, or
 local VAR = "WowBg3StandIn"
 pcall(Ext.Vars.RegisterUserVariable, VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
 
--- The stand-in root templates (link/src/bridge.rs STANDINS: wolf, boar, bear, spider, rat, zombie,
+-- The stand-in root templates (bridge/src/bridge.rs STANDINS: wolf, boar, bear, spider, rat, zombie,
 -- goblin, human).
 M.TEMPLATES = {
     ["41da0eff-b533-43cc-a014-218f7d23fa11"] = "wolf", ["b9186958-8507-4076-ade5-0a3b43763997"] = "boar",

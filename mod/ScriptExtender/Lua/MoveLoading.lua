@@ -19,7 +19,7 @@
 -- ScreenFadeTo's arguments are (Character, Seconds, FadeStyle, FadeID) (the names BG3 registers for Osiris):
 -- the third is the style (0 black, 1 bright), not the wheel; ScreenFadeHasSpin is not one of its arguments.
 --
--- A far switch (AI Context/multi-world-design.md phase 2) takes the same cover. When the player takes control
+-- A far switch (the multi-continent party, phase 2) takes the same cover. When the player takes control
 -- of a party member over FAR_SWITCH_M from the one controlled before, both in world mode's void, BG3 makes its
 -- own short fade and its camera jumps there; benilla's world round that place streams only once the server's
 -- Far Sight is out on that member's bot, so after BG3's fade the picture was void (0.1.3013.58). The fade

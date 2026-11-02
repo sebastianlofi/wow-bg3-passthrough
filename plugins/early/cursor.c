@@ -10,7 +10,7 @@
  *    the X server for the cursor image now shown (XFixesGetCursorImage, only when the X cursor serial
  *    changed, so the pointer was over BG3's window) and hashes it (FNV-1a over the 32-bit ARGB
  *    pixels). If it is BG3's own Listen, Listen pressed, ListenWarning or ListenWarning pressed
- *    (hashes taken from the X server in the harness, tmp/interaction/xcursor.py), that SDL cursor is
+ *    (hashes taken from the X server in the test harness), that SDL cursor is
  *    swapped for ours from now on: SDL color cursors made from wow-bg3/cursors/quest-*.cur.
  *    BG3's OpenDoor cursors (no BG3 door in world mode) the same way for WoW's merchant cursor,
  *    merchant*.cur (benilla patch 0064): their hashes computed from Game.pak's Cursor_OpenDoor_*.cur

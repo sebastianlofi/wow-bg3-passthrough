@@ -89,7 +89,7 @@ diff --git a/crates/benilla-app/src/wowbg3_see.rs b/crates/benilla-app/src/wowbg
 +            // Patch 0097: no collision any more, so a hill in the way opens like a wall.
 +            terrain: true,
              // Her body's depth: a wall she stands against lies within it and must never count as
-             // in front of her (0.15 left a torn patch on the wall at her shoulder, 2026-10-29).
+             // in front of her (0.15 left a torn patch on the wall at her shoulder).
              near: 0.6,
 @@ -87,7 +88,8 @@
              scale: 2.0,

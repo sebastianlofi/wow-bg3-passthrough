@@ -3,7 +3,7 @@
 
 Shipped as Mods/WOW-BG3/bg3le/install.py with bg3le's own installer (bg3le_install.py, MIT, unchanged), its
 launch wrapper (bg3le-launch) and our libbg3le.so: bg3le (github.com/lenonk/bg3le) with WOW-BG3's patches
-0003 (plugins from a mod's folder), 0004 (the held loading screen) and those after them (bg3/patches/).
+0003 (plugins from a mod's folder), 0004 (the held loading screen) and those after them (patches/bg3le/).
 It does what bg3le's installer does, with our library and without bg3le's console client:
 
   * copies libbg3le.so and bg3le-launch into ~/.local/share/bg3le (lib/, bin/), as bg3le's installer;

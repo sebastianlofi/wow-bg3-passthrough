@@ -2,8 +2,8 @@
 
 WOW_BG3_SERVER unset (harness A, the default): the test server in Docker, exactly as the tools did it
 before: the database container's shell (`docker exec`), mangosd's console (Docker attach).
-WOW_BG3_SERVER=FOLDER (harness B sets tmp/harness-b/server): a portable server
-(server/portable/wowbg3-server.sh): the same shell command runs on the host with `mariadb` and
+WOW_BG3_SERVER=FOLDER (a test harness sets it): a portable server
+(server/wowbg3-server.sh): the same shell command runs on the host with `mariadb` and
 `mariadb-dump` on PATH, MYSQL_UNIX_PORT at its socket and MARIADB_ROOT_PASSWORD set, and console lines go
 through `wowbg3-server.sh console`.
 

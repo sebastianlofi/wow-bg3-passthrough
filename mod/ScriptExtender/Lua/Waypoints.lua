@@ -4,7 +4,7 @@
 -- wow_waypoints.panel). A click writes wow-bg3/link/waypoint-click.json {Id}, and the helper runs `waypoint go`
 -- as if typed: the same move, the same refusals, shown in BG3's message box (wow-bg3/link/waypoint-refused.json).
 --
--- What BG3's panel takes (tried in game, 2026-11-01):
+-- What BG3's panel takes (tried in game):
 --   * RegisterWaypoint(id, item), UnlockWaypoint(id, trigger, player). The id shows as the entry's name, so the
 --     id is the WoW name. The item only has to exist (a Helper_Waypoint under the hero, invisible).
 --   * The trigger must be a point trigger in the current level; any other kind leaves no entry. 36 are below,

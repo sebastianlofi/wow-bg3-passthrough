@@ -1,7 +1,7 @@
 -- RenderScreen.lua (client): tells the capture layer / render plugin when a
 -- BG3 screen with its own 3D picture is open (character creation's screen: level-up, respec at
 -- Withers, the magic mirror). There the layer presents BG3's own picture untouched and stops leaving
--- the figures to WoW (bg3/capture/wowbg3_capture.c, "screen"), so the character BG3 draws there shows
+-- the figures to WoW (plugins/capture/wowbg3_capture.c, "screen"), so the character BG3 draws there shows
 -- instead of WoW's world. File: wow-bg3/link/bg3screen.txt, "1 <widget>" while one is open, "0" when
 -- none is; written on a change and once at start. Inventory and character sheet need nothing: BG3
 -- draws their figure into a small target of its own (466 x 460 at 1280x720), never on the scene depth.

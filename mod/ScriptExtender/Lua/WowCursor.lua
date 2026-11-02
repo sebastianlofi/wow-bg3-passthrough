@@ -12,7 +12,7 @@
 -- cursor kind and gray state for it: BG3 shows Melee (MeleeWarning when WoW's is grayed). BG3
 -- picking a stand-in counts too (WoW's model and the stand-in are not always under the same
 -- pixel: the stand-in follows the mob 0.35 m at a time, and is often smaller than WoW's model).
--- Since 2026-11-02 BG3's pick finds the stand-in wherever WoW has its unit under the pointer
+-- Now BG3's pick finds the stand-in wherever WoW has its unit under the pointer
 -- (StandInAim.lua, plugin op 32): every BG3 action aimed at it (attack, spell, shove, throw, talk,
 -- pickpocket) is BG3's own, on WoW's model as on the stand-in. Over a stand-in BG3 writes its own
 -- RequestedCursor (Arrow for a neutral one) every frame after this module's tick (harness
@@ -33,7 +33,7 @@
 -- except over a WoW quest giver, which shows WoW's gold ! for a quest to pick up and gold ? for one to
 -- hand in). Two BG3 cursor types world mode never uses, Listen and ListenWarning, show WoW's art:
 -- BG3 builds its SDL cursors from Game.pak's Cursors/*.cur before any plugin or Lua runs (harness:
--- an override of the files came too late), so the bg3le plugin wowbg3-early (bg3/plugin/early)
+-- an override of the files came too late), so the bg3le plugin wowbg3-early (plugins/early)
 -- hooks BG3's SDL_SetCursor and swaps BG3's Listen cursors for SDL cursors made from
 -- Script Extender/wow-bg3/cursors/quest-*.cur (WoW's Interface\GossipFrame\AvailableQuestIcon.blp
 -- and ActiveQuestIcon.blp of the player's WoW; link/tools/wowcursor.py, or benilla in the release).

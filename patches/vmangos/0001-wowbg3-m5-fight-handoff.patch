@@ -230,7 +230,7 @@ index 0000000..ee3a3ec
 + */
 +
 +// WOW-BG3 (local patch): the server side of a fight that BG3 runs. See
-+// WowBg3Fights.h for the hooks and `AI Context/m5-server-handoff.md` in the
++// WowBg3Fights.h for the hooks and `bridge/src/handoff.rs` in the
 +// WOW-BG3 project for the protocol.
 +//
 +// Threads: commands, timeouts and logout run on the world thread while no map
@@ -1496,7 +1496,7 @@ index 0000000..f1adc47
 +// healing except what the fight's owner applies through `.wowbg3 hp`. That
 +// damage comes from the player, so a kill gives normal XP, loot and quest
 +// credit, once. The player's own client drives it with `.wowbg3` chat
-+// commands; see `AI Context/m5-server-handoff.md` in the WOW-BG3 project.
++// commands; see `bridge/src/handoff.rs` in the WOW-BG3 project.
 +
 +#ifndef MANGOS_WOWBG3_FIGHTS_H
 +#define MANGOS_WOWBG3_FIGHTS_H

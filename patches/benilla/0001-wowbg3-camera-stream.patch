@@ -33,7 +33,7 @@ index 0000000..b0bfb1a
 +//! WOW-BG3 link (local fork, not upstream benilla): the visible game owns the camera, as in
 +//! SkyCraft. Every frame the world camera's pose is written to `$WOW_BG3_LINK_DIR/camera.bin`,
 +//! which the hidden BG3's `wowbg3` native plugin reads to drive its own camera
-+//! (`bg3/plugin`, "following benilla's camera"). Off unless `$WOW_BG3_LINK_DIR` is set.
++//! (`plugins`, "following benilla's camera"). Off unless `$WOW_BG3_LINK_DIR` is set.
 +//!
 +//! Record (96 bytes, little endian, rewritten in place): `WBC1`, seq u32, eye[3] f32,
 +//! forward[3] f32, up[3] f32 (WoW world, yards), vertical fov f32 (radians), aspect f32,

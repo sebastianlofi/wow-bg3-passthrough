@@ -63,7 +63,7 @@ function M.Wares(l, guid, wares, rowOf)
     return out
 end
 
--- ---- BG3's special arrows, in place of WoW's arrows and bullets (his ruling, 2026-11-01) ----
+-- ---- BG3's special arrows, in place of WoW's arrows and bullets (the owner's ruling) ----
 -- BG3 items, not WoW's: BG3's barter takes the gold, WoW's money follows it (Inventory.lua), the save holds them.
 -- From Shared.pak's Object.txt: name, root template, ValueLevel, ObjectCategory. Not sold by BG3's tables: those with no
 -- category (Piercing, Barbed, Celestial, Fey, Giant, Ooze, Plant slaying).

@@ -3067,7 +3067,7 @@ constexpr int kCeilingHits = 4;       // of them, a ceiling
 constexpr float kUnroofNearM = 2.5f;  // free: the unroof walk stops this far from her chest
 constexpr float kCeilingMarginM = 0.45f;
 // Patch 0090/0091 (the see-through, benilla): what the eye clearance does, WOWBG3_CAM_INDOOR.
-// The design rule for what stands between the camera and the character (2026-10-29): ceilings,
+// The design rule for what stands between the camera and the character: ceilings,
 // bushes, skinny trees and posts phase out; walls get a see-through opening; mountains, rocks and
 // big trees the camera bumps into and goes around. benilla does the first two (0091 drops a
 // ceiling group, 0090 cuts the opening), so the eye clearance is left with the third.
@@ -3075,7 +3075,7 @@ constexpr float kCeilingMarginM = 0.45f;
 //         chest and stays under the ceiling over her. It never sits in a wall, but indoors it is
 //         pinned: measured in the Lion's Pride Inn, the served eye stopped at z 62.55 whatever the
 //         zoom while BG3's own eye wanted 6.51 m more.
-//   free  the default: no collision at all since 2026-10-31 (clear_eye), the see-through takes what is in
+//   free  the default: no collision at all (clear_eye), the see-through takes what is in
 //         the way everywhere (benilla 0097) and rigid_pose keeps the eye at the height of whoever it
 //         follows. The rest of this note is the rule before that, the code still there for now:
 //         the see-through is for indoors, and indoors the
@@ -3091,8 +3091,8 @@ constexpr float kCeilingMarginM = 0.45f;
 //         it: from an interior room WoW drew the outside only through its windows, so a cut wall
 //         showed the sky (the void outside the inn). benilla 0090 now draws the exterior while the
 //         cut is live, and the walk only hurt: under the inn's eave it put the eye at 3.6 yd in the
-//         porch planks with her out of view, once in a pumpkin. Off by default since 2026-10-29
-//         (proved both ways at the inn: `tmp/occl20261029/eaves.sh`, sheets ron*/roff*).
+//         porch planks with her out of view, once in a pumpkin. Off by default
+//         (proved both ways at the inn, with test sheets of it on and off).
 // Big doodads (a boulder, a big tree: kind 5, at least 4 yd on the smallest side of WoW's collision) push the eye in
 // like a hill. Thinner ones never do. A big tree's canopy is not in WoW's collision, so
 // the camera bumps its trunk only.
@@ -3102,7 +3102,7 @@ bool g_unroof = false;  // free: the unroof walk (IndoorMode); WOWBG3_CAM_UNROOF
 constexpr float kEyeSolidM = 1.5f;  // free: a face nearer than this to the eye is one it sits in
 // What the eye may not sit in: terrain, buildings and WoW's doodads (M2s: a pumpkin, a cart, a crate).
 // Terrain and big doodads push the eye in along the line; a small doodad is never bumped into, but an eye
-// inside one is a picture of its inside (2026-10-29: under the Lion's Pride Inn's eave the eye ended up in a
+// inside one is a picture of its inside (under the Lion's Pride Inn's eave the eye ended up in a
 // Hallow's End pumpkin).
 constexpr std::uint32_t kM2Kinds = (1u << 3) | (1u << 5), kSolidKinds = kCameraKinds | kM2Kinds;
 constexpr float kEyeInM2M = 0.5f;   // free: an M2 face this near on the way to her: the eye is in it
@@ -3408,7 +3408,7 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     // start teleports her 1.2 km): left alone.
     if (!(len > 0.5f) || len > 60.0f) return false;
     *tested = true;
-    // `free`: nothing bumps the eye (playtest feedback, 2026-10-31: "ignore all collisions altogether"); what
+    // `free`: nothing bumps the eye (playtest feedback: "ignore all collisions altogether"); what
     // stands in the way is the see-through's. `hold` below is the old rule.
     if (g_indoor == IndoorMode::Free) return true;
     float f = 1.0f, t = 2.0f;
@@ -3502,7 +3502,7 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     return true;
 }
 
-// The rigid orbit, the design rule of 2026-11-01: the camera stays at the height of whoever it follows, zooms
+// The rigid orbit, the design rule: the camera stays at the height of whoever it follows, zooms
 // and turns, and bumps into nothing. BG3's eye is no use for it: over a cave it stands on the hill, under a tree it
 // swings up (14 yd over her and 3 back at 69 degrees, where it is 10 and 10 at 41), so anything worked out from
 // that eye comes out wrong (a height pin put the eye at her boot). CameraPose.lua sends BG3's own wishes from its

@@ -6,7 +6,7 @@
   bg3tex.py vt GAME_DATA GTEX LAYER LEVEL OUT.png  one virtual texture's layer (0 albedo, 1 normal,
                                                    2 physical) at a mip level (0 = full size)
 
-Needs numpy, pillow, lz4 (tmp/pyenv) and libfastlz.so next to this file (FastLZ, built from
+Needs numpy, pillow, lz4 (the release ships them in python/) and libfastlz.so next to this file (FastLZ, built from
 LSLib's LSLibNative/fastlz.c: cc -O2 -shared -fPIC fastlz.c -o libfastlz.so)."""
 import ctypes, os, struct, sys
 

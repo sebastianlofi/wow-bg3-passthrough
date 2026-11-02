@@ -1,5 +1,5 @@
 -- WOW-BG3 link protocol v1 for Lua 5.3: strict codec and stop-and-wait endpoint.
--- Mirrors link/src/wire.rs. Pure Lua: no Ext, io or os calls, so it is tested outside BG3.
+-- Mirrors bridge/src/wire.rs. Pure Lua: no Ext, io or os calls, so it is tested outside BG3.
 -- Fail closed: anything Rust rejects is rejected. A few non-canonical forms Rust tolerates
 -- but never emits (array-form structs, map-form enums) are also rejected here.
 local M = {}

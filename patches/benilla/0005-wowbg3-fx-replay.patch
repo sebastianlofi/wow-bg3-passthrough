@@ -47,7 +47,7 @@ index 0000000..48b507f
 @@ -0,0 +1,1606 @@
 +//! WOW-BG3 (local fork, patch 0005): BG3's own effects replayed inside WoW.
 +//! Spell effects must look exactly as in BG3, drawn into WoW's world, "1:1 like
-+//! SkyCraft". The BG3 capture layer (`bg3/capture`, format in `link/benilla/fx-replay-format.md`)
++//! SkyCraft". The BG3 capture layer (`plugins/capture`, format in `link/benilla/fx-replay-format.md`)
 +//! records every effect draw near Tav: `fxframe.bin` each BG3 frame in `$WOW_BG3_TAV_DIR`
 +//! (default `/tmp/wowbg3/tav`), and once per key the pipeline recipes, SPIR-V modules, samplers
 +//! and textures under `$WOW_BG3_FX_DIR` (default the capture directory's `fx/`).

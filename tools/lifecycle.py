@@ -117,7 +117,7 @@ def set_side(side):
 
 def benilla_runs():
     """A live process named benilla, on this machine (or in this runtime's view of it). One that crashed stays
-    in the list as a zombie until the coordinator waits for it (seen 2026-11-01), and counts as gone."""
+    in the list as a zombie until the coordinator waits for it (seen in a test), and counts as gone."""
     for c in glob.glob('/proc/[0-9]*/stat'):
         try:
             head, _, rest = Path(c).read_text().rpartition(')')
@@ -692,7 +692,7 @@ class Life:
             self.snapshot(req)
         self.index_save()
         if self.session == session:
-            # benilla gone (a crash, 2026-11-01: the GPU lost at camp's door) and nothing brought it back: the
+            # benilla gone (a crash: the GPU lost at camp's door) and nothing brought it back: the
             # world stayed gone until a reload. Back here, at the WoW side's state as it is; never at camp,
             # where the world mode cannot start. Three times a session, then it stays down.
             if self.up['benilla'] and time.time() - self.benilla_seen > 5.0:

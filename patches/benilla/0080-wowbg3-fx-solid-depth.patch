@@ -5,7 +5,7 @@ lays the mesh down with an alpha test and a depth write (zw1, greater-or-equal, 
 with an OpKill), and the next draws the colour with an EQUAL test, no write and no discard of its
 own. The replay forced `depth_write_enabled: false` on every draw, so the EQUAL draws failed
 everywhere and Grease's blob and splash never arrived; forcing their test to greater-or-equal
-instead (tried 2026-10-28) drew the whole unmasked billboard, a black quad and black shards.
+instead (tried) drew the whole unmasked billboard, a black quad and black shards.
 
 Now a draw writes depth exactly when BG3's recipe says it does. The replay's depth is its own copy
 of WoW's (`wowbg3_fx_depth`, written by the prep pass), so WoW's own depth is untouched; it is reset

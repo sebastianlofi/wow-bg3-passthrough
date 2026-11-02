@@ -277,7 +277,7 @@ local function newBackend(actors, void, runId, session)
         return {h[1] + dx * k, math.max(w[2], h[2]), h[3] + dz * k}
     end
 
-    -- Command files (same protocol as bg3/tools/action-command.py; never retried).
+    -- Command files (the test harness's action-command protocol; never retried).
     local function wait(n)
         local due = ticks + n
         while ticks < due do coroutine.yield() end

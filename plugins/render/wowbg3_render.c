@@ -1,7 +1,7 @@
 // wowbg3_render.c: the WOW-BG3 capture layer as a bg3le plugin (plug-and-play plan
 // "Late-hook rendering"; the render-plugin notes).
 //
-// The layer's own code (bg3/capture/wowbg3_capture.c and its .inc.c files, included below with
+// The layer's own code (plugins/capture/wowbg3_capture.c and its .inc.c files, included below with
 // WOWBG3_PLUGIN) runs unchanged: same hooks, same compositor, same files under /logs/capture. Only
 // the way in differs. A Vulkan layer sits in the loader's chain from the instance on; this plugin
 // arrives at ~1.7 s, after BG3 has its instance, device and swapchain, and gets in the SkyCraft way:

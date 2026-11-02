@@ -16,7 +16,7 @@
 -- held too). Tick is rewritten every M.Keep ticks while held (a heartbeat: a backend releases when it
 -- stops). A new Lua session (a load) starts with Hold = false, and so does any state that is not
 -- Running or a held state (Session.lua: a save or a pause keeps the hold).
--- The backend (today the fight bridge, link/src, with the server's hold-area verb) turns it into
+-- The backend (today the fight bridge, bridge/src, with the server's hold-area verb) turns it into
 -- "hold every creature within Radius of these points" and "release".
 -- The world's turn (a playtest report: the environment's turn came and nothing in WoW moved): BG3
 -- pauses the world only while the party takes its turns; once every member in turn-based mode has

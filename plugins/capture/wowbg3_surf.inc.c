@@ -106,7 +106,7 @@ static struct {
     uint32_t copies_next;
     // statistics since the last log
     uint64_t injects, albs, nowow, nocam, decs, fwds, keeps, composed, nosurf, stale, other_frame;
-    uint64_t nodec, nofwd;  // the frame had one kind of copy but not the other (2026-10-29)
+    uint64_t nodec, nofwd;  // the frame had one kind of copy but not the other
     uint64_t deepest;   // the furthest a recorded frame ran ahead of the presented one (SF_SLOTS must beat it)
     uint64_t last_serial;  // the newest frame recorded (for `deepest`)
     uint64_t endwhy[8];  // 6 sf_init failed, 7 BG3's view-projection not invertible
@@ -569,7 +569,7 @@ static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs
     if (!g_cc.surf || !g_sf.ready || g_screen) return;  // a BG3 screen (screen_check): BG3's own picture
     int depth = 0;
     for (uint32_t k = 0; k < n; k++) depth |= imgs[k] == g_role.depth;
-    // Word "surfscene" (2026-10-29): take the surfaces' look from BG3's **lit** scene instead of its
+    // Word "surfscene": take the surfaces' look from BG3's **lit** scene instead of its
     // pre-lighting forward layer. Measured: the pre-lighting layer (H) is empty on WoW's ground in
     // the void -- 40x it with no floor and nothing appears -- so all that reached WoW's picture was
     // the decals' flat albedo change, while BG3's own picture shows the surface bright and lumpy.
@@ -633,7 +633,7 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     if (t_sf_cb != cb) return;
     t_sf_cb = VK_NULL_HANDLE;
     if (g_cc.surfscene && !g_cc.surfpost) t_sf_fwd = 0;  // the lit-scene copy at the pass's start holds that slot
-    // Word "surfpost" (research, 2026-10-29): take the copy at the END of BG3's effects pass instead
+    // Word "surfpost" (research): take the copy at the END of BG3's effects pass instead
     // of before it, so it carries BG3's effects as well as its surfaces. Tells whether a thing that
     // is missing from WoW's picture (Grease's 3D burst blob) is drawn in that pass at all.
     if (g_cc.surfpost && !t_sf_fwd) {

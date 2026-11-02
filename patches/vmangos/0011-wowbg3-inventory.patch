@@ -65,7 +65,7 @@ index 0000000..bd9415a
 +// inventory over the party's WoW characters. Every action goes through the same
 +// WorldSession handlers a client's packets reach (all of WoW's checks: range,
 +// class, level, bag space, vendor stock, reputation price), then the verb reports
-+// what changed. Protocol: `AI Context/m5-server-handoff.md` ("Inventory verbs").
++// what changed. Protocol: `tools/inventory_bridge.py`.
 +
 +#include "WowBg3Items.h"
 +#include "WowBg3Party.h"

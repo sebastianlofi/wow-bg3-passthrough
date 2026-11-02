@@ -1,5 +1,5 @@
 WOW-BG3 benilla patch 0112: camera.bin says whether WoW's world round the eye is loaded.
-A far switch to a party member (AI Context/multi-world-design.md phase 2) moved BG3's camera, and benilla's with it, to
+A far switch to a party member (the multi-continent party, phase 2) moved BG3's camera, and benilla's with it, to
 a place whose world streams only once the server's Far Sight is out on that member's bot; BG3's own short fade ended over
 void (0.1.3013.58). camera.bin's player flags gain bit 1 (the view is out on another character, patch 0040) and bit 2
 (the world round the eye is loaded: the stream's focus is the eye, or the body within 100 yd of it, the load facts are
@@ -13,7 +13,7 @@ diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
  //! (bit 0: the server has placed us), pad u32. Readers that know only the first 72 bytes
  //! (the camera) keep working.
 +//!
-+//! Patch 0112 (a far switch's cover, AI Context/multi-world-design.md phase 2) adds two flag bits:
++//! Patch 0112 (a far switch's cover, the multi-continent party's phase 2) adds two flag bits:
 +//! bit 1, the view is out on another character (Far Sight, patch 0040); bit 2, the world round the
 +//! eye is loaded ([`eye_ready`]). BG3's `MoveLoading.lua` keeps its screen fade over a switch to a
 +//! party member far away until bit 2 holds with the eye at that member.

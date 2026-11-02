@@ -1272,7 +1272,7 @@ static int fxc_solid(const Recipe* r) {
     // colour with equality and no write and has no discard of its own. The replay used to force
     // every draw's depth write off, so the equality draws failed everywhere, which is why Grease's
     // blob and splash never arrived; forcing the test to greater-or-equal instead drew the whole
-    // unmasked billboard (a black quad and black shards, 2026-10-28). benilla 0080 keeps the write
+    // unmasked billboard (a black quad and black shards). benilla 0080 keeps the write
     // and resets its own depth copy between the over-black and over-white runs, so the mask is
     // back and these are taken like any other solid piece.
     for (uint32_t k = 0; k < g_cc.n_solid_skip; k++) if (fxc_stage_is(r, g_cc.solid_skip[k])) return 0;
@@ -2574,7 +2574,7 @@ static void hide_read(void) {
 // edges of the WoW mobs' BG3 stand-ins, which WoW draws itself) would otherwise pass as effects
 // near Tav. Two insert-only tables, each cleared every MESH_EVERY presents in turn, so a buffer
 // stays known while it is drawn and a recycled handle is forgotten within 2 * MESH_EVERY.
-// Keyed by the slice a draw reads (ib_slice, as the prop ages below), not the buffer (2026-10-29): BG3
+// Keyed by the slice a draw reads (ib_slice, as the prop ages below), not the buffer: BG3
 // packs many meshes into one index buffer and recycles them, and an effect drawn from a buffer that
 // also held a mesh was taken for that mesh and voided -- the 399-spell sweep lost Ray of Sickness's
 // beam (346 draws 7 m from Tav), Lightning Bolt's, Gust of Wind's and Eyebite's pieces that way. A
@@ -2617,7 +2617,7 @@ static int mesh_has(uint64_t ib) {
     }
     return 0;
 }
-// Word "fxprops" (2026-10-29): a spell's 3D props kept in the void. Grease's blobs -- the lumps
+// Word "fxprops": a spell's 3D props kept in the void. Grease's blobs -- the lumps
 // that pop during the cast animation and cast a shadow -- are ordinary opaque geometry: one mesh
 // drawn in BG3's depth prepass, its G-buffer and its normal pass, every draw of it thrown away by
 // `void_skip` because it is not on the keep list and not an effects-pass draw. Measured by grouping
@@ -2652,7 +2652,7 @@ static int mesh_has(uint64_t ib) {
 // its age starts over. Scenery coming back into view is the same event as before, and the same guards
 // keep it out: placed near Tav, and a character's slices are on the hide list.
 #define IBAGE_GAP 60u
-// And only while a spell is on (the build session's quiet-baseline check, 2026-10-29 night): with
+// And only while a spell is on (a quiet-baseline check): with
 // ages that start over, arriving somewhere made the things around Tav young -- at Razor Hill's inn an
 // unskinned 21600-index mesh 11 m off was kept every frame with no cast, which the old binary culled.
 // A spell that makes a prop also draws effects, so a slice is made only within IBAGE_FX presents of an
@@ -2776,7 +2776,7 @@ static void hide_ask(uint64_t now) {
     fprintf(f, "%llu\n", (unsigned long long)now);
     fclose(f);
 }
-// Word "fxprops", a status's mesh (2026-11-01). The age above suits what a spell leaves for a moment. A
+// Word "fxprops", a status's mesh. The age above suits what a spell leaves for a moment. A
 // status plays its effect for as long as it lasts: NET (Hooked Net, Projectile_ThrowNet) loops
 // VFX_Status_Ensnared_Net_Loop_Root_01, whose net is an opaque mesh (VFX_Model_DefaultLit_VertexOffset_FishNet)
 // drawn in the G-buffer like any prop, so the age took it after 900 presents (6.4 s at 140 a second, seen in
@@ -3002,7 +3002,7 @@ static int prop_near(const Recipe* r, uint32_t fi, uint32_t first, int32_t vo) {
 // What the void lets through on a young or solid guess, one log line per slice, so a BG3 mesh seen in the
 // picture can be named afterwards: the buffer against the lines "WOW-BG3 hide:" in bg3le.log (TavPlan.lua:
 // whose it is), the time (CLOCK_MONOTONIC seconds, as bg3le.log's) against "WOW-BG3 dialog:". No recording
-// exists of the shine on a shield in a dialog (playtest feedback, 2026-11-01); this is what catches it next time.
+// exists of the shine on a shield in a dialog (playtest feedback); this is what catches it next time.
 #define VOID_SAY_CAP 512u
 #define VOID_SAY_LINES 8u  // at most so many lines per 300 presents
 static uint64_t g_void_said[VOID_SAY_CAP], g_void_said_win, g_void_line_win;
@@ -3188,7 +3188,7 @@ static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t ins
     }
     pthread_mutex_lock(&g_fxl_lock);
     if (!g_fxw) g_fxw = calloc(FXW_CAP, sizeof *g_fxw);
-    // Word "fxwib" (2026-10-29): the index buffer joins the group key, so every distinct mesh is its
+    // Word "fxwib": the index buffer joins the group key, so every distinct mesh is its
     // own group instead of being collapsed with everything that shares its pipeline. Without it a
     // thing that appears only during a cast (Grease's 3D blobs) cannot be told from the draws it
     // shares shaders with: a cast grew a dozen groups by one or two draws each and named nothing.

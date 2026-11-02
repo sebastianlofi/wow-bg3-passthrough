@@ -1,7 +1,7 @@
 -- Tav's geometry for WoW (Tav is drawn inside WoW with WoW's light and
 -- fog, as SkyCraft copies its geometry). This walks Tav's render objects and writes where their
 -- mesh data and poses live (wow-bg3/link/tavplan.txt); the capture layer, inside the same process,
--- copies the meshes once and the poses every frame for benilla (bg3/capture/wowbg3_capture.c).
+-- copies the meshes once and the poses every frame for benilla (plugins/capture/wowbg3_capture.c).
 --
 -- Plan (text, one record a line, handles and addresses hex):
 --   TAVPLAN 1 <seq> <Centre xyz> <WowOrigin xyz>      the world-mode mapping (see WorldMode.lua)

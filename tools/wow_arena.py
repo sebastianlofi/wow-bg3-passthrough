@@ -56,7 +56,7 @@ and writes, for a square of SIZE metres centred on the WoW point:
   arena.json     corners, counts, mapping
 Mapping: WoW delta (x, y, z) yards -> (y, z, -x) * 0.9144 metres, added to the BG3 centre (--mirror 1,
 the default: BG3 renders its world left-handed, so only a mirrored mapping makes BG3's
-picture under WoW's camera match WoW's; see the collision-hooks notes). --mirror 0 is link/src/coords.rs
+picture under WoW's camera match WoW's; see the collision-hooks notes). --mirror 0 is bridge/src/coords.rs
 at zero yaw, (-y, z, -x), which the patch 0003 proofs used. Size up to 120 m (wowbg3 plugin limits).
 Output is derived from Blizzard data: keep it out of git.
 """

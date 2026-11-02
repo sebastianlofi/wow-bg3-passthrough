@@ -7,7 +7,7 @@ index bc2b91f6..780dc81a 100644
  }
  
 +/// WOW-BG3 (`WOW_BG3_M5`): the server holds a BG3-run fight's mobs with the GM Freeze aura 9454
-+/// (`SPELL_AURA_MOD_STUN`, see AI Context/m5-server-handoff.md), whose SpellVisual 87 is Sleep's:
++/// (`SPELL_AURA_MOD_STUN`, vmangos patch 0001), whose SpellVisual 87 is Sleep's:
 +/// its state kit drew Zzz over every held mob. The hold is bookkeeping, not a
 +/// WoW effect, so its state kit is never armed.
 +fn wowbg3_hidden_state(spell_id: u32) -> bool {

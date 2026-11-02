@@ -33,7 +33,7 @@ the pool is short, squares go in tiers: first the square under every member, the
 farthest from the camera gets fewer squares, never none. The fall alarm runs per member.
 link/party-wow.json (Format 1) says
 where every member stands in WoW (for the bots that stand in for them on the server: the fight bridge,
-link/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs from it). The plugin
+bridge/src/mirror.rs PartyLink, sends patch 0010's `move`, `feed` and `view` verbs from it). The plugin
 (0.2.9) builds the ray hooks' cell grids per cluster of squares, so the triangles of members far
 apart need no huge grid, and takes the pool from several out-of-bounds layers at once (--layer
 "-1.981,9.74").

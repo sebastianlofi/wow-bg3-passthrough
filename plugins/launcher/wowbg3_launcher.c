@@ -648,7 +648,7 @@ static void write_status(const char* why) {
 // ---- the supervisor thread ----
 static atomic_int g_quit;
 // <data>/run/stop written since this BG3 started: every child is stopped and stays stopped (a tool's clean
-// stop of the WoW side before it ends BG3 from outside, e.g. release/pc/release-mode.sh stop: a SIGTERM to
+// stop of the WoW side before it ends BG3 from outside, e.g. a test script: a SIGTERM to
 // BG3 itself skips exit() and with it the children's clean shutdown).
 static int s_stop_all = 0;
 static double g_start_wall = 0;

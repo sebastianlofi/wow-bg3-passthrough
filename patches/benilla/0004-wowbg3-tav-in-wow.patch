@@ -60,7 +60,7 @@ index 0000000..8c4295d
 +//! model and animation show in WoW proper, lit and fogged like the world around her, the way
 +//! SkyCraft copies its geometry into the other engine instead of reprojecting pixels.
 +//!
-+//! BG3's capture layer (`bg3/capture/wowbg3_capture.c`, "Tav geometry copy") copies Tav's meshes
++//! BG3's capture layer (`plugins/capture/wowbg3_capture.c`, "Tav geometry copy") copies Tav's meshes
 +//! off the GPU once (`tavmesh.bin`) and her bone palettes and object transforms every frame
 +//! (`tavpose.bin`), into `$WOW_BG3_TAV_DIR` (default `/tmp/wowbg3/tav`). Here each mesh becomes a
 +//! WoW model-material mesh (the entity lane: ground shade, sun, fog), skinned on the CPU every

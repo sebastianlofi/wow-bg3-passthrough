@@ -15,7 +15,7 @@ diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg
  //! drawn from another plan's pose by key and frames with no pose for the figure.
 +//!
 +//! Patch 0033 (the party: BG3's companions travel with the hero in world mode,
-+//! client-only, AI Context/party-design.md): the plan holds the hero and her companions, each a
++//! client-only): the plan holds the hero and her companions, each a
 +//! figure (`TavPlan.lua`: figure 0 the hero, her lines first; the layer writes each mesh's figure in
 +//! the TVM1 record's spare word). The hero is drawn as before. Each companion's figure gets a root of
 +//! its own at its own place (its first mesh's object origin, mapped), stands on WoW's ground under it

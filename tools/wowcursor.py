@@ -12,7 +12,7 @@ ActiveQuestIcon.blp (16 x 16), scaled to the cursor size.
   wowcursor.py [--data WOW_DATA_DIR] [--out DIR]     write quest-available.cur, quest-turnin.cur,
                                                       merchant.cur, merchant-gray.cur (and their
                                                       -pressed variants) into DIR
-Default DIR: the private profile's Script Extender/wow-bg3/cursors. Needs Pillow (tmp/pyenv).
+Default DIR: the private profile's Script Extender/wow-bg3/cursors. Needs Pillow (the release ships it in python/).
 Output is derived from Blizzard data: never commit it.
 """
 import argparse

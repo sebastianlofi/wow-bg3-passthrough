@@ -14,7 +14,7 @@
 -- (bg3le patch 0006, abilities_first in wowbg3-coord.py; no mod's Lua runs before BG3 loads its stats). No Lua per
 -- copy: Ext.Stats.Create and SetRawAttribute cost 8.4 s for 1,355 copies on every start. Never create a copy later:
 -- one made and synced in a running game goes into a spellbook, then crashes BG3 (signal 11 on a worker thread) when
--- the AI reaches it, even with no field changed (harness 2026-10-31).
+-- the AI reaches it, even with no field changed (seen in the test harness).
 --
 -- Status: wow-bg3/link/abilities-status.json: what was granted, what failed, every cast of a copy and every hit a
 -- stand-in lands, with the copy it was using.

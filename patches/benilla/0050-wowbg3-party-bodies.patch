@@ -97,7 +97,7 @@ new file mode 100644
 +//! `party-multiplayer-design.md`), so benilla streams it as another player and drew its WoW body
 +//! beside BG3's own figure of the companion (`wowbg3_tav`, patch 0033). The fight bridge moves the bot
 +//! with the server's `move` verb, a teleport at most once a second once the member is 3 yd away
-+//! (`link/src/mirror.rs` `PartyLink`), so that body jumped after her.
++//! (`bridge/src/mirror.rs` `PartyLink`), so that body jumped after her.
 +//!
 +//! In world mode (`wowbg3_lead::hide_self`) each bot's body is now:
 +//! - hidden: its root `Visibility::Hidden` after the exterior election, so its model, name, blob shadow

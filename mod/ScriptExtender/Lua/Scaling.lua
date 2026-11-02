@@ -1,5 +1,4 @@
--- Stand-in numbers from the balance research (docs/agents-20261031/balance-research.md in the private
--- workspace; the simulator is tools/balance-sim there): a WoW mob's BG3 stats follow BG3's own enemy curves
+-- Stand-in numbers from the balance research (a balance simulator run outside this repository): a WoW mob's BG3 stats follow BG3's own enemy curves
 -- at the effective level of its own WoW level, and its HP follows what a party of four deals in a turn at that
 -- level. Nothing of the player's party goes in, not its level and not its size (playtest feedback): a mob is what it is
 -- for good, and WoW's zones are the order to go through them. Switch: `scaling` in settings.conf,

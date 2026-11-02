@@ -20,8 +20,8 @@ for it at that moment; the player never sees it.
     benilla's unit (WOW_BG3_ACCOUNT) and server/tools/launch-baseline.sh reads its password here
     (`wowaccount.py password ACCOUNT`); the release's coordinator calls password() in-process.
 Folder: $WOWBG3_ACCOUNTS_DIR; else $WOWBG3_DATA (the release's data folder, ~/.local/share/wow-bg3, the
-launcher plugin sets it); else the parent of $WOWBG3_SERVER_VAR (the same folder, for tools run through
-release/pc/rh.sh); else $WOW_BG3_SERVER/var (harness B's portable server); else server/private
+launcher plugin sets it); else the parent of $WOWBG3_SERVER_VAR (the same folder, for tools run in release
+mode); else $WOW_BG3_SERVER/var (harness B's portable server); else server/private
 (harness A's test server).
 API (release's coordinator, py3.9): new(hero, session) -> account; account_for(char) -> account or None;
 password(account) -> str; ensure(account) -> account; note_hero(account, char); console(line, seconds).
@@ -48,7 +48,7 @@ def home():
         return Path(os.environ['WOWBG3_ACCOUNTS_DIR'])
     if os.environ.get('WOWBG3_DATA'):
         return Path(os.environ['WOWBG3_DATA'])
-    if os.environ.get('WOWBG3_SERVER_VAR'):  # release mode's server var is DATA/server (tools through release/pc/rh.sh)
+    if os.environ.get('WOWBG3_SERVER_VAR'):  # release mode's server var is DATA/server (tools run in release mode)
         return Path(os.environ['WOWBG3_SERVER_VAR']).parent
     if os.environ.get('WOW_BG3_SERVER'):
         return Path(os.environ['WOW_BG3_SERVER']) / 'var'

@@ -4,7 +4,7 @@
 -- turn-based mode work on WoW's mobs. WoW keeps drawing the mobs: the capture layer's "void" keep
 -- list (TavPlan.PublishKeep) leaves the stand-ins out of the composite.
 --
--- Driven by wow-bg3/link/mirror.json (the fight bridge, link/src/mirror.rs, every 250 ms):
+-- Driven by wow-bg3/link/mirror.json (the fight bridge, bridge/src/mirror.rs, every 250 ms):
 --   {Seq, Session, Active, HeroWowMaxHp, Hostile = faction, Neutral = faction, Fight = {guid...},
 --    Mobs = {{Guid, Template, Kind, Hostile, Pos = {x,y,z} BG3, Dir = {fx,fz} BG3 forward, WowHp,
 --             WowMaxHp, WowDamage, BaseDamage, Name}...}}

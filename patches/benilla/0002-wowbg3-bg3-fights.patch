@@ -65,7 +65,7 @@
 @@ -0,0 +1,517 @@
 +//! WOW-BG3 fights (local fork, not upstream benilla).
 +//! Attacking a Young Wolf (creature 299) no longer starts a WoW fight: the swing stays off the
-+//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `link/src/bridge.rs`),
++//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `bridge/src/bridge.rs`),
 +//! which sets up the fight in the hidden BG3. While it runs, BG3 decides everything:
 +//! - on your turn, a right-click on the ground asks BG3 to move there (BG3 paths it on WoW
 +//!   ground; the character then walks to where BG3 put it), a right-click on the wolf asks for

@@ -792,7 +792,7 @@ index 0000000..361e315
 + */
 +
 +// WOW-BG3 (local patch 0010): party members as WoW characters. See WowBg3Party.h
-+// and `AI Context/m5-server-handoff.md` ("Party verbs") in the WOW-BG3 project.
++// and its callers in `tools/` of the WOW-BG3 project.
 +//
 +// Threads: verbs, the tick and logout run on the world thread while no map
 +// updates. BotOwner, AnyBots and IsPartyBot are also called from map threads
@@ -2356,7 +2356,7 @@ index 0000000..b57ff9a
 +// report the creatures around any member (the per-member feed), point the
 +// hero's camera at a member (Far Sight), kill and revive members in place
 +// (BG3 death rules: no release, no graveyard) and load movement map tiles
-+// written while the server runs. Protocol: `AI Context/m5-server-handoff.md`
++// written while the server runs. Protocol: its callers in `tools/`
 +// in the WOW-BG3 project.
 +
 +#ifndef MANGOS_WOWBG3_PARTY_H

@@ -52,7 +52,7 @@ index 6b1efc7..a73b2dd 100644
 @@ -1,39 +1,84 @@
 -//! WOW-BG3 fights (local fork, not upstream benilla).
 -//! Attacking a Young Wolf (creature 299) no longer starts a WoW fight: the swing stays off the
--//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `link/src/bridge.rs`),
+-//! wire and a pull goes to the WoW-side bridge (`wow-bg3-link bridge`, `bridge/src/bridge.rs`),
 -//! which sets up the fight in the hidden BG3. While it runs, BG3 decides everything:
 -//! - on your turn, a right-click on the ground asks BG3 to move there (BG3 paths it on WoW
 -//!   ground; the character then walks to where BG3 put it), a right-click on the wolf asks for
@@ -65,7 +65,7 @@ index 6b1efc7..a73b2dd 100644
 +//! you; neutral mobs only when attacked; every mob in combat with you joins one encounter, and adds
 +//! join it while it runs):
 +//! - A swing at any attackable creature stays off the wire and pulls it, with every other mob in
-+//!   combat with you, into a BG3 fight (`pull.json` for the bridge, `link/src/bridge.rs`). A hostile
++//!   combat with you, into a BG3 fight (`pull.json` for the bridge, `bridge/src/bridge.rs`). A hostile
 +//!   mob that aggroes you (its target is you and it is in combat) pulls the same way.
 +//! - While the fight runs, mobs that enter combat with you, or that you attack, join it
 +//!   (`join.json`, every mob asked for so far; the bridge skips the ones already in).
@@ -79,7 +79,7 @@ index 6b1efc7..a73b2dd 100644
 +//!
 +//! There is no server freeze yet: the real mobs keep their WoW AI meanwhile and a BG3 kill
 +//! gives no WoW credit. With `WOW_BG3_M5=1` the bridge's server requests (`server-cmd.txt`, see
-+//! `link/src/handoff.rs` and `AI Context/m5-server-handoff.md`) go out once each as SAY chat.
++//! `bridge/src/handoff.rs`) go out once each as SAY chat.
  //!
  //! `WOW_BG3_AUTOFIGHT=1` (harness tests only): ten seconds in the world, the nearest Young Wolf
  //! within reach is pulled as if attacked, and each of your turns plays itself (first turn: a
@@ -94,7 +94,7 @@ index 6b1efc7..a73b2dd 100644
 +//!
 +//! Mirrored mobs (world mode): every 12 frames `mobs.txt` lists the hero and every
 +//! living attackable creature within 40 yards (position, facing, HP, hostile or neutral, combat
-+//! flags) for the bridge, which keeps a BG3 stand-in at each (`link/src/mirror.rs`, `Mirrors.lua`).
++//! flags) for the bridge, which keeps a BG3 stand-in at each (`bridge/src/mirror.rs`, `Mirrors.lua`).
 +//! `mirrored.txt` (bridge) names the mobs that have one (`m GUID`): BG3 takes clicks on those (its
 +//! own attack, spell, throw or targeting on the stand-in), so the pointer link does not claim them
 +//! for WoW (`claims_hover`). Mobs held by a turn-based freeze (`h GUID`) never pull by their

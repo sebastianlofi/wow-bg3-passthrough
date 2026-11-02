@@ -78,7 +78,7 @@ function M.Start(runId)
     end)
     local tavSeq, tavFd = 0, nil
     local inSeq, clicks, rclicks, lastX, lastY = 0, 0, 0, nil, nil
-    -- BG3's window size for BGI2 (bg3/tools/sandbox.py writes window.json at each launch; 1280x720 for harness runs).
+    -- BG3's window size for BGI2 (the test harness writes window.json at each launch; 1280x720 for harness runs).
     local win = readJson("window.json") or {}
     local W, H = tonumber(win.Width) or 1280, tonumber(win.Height) or 720
 

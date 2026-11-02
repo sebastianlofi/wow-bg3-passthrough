@@ -1,4 +1,4 @@
--- The wowbg3 bg3le native plugin (bg3/plugin) seen from Lua. A plugin cannot add Lua
+-- The wowbg3 bg3le native plugin (plugins) seen from Lua. A plugin cannot add Lua
 -- functions, so it answers one reserved physics query instead: RaycastClosest with
 -- type 0, include 0 and context 0x57423301, the opcode in the exclude mask and six
 -- float arguments. The call runs synchronously on this context's own thread. Results

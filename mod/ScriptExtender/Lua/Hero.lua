@@ -8,7 +8,7 @@
 --           until world mode rebuilds BG3's spatial grid (no party components, and the HUD's
 --           SelectedCharacter is nil; harness, Tav's world-mode quicksave).
 -- World mode teleports the hero it had at Start and brings that one back at Stop (WorldMode.lua).
--- hero.json also serves the tools outside BG3 (world bridge, harness helpers, bg3/tools/hero.py):
+-- hero.json also serves the tools outside BG3 (world bridge, test harness helpers):
 -- {RunId, Uuid, Name, Region, Ready, NewGame, ...}; Ready: the hero is in the tutorial level
 -- (TUT_Avernus_C, the level world mode's void is made for), the game runs, no dialog holds the hero,
 -- and (a new game, NewGame.lua) the level's gameplay has started.

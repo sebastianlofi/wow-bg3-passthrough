@@ -6,7 +6,7 @@ camera and the player ... that circular see-through window BG3 draws"). In world
 occluding geometry is WoW's and benilla draws it, so the cut is made here, with BG3's own law.
 
 Where BG3 does it: in every wall's own material shader. `Base_ST_FOR` and kin in `Materials.pak`
-(read with this repository's `release/lspk.py` and `tmp/occl20261029/spvdis.py`; the Vulkan build
+(read with this repository's `release/lspk.py` and a SPIR-V disassembler; the Vulkan build
 is stripped, the DX12 build keeps the names `g_SeeThroughPosition0`, `g_LocalCoverageScalar`,
 `_FadeOpacity`) read an engine block (set 0, binding 6): two capsules, each from one shared point to
 a target with a size `R`, and the materials' `SeeThroughEnabled` switch. They bind one texture by
@@ -166,14 +166,14 @@ index 0000000..e459787
 +    on: bool,
 +    /// BG3's capsule size `R` in yards: the cut reaches `R / 2` from the line to her, give or take
 +    /// the noise. BG3's own value is written by its engine straight into GPU memory and could not
-+    /// be read (`tmp/occl20261029/stscan`); this one is matched by eye to BG3's frames.
++    /// be read (a scan of its buffers); this one is matched by eye to BG3's frames.
 +    radius: f32,
 +    /// The cap that keeps the cut a window in the picture instead of the whole picture: its reach
 +    /// (`R / 2`) never exceeds this share of the screen's half height at her distance. At BG3's
 +    /// closest camera (6.75 yd from her chest, 55 degrees of vertical field) an uncapped cut is
 +    /// wider than the screen, and then everything in front of her goes, the ground included:
 +    /// A playtest showed exactly that, "the ground is going see-through at the bottom there, that
-+    /// doesn't make sense" (2026-10-29).
++    /// doesn't make sense".
 +    screen: f32,
 +    /// Whether WoW's terrain is cut with the rest. Off: a hill or the ground in front of her is
 +    /// never removed, which is what the eye clearance already keeps the camera out of; the cut is
@@ -198,7 +198,7 @@ index 0000000..e459787
 +            screen: 0.45,
 +            terrain: false,
 +            // Her body's depth: a wall she stands against lies within it and must never count as
-+            // in front of her (0.15 left a torn patch on the wall at her shoulder, 2026-10-29).
++            // in front of her (0.15 left a torn patch on the wall at her shoulder).
 +            near: 0.6,
 +            amp: 0.5 / 0.9144,
 +            scale: 2.0,
@@ -485,7 +485,7 @@ index 638ac1d..a6f9006 100644
 +    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
 +    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
 +    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-+    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // steeply took the upper part of the wall behind her: in a playtest, "the circle
 +    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    let from_her = world_pos - c.xyz;
 +    let to_eye = eye - c.xyz;
@@ -530,7 +530,7 @@ index 638ac1d..a6f9006 100644
  
 +    // Patch 0090: BG3's see-through, only where `cut_params.w` asks for terrain. Off by
 +    // default: a close camera puts the ground right in front of her inside the circle, and ground
-+    // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
++    // one can see through is worse than a hill one cannot see past (playtest feedback). A hill
 +    // between BG3's camera and her is the eye clearance's job, not the circle's.
 +    if (wow_light.cut_params.w > 0.5 && wow_cut(in.world_position.xyz, in.uv)) {
 +        discard;
@@ -612,7 +612,7 @@ index 0481947..013a501 100644
 +    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
 +    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
 +    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-+    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // steeply took the upper part of the wall behind her: in a playtest, "the circle
 +    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    let from_her = world_pos - c.xyz;
 +    let to_eye = eye - c.xyz;
@@ -862,7 +862,7 @@ index 0000000..4b53f75
 +//!
 +//! BG3 cuts the geometry between its camera and the character away, so she is never hidden by a
 +//! tree, a hut or a roof. It does it in every wall's own material shader (`Base_*_FOR` and kin in
-+//! `Materials.pak`; read with `tmp/occl20261029/spvdis.py`, its names from the DX12 build): an
++//! `Materials.pak`; read with a SPIR-V disassembler, its names from the DX12 build): an
 +//! engine block (set 0, binding 6) carries two **capsules**, each from one shared point to a target
 +//! with a size `R`, and a texture the materials bind by id, `REF_Cloud_B` (512 x 512 cloud noise).
 +//! Per fragment: `n = 2·cloud(uv·2).r − 1`; for each capsule the distance `d` from the fragment to
@@ -1018,7 +1018,7 @@ index fd7888c..befdd65 100644
 +    // camera along the line to her: the ground she stands on and the floor in front of her feet lie
 +    // below that line's start and stay. And in front of her on the ground plane, toward the camera:
 +    // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-+    // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
++    // steeply took the upper part of the wall behind her: in a playtest, "the circle
 +    // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    let from_her = world_pos - c.xyz;
 +    let to_eye = eye - c.xyz;
@@ -1115,7 +1115,7 @@ index f562c1a..a892e57 100644
 +        // Patch 0090: her own room, when the see-through circle is live. The circle can cut a
 +        // building's roof or wall away from a camera standing outside it, and the portal walk from
 +        // that camera admits no room inside, so the hole would show the building's back faces —
-+        // nothing, that is, and then the sky (playtest feedback, 2026-10-29: "the outside doesn't look like
++        // nothing, that is, and then the sky (playtest feedback: "the outside doesn't look like
 +        // a cyan void ... it just continues rendering"). A second flood seeded where she stands,
 +        // unioned into the visible set alone: the fog, the claim and the deferred windows stay the
 +        // camera's, and only the placement she is actually inside pays for it.

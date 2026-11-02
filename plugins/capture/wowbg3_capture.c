@@ -34,7 +34,7 @@
 #define LAYER_NAME "VK_LAYER_WOWBG3_capture"
 #define MAX_ENTRIES 64
 
-#ifdef WOWBG3_PLUGIN  // built into the bg3le render plugin (bg3/plugin/render): nothing exported but its init
+#ifdef WOWBG3_PLUGIN  // built into the bg3le render plugin (plugins/render): nothing exported but its init
 #define EXPORT
 #else
 #define EXPORT __attribute__((visibility("default")))
@@ -124,7 +124,7 @@ static void logf_(const char* fmt, ...) {
     fclose(f);
 }
 
-// Which side draws: this layer, or the bg3le render plugin (bg3/plugin/render), which
+// Which side draws: this layer, or the bg3le render plugin (plugins/render), which
 // runs this same code through BG3's own device table. Env WOW_BG3_RENDER, else the first word of
 // OUT_DIR/render: "plugin" (the layer passes every call straight through, the plugin draws),
 // "layer" (the plugin stays out), "off" (neither draws). Unset: the layer draws when it is loaded,

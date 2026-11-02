@@ -9,7 +9,7 @@ diff --git a/crates/benilla-assets/src/shaders/terrain.wgsl b/crates/benilla-ass
 +++ b/crates/benilla-assets/src/shaders/terrain.wgsl
 @@ -320,7 +320,10 @@
      // default: a close camera puts the ground right in front of her inside the circle, and ground
-     // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
+     // one can see through is worse than a hill one cannot see past (playtest feedback). A hill
      // between BG3's camera and her is the eye clearance's job, not the circle's.
 -    if (wow_light.cut_params.w > 0.5 && wow_cut(in.world_position.xyz, in.uv)) {
 +    // Patch 0098: ground one can walk on stays, however the camera looks at it; a cliff goes (50 degrees,

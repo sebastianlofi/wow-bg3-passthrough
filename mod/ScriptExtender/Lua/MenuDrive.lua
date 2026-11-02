@@ -1,6 +1,6 @@
 -- BG3's main menu and character creation driven through their own view-model commands, the ones
--- their buttons run: the harness's headless New Game (bg3/tools/menu-drive.py newgame)
--- and loading a named save (bg3/tools/resume-save.sh with WOW_BG3_SAVE). A human does the same with
+-- their buttons run: the test harness's headless New Game
+-- and loading a named save (with WOW_BG3_SAVE). A human does the same with
 -- the mouse; nothing here changes BG3's rules or files.
 -- wow-bg3/menu-drive.json {RunId, Sequence, Action, ...} -> wow-bg3/menu-drive-result.json
 -- {RunId, Sequence, State, OK, Value}; never retried (the caller looks at the result and the UI):

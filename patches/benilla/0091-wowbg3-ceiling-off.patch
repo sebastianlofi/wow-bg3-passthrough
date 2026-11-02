@@ -1,6 +1,6 @@
 WOW-BG3 benilla patch 0091: the storeys above the character are not drawn while she is below them.
 
-The design rule, given on 2026-10-29: what stands between the camera and the character is handled
+The design rule: what stands between the camera and the character is handled
 three ways depending on what it is: ceilings, bushes, skinny trees and posts **phase out**; walls get
 the **see-through opening** 0090 cuts; mountains, rocks and big trees the camera **bumps into**. And
 on floors, like BG3: "while on the first floor the second floor should just be fully faded out, and
@@ -54,7 +54,7 @@ index f1adab2..ebcb12d 100644
 +/// WOW-BG3 patch 0091: the floors above her are not drawn while she is downstairs.
 +///
 +/// BG3 takes the storeys above the character away whole while she is on a lower one, and brings
-+/// them back when she climbs up (playtest feedback, 2026-10-29: "while on the first floor the second floor
++/// them back when she climbs up (playtest feedback: "while on the first floor the second floor
 +/// should just be fully faded out, like in BG3, and then come back when you go upstairs"). The
 +/// see-through (patch 0090) is only for what stands between the camera and her on her own level;
 +/// walls get its opening. WoW's buildings are grouped — a roof, a floor, a room are separate MOGP
@@ -69,7 +69,7 @@ index f1adab2..ebcb12d 100644
 +/// line from the eye to her, which left half the upstairs standing round her (the bed, the far
 +/// walls); BG3 takes the whole storey. The first version without the height test took the floor
 +/// and the far walls with the roof and left her standing on a scrap of plank in open sky
-+/// (`tmp/occl20261029/shots/bed-on-0000.png`, kept as the counter-example).
++/// (a test shot kept as the counter-example).
 +fn above_her(anchor: Vec3, room: (Vec3, Vec3), origin: Vec3, aabb: &bevy::camera::primitives::Aabb) -> bool {
 +    let centre = origin + Vec3::from(aabb.center);
 +    let half = Vec3::from(aabb.half_extents);

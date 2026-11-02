@@ -155,7 +155,7 @@ index 0000000..b92a6df
 +//! With `WOW_BG3_FRAMES=<file>` (normally `/tmp/wowbg3/wowframe.bin`) a colour image and the
 +//! world camera's depth after the main pass are copied back every frame and written in place
 +//! into two slot files beside that name (`wowframe.a.bin`, `wowframe.b.bin`, alternating, so a
-+//! reader always finds one whole). The BG3 Vulkan layer (`bg3/capture`) reads them and draws
++//! reader always finds one whole). The BG3 Vulkan layer (`plugins/capture`) reads them and draws
 +//! WoW's world behind BG3's characters, effects and UI.
 +//!
 +//! File layout (little endian): a 64-byte header then colour rows then depth rows.

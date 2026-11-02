@@ -87,7 +87,7 @@ index e459787..c1fb5ea 100644
      /// How far the look point must be from her before the second capsule is used (yd).
      look_apart: f32,
 +    /// Patch 0095: cut outdoors too. Off: the see-through is for indoors, where the camera is not
-+    /// bumped; outdoors the plugin's eye clearance bumps it (playtest feedback, 2026-10-31).
++    /// bumped; outdoors the plugin's eye clearance bumps it (playtest feedback).
 +    outdoors: bool,
 +    /// Patch 0095: patch 0092's fade of the small doodads in the way. Off for now (playtest feedback).
 +    phase: bool,
@@ -180,7 +180,7 @@ index a6f9006..924ebb6 100644
  fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
 @@ -226,6 +228,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
      // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // steeply took the upper part of the wall behind her: in a playtest, "the circle
      // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
 +    // floor a few yards in front of her passes both tests below, and floors went see-through.
@@ -241,7 +241,7 @@ index a6f9006..924ebb6 100644
 +
      // Patch 0090: BG3's see-through, only where `cut_params.w` asks for terrain. Off by
      // default: a close camera puts the ground right in front of her inside the circle, and ground
-     // one can see through is worse than a hill one cannot see past (playtest feedback, 2026-10-29). A hill
+     // one can see through is worse than a hill one cannot see past (playtest feedback). A hill
 diff --git a/crates/benilla-assets/src/shaders/wow_model.wgsl b/crates/benilla-assets/src/shaders/wow_model.wgsl
 index fa4aa93..6998d4d 100644
 --- a/crates/benilla-assets/src/shaders/wow_model.wgsl
@@ -266,7 +266,7 @@ index fa4aa93..6998d4d 100644
  fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
 @@ -954,6 +956,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
      // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // steeply took the upper part of the wall behind her: in a playtest, "the circle
      // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
 +    // floor a few yards in front of her passes both tests below, and floors went see-through.
@@ -466,7 +466,7 @@ index c3c75b6..497429b 100644
  fn wow_see_texel(base: u32, p: vec2<i32>) -> f32 {
 @@ -239,6 +241,12 @@ fn wow_see_capsule(c: vec4<f32>, eye: vec3<f32>, world_pos: vec3<f32>, n: f32, a
      // nothing behind her stays open at any height. (With the first test alone, a camera looking down
-     // steeply took the upper part of the wall behind her: in a playtest, 2026-10-29, "the circle
+     // steeply took the upper part of the wall behind her: in a playtest, "the circle
      // sometimes opens up the wall BEHIND the avatar depending on the camera angle".)
 +    // Patch 0095: nor what lies at her feet or under them, whatever the camera's angle: from above, the
 +    // floor a few yards in front of her passes both tests below, and floors went see-through.
