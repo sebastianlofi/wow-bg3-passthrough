@@ -23,7 +23,8 @@
 --                     TeleportToPosition, another level through a companion standing there (TeleportTo),
 --                     else off stage where it stands
 --   Gather {Position, Upkeep}  (WorldMode.lua) every companion next to the hero (or Position) and
---                     chained; Upkeep true while world mode runs (below), false at its Stop
+--                     chained, each with its summons (BG3's teleport takes them along); Upkeep true while
+--                     world mode runs (below), false at its Stop
 --   Refill            ("a command to refill my resources (spell slots, rage, etc)")
 --                     BG3's own full restore, Osiris RestoreParty on the hero (every party member's HP and
 --                     action resources), then ResetCooldowns on each member; anything still under its
@@ -45,7 +46,8 @@
 -- is ever put back: a fall is BG3's own, and world_bridge.py's fall alarm logs one that nothing can stop.
 -- Help: a member down after a fight stays down until the player uses BG3's Help, as in BG3.
 -- Status: wow-bg3/party.json (on change within 10 ticks, else every 300): {RunId, Tick, Hero, Members =
--- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Upkeep}.
+-- [{Uuid, Name, Hero, Hp, MaxHp, Dead, Downed, InCombat, Combat, Pos, Region, OnStage}], Summons = the party's
+-- summons (M.Summons: [{Uuid, Name, Summoner, Dead, OnStage, Pos, Region}]), Upkeep}.
 -- Read by TavPlan.lua/WorldMode.lua (the figures WoW draws), Mirrors.lua and ActionMonitor.lua (the
 -- party in fights) and the tools.
 local M = {}
@@ -152,6 +154,29 @@ function M.Snapshot()
     for _, u in ipairs(M.Party()) do out[#out + 1] = member(u, hero) end
     return out
 end
+-- The party's summons (a familiar, a spirit companion, a raised dead): every eoc::summon::IsSummon whose
+-- Summoner (or Owner) is a party member. They are not in DB_Players, so M.Party() never lists them, but
+-- the player walks them like members (the maintainer 2026-11-02: his Find Familiar spider), so world_bridge.py
+-- gives each its own treadmill squares from this list. [{Uuid, Name, Summoner, Dead, OnStage, Pos, Region}]
+function M.Summons()
+    local members = {}
+    for _, u in ipairs(M.Party()) do members[u] = true end
+    local out = {}
+    pcall(function()
+        for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("IsSummon")) do
+            local okU, u = pcall(function() return e.Uuid.EntityUuid end)
+            local okS, by = pcall(function() return e.IsSummon.Summoner.Uuid.EntityUuid end)
+            local okO, owner = pcall(function() return e.IsSummon.Owner.Uuid.EntityUuid end)
+            local of = (okS and members[by] and by) or (okO and members[owner] and owner) or nil
+            if okU and u and of and not members[u] then
+                out[#out + 1] = {Uuid = u, Name = nameOf(u), Summoner = of, Dead = q(Osi.IsDead, u) == 1,
+                    OnStage = q(Osi.IsOnStage, u) == 1, Pos = pos(u), Region = q(Osi.GetRegion, u)}
+            end
+        end
+    end)
+    table.sort(out, function(a, b) return a.Uuid < b.Uuid end)
+    return out
+end
 
 local function resolve(name)
     assert(type(name) == "string" and #name >= 2, "Name required (e.g. shadowheart, astarion)")
@@ -176,7 +201,9 @@ local function placeNear(u, at, i)
     local side = (i % 2 == 0) and 1 or -1
     local row = math.floor(i / 2)
     local p = {at[1] + side * 1.4, at[2] + 0.5, at[3] + 1.2 + row * 1.2}
-    Osi.TeleportToPosition(u, p[1], p[2], p[3], "", 0, 0, 0, 0, 1)
+    -- Osiris: source, x, y, z, event, linked characters, party followers, summons, leave combat, snap. Its
+    -- summons come too (BG3's own teleport of them): a familiar left where the save had it is on no ground.
+    Osi.TeleportToPosition(u, p[1], p[2], p[3], "", 0, 0, 1, 0, 1)
     return p
 end
 
@@ -433,7 +460,8 @@ function M.Start(runId)
         for i, u in ipairs(M.Party()) do
             if u ~= hero then
                 if q(Osi.GetRegion, u) ~= heroRegion then
-                    Osi.TeleportTo(u, hero, "", 0, 0, 0, 1, 1)
+                    -- source, target, event, linked characters, party followers, summons, leave combat, snap
+                    Osi.TeleportTo(u, hero, "", 0, 0, 1, 1, 1)
                     pcall(waitFor, function() return q(Osi.GetRegion, u) == heroRegion end, 300, "")
                 end
                 if q(Osi.IsOnStage, u) ~= 1 then Osi.SetOnStage(u, 1) end
@@ -570,12 +598,12 @@ function M.Start(runId)
     end
 
     local function writeStatus(force)
-        local snap = M.Snapshot()
-        local key = Ext.Json.Stringify(snap)
+        local snap, summons = M.Snapshot(), M.Summons()
+        local key = Ext.Json.Stringify({snap, summons})
         if not force and key == lastKey and tick - lastWrite < 300 then return end
         lastKey, lastWrite = key, tick
         Ext.IO.SaveFile("wow-bg3/party.json", Ext.Json.Stringify({RunId = runId, Tick = tick, Hero = Hero.Uuid(),
-            Members = snap, Upkeep = upkeep}))
+            Members = snap, Summons = summons, Upkeep = upkeep}))
     end
 
     -- Origin portraits: BG3's own re-render has its coloured backdrop since the capture layer keeps

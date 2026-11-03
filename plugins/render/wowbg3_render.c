@@ -797,6 +797,7 @@ static const Hook HOOKS[] = {
     HK(UpdateDescriptorSets), HK(UpdateDescriptorSetWithTemplate), HK(CreateDescriptorUpdateTemplate),
     HK(CreateShaderModule), HK(CreateSampler), HK(CreateDescriptorSetLayout), HK(CreatePipelineLayout),
     HK(CmdSetViewport), HK(CmdSetScissor),
+    HK(AllocateDescriptorSets), HK(FreeDescriptorSets), HK(ResetDescriptorPool), HK(DestroyDescriptorPool),
 };
 #undef HK
 
@@ -1044,6 +1045,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_present(VkQueue q, const VkPresentInfoK
              (unsigned long long)g_unk.total, (unsigned long long)g_unk.passes, (unsigned long long)g_unk.rp,
              (unsigned long long)g_unk.fb, (unsigned long long)g_unk.view, (unsigned long long)g_unk.img, (unsigned long long)g_unk.swap);
         memset(&g_unk, 0, sizeof g_unk);
+    }
+    if (n % 18000 == 0) {  // BG3's descriptor sets in the table: live count stays bounded (sets_log)
+        pthread_mutex_lock(&g_fxl_lock);
+        sets_log("every 18000 presents");
+        pthread_mutex_unlock(&g_fxl_lock);
     }
     // A swapchain made before the hooks: the layer never saw it and it lacks copy usage. Ask BG3
     // for a new one (it presented; the answer only says the chain is stale), at most 3 times.

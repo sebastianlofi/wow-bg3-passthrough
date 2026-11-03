@@ -1,0 +1,195 @@
+WOW-BG3 benilla patch 0113: a replayed BG3 click carries the modifier keys held on it.
+A Shift-click in WoW's quest log never watched the quest (playtest 2026-11-02): WoW's handlers read
+IsShiftKeyDown from benilla's own keyboard, which hears BG3's keys only while WoW's chat box is
+typing (patch 0008), so every click forwarded from BG3 was a plain one. bg3input.bin may be BGI3
+(40 bytes: BGI2's fields, the newest click's modifiers at 32 as bits 1 Shift, 2 Ctrl, 4 Alt, the seq
+again at 36; WorldMode.lua writes it); the replay presses those keys on benilla's keyboard with the
+button and lets go of them the frame after the button's release, once OnClick has run. BGI1 and BGI2
+still decode (no modifiers). The pointer log line names the modifiers.
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 2eacf13..2295d30 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -80,6 +80,14 @@
+ //! Patch 0025 (the body trailed Tav by 1.4 yd, WoW's ripples came late):
+ //! the own body follows her frame by frame from the BG3 packet's pose ([`body`]); the `tav.bin`
+ //! Click to Move follow above is the fallback without packets.
++//!
++//! Patch 0113 (a Shift-click in WoW's quest log never watched the quest): a replayed click came
++//! without the keys held on it. `IsShiftKeyDown` (and Ctrl, Alt) read benilla's own keyboard,
++//! which hears BG3's keys only while WoW's chat box is typing (patch 0008), so every forwarded
++//! click was a plain one. `bg3input.bin` may now be `BGI3` (40 bytes: `BGI2`'s fields, the
++//! modifiers held on the newest click at 32 as bits 1 Shift, 2 Ctrl, 4 Alt, the seq again at 36);
++//! a replayed click presses those keys on benilla's keyboard with the button and lets go of them
++//! the frame after the button's release, when WoW's `OnClick` has run.
+ 
+ // Patch 0025: the own body follows BG3's character frame by frame.
+ #[path = "wowbg3_body.rs"]
+@@ -597,6 +605,10 @@ struct PointerLink {
+     /// BG3's right clicks so far (`BGI2`; `None` until the first such record).
+     right_clicks: Option<u32>,
+     release: Option<(MouseButton, u8)>,
++    /// Patch 0113: the modifier keys (`BGI3` bits) pressed on benilla's keyboard for the replayed
++    /// click, and whether they are due to be let go this frame (the button went up last frame).
++    held_mods: u32,
++    mods_due: bool,
+     hover_flags: u32,
+     /// Patch 0067: the guid of the unit last reported under the pointer (0 for none).
+     hover_guid: u64,
+@@ -610,16 +622,24 @@ pub(crate) struct BgInput {
+     /// BG3's cursor and window size (px).
+     pub(crate) at: Vec2,
+     pub(crate) size: Vec2,
+-    /// Left clicks so far, and right clicks (`BGI2` only).
++    /// Left clicks so far, and right clicks (`BGI2` and `BGI3`).
+     pub(crate) left: u32,
+     pub(crate) right: Option<u32>,
++    /// Patch 0113: the modifier keys held on the newest click (`BGI3`; 0 before it).
++    pub(crate) mods: u32,
+ }
+ 
+-/// Decodes `bg3input.bin`, `BGI1` or `BGI2`; `None` when torn, foreign or not finite.
++/// Patch 0113: `BGI3`'s modifier bits.
++pub(crate) const MOD_SHIFT: u32 = 1;
++pub(crate) const MOD_CTRL: u32 = 2;
++pub(crate) const MOD_ALT: u32 = 4;
++
++/// Decodes `bg3input.bin`, `BGI1`, `BGI2` or `BGI3`; `None` when torn, foreign or not finite.
+ pub(crate) fn decode_input(rec: &[u8]) -> Option<BgInput> {
+     let (len, right, again) = match rec.get(0..4)? {
+         b"BGI1" => (32, None, 28),
+         b"BGI2" => (36, Some(28), 32),
++        b"BGI3" => (40, Some(28), 36),
+         _ => return None,
+     };
+     if rec.len() < len {
+@@ -632,7 +652,32 @@ pub(crate) fn decode_input(rec: &[u8]) -> Option<BgInput> {
+     // `BGI2` names 40 bytes: the seq again after the clicks, or after a pad.
+     let whole = seq == u(again) || (again == 32 && rec.len() >= 40 && seq == u(36));
+     let ok = seq != 0 && whole && at.is_finite() && size.x >= 1.0 && size.y >= 1.0;
+-    ok.then_some(BgInput { seq, at, size, left: u(24), right: right.map(u) })
++    let mods = if again == 36 { u(32) & (MOD_SHIFT | MOD_CTRL | MOD_ALT) } else { 0 };
++    ok.then_some(BgInput { seq, at, size, left: u(24), right: right.map(u), mods })
++}
++
++/// Patch 0113: presses and lets go of the modifier keys on benilla's keyboard so that `to` is held
++/// (from `from`), as winit's own key messages: `IsShiftKeyDown` and the rest read that keyboard.
++fn set_mods(
++    keys: &mut MessageWriter<bevy::input::keyboard::KeyboardInput>,
++    window: Entity,
++    from: u32,
++    to: u32,
++) {
++    use bevy::input::keyboard::{Key, KeyboardInput};
++    use bevy::input::ButtonState;
++    for (bit, key_code, logical_key) in [
++        (MOD_SHIFT, KeyCode::ShiftLeft, Key::Shift),
++        (MOD_CTRL, KeyCode::ControlLeft, Key::Control),
++        (MOD_ALT, KeyCode::AltLeft, Key::Alt),
++    ] {
++        let state = match (from & bit != 0, to & bit != 0) {
++            (false, true) => ButtonState::Pressed,
++            (true, false) => ButtonState::Released,
++            _ => continue,
++        };
++        keys.write(KeyboardInput { key_code, logical_key, state, text: None, repeat: false, window });
++    }
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -642,7 +687,10 @@ fn forward_pointer(
+     over_ui: Res<crate::ui_script::PointerOverUi>,
+     hovered: Res<crate::target::Hovered>,
+     object: Res<crate::target::HoveredObject>,
+-    mut buttons: MessageWriter<bevy::input::mouse::MouseButtonInput>,
++    (mut buttons, mut keys): (
++        MessageWriter<bevy::input::mouse::MouseButtonInput>,
++        MessageWriter<bevy::input::keyboard::KeyboardInput>,
++    ),
+     (mut idle, time): (ResMut<crate::ui_chat::idle::LastInput>, Res<Time<Real>>),
+     world_cursor: Res<crate::target::WorldCursor>,
+     quest: Res<crate::ui_quest::QuestGiver>,
+@@ -651,11 +699,19 @@ fn forward_pointer(
+     use bevy::input::mouse::MouseButtonInput;
+     use bevy::input::ButtonState;
+     let Ok((window_entity, window)) = windows.single() else { return };
++    // Patch 0113: the modifier keys of the last replayed click go up the frame after its button
++    // did, so the release's `OnClick` (WoW's clicks fire on the button's release) still saw them.
++    if link.mods_due {
++        set_mods(&mut keys, window_entity, link.held_mods, 0);
++        link.held_mods = 0;
++        link.mods_due = false;
++    }
+     // A press injected last frame is released two frames later, as a short real click.
+     if let Some((button, frames)) = link.release {
+         if frames == 0 {
+             buttons.write(MouseButtonInput { button, state: ButtonState::Released, window: window_entity });
+             link.release = None;
++            link.mods_due = link.held_mods != 0;
+         } else {
+             link.release = Some((button, frames - 1));
+         }
+@@ -769,9 +825,19 @@ fn forward_pointer(
+         (false, false) => return,
+     };
+     info!(
+-        "wowbg3 pointer: BG3 {} click at {point:?} goes to WoW as {button:?}",
+-        if new_right { "right" } else { "left" }
++        "wowbg3 pointer: BG3 {} click at {point:?} goes to WoW as {button:?}, modifiers {} \
++         (Shift {}, Ctrl {}, Alt {})",
++        if new_right { "right" } else { "left" },
++        input.mods,
++        input.mods & MOD_SHIFT != 0,
++        input.mods & MOD_CTRL != 0,
++        input.mods & MOD_ALT != 0,
+     );
++    // Patch 0113: the keys held on BG3's click are down on benilla's keyboard before the button, in
++    // the same frame, so the press and the release both see them.
++    set_mods(&mut keys, window_entity, link.held_mods, input.mods);
++    link.held_mods = input.mods;
++    link.mods_due = false;
+     buttons.write(MouseButtonInput { button, state: ButtonState::Pressed, window: window_entity });
+     link.release = Some((button, 1));
+ }
+@@ -788,6 +854,8 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+         clicks: None,
+         right_clicks: None,
+         release: None,
++        held_mods: 0,
++        mods_due: false,
+         hover_flags: 0,
+         hover_guid: 0,
+         hover_seq: 0,
+@@ -1081,11 +1149,32 @@ mod tests {
+         rec[32..36].copy_from_slice(&9u32.to_le_bytes());
+         let i = decode_input(&rec).unwrap();
+         assert_eq!((i.seq, i.at, i.size, i.left, i.right), (9, Vec2::new(100.0, 200.0), Vec2::new(1280.0, 800.0), 4, Some(3)));
++        assert_eq!(i.mods, 0, "BGI2 carries no modifiers");
+         assert!(decode_input(&rec[..35]).is_none(), "short record");
+         rec[32..36].copy_from_slice(&10u32.to_le_bytes());
+         assert!(decode_input(&rec).is_none(), "torn record");
+     }
+ 
++    #[test]
++    fn decodes_input_with_modifiers() {
++        // Patch 0113, BGI3: BGI2's fields, the newest click's modifiers at 32, seq again at 36.
++        let mut rec = [0u8; 40];
++        rec[0..4].copy_from_slice(b"BGI3");
++        rec[4..8].copy_from_slice(&11u32.to_le_bytes());
++        for (i, v) in [300.0f32, 340.0, 2560.0, 1440.0].iter().enumerate() {
++            rec[8 + 4 * i..12 + 4 * i].copy_from_slice(&v.to_le_bytes());
++        }
++        rec[24..28].copy_from_slice(&7u32.to_le_bytes());
++        rec[28..32].copy_from_slice(&2u32.to_le_bytes());
++        rec[32..36].copy_from_slice(&(MOD_SHIFT | 0x100).to_le_bytes());
++        rec[36..40].copy_from_slice(&11u32.to_le_bytes());
++        let i = decode_input(&rec).unwrap();
++        assert_eq!((i.seq, i.left, i.right, i.mods), (11, 7, Some(2), MOD_SHIFT), "unknown bits dropped");
++        assert!(decode_input(&rec[..39]).is_none(), "short record");
++        rec[36..40].copy_from_slice(&12u32.to_le_bytes());
++        assert!(decode_input(&rec).is_none(), "torn record");
++    }
++
+     #[test]
+     fn decodes_ui() {
+         let mut rec = [0u8; 32];

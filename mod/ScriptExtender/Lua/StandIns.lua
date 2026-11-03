@@ -459,8 +459,11 @@ function M.Start(runId)
                         hpHome[uuid] = q(function() local h = Ext.Entity.Get(uuid).Health; return {h.Hp, h.MaxHp} end)
                     end
                 end
-                -- Osiris: source, x, y, z, event, linked characters, party followers, summons, leave combat, snap to ground
-                Osi.TeleportToPosition(uuid, p[1], p[2], p[3], "", 0, 0, 0, 0, c.Snap == false and 0 or 1)
+                -- Osiris: source, x, y, z, event, linked characters, party followers, summons, leave combat, snap to ground.
+                -- The hero's summons come along, BG3's default (its story helpers pass summons 1): with 0 a familiar
+                -- stayed where the save had it, off WoW's ground, at every world mode Start after a load (2026-11-02).
+                local summons = uuid == Hero.Uuid() and 1 or 0
+                Osi.TeleportToPosition(uuid, p[1], p[2], p[3], "", 0, 0, summons, 0, c.Snap == false and 0 or 1)
                 -- On the log's clock: the server stopped for seconds soon after some of these (plugin op 70's trace).
                 Ext.Log.Print(string.format("WOW-BG3 stand-ins: %s %s to %.1f %.1f %.1f, snap %s", c.Action,
                     uuid == Hero.Uuid() and "the hero" or uuid, p[1], p[2], p[3], tostring(c.Snap ~= false)))

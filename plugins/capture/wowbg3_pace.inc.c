@@ -92,8 +92,8 @@ static void pace_gbuffer(VkCommandBuffer cb) {
 
 // Set 0 binding 1 (BG3's view constants) as bound on this thread now, NULL when not mapped.
 static const uint8_t* pace_view_constants(uint32_t need) {
-    if (!t_set[0] || !g_set) return NULL;
-    SetInfo* si = TABLE_FIND(g_set, SET_CAP, t_set[0], 0);
+    if (!t_set[0]) return NULL;
+    SetInfo* si = set_find(t_set[0]);
     if (!si) return NULL;
     DescSlot* sl = &si->slot[1];
     if (!sl->res) return NULL;

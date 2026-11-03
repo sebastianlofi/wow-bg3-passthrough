@@ -251,6 +251,9 @@ typedef struct {
     // GPU compositor (wowbg3_compose_gpu.inc.c)
     PFN_vkCreateDescriptorPool CreateDescriptorPool;
     PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+    PFN_vkFreeDescriptorSets FreeDescriptorSets;      // BG3's sets: their entries end with them (set table)
+    PFN_vkResetDescriptorPool ResetDescriptorPool;
+    PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
     PFN_vkGetFenceStatus GetFenceStatus;
     PFN_vkDestroyShaderModule DestroyShaderModule;
     PFN_vkCreateQueryPool CreateQueryPool;
@@ -2094,9 +2097,185 @@ static const uint8_t* buf_cpu(uint64_t buffer, uint64_t off, uint64_t* left) {
 // vkUpdateDescriptorSets and update templates. Effects keep their object transforms in uniforms.
 typedef struct { uint8_t type; int32_t layout; uint64_t res, off, range, samp; } DescSlot;  // layout: an image's, from its descriptor
 #define DESC_SLOTS 32  // indexed by binding number (BG3's scene set uses bindings up to 30)
-typedef struct { uint64_t h; DescSlot slot[DESC_SLOTS]; } SetInfo;
-#define SET_CAP (1u << 15)
-static SetInfo* g_set;
+// A set lives from vkAllocateDescriptorSets to vkFreeDescriptorSets, or to the reset or destruction
+// of its pool; its entry goes then, so the table holds the live sets only. Kept forever, as before
+// 2026-11-02, the dead handles filled all 32768 entries within half an hour of the maintainer's session
+// (HUD targets remade 295 times; a level-up and a companion joining): every set made after that
+// was unknown, so the final pass's HUD was not found (BG3's HUD gone) and effects lost their textures.
+// pool: the pool it came from (0: allocated before the hooks); pidx: its place in that pool's list.
+typedef struct { uint64_t h; uint64_t pool; uint32_t pidx; DescSlot slot[DESC_SLOTS]; } SetInfo;
+// Open addressing; a freed entry becomes a tombstone (SET_TOMB), so entries never move under the
+// recording threads that look sets up without the lock (set_find). When live entries and tombstones
+// pass 3/4 of the table, the live ones are copied into a new table (twice the size while they would
+// fill a quarter of it) and the pointer swapped; an old table is freed 2 s later, after any lookup
+// still reading it is long done (at most SET_OLD of them wait). Writers hold g_fxl_lock.
+typedef struct { uint32_t cap, used, tombs; SetInfo e[]; } SetTab;  // used: entries not empty (live + tombstones)
+#define SET_CAP0 (1u << 15)
+#define SET_TOMB (~0ull)
+static SetTab* volatile g_settab;
+#define SET_OLD 3
+static SetTab* g_settab_old[SET_OLD];
+static double g_settab_old_t[SET_OLD];
+// The pools' sets (g_fxl_lock held): sets[pidx] is each live set of the pool.
+typedef struct { uint64_t h; uint64_t* sets; uint32_t n, cap; } PoolInfo;
+#define POOL_CAP (1u << 13)
+static PoolInfo* g_pool;
+static struct { uint64_t allocs, frees, resets, destroys, dropped, rebuilds, unseen, failed, pools_full; } g_sets;
+static SetInfo* set_find(uint64_t key) {
+    SetTab* t = __atomic_load_n(&g_settab, __ATOMIC_ACQUIRE);
+    if (!t || !key || key == SET_TOMB) return NULL;
+    uint32_t i = hslot(key, t->cap);
+    for (uint32_t n = 0; n < t->cap; n++, i = (i + 1) & (t->cap - 1)) {
+        uint64_t h = __atomic_load_n(&t->e[i].h, __ATOMIC_ACQUIRE);
+        if (h == key) return &t->e[i];
+        if (!h) return NULL;
+    }
+    return NULL;
+}
+// The entry of `key` in table t, made if missing (g_fxl_lock held; no room check).
+static SetInfo* set_put(SetTab* t, uint64_t key) {
+    uint32_t i = hslot(key, t->cap), tomb = UINT32_MAX, n = 0;
+    for (; n < t->cap; n++, i = (i + 1) & (t->cap - 1)) {
+        uint64_t h = t->e[i].h;
+        if (h == key) return &t->e[i];
+        if (h == SET_TOMB) { if (tomb == UINT32_MAX) tomb = i; continue; }
+        if (!h) break;
+    }
+    if (tomb != UINT32_MAX) { i = tomb; t->tombs--; }
+    else if (n == t->cap) return NULL;
+    else t->used++;
+    SetInfo* s = &t->e[i];
+    memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
+    __atomic_store_n(&s->h, key, __ATOMIC_RELEASE);
+    return s;
+}
+static uint32_t set_live(const SetTab* t) { return t ? t->used - t->tombs : 0; }
+static void sets_log(const char* why) {
+    SetTab* t = g_settab;
+    logf_("sets: %s: %u live of %u entries (%u freed), %llu allocated, %llu freed one by one, %llu pool resets, %llu pools destroyed,"
+          " %llu entries dropped, %llu rebuilds, %llu updated with no allocation seen, %llu not stored",
+          why, set_live(t), t ? t->cap : 0, t ? t->tombs : 0, (unsigned long long)g_sets.allocs, (unsigned long long)g_sets.frees,
+          (unsigned long long)g_sets.resets, (unsigned long long)g_sets.destroys, (unsigned long long)g_sets.dropped,
+          (unsigned long long)g_sets.rebuilds, (unsigned long long)g_sets.unseen, (unsigned long long)g_sets.failed);
+}
+// Room for one more entry (g_fxl_lock held).
+static void set_room(void) {
+    int ring = -1;
+    for (int k = 0; k < SET_OLD; k++) {
+        if (g_settab_old[k] && now_s() - g_settab_old_t[k] > 2.0) { free(g_settab_old[k]); g_settab_old[k] = NULL; }
+        if (!g_settab_old[k]) ring = k;
+    }
+    SetTab* t = g_settab;
+    if (!t) {
+        t = calloc(1, sizeof *t + (size_t)SET_CAP0 * sizeof t->e[0]);
+        if (t) t->cap = SET_CAP0;
+        __atomic_store_n(&g_settab, t, __ATOMIC_RELEASE);
+        return;
+    }
+    if ((uint64_t)t->used * 4 < (uint64_t)t->cap * 3 || ring < 0) return;
+    uint32_t live = set_live(t), cap = t->cap;
+    while ((uint64_t)live * 4 > cap) cap *= 2;
+    SetTab* nt = calloc(1, sizeof *nt + (size_t)cap * sizeof nt->e[0]);
+    if (!nt) { sets_log("no memory for a new table"); return; }
+    nt->cap = cap;
+    for (uint32_t i = 0; i < t->cap; i++) {
+        if (!t->e[i].h || t->e[i].h == SET_TOMB) continue;
+        SetInfo* s = set_put(nt, t->e[i].h);
+        if (s) memcpy(&s->pool, &t->e[i].pool, sizeof *s - offsetof(SetInfo, pool));
+    }
+    __atomic_store_n(&g_settab, nt, __ATOMIC_RELEASE);
+    g_settab_old[ring] = t; g_settab_old_t[ring] = now_s();
+    g_sets.rebuilds++;
+    sets_log("table rebuilt");
+}
+// The entry of `key`, made if missing (g_fxl_lock held).
+static SetInfo* set_get(uint64_t key) {
+    if (!key || key == SET_TOMB) return NULL;
+    set_room();
+    SetInfo* s = g_settab ? set_put(g_settab, key) : NULL;
+    if (!s && !g_sets.failed++) sets_log("table full, a set not stored");
+    return s;
+}
+static PoolInfo* pool_info(uint64_t pool, int create) {  // g_fxl_lock held
+    if (!pool) return NULL;
+    if (!g_pool) g_pool = calloc(POOL_CAP, sizeof *g_pool);
+    PoolInfo* p = g_pool ? TABLE_FIND(g_pool, POOL_CAP, pool, create) : NULL;
+    if (!p && create && !g_sets.pools_full++) logf_("sets: pool table full; sets of new pools are dropped only when freed one by one");
+    return p;
+}
+// Takes pool p's entry out of its table: the entries after it move back (only writers, under the lock, read it).
+static void pool_remove(PoolInfo* p) {
+    free(p->sets);
+    uint32_t i = (uint32_t)(p - g_pool), j = i;
+    for (;;) {
+        memset(&g_pool[i], 0, sizeof g_pool[i]);
+        for (;;) {
+            j = (j + 1) & (POOL_CAP - 1);
+            if (!g_pool[j].h) return;
+            uint32_t k = hslot(g_pool[j].h, POOL_CAP);
+            if (i <= j ? (i < k && k <= j) : (i < k || k <= j)) continue;  // its home lies after the hole: it stays
+            break;
+        }
+        g_pool[i] = g_pool[j];
+        i = j;
+    }
+}
+// Set s (an entry of the current table) leaves its pool's list (g_fxl_lock held).
+static void pool_unlist(SetInfo* s) {
+    PoolInfo* p = pool_info(s->pool, 0);
+    if (!p || s->pidx >= p->n || p->sets[s->pidx] != s->h) return;
+    uint64_t last = p->sets[--p->n];
+    if (s->pidx < p->n) {
+        p->sets[s->pidx] = last;
+        SetInfo* m = set_find(last);
+        if (m) m->pidx = s->pidx;
+    }
+}
+static void set_drop(SetInfo* s) {  // g_fxl_lock held; s in the current table
+    __atomic_store_n(&s->h, SET_TOMB, __ATOMIC_RELEASE);
+    memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
+    g_settab->tombs++;
+    g_sets.dropped++;
+}
+static void sets_allocated(uint64_t pool, uint32_t n, const VkDescriptorSet* sets) {  // g_fxl_lock held
+    for (uint32_t k = 0; k < n; k++) {
+        SetInfo* s = set_get((uint64_t)sets[k]);
+        if (!s) continue;
+        if (s->pool) pool_unlist(s);  // a set whose end was never seen: a new one now
+        memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
+        g_sets.allocs++;
+        PoolInfo* p = pool_info(pool, 1);
+        if (!p) continue;
+        if (p->n == p->cap) {
+            uint32_t cap = p->cap ? p->cap * 2 : 64;
+            uint64_t* ns = realloc(p->sets, (size_t)cap * sizeof *ns);
+            if (!ns) continue;
+            p->sets = ns; p->cap = cap;
+        }
+        s->pool = pool; s->pidx = p->n;
+        p->sets[p->n++] = s->h;
+    }
+}
+static void sets_freed(uint64_t pool, uint32_t n, const VkDescriptorSet* sets) {  // g_fxl_lock held
+    for (uint32_t k = 0; k < n; k++) {
+        SetInfo* s = set_find((uint64_t)sets[k]);
+        if (!s || (s->pool && pool && s->pool != pool)) continue;
+        pool_unlist(s);
+        set_drop(s);
+        g_sets.frees++;
+    }
+}
+static void sets_pool_end(uint64_t pool, int destroyed) {  // g_fxl_lock held
+    PoolInfo* p = pool_info(pool, 0);
+    if (destroyed) g_sets.destroys++; else g_sets.resets++;
+    if (!p) return;
+    for (uint32_t k = 0; k < p->n; k++) {
+        SetInfo* s = set_find(p->sets[k]);
+        if (s && s->pool == pool) set_drop(s);
+    }
+    p->n = 0;
+    if (destroyed) pool_remove(p);
+}
 typedef struct { uint64_t h; uint32_t n; struct { uint32_t binding, elem, count, type; uint64_t off, stride; } e[16]; } TmplInfo;
 #define TMPL_CAP (1u << 12)
 static TmplInfo* g_tmpl;
@@ -2104,10 +2283,48 @@ static volatile uint32_t g_tmpl_updates, g_set_updates;
 static void set_slot(uint64_t set, uint32_t binding, uint32_t type, uint64_t res, uint64_t off, uint64_t range, uint64_t samp,
                      int32_t layout) {
     if (binding >= DESC_SLOTS) return;
-    if (!g_set) g_set = calloc(SET_CAP, sizeof *g_set);
-    SetInfo* si = g_set ? TABLE_FIND(g_set, SET_CAP, set, 1) : NULL;
+    SetInfo* si = set_find(set);
+    if (!si) { si = set_get(set); if (si) g_sets.unseen++; }  // allocated before the hooks
     if (!si) return;
     si->slot[binding] = (DescSlot){(uint8_t)type, layout, res, off, range, samp};
+}
+static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo* ai,
+                                                                   VkDescriptorSet* sets) {
+    DeviceData* d = device_for(device);
+    if (!d || !d->AllocateDescriptorSets) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = d->AllocateDescriptorSets(device, ai, sets);
+    if (r == VK_SUCCESS) {
+        pthread_mutex_lock(&g_fxl_lock);
+        sets_allocated((uint64_t)ai->descriptorPool, ai->descriptorSetCount, sets);
+        pthread_mutex_unlock(&g_fxl_lock);
+    }
+    return r;
+}
+// The entries go before the driver frees: once freed, a handle can come back from another thread's allocation.
+static VKAPI_ATTR VkResult VKAPI_CALL layer_FreeDescriptorSets(VkDevice device, VkDescriptorPool pool, uint32_t n,
+                                                               const VkDescriptorSet* sets) {
+    DeviceData* d = device_for(device);
+    if (!d || !d->FreeDescriptorSets) return VK_ERROR_INITIALIZATION_FAILED;
+    pthread_mutex_lock(&g_fxl_lock);
+    sets_freed((uint64_t)pool, n, sets);
+    pthread_mutex_unlock(&g_fxl_lock);
+    return d->FreeDescriptorSets(device, pool, n, sets);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL layer_ResetDescriptorPool(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags fl) {
+    DeviceData* d = device_for(device);
+    if (!d || !d->ResetDescriptorPool) return VK_ERROR_INITIALIZATION_FAILED;
+    pthread_mutex_lock(&g_fxl_lock);
+    sets_pool_end((uint64_t)pool, 0);
+    pthread_mutex_unlock(&g_fxl_lock);
+    return d->ResetDescriptorPool(device, pool, fl);
+}
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyDescriptorPool(VkDevice device, VkDescriptorPool pool, const VkAllocationCallbacks* alloc) {
+    DeviceData* d = device_for(device);
+    if (!d || !d->DestroyDescriptorPool) return;
+    pthread_mutex_lock(&g_fxl_lock);
+    if (pool) sets_pool_end((uint64_t)pool, 1);
+    pthread_mutex_unlock(&g_fxl_lock);
+    d->DestroyDescriptorPool(device, pool, alloc);
 }
 static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(VkDevice device, uint32_t nw, const VkWriteDescriptorSet* w,
                                                              uint32_t nc, const VkCopyDescriptorSet* c) {
@@ -2128,8 +2345,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(VkDevice device, ui
                          (uint64_t)x->pImageInfo[k].sampler, (int32_t)x->pImageInfo[k].imageLayout);
         }
     }
-    for (uint32_t i = 0; i < nc && g_set; i++) {  // copies carry slots between sets
-        SetInfo* from = TABLE_FIND(g_set, SET_CAP, (uint64_t)c[i].srcSet, 0);
+    for (uint32_t i = 0; i < nc; i++) {  // copies carry slots between sets
+        SetInfo* from = set_find((uint64_t)c[i].srcSet);
         for (uint32_t k = 0; from && k < c[i].descriptorCount && k < 1; k++) {
             uint32_t sb = c[i].srcBinding, db = c[i].dstBinding;
             if (sb >= DESC_SLOTS || db >= DESC_SLOTS || c[i].srcArrayElement || c[i].dstArrayElement) continue;
@@ -2272,7 +2489,7 @@ static void fxl_draw(VkCommandBuffer cb, const char* kind, uint32_t count, uint3
         // Uniform and storage buffers of sets 0..3 (record binding 16 + set * 16 + binding; images
         // are logged in fxlog.txt only).
         for (int st = 0; st < 4; st++) {
-            SetInfo* si = (g_set && t_set[st]) ? TABLE_FIND(g_set, SET_CAP, t_set[st], 0) : NULL;
+            SetInfo* si = set_find(t_set[st]);
             if (!si) continue;
             uint32_t dn = 0;
             char line[512];
@@ -2438,7 +2655,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         for (uint32_t k = 0; k < n; k++) {
             uint32_t s = first + k, nd_here = 0;
             if (s < 8) t_cset[s] = (uint64_t)sets[k];
-            SetInfo* si = g_set ? TABLE_FIND(g_set, SET_CAP, (uint64_t)sets[k], 0) : NULL;
+            SetInfo* si = set_find((uint64_t)sets[k]);
             for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
                 if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
                     if (s < 8 && nd_here < 8 && di < nd) t_cdyn[s][nd_here] = dyn[di];
@@ -2454,7 +2671,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         for (uint32_t k = 0; k < n; k++) {
             uint32_t s = first + k, nd_here = 0;
             if (s < 8) t_set[s] = (uint64_t)sets[k];
-            SetInfo* si = g_set ? TABLE_FIND(g_set, SET_CAP, (uint64_t)sets[k], 0) : NULL;
+            SetInfo* si = set_find((uint64_t)sets[k]);
             for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
                 if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
                     if (s < 8 && nd_here < 8 && di < nd) t_dyn[s][nd_here] = dyn[di];
@@ -2689,11 +2906,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderingKHR(VkCommandBuffer cb) {
 // the swapchain-sized RGBA8/BGRA8 colour target among its bound images (the other is BG3's scene,
 // A2B10G10R10), with the layout its descriptor gives. role_submit makes it the main UI.
 static void role_final_draw(VkCommandBuffer cb) {
-    if (t_bind_cb != cb || !g_set || !g_img) return;
+    if (t_bind_cb != cb || !g_settab || !g_img) return;
     uint64_t views[16]; int32_t lays[16]; uint32_t nv = 0;
     pthread_mutex_lock(&g_fxl_lock);
     for (int s = 0; s < 8; s++) {
-        SetInfo* si = t_set[s] ? TABLE_FIND(g_set, SET_CAP, t_set[s], 0) : NULL;
+        SetInfo* si = t_set[s] ? set_find(t_set[s]) : NULL;
         for (uint32_t b = 0; si && b < DESC_SLOTS && nv < 16; b++) {
             const DescSlot* sl = &si->slot[b];
             if (sl->res && (sl->type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || sl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
@@ -3790,7 +4007,7 @@ static void device_fns(DeviceData* d, VkDevice dev, PFN_vkGetDeviceProcAddr gdpa
     DEV_FN(CmdBindDescriptorSets); DEV_FN(CmdPushConstants); DEV_FN(UnmapMemory); DEV_FN(UpdateDescriptorSets); DEV_FN(UpdateDescriptorSetWithTemplate);
     DEV_FN(CreateDescriptorUpdateTemplate); DEV_FN(CreateShaderModule); DEV_FN(CreateSampler);
     DEV_FN(CreateDescriptorSetLayout); DEV_FN(CreatePipelineLayout); DEV_FN(CmdSetViewport);
-    DEV_FN(CreateDescriptorPool); DEV_FN(AllocateDescriptorSets); DEV_FN(GetFenceStatus); DEV_FN(DestroyShaderModule);
+    DEV_FN(CreateDescriptorPool); DEV_FN(AllocateDescriptorSets); DEV_FN(FreeDescriptorSets); DEV_FN(ResetDescriptorPool); DEV_FN(DestroyDescriptorPool); DEV_FN(GetFenceStatus); DEV_FN(DestroyShaderModule);
     DEV_FN(CreateQueryPool); DEV_FN(CmdResetQueryPool); DEV_FN(CmdWriteTimestamp); DEV_FN(GetQueryPoolResults);
     DEV_FN(CmdSetScissor); DEV_FN(DestroyImageView); DEV_FN(DestroyFramebuffer);
     d->DestroyBufferNext = d->DestroyBuffer;
@@ -3885,6 +4102,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL wowbg3_GetInstanceProcAddr(VkIns
     HOOK(CmdBindDescriptorSets); HOOK(CmdPushConstants); HOOK(MapMemory); HOOK(UnmapMemory); HOOK(UpdateDescriptorSets);
     HOOK(UpdateDescriptorSetWithTemplate); HOOK(CreateDescriptorUpdateTemplate); HOOK(CreateShaderModule);
     HOOK(CreateSampler); HOOK(CreateDescriptorSetLayout); HOOK(CreatePipelineLayout); HOOK(CmdSetViewport); HOOK(CmdSetScissor);
+    HOOK(AllocateDescriptorSets); HOOK(FreeDescriptorSets); HOOK(ResetDescriptorPool); HOOK(DestroyDescriptorPool);
     if (!instance) return NULL;
     InstanceData* d = instance_for(instance);
     return d ? d->gipa(instance, name) : NULL;
@@ -3914,6 +4132,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL wowbg3_GetDeviceProcAddr(VkDevic
     HOOK(CmdBindDescriptorSets); HOOK(CmdPushConstants); HOOK(MapMemory); HOOK(UnmapMemory); HOOK(UpdateDescriptorSets);
     HOOK(UpdateDescriptorSetWithTemplate); HOOK(CreateDescriptorUpdateTemplate); HOOK(CreateShaderModule);
     HOOK(CreateSampler); HOOK(CreateDescriptorSetLayout); HOOK(CreatePipelineLayout); HOOK(CmdSetViewport); HOOK(CmdSetScissor);
+    HOOK(AllocateDescriptorSets); HOOK(FreeDescriptorSets); HOOK(ResetDescriptorPool); HOOK(DestroyDescriptorPool);
 #undef HOOK
     DeviceData* d = device_for(device);
     return d ? d->gdpa(device, name) : NULL;

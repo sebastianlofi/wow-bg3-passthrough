@@ -13,11 +13,14 @@ local function behavior()
     end
 end
 
+-- Written every tick (one BG3 tick per rendered frame). `rigid_pose` builds the eye of every frame, BG3's and the
+-- one sent to benilla, from the newest record and holds it until the next: written every other tick, the look
+-- point, direction and zoom moved once per two frames while the hero, drawn from that frame's own pose, moved
+-- every frame. Walking or turning, she and the camera then shook against each other at half the frame rate, by
+-- one frame's step: worst zoomed in, where she is near the eye and the frame rate is lowest.
 function M.Start()
-    local seq, ticks, lastY = 0, 0, nil
+    local seq, lastY = 0, nil
     Ext.Events.Tick:Subscribe(function()
-        ticks = ticks + 1
-        if ticks % 2 ~= 0 then return end
         local ok, rec = pcall(function()
             local b = behavior()
             if not b then return nil end

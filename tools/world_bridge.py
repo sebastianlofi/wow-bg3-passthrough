@@ -25,8 +25,8 @@ link/world.json carries the session mapping while it runs, so a WoW pull (wow-bg
 cuts its fight arena with the same mapping and LinkLive.lua fights where Tav already stands.
 
 A treadmill per party member (party-multiplayer-design.md "Ground"):
-every party member in Party.lua's wow-bg3/party.json (the hero first, its position from tav.bin) has
-its own window of squares (the same rules as the hero's: the 2 x 2 round its lattice node, the
+every party member in Party.lua's wow-bg3/party.json (the hero first, its position from tav.bin), and
+every member's summon there (Summons: a familiar the player walks on its own), has its own window of squares (the same rules as the hero's: the 2 x 2 round its lattice node, the
 squares ahead or the --floor block), all from one pool, so members can be any distance apart. When
 the pool is short, squares go in tiers: first the square under every member, then every member's
 2 x 2, then the rest of each window, members nearest BG3's camera (bg3cam.bin) first; so the member
@@ -453,9 +453,11 @@ def faces_over(tris, x, z):
 
 
 class Walker:
-    """One party member's window on the lattice (its own node, look-ahead axis and fall alarm)."""
+    """One party member's window on the lattice (its own node, look-ahead axis and fall alarm); a party
+    member's summon (summon True) has one too, but no WoW character (left out of party-wow.json)."""
     def __init__(self, uuid, name):
         self.uuid, self.name = uuid, name
+        self.summon = False
         self.node = (0, 0)
         self.ahead_axis = None
         self.fall_said = 0.0
@@ -732,10 +734,19 @@ class World:
         try:
             party = json.loads((IO / 'party.json').read_text())
             if party.get('RunId') == self.run:
-                for m in party.get('Members', []):
+                # The members, then their summons (Party.lua M.Summons: a familiar the player walks on its own
+                # needs ground of its own as much as a companion does; the maintainer 2026-11-02, his spider).
+                summons = party.get('Summons')
+                rows = [(m, False) for m in party.get('Members', [])]
+                rows += [(m, True) for m in (summons if isinstance(summons, list) else [])]
+                for m, summon in rows:
+                    if not isinstance(m, dict):
+                        continue
                     p = m.get('Pos')
                     u = m.get('Uuid')
                     if m.get('Hero') or u == hero_uuid or not isinstance(u, str) or m.get('OnStage') is False:
+                        continue
+                    if summon and m.get('Dead'):
                         continue
                     if not isinstance(p, list) or len(p) != 3 or not all(isinstance(v, (int, float)) for v in p):
                         continue
@@ -743,7 +754,9 @@ class World:
                     # itself (its own AI grid, world-status.json LevelBounds, 64 m round it).
                     if abs(p[0] - self.centre[0]) > 20000 or abs(p[2] - self.centre[2]) > 20000 or self.in_level(p):
                         continue
-                    out.append((self.walker(u, m.get('Name') or u[:8]), tuple(p), bool(m.get('Dead'))))
+                    w = self.walker(u, m.get('Name') or u[:8])
+                    w.summon = summon
+                    out.append((w, tuple(p), bool(m.get('Dead'))))
         except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
             pass
         eye = camera_wow()
@@ -1123,6 +1136,8 @@ class World:
             return
         rows = []
         for w, p, dead in self.members:
+            if w.summon:
+                continue  # no WoW character (bot) stands in for a summon
             wx, wy = self.wow_xy(p[0], p[2])
             wz = self.origin[2] + (p[1] - self.centre[1]) / YD
             rows.append({'Uuid': w.uuid, 'Name': w.name, 'Hero': w is getattr(self, 'hero_walker', None),

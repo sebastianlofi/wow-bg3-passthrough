@@ -1165,10 +1165,21 @@ local function fillHolder(standin, prefix, list)
             size[tag] = M.AmountOf(row, w.Count or row.bc or 1)
         end
         -- Gone without a trace: the player took it and BG3 merged it into a stack of theirs (no
-        -- RemovedFrom for a merge, harness).
+        -- RemovedFrom for a merge, harness). A ware only while its trade is open (a world move or an
+        -- opening trade clears a vendor's stock too); loot while its corpse is still there (Mirrors removes
+        -- a corpse with what it holds). Loot was held to the vendors' rule by mistake: a boar's pelt that
+        -- merged into the looter's pelts never reached WoW and was put back in the corpse, again and again.
         local old = sideUuid[tag]
         if not have[tag] and old and not deleted[old] and not q(Ext.Entity.Get, old) then
-            if buying(standin) then askFor(old, tag, sideCount[tag]) else deleted[old] = true end
+            local looted = prefix:sub(1, 1) == "L" and (WOWBG3MirrorOwned or {})[standin] ~= nil
+                and q(Ext.Entity.Get, standin) ~= nil
+            if buying(standin) or looted then
+                if looted then state.LootMerged = (state.LootMerged or 0) + 1 end
+                askFor(old, tag, sideCount[tag])
+            else
+                deleted[old] = true
+                if prefix:sub(1, 1) == "L" then state.LootRemade = (state.LootRemade or 0) + 1 end
+            end
         end
         if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) and not (old and pendingItem[old]) then
             local n = M.AmountOf(M.Item(w.Entry), w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1)

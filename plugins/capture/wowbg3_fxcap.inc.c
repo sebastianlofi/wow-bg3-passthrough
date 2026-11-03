@@ -903,8 +903,8 @@ static uint64_t fxc_texkey(uint64_t view) {
 
 // A mapped uniform range of a bound set slot (dynamic offsets applied), or NULL.
 static const uint8_t* fxc_slot_cpu(uint32_t set, uint32_t binding, uint32_t need) {
-    if (set >= 8 || binding >= DESC_SLOTS || !t_set[set] || !g_set) return NULL;
-    SetInfo* si = TABLE_FIND(g_set, SET_CAP, t_set[set], 0);
+    if (set >= 8 || binding >= DESC_SLOTS || !t_set[set]) return NULL;
+    SetInfo* si = set_find(t_set[set]);
     if (!si) return NULL;
     DescSlot* sl = &si->slot[binding];
     if (!sl->res) return NULL;
@@ -933,8 +933,8 @@ static const uint8_t* fxc_slot_cpu(uint32_t set, uint32_t binding, uint32_t need
 // BG3 renders camera-relative; the view constants (set 0, binding 1) hold the eye at float 24.
 #define FXC_MAX_SCALE 50.0f
 static const DescSlot* fxc_slot(uint32_t set, uint32_t binding) {
-    if (set >= 8 || binding >= DESC_SLOTS || !t_set[set] || !g_set) return NULL;
-    SetInfo* si = TABLE_FIND(g_set, SET_CAP, t_set[set], 0);
+    if (set >= 8 || binding >= DESC_SLOTS || !t_set[set]) return NULL;
+    SetInfo* si = set_find(t_set[set]);
     return si && si->slot[binding].res ? &si->slot[binding] : NULL;
 }
 static int fxc_place(const Recipe* r, uint32_t fi, float at[3], float obj_out[16]) {
@@ -1240,7 +1240,7 @@ static int fxc_unsup_draw(const Recipe* r) {
     uint32_t nsets = pl ? pl->nsets : 0;
     for (uint32_t s = 0; s < nsets && s < 8; s++) {
         DslInfo* l = g_dsl ? TABLE_FIND(g_dsl, DSL_CAP, pl->sets[s], 0) : NULL;
-        SetInfo* si = (g_set && t_set[s]) ? TABLE_FIND(g_set, SET_CAP, t_set[s], 0) : NULL;
+        SetInfo* si = set_find(t_set[s]);
         for (uint32_t k = 0; l && si && k < l->n; k++) {
             uint32_t binding = l->b[k].binding, type = l->b[k].type;
             if (binding >= 32 || binding >= DESC_SLOTS || !(r->used[s] >> binding & 1)) continue;
@@ -1531,7 +1531,7 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
     by_u32(d, nsets);
     for (uint32_t s = 0; s < nsets; s++) {
         DslInfo* l = g_dsl ? TABLE_FIND(g_dsl, DSL_CAP, pl->sets[s], 0) : NULL;
-        SetInfo* si = (g_set && t_set[s]) ? TABLE_FIND(g_set, SET_CAP, t_set[s], 0) : NULL;
+        SetInfo* si = set_find(t_set[s]);
         uint32_t n = l ? l->n : 0, nu = 0;
         for (uint32_t k = 0; k < n; k++) if (l->b[k].binding < 32 && (r->used[s] >> l->b[k].binding & 1)) nu++;
         by_u32(d, s); by_u32(d, nu);
@@ -2196,8 +2196,8 @@ static __thread uint64_t t_post_pipe, t_post_key, t_post_cpipe, t_post_ckey;
 
 // A bound slot of `sets` (dynamic offsets applied), or NULL.
 static const DescSlot* post_slot(const uint64_t* sets, uint32_t dyn[8][8], const uint32_t* ndyn, uint32_t set, uint32_t binding, uint64_t* off) {
-    if (set >= 8 || binding >= DESC_SLOTS || !sets[set] || !g_set) return NULL;
-    SetInfo* si = TABLE_FIND(g_set, SET_CAP, sets[set], 0);
+    if (set >= 8 || binding >= DESC_SLOTS || !sets[set]) return NULL;
+    SetInfo* si = set_find(sets[set]);
     if (!si || (!si->slot[binding].res && !si->slot[binding].samp)) return NULL;
     DescSlot* sl = &si->slot[binding];
     *off = sl->off;
@@ -2243,7 +2243,7 @@ static void sight_note(void) {  // g_fxl_lock held
     if (!f) { g_sight_lines = 0; return; }
     fprintf(f, "sight %d %d%d%d c", g_sight_lines, okc, okv, okr);
     if (!okc) {  // why set 1 binding 0 was not read (release batch: through the plugin)
-        SetInfo* si = (t_set[1] && g_set) ? TABLE_FIND(g_set, SET_CAP, t_set[1], 0) : NULL;
+        SetInfo* si = set_find(t_set[1]);
         const DescSlot* sl = si ? &si->slot[0] : NULL;
         BufInfo* bi = (sl && sl->res && g_buf) ? TABLE_FIND(g_buf, BUF_CAP, sl->res, 0) : NULL;
         MemInfo* mi = (bi && bi->mem && g_mem) ? TABLE_FIND(g_mem, MEM_CAP, bi->mem, 0) : NULL;
@@ -2407,7 +2407,7 @@ static void tav_log_draw(VkCommandBuffer cb) {
         for (uint32_t k = 0; r && k < r->ncolor; k++) fprintf(f, " c%u:f%u", k, r->blend[k][8]);
         fprintf(f, "\n");
         for (int s = 0; s < 8; s++) {
-            SetInfo* si = (g_set && t_set[s]) ? TABLE_FIND(g_set, SET_CAP, t_set[s], 0) : NULL;
+            SetInfo* si = set_find(t_set[s]);
             if (!si) continue;
             fprintf(f, "  set%d", s);
             for (uint32_t b = 0; b < DESC_SLOTS; b++) {
@@ -3424,9 +3424,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(VkDevice devi
 // Render-target images (colour, depth or storage usage) bound in `sets`: sampled ones into
 // rd, storage ones into wr. Returns through the counts.
 static void bound_targets(const uint64_t* sets, uint64_t* rd, uint32_t* nrd, uint32_t rcap, uint64_t* wr, uint32_t* nwr, uint32_t wcap) {
-    if (!g_set) return;
+    if (!g_settab) return;
     for (int s = 0; s < 8; s++) {
-        SetInfo* si = sets[s] ? TABLE_FIND(g_set, SET_CAP, sets[s], 0) : NULL;
+        SetInfo* si = set_find(sets[s]);
         for (uint32_t b = 0; si && b < DESC_SLOTS; b++) {
             DescSlot* sl = &si->slot[b];
             int st = sl->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;

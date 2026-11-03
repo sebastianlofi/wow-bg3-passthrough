@@ -21,9 +21,13 @@
 -- delta (dx, dy, dz) from WowOrigin.
 --
 -- Pointer (clicks on WoW's people and things go to WoW): while started, BG3's cursor
--- and counts of left and right clicks go to benilla (link/bg3input.bin: "BGI2", seq, x, y, window
--- w, h, left clicks, right clicks, seq again), which aims WoW's mouseover there and replays a left
--- click, or WoW's interact for a right click (talk, vendor, quest, loot). When WoW
+-- and counts of left and right clicks go to benilla (link/bg3input.bin: "BGI3", seq, x, y, window
+-- w, h, left clicks, right clicks, the modifier keys held on the newest click (1 Shift, 2 Ctrl,
+-- 4 Alt), seq again), which aims WoW's mouseover there and replays a left click, or WoW's interact
+-- for a right click (talk, vendor, quest, loot), with those keys held on benilla's keyboard
+-- (benilla 0113: WoW's Shift-click watches a quest, links an item into chat, splits a stack;
+-- benilla hears BG3's keys only while WoW's chat box types, so without them every click was a
+-- plain one). When WoW
 -- says it has its UI or a unit under the pointer (link/wowhover.bin: "WBH1", seq, flags, seq;
 -- flags 1 UI, 2 a unit or object WoW takes; 4, a mirrored mob, is BG3's and not tested here),
 -- BG3's own action for that click is prevented, so Tav does not also walk there. Friendly NPCs
@@ -78,7 +82,10 @@ function M.Start(runId)
     end)
     local tavSeq, tavFd = 0, nil
     local inSeq, clicks, rclicks, lastX, lastY = 0, 0, 0, nil, nil
-    -- BG3's window size for BGI2 (the test harness writes window.json at each launch; 1280x720 for harness runs).
+    -- The modifier keys held now (BGI3 bits: 1 Shift, 2 Ctrl, 4 Alt; from BG3's key events) and on
+    -- the newest forwarded click.
+    local heldMods, clickMods = 0, 0
+    -- BG3's window size for BGI3 (the test harness writes window.json at each launch; 1280x720 for harness runs).
     local win = readJson("window.json") or {}
     local W, H = tonumber(win.Width) or 1280, tonumber(win.Height) or 720
 
@@ -199,7 +206,8 @@ function M.Start(runId)
         if r then report, lastExtra = r, {} end
         local s = {RunId = runId, Tick = ticks, Active = state ~= nil, Jobs = #jobs, PointerHook = M.InputHook,
             PointerEvents = M.InputEvents or 0, Clicks = clicks, RightClicks = rclicks,
-            WindowClicks = M.WindowClicks or 0, LastWindow = M.LastWindow}
+            WindowClicks = M.WindowClicks or 0, LastWindow = M.LastWindow, ModsHook = M.ModsHook,
+            ClickMods = clickMods}
         for k, v in pairs(lastExtra) do s[k] = v end
         for k, v in pairs(report) do s[k] = v end
         s.LevelBounds = M.LevelBounds
@@ -307,7 +315,7 @@ function M.Start(runId)
         lastX, lastY = c[1], c[2]
         inSeq = inSeq + 1
         Ext.IO.SaveFile("wow-bg3/link/bg3input.bin",
-            string.pack("<c4I4ffffI4I4I4", "BGI2", inSeq, c[1], c[2], W, H, clicks, rclicks, inSeq))
+            string.pack("<c4I4ffffI4I4I4I4", "BGI3", inSeq, c[1], c[2], W, H, clicks, rclicks, clickMods, inSeq))
     end
     local function wowFlags()
         local raw = Ext.IO.LoadFile("wow-bg3/link/wowhover.bin")
@@ -418,17 +426,38 @@ function M.Start(runId)
                 if ev.Pressed == true then pcall(stopErrandNow) end
                 if ev.Pressed == false and not bg3Attack and not unheard then
                     if ev.Button == 1 then clicks = clicks + 1 else rclicks = rclicks + 1 end
+                    clickMods = heldMods
+                    M.LastClickMods = clickMods
                     publishInput(true)
                 end
                 if takes then pcall(function() e:PreventAction() end) end
         end
         M.RouteClick = route
+        -- The modifier keys held (see the header): every key event carries SDL's modifier state after
+        -- that key (SDL updates it before it sends the event), as the labels of SDLKeyModifier.
+        local function modBits(labels)
+            local bits = 0
+            for _, label in ipairs(labels or {}) do
+                local l = string.lower(tostring(label))
+                if l:find("shift") then bits = bits | 1 end
+                if l:find("ctrl") then bits = bits | 2 end
+                if l:find("alt") then bits = bits | 4 end
+            end
+            return bits
+        end
+        local okKeys, errKeys = pcall(function()
+            Ext.Events.KeyInput:Subscribe(function(e)
+                heldMods = modBits(e.Modifiers)
+                M.HeldMods = heldMods
+            end)
+        end)
+        M.ModsHook = okKeys and "KeyInput" or ("none: " .. tostring(errKeys))
         WOWBG3World = M -- for the harness's research chunks (Ext.Require does not resolve from them)
         local ok, err = pcall(function()
             Ext.Events.MouseButtonInput:Subscribe(route)
         end)
         M.InputHook = ok and "MouseButtonInput" or ("none: " .. tostring(err))
-        Ext.Log.Print("WOW-BG3 world: pointer hook " .. M.InputHook)
+        Ext.Log.Print("WOW-BG3 world: pointer hook " .. M.InputHook .. ", modifier keys " .. M.ModsHook)
     end
 
     -- Errands (see the header). placed: pool subgrid K -> {MinX, MinZ} of the 64 m square it was
