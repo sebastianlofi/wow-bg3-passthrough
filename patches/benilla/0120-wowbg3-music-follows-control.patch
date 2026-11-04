@@ -1,0 +1,106 @@
+WOW-BG3 benilla patch 0120: WoW's music follows the character the player controls.
+tav.bin flags bit 4 (controlled character in a BG3 fight, MusicRule.lua) decides the yield, in place of
+the hero's flag and any fight of the party's (0102's in_fight): a companion or a summon fighting elsewhere
+no longer stops WoW's track. Bit 8 (BG3's fight music shut): control left a running fight, so WoW's track
+starts at once instead of 8 s later, which is for BG3's win stinger.
+diff --git a/crates/benilla-app/src/sound/mod.rs b/crates/benilla-app/src/sound/mod.rs
+index f1cac79..bf7ffc8 100644
+--- a/crates/benilla-app/src/sound/mod.rs
++++ b/crates/benilla-app/src/sound/mod.rs
+@@ -252,10 +252,8 @@ fn feed_music_suppression(
+ /// Copy BG3's fight into [`SoundConfig::music_yield`] (world mode only). In `WorldStage::Stream`
+ /// like the cinematic's flag, so [`zone::zone_audio`] in `Present` sees it the same frame.
+ fn feed_music_yield(mut config: ResMut<SoundConfig>) {
+-    // Patch 0102: the fight too, from its pull: BG3's flag is the hero's and goes off while the fight
+-    // and its music go on.
+-    let fight = crate::wowbg3_lead::hide_self()
+-        && (crate::wowbg3_lead::bg3_combat() || crate::wowbg3_fight::in_fight());
++    // Patch 0120: the character the player controls, not the hero and not any fight of the party's.
++    let fight = crate::wowbg3_lead::hide_self() && crate::wowbg3_lead::bg3_music_fight();
+     if config.music_yield != fight {
+         config.music_yield = fight;
+     }
+diff --git a/crates/benilla-app/src/sound/zone.rs b/crates/benilla-app/src/sound/zone.rs
+index 09db9a7..de62c14 100644
+--- a/crates/benilla-app/src/sound/zone.rs
++++ b/crates/benilla-app/src/sound/zone.rs
+@@ -503,8 +503,10 @@ fn apply_music_yield(zone: &mut ZoneAudio, yielding: bool, now: f64) {
+         return;
+     }
+     if zone.zone_music != 0 {
+-        zone.next_track_at = Some(now + FIGHT_MUSIC_RESUME_SECS);
+-        info!("zone music: BG3's fight is over, back in {FIGHT_MUSIC_RESUME_SECS:.1}s");
++        // Patch 0120: control left a running fight: BG3's music is shut, no end of it to wait for.
++        let wait = if crate::wowbg3_lead::bg3_music_shut() { 0.0 } else { FIGHT_MUSIC_RESUME_SECS };
++        zone.next_track_at = Some(now + wait);
++        info!("zone music: BG3's fight music is over, back in {wait:.1}s");
+     }
+ }
+ 
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+index fb4609f..e4e706a 100644
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -293,11 +293,6 @@ pub(crate) fn mutes_swing(attacker: u64) -> bool {
+     SHARED.lock().is_ok_and(|s| s.held.contains(&attacker))
+ }
+ 
+-/// Patch 0102: a fight runs, from the pull to its end, whatever the hero's own state.
+-pub(crate) fn in_fight() -> bool {
+-    SHARED.lock().is_ok_and(|s| s.active)
+-}
+-
+ /// A fight mob's model: where BG3 has it and what it still has to play.
+ #[derive(Default)]
+ struct Held {
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 2295d30..24296db 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -193,6 +193,10 @@ static TAV_SEEN_MS: AtomicU64 = AtomicU64::new(0);
+ /// BG3 sets it when its window loses focus (its MuteSoundWhenNotFocused option) or its master
+ /// volume is 0.
+ static TAV_MUTED: AtomicBool = AtomicBool::new(false);
++/// Patch 0120: the character the player controls is in a BG3 fight (`tav.bin` flags bit 4).
++static TAV_MUSIC_FIGHT: AtomicBool = AtomicBool::new(false);
++/// Patch 0120: BG3's fight music is shut (`tav.bin` flags bit 8): a fight goes on, not the controlled one's.
++static TAV_MUSIC_SHUT: AtomicBool = AtomicBool::new(false);
+ 
+ /// Patch 0030: how old the last `tav.bin` record may be for its combat bit to count.
+ const COMBAT_FRESH_MS: u64 = 5000;
+@@ -208,6 +212,20 @@ pub(crate) fn bg3_combat() -> bool {
+         && TAV_COMBAT.load(Ordering::Relaxed)
+ }
+ 
++/// Patch 0120: BG3's music plays for the character the player controls, so WoW's zone music yields
++/// to it (`sound::SoundConfig::music_yield`). False with no record for 5 s.
++pub(crate) fn bg3_music_fight() -> bool {
++    let seen = TAV_SEEN_MS.load(Ordering::Relaxed);
++    seen != 0
++        && clock_ms().saturating_sub(seen) <= COMBAT_FRESH_MS
++        && TAV_MUSIC_FIGHT.load(Ordering::Relaxed)
++}
++
++/// Patch 0120: BG3's fight music is shut, so nothing of BG3's has to finish before WoW's track.
++pub(crate) fn bg3_music_shut() -> bool {
++    TAV_MUSIC_SHUT.load(Ordering::Relaxed)
++}
++
+ /// Patch 0030: BG3's own sound is muted (`tav.bin` flags bit 2). In world mode the
+ /// window played in is BG3's, so WoW's sound goes quiet with BG3's, as the reference mutes when
+ /// its own window is inactive. False with no record for 5 s.
+@@ -438,6 +456,14 @@ fn read_tav(
+         TAV_COMBAT.store(flags & 1 != 0, Ordering::Relaxed);
+         // Patch 0030: BG3's own sound muted (flags bit 2).
+         TAV_MUTED.store(flags & 2 != 0, Ordering::Relaxed);
++        // Patch 0120: the controlled character in a fight (bit 4), BG3's fight music shut (bit 8).
++        let fight = flags & 4 != 0;
++        let shut = flags & 8 != 0;
++        let was_fight = TAV_MUSIC_FIGHT.swap(fight, Ordering::Relaxed);
++        let was_shut = TAV_MUSIC_SHUT.swap(shut, Ordering::Relaxed);
++        if was_fight != fight || was_shut != shut {
++            info!("music: controlled character in a BG3 fight {fight}, BG3's fight music shut {shut}");
++        }
+     }
+     let at = wow_to_bevy(wow);
+     // Tav walking is the player at the keyboard too (WoW's idle clock).

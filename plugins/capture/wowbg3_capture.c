@@ -519,7 +519,7 @@ static void check_request(void) {
 #define RP_CAP (1u << 13)
 #define CB_CAP (1u << 13)
 
-typedef struct { uint64_t h; uint32_t id; VkFormat fmt; uint32_t w, hgt, depth, layers, mips; VkImageUsageFlags usage; VkSampleCountFlagBits samples; VkImageType type; } ImgInfo;
+typedef struct { uint64_t h; uint32_t id; VkFormat fmt; uint32_t w, hgt, depth, layers, mips; VkImageUsageFlags usage; VkSampleCountFlagBits samples; VkImageType type; uint64_t copy_src; } ImgInfo;
 typedef struct { uint64_t h; uint64_t image; } ViewInfo;
 typedef struct { uint64_t h; uint32_t n; uint64_t views[8]; } FbInfo;
 typedef struct { uint64_t h; uint32_t n; VkFormat fmts[8]; uint8_t load[8], store[8]; int32_t final[8], init[8]; } RpInfo;
@@ -1865,6 +1865,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(VkDevice device, const V
             i->id = ++g_img_ids; i->fmt = info->format; i->w = info->extent.width; i->hgt = info->extent.height;
             i->layers = info->arrayLayers; i->mips = info->mipLevels; i->usage = info->usage; i->samples = info->samples;
             i->depth = info->extent.depth; i->type = info->imageType;
+            __atomic_store_n(&i->copy_src, 0, __ATOMIC_RELAXED);  // a reused handle is a new image
         }
         pthread_mutex_unlock(&g_trace_lock);
     }
@@ -3143,7 +3144,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdCopyImage(VkCommandBuffer cb, VkImage
     DeviceData* d = device_for(cb);
     if (!d) return;
     if (g_trace_armed) log_transfer(cb, "COPY", (uint64_t)s, (uint64_t)t);
-    if (g_fxc_on) fxc_copy((uint64_t)s, (uint64_t)t);
+    fxc_copy((uint64_t)s, (uint64_t)t);
     d->CmdCopyImage(cb, s, sl, t, tl, n, r);
 }
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage t,

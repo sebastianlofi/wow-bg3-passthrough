@@ -717,20 +717,16 @@ static struct { uint64_t need, cut, frames, small; } g_clus;  // worker side (g_
 // The effects pass's colour target, per recording thread (BG3 records passes on several threads),
 // and the images copied from it right before (BG3 samples a copy of the scene for refraction).
 static __thread uint64_t t_pass_target;
-static struct { uint64_t src, dst; } g_copyof[64];
-static uint32_t g_ncopyof;
+// The source is kept on the destination's own image entry: BG3 rebuilds its render targets many times a
+// session, so any list of its own runs out, and a read of the copy with no source was a black refraction.
 static void fxc_copy(uint64_t src, uint64_t dst) {
-    pthread_mutex_lock(&g_fxl_lock);
-    uint32_t k = 0;
-    while (k < g_ncopyof && g_copyof[k].dst != dst) k++;
-    if (k == g_ncopyof) { if (g_ncopyof < 64) g_ncopyof++; else k = (uint32_t)(dst % 64); }
-    g_copyof[k].src = src; g_copyof[k].dst = dst;
-    pthread_mutex_unlock(&g_fxl_lock);
+    ImgInfo* i = g_img ? TABLE_FIND(g_img, IMG_CAP, dst, 0) : NULL;
+    if (i) __atomic_store_n(&i->copy_src, src, __ATOMIC_RELAXED);
 }
-static uint64_t fxc_copy_source(uint64_t dst) {  // g_fxl_lock held
-    for (uint32_t k = 0; k < g_ncopyof; k++) if (g_copyof[k].dst == dst) return g_copyof[k].src;
-    return 0;
-}
+static uint64_t fxc_copy_source(const ImgInfo* i) { return __atomic_load_n(&i->copy_src, __ATOMIC_RELAXED); }
+// Since the last log line: effects draws' bindings of the pass target's copy, and of an image of the
+// pass target's format and size that is not known as one (it replays as the neutral texture).
+static uint64_t g_scene_reads, g_scene_missed;
 
 // Static GPU buffer ranges already read (vertex meshes, quad index buffers): key -> bytes.
 typedef struct { uint64_t h; uint64_t buffer, off, size; uint8_t* data; } GpuCache;
@@ -867,12 +863,17 @@ static uint64_t fxc_texkey(uint64_t view) {
     ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, image, 0);
     if (!i) return 3;
     if (i->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) {
-        if (image == t_pass_target || (t_pass_target && fxc_copy_source(image) == t_pass_target)) return 2;
+        if (image == t_pass_target || (t_pass_target && fxc_copy_source(i) == t_pass_target)) {
+            __atomic_add_fetch(&g_scene_reads, 1, __ATOMIC_RELAXED);
+            return 2;
+        }
         if (i->fmt == VK_FORMAT_R32_SFLOAT && i->w == g_role.ew && i->hgt == g_role.eh) return 4;  // BG3's linear view depth
         // BG3's G-buffer normal (R16G16, the view-space normal encoded; projected decals read it).
         if (i->fmt == VK_FORMAT_R16G16_SFLOAT && i->w == g_role.ew && i->hgt == g_role.eh) return 6;
         // BG3's froxel light grid (B10G11R11 at froxel size; its shaders read value * 32 as light).
         if (i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (i->w != g_role.ew || i->hgt != g_role.eh)) return 5;
+        ImgInfo* pt = t_pass_target ? TABLE_FIND(g_img, IMG_CAP, t_pass_target, 0) : NULL;
+        if (pt && i->fmt == pt->fmt && i->w == pt->w && i->hgt == pt->hgt) __atomic_add_fetch(&g_scene_missed, 1, __ATOMIC_RELAXED);
         // Render targets the effects read (soft particles, fog volumes): logged once each, for mapping.
         static uint64_t said[64];
         static uint32_t nsaid;
@@ -880,8 +881,9 @@ static uint64_t fxc_texkey(uint64_t view) {
         for (uint32_t k = 0; k < nsaid; k++) if (said[k] == image) known = 1;
         if (!known && nsaid < 64) {
             said[nsaid++] = image;
-            logf_("fxcopy: effects read render target %llx id %u: format %d %ux%u layers %u mips %u usage %x", (unsigned long long)image,
-                  i->id, (int)i->fmt, i->w, i->hgt, i->layers, i->mips, (unsigned)i->usage);
+            logf_("fxcopy: effects read render target %llx id %u: format %d %ux%u layers %u mips %u usage %x, copy of %llx (pass target %llx)", (unsigned long long)image,
+                  i->id, (int)i->fmt, i->w, i->hgt, i->layers, i->mips, (unsigned)i->usage, (unsigned long long)fxc_copy_source(i),
+                  (unsigned long long)t_pass_target);
         }
         return 3;
     }
@@ -1356,11 +1358,22 @@ static int glow_draw(VkCommandBuffer cb, const Recipe* r) {
     __atomic_add_fetch(&g_glow_kept, 1, __ATOMIC_RELAXED);
     return 1;
 }
+// BG3's preview of a character at the spot an attack would move it to (hovering an attack's target):
+// the character's own meshes drawn again, blended and writing depth, by these two vertex shaders (bodies
+// and what they hold), and only while the preview shows. Nothing else in the effects pass draws with them.
+#define GHOST_BODY_VS 0x2fb86f28628f6e05ull
+#define GHOST_RIGID_VS 0x4d43855496e316eaull
+static int ghost_recipe(const Recipe* r) {
+    for (uint32_t k = 0; k < r->nstages; k++)
+        if (r->st[k].key == GHOST_BODY_VS || r->st[k].key == GHOST_RIGID_VS) return 1;
+    return 0;
+}
 static int fxc_figure_extra(VkCommandBuffer cb) {
     if ((!g_cc.fxhl && !g_cc.fxglow) || t_bind_cb != cb || !t_pipe) return 0;
     RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
     Recipe* r = ri ? ri->r : NULL;
     if (!r || !(r->have & 1)) return 0;
+    if (g_cc.fxglow && t_fxl_cb == cb && ghost_recipe(r)) { t_fxc_glow = 1; return 1; }
     if (g_cc.fxglow && glow_draw(cb, r)) return 1;
     return g_cc.fxhl && r->ncolor && r->blend[0][0] && r->ztest && !r->zwrite && !r->nskin;
 }
@@ -1400,10 +1413,12 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
         // Effects only: blended, depth-tested, not writing depth. The same pass also forward-renders
         // parts of BG3's level (opaque, or full-screen haze without a depth test); those stay BG3's.
         const int solid = fxc_solid(r);
-        if (!solid && (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite)) return 'N';
+        const int ghost = g_cc.fxglow && ghost_recipe(r);
+        if (ghost) t_fxc_glow = 1;  // its virtual texture binding, as a glow's
+        if (!solid && !ghost && (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite)) return 'N';
         // A character's or the level's mesh. A spell's solid piece shares its slice with the depth and
         // G-buffer passes BG3 draws it in as well, so this test is for the blended draws.
-        if (!solid && indexed && t_ib_cb == cb && mesh_draw(count, first, vo)) return 'M';
+        if (!solid && !ghost && indexed && t_ib_cb == cb && mesh_draw(count, first, vo)) return 'M';
         // Skinning tells a spell's solid piece from a body, not from what a stand-in holds: a sword or a
         // shield is rigid (unskinned) too. The hide list names those by their index buffers.
         if (solid && indexed && t_ib_cb == cb && hide_has(t_ib)) return 'M';
@@ -3343,6 +3358,8 @@ static void fxc_present(QueueData* q) {
             uint64_t cneed = g_clus.need, ccut = g_clus.cut, cframes = g_clus.frames;
             g_clus.need = g_clus.cut = g_clus.frames = 0;
             pthread_mutex_unlock(&g_fxj_data);
+            uint64_t sread = __atomic_exchange_n(&g_scene_reads, 0, __ATOMIC_RELAXED), smiss = __atomic_exchange_n(&g_scene_missed, 0, __ATOMIC_RELAXED);
+            if (sread || smiss) logf_("fxcopy: scene copy read by %llu bindings, %llu of the scene's format and size not known as its copy", (unsigned long long)sread, (unsigned long long)smiss);
             if (g_fxc.skin_draws || g_fxc.skin_full || cframes || g_fxc.unsup)
                 logf_("fxcopy: since the last line: %llu draws dropped (a texture the layer cannot export, benilla skips them);"
                       " skinned stream trimmed in %llu draws (%.1f KB instead of %.1f MB), %llu draws whole"

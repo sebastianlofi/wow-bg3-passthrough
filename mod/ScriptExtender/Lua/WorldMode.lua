@@ -16,7 +16,7 @@
 -- upkeep; back next to the hero at Stop) and WoW draws them like the hero (TavPlan.lua figures).
 -- Music: Start turns BG3's exploration music off (BG3's own Music_Off event
 -- through Osiris, StandIns.lua Music), so WoW's zone music and ambience play (benilla 0030); BG3's
--- combat music still plays in fights, and WoW's music yields to it while Tav is in a BG3 combat.
+-- combat music still plays in fights. Which of the two plays follows the controlled character: MusicRule.lua.
 -- Mapping (mirrored, BG3 renders left-handed): BG3 = Centre + (dy, dz, -dx) * 0.9144 for a WoW
 -- delta (dx, dy, dz) from WowOrigin.
 --
@@ -56,6 +56,7 @@ local TavPlan = Ext.Require("TavPlan.lua")
 local Session = Ext.Require("Session.lua") -- held game states (a save): keep world mode (F5 fix)
 local Hero = Ext.Require("Hero.lua") -- the hero: the character the player controls
 local Camp = Ext.Require("Camp.lua") -- the switch `camp` and a trip's numbers (the module runs on the server)
+local MusicRule = Ext.Require("MusicRule.lua") -- which game's music plays: tav.bin flags 4 and 8
 local Arena = Ext.Require("Arena.lua") -- which arena actions only the client carries out (Arena.ClientOnly)
 local YD = 0.9144
 local MAX_SECONDS = 900
@@ -241,7 +242,8 @@ function M.Start(runId)
     end
 
     -- Tav's position for benilla: "TAV1", seq, WoW xyz, BG3 xyz, yaw (BG3 radians), flags (1 Tav in a
-    -- BG3 combat, 2 BG3's own sound muted: WoW's goes quiet with it, benilla 0030), seq2.
+    -- BG3 combat, 2 BG3's own sound muted: WoW's goes quiet with it, benilla 0030, 4 the controlled character
+    -- in a BG3 fight, 8 BG3's fight music shut: WoW's music follows these, benilla 0120), seq2.
     -- A trip to camp (Camp.lua, switch `camp`): tav.bin keeps the spot the hero left and says "muted"
     -- (WoW's sound quiet, benilla 0030), so the WoW body stands still and the bridge holds its squares
     -- with no change on either side. A big jump is held back until Camp.lua has said what it is: one
@@ -296,6 +298,7 @@ function M.Start(runId)
         local okc, tb = pcall(function() return Hero.Entity().TurnBased end)
         if okc and tb and tb.IsInCombat_M then flags = flags | 1 end
         if bg3Muted() or camp.In then flags = flags | 2 end
+        flags = flags | MusicRule.Flags(runId, camp.In)
         local rec = string.pack("<c4I4fffffffI4I4", "TAV1", tavSeq, w[1], w[2], w[3], p[1], p[2], p[3], 0.0, flags, tavSeq)
         Ext.IO.SaveFile("wow-bg3/link/tav.bin", rec)
     end
@@ -705,6 +708,7 @@ function M.Start(runId)
         -- otherwise walk the WoW character toward that spot's mapping while Stop runs.
         state.Started = false
         placeBanner("Collapsed")
+        pcall(MusicRule.Release)
         local problems = {}
         for _, step in ipairs({
             function() arena({Action = "Lead", On = false}) end,
