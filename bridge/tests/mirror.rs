@@ -4,7 +4,7 @@ use wow_bg3_link::{
     bridge::{Combatant, CreatureStats, Fight},
     coords::{Basis, Point},
     handoff::{Handoff, ServerHandoff},
-    mirror::{KILL_RETRY_MS, Mapping, Mirror, bg3_forward, parse_mobs, parse_status},
+    mirror::{KILL_RETRY_MS, Mapping, Mirror, SETTLE_MS, bg3_forward, parse_mobs, parse_status},
 };
 
 const MOBS: &str = "seq 7\n\
@@ -307,6 +307,42 @@ fn a_dead_stand_ins_mob_counts_as_respawned_only_after_a_confirmed_kill_and_leav
         "Mobs": {GUID: {"Uuid": "u2", "Hp": 11, "MaxHp": 11}}}));
     m.note_respawns();
     assert!(m.respawned().is_empty());
+}
+
+#[test]
+fn a_respawned_mob_is_not_killed_by_its_old_corpse() {
+    const GUID: &str = "f130000000012b01";
+    let corpse = json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u1", "Hp": 0, "MaxHp": 11, "Dead": true, "HitByTav": true}}});
+    let without = "seq 9\nhero 0000000000000001 -8920 53 132 0.5 52 52 1\n";
+    let mut m = mirror();
+    // The fight's last blow: WoW confirms it, the fight's end settles the mob, it leaves the list.
+    m.status = parse_status(&corpse);
+    m.kill_event("WOWBG3 hp pull-1 F130000000012B01 killed 0 42");
+    m.settle([GUID.to_string()], 1_000);
+    m.mobs = parse_mobs(without);
+    m.note_respawns();
+    assert!(m.kills_due(1_000 + SETTLE_MS).is_empty());
+    // WoW respawns it past the settling time. The poll that first lists it still reads the corpse's
+    // status (the mod removes it only after this plan): the corpse goes, the kill does not.
+    let after = 180_000;
+    m.mobs = parse_mobs(MOBS);
+    m.note_respawns();
+    assert_eq!(m.respawned(), vec![GUID.to_string()]);
+    assert!(m.dead_unfought(after).is_empty());
+    assert!(m.kills_due(after).is_empty());
+    let mut rec = Record(Vec::new());
+    wow_bg3_link::bridge::kills_outside_fights(&mut m, &mut rec).unwrap();
+    assert!(rec.0.is_empty(), "free kill: {:?}", rec.0);
+    // Its new stand-in lives; that life's own one-blow kill is owed again.
+    m.status = parse_status(&json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u2", "Hp": 11, "MaxHp": 11}}}));
+    m.note_respawns();
+    assert!(m.kills_due(after + 1_000).is_empty());
+    m.status = parse_status(&json!({"Tav": {"Hp": 14, "MaxHp": 14},
+        "Mobs": {GUID: {"Uuid": "u2", "Hp": 0, "MaxHp": 11, "Dead": true, "HitByTav": true}}}));
+    m.note_respawns();
+    assert_eq!(m.kills_due(after + 2_000), vec![GUID.to_string()]);
 }
 
 #[test]

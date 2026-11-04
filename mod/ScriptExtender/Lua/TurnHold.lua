@@ -1,5 +1,5 @@
 -- TurnHold (server; party-multiplayer-design.md "Turn-based mode"). Design: turning on
--- BG3's turn-based mode outside combat stops every WoW creature and NPC near any party member in place
+-- BG3's turn-based mode outside combat stops every WoW creature and NPC near a member in that mode in place
 -- (hostile, neutral, friendly, critters, patrols mid-path, their WoW models too); turning it off lets
 -- them go. In combat nothing changes: the fight holds its own mobs as before.
 --
@@ -18,9 +18,10 @@
 -- Running or a held state (Session.lua: a save or a pause keeps the hold).
 -- The backend (today the fight bridge, bridge/src, with the server's hold verbs, vmangos 0026) turns it
 -- into "hold exactly these creatures", "let these go" and "release".
--- Guids: every WoW creature the party's world has loaded (mirror.json Mobs, WoW's own visible set
--- round the members, the list stand-ins are made from; no distance of ours) and every creature whose
--- stand-in BG3's turn-based mode froze (WOWBG3MirrorOwned, Mirrors.lua: stand-in uuid -> WoW guid).
+-- Guids: every WoW creature loaded round a member in turn-based mode (mirror.json Mobs, the list stand-ins
+-- are made from, within WoW's visibility of that member, M.Seen; the list also holds what other members
+-- far away see, and those stay free) and every creature whose stand-in BG3's turn-based mode froze
+-- (WOWBG3MirrorOwned, Mirrors.lua: stand-in uuid -> WoW guid).
 -- A creature in a fight stays the fight's. Seq goes up when that set changes too.
 -- Why not BG3's list alone: its tag covers only what is close. What BG3 freezes was measured: every
 -- character it takes into the party's turn-based mode gets the eoc::ftb::IsInFtbComponent tag (IsInFTB,
@@ -41,13 +42,15 @@
 -- models (M.StartClient): someone in turn-based mode and nobody's turn (IsCurrentTurn) for
 -- M.WorldTicks checks in a row is the world's turn. It writes wow-bg3/link/ftbturn.txt, "<seq> world" or
 -- "<seq> party", on a change; while it says world this file releases the hold (Hold false) and holds
--- again when the party's turn comes back.
+-- again when the party's turn comes back. A companion can be in the mode without the hero, so the client
+-- goes by link/ftbparty.txt, this file's word on whether any member is ("1" or "0").
 local M = {}
 local Hero = Ext.Require("Hero.lua")
 local Session = Ext.Require("Session.lua")
 
 local OUT = "wow-bg3/link/turnhold.json"
 local YD = 0.9144
+M.Seen = 100   -- WoW yards round a member: WoW's visibility on continents (mirror.rs FEED_RANGE)
 M.Move = 4.0   -- metres a member walks before the points are sent again
 M.Every = 6    -- ticks between checks
 M.Keep = 150   -- ticks between heartbeats while held (about 5 s)
@@ -132,9 +135,10 @@ local function bg3Frozen(members)
     return guids, census
 end
 
--- What the hold takes (see the header): the creatures BG3 froze plus WoW's loaded ones outside a fight;
+-- What the hold takes (see the header): the creatures BG3 froze plus the ones loaded round a member in
+-- the mode and outside a fight;
 -- sorted, so the key below only changes when the set does. Second value: how many WoW has loaded.
-local function heldGuids(frozen)
+local function heldGuids(frozen, members)
     local seen, out = {}, {}
     local function add(g)
         if not seen[g] then seen[g] = true; out[#out + 1] = g end
@@ -144,9 +148,17 @@ local function heldGuids(frozen)
     local mobs = plan and plan.Active == true and type(plan.Mobs) == "table" and plan.Mobs or {}
     local fight = {}
     for _, g in ipairs(plan and type(plan.Fight) == "table" and plan.Fight or {}) do fight[g] = true end
+    local reach = (M.Seen * YD) ^ 2
+    local function seen(p)
+        if type(p) ~= "table" or #p ~= 3 then return false end
+        for _, b in ipairs(members) do
+            if (p[1] - b.Bg3[1]) ^ 2 + (p[2] - b.Bg3[2]) ^ 2 + (p[3] - b.Bg3[3]) ^ 2 <= reach then return true end
+        end
+        return false
+    end
     for _, m in ipairs(mobs) do
         local g = m.Guid
-        if type(g) == "string" and g:match("^%x+$") and not fight[g] then add(g) end
+        if type(g) == "string" and g:match("^%x+$") and not fight[g] and seen(m.Pos) then add(g) end
     end
     table.sort(out)
     return out, #mobs
@@ -209,8 +221,19 @@ function M.Start(runId)
         Ext.Utils.Print("WOW-BG3 turnhold: released (" .. why .. ")")
     end
 
+    -- Whether any member is in the mode, for the client half (see the header).
+    local partyWord
+    local function sayParty(on)
+        local word = on and "1" or "0"
+        if word ~= partyWord then
+            partyWord = word
+            Ext.IO.SaveFile("wow-bg3/link/ftbparty.txt", word)
+        end
+    end
+
     -- A new Lua session (game start or a load): nothing held from before.
     write({})
+    sayParty(false)
     -- The world's turn (see the header): the client's word, written in this session.
     local turnSeen = Ext.IO.LoadFile("wow-bg3/link/ftbturn.txt")
     local function worldTurn()
@@ -247,6 +270,7 @@ function M.Start(runId)
                     end
                 end
             end
+            sayParty(#members > 0)
             if #members == 0 then
                 release(M.On and "nobody in turn-based mode out of combat" or "off")
                 return
@@ -258,7 +282,7 @@ function M.Start(runId)
             end
             local bg3, census = bg3Frozen(members)
             stats.Bg3 = census
-            local guids, loaded = heldGuids(bg3)
+            local guids, loaded = heldGuids(bg3, members)
             stats.Loaded = loaded
             local key = table.concat(guids, ",")
             local other = key ~= frozenKey
@@ -286,18 +310,17 @@ M.WorldTicks = 3 -- checks (every 2 ticks)
 function M.StartClient(runId)
     local Probe = Ext.Require("ActionProbe.lua")
     local ticks, quiet, said, seq = 0, 0, nil, 0
-    -- BG3's UI is read only in a running game and only while the hero is in turn-based mode (her
-    -- IsInFTB tag): reading the view models every tick through the splash screen crashed BG3 in the
-    -- Script Extender's UI bridge (harness).
-    local function heroInFtb()
-        local e = Ext.Entity.Get(Hero.Uuid())
-        return e ~= nil and e.IsInFTB ~= nil
+    -- BG3's UI is read only in a running game and only while a member is in turn-based mode (the
+    -- server half's word): reading the view models every tick through the splash screen crashed BG3 in
+    -- the Script Extender's UI bridge (harness).
+    local function memberInFtb()
+        return Ext.IO.LoadFile("wow-bg3/link/ftbparty.txt") == "1"
     end
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
         if ticks % 2 ~= 0 then return end
         if Ext.Utils.GetGameState() ~= "Running" then return end
-        local okH, inFtb = pcall(heroInFtb)
+        local okH, inFtb = pcall(memberInFtb)
         if not (okH and inFtb) then
             quiet = 0
             if said ~= "party" and said ~= nil then

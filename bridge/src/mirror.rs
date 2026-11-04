@@ -1004,12 +1004,14 @@ impl Mirror {
         out.into_iter().map(|m| m.guid.clone()).collect()
     }
     /// Mirrored mobs whose stand-in BG3 killed outside any fight (one blow out of combat) while
-    /// the WoW mob still lives: the kill still goes to the server.
+    /// the WoW mob still lives: the kill still goes to the server. Not a corpse whose death WoW has
+    /// already confirmed: a listed mob with such a corpse has respawned, and the corpse stays in
+    /// `status` until the mod has read `WowRespawned` and removed it ([`Mirror::respawned`]).
     pub fn dead_unfought(&self, now: u64) -> Vec<String> {
         self.mobs
             .mobs
             .iter()
-            .filter(|m| !self.settled_now(&m.guid, now))
+            .filter(|m| !self.settled_now(&m.guid, now) && !self.wow_killed.contains_key(&m.guid))
             .filter(|m| {
                 self.status
                     .mobs
