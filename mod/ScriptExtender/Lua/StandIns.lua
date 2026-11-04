@@ -42,7 +42,7 @@
 --   Face     {Target, Dir = {x, z}}              harness (facing research): a created
 --                                                stand-in looks along Dir (its -z, through the
 --                                                Steering component, as Mirrors.lua turns them)
---   Teleport {Target, Position, Snap}            Osiris TeleportToPosition of the disposable character
+--   Teleport {Target, Position, Near, Snap}      Osiris TeleportToPosition of the disposable character
 --                                                or a created stand-in to the void arena (approved
 --                                                design, void step 4); the first teleport
 --                                                records where it stood
@@ -451,17 +451,38 @@ function M.Start(runId)
                     p = c.Position
                     assert(type(p) == "table" and #p == 3, "Position required")
                     for i = 1, 3 do assert(type(p[i]) == "number" and p[i] == p[i], "Position must be numbers") end
-                    local anchor = home[Hero.Uuid()] or vec(Ext.Entity.Get(Hero.Uuid()).Transform.Transform.Translate)
+                    -- Measured from what the teleport is relative to: Near, the void spot world mode works around
+                    -- (its Start and a move send their Centre), else the hero's home or position. The hero's home
+                    -- is where the save left her, and BG3's camp (about 384, 6, -752) lies 2.99 to 3.05 km from the
+                    -- Centre: a camp save's Start passed this by 11 m, from camp's east side it fails.
+                    local anchor, what = home[Hero.Uuid()] or vec(Ext.Entity.Get(Hero.Uuid()).Transform.Transform.Translate),
+                        "the disposable character's home"
+                    local near = nil
+                    if c.Near ~= nil then
+                        local n = c.Near
+                        assert(type(n) == "table" and #n == 3 and tonumber(n[1]) and tonumber(n[3]), "Near is a point {X, Y, Z}")
+                        near = {tonumber(n[1]), tonumber(n[2]) or 0, tonumber(n[3])}
+                        anchor, what = near, "Near"
+                    end
                     local dx, dz = p[1] - anchor[1], p[3] - anchor[3]
-                    assert(math.sqrt(dx * dx + dz * dz) <= VOID_RADIUS, "Teleport target too far from the disposable character's home")
+                    assert(math.sqrt(dx * dx + dz * dz) <= VOID_RADIUS, "Teleport target too far from " .. what)
                     if not home[uuid] then
-                        home[uuid] = inVoid(here) and {LEVEL_SPOT[1], LEVEL_SPOT[2], LEVEL_SPOT[3]} or here
+                        -- In the void: near world mode's Centre when the caller says where that is (as Camp.lua tells
+                        -- a void jump), else LEVEL_REACH from the level's spot. That far test calls the east of camp
+                        -- void (x 420, -790 is 606 m from the spot), and Stop would then send the hero to LEVEL_SPOT.
+                        local void
+                        if near then
+                            void = math.sqrt((here[1] - near[1]) ^ 2 + (here[3] - near[3]) ^ 2) < Ext.Require("Camp.lua").VOID_REACH
+                        else
+                            void = inVoid(here)
+                        end
+                        home[uuid] = void and {LEVEL_SPOT[1], LEVEL_SPOT[2], LEVEL_SPOT[3]} or here
                         hpHome[uuid] = q(function() local h = Ext.Entity.Get(uuid).Health; return {h.Hp, h.MaxHp} end)
                     end
                 end
                 -- Osiris: source, x, y, z, event, linked characters, party followers, summons, leave combat, snap to ground.
                 -- The hero's summons come along, BG3's default (its story helpers pass summons 1): with 0 a familiar
-                -- stayed where the save had it, off WoW's ground, at every world mode Start after a load (2026-11-02).
+                -- stayed where the save had it, off WoW's ground, at every world mode Start after a load.
                 local summons = uuid == Hero.Uuid() and 1 or 0
                 Osi.TeleportToPosition(uuid, p[1], p[2], p[3], "", 0, 0, summons, 0, c.Snap == false and 0 or 1)
                 -- On the log's clock: the server stopped for seconds soon after some of these (plugin op 70's trace).

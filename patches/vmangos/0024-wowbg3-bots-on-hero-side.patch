@@ -1,0 +1,295 @@
+WOW-BG3 vmangos patch 0024: a party is one WoW side, its owner's.
+
+A party bot of another side than its owner (seen in play: Razor Hill's guards attacked an orc
+hero's party for its Human Shadowheart; "keep race, take the faction of the main character") keeps its
+race, class and quests and, while it is the owner's bot, borrows the owner's side: at its login (before it
+is put on its map) and on every party tick, vmangos' Player::SetFactionForRace with the owner's race (team
+and faction template), the owner's faction template itself (after `faction`, 0009), the owner's standing
+and flags with every reputation faction (in memory), and the owner's forced reactions. Guards, towns,
+attackability, PvP areas and the per-member feed's REACT then treat it as the owner. Its own reputation is
+not saved over while it borrows; on its owner's side again it gets its own back. A bot of its owner's side
+is left as it is. `.wowbg3 side MEMBER` (read only) answers `WOWBG3 side MEMBER RACE TEAM FACTION BORROWED`.
+
+diff --git a/src/game/Handlers/CharacterHandler.cpp b/src/game/Handlers/CharacterHandler.cpp
+index 2176725..bae3292 100644
+--- a/src/game/Handlers/CharacterHandler.cpp
++++ b/src/game/Handlers/CharacterHandler.cpp
+@@ -573,6 +573,7 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder *holder)
+     if (!pCurrChar->IsAlive())
+         pCurrChar->SendCorpseReclaimDelay(true);
+ 
++    WowBg3::OnPartyBotLogin(pCurrChar);                     // WOW-BG3 0024: a party bot takes its hero's side
+     pCurrChar->SendInitialPacketsBeforeAddToMap();
+     GetMasterPlayer()->SendInitialActionButtons();
+ 
+diff --git a/src/game/Objects/Player.cpp b/src/game/Objects/Player.cpp
+index 7b2a7d5..1868ee9 100644
+--- a/src/game/Objects/Player.cpp
++++ b/src/game/Objects/Player.cpp
+@@ -32,6 +32,7 @@
+ #include "Opcodes.h"
+ #include "SpellMgr.h"
+ #include "World.h"
++#include "WowBg3Party.h"
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
+ #include "UpdateMask.h"
+@@ -16523,7 +16524,8 @@ void Player::SaveToDB(bool online, bool force)
+     _SaveSpellCooldowns();
+     _SaveAuras();
+     _SaveSkills();
+-    m_reputationMgr.SaveToDB();
++    if (!WowBg3::BorrowsSide(this))                         // WOW-BG3 0024: a party bot's borrowed side
++        m_reputationMgr.SaveToDB();
+     m_honorMgr.Save();
+ 
+     // Systeme de phasing
+diff --git a/src/game/ReputationMgr.h b/src/game/ReputationMgr.h
+index e1977e2..0b6497c 100644
+--- a/src/game/ReputationMgr.h
++++ b/src/game/ReputationMgr.h
+@@ -99,6 +99,12 @@ class ReputationMgr
+             ForcedReactions::const_iterator forceItr = m_forcedReactions.find(factionTemplateEntry->faction);
+             return forceItr != m_forcedReactions.end() ? &forceItr->second : nullptr;
+         }
++        // WOW-BG3 (0024): the same by faction id (a party bot takes its owner's ranks).
++        ReputationRank const* GetForcedRankIfAny(uint32 factionId) const
++        {
++            ForcedReactions::const_iterator forceItr = m_forcedReactions.find(factionId);
++            return forceItr != m_forcedReactions.end() ? &forceItr->second : nullptr;
++        }
+ 
+     public:                                                 // modifiers
+         bool SetReputation(FactionEntry const* factionEntry, int32 standing)
+diff --git a/src/game/WowBg3Party.cpp b/src/game/WowBg3Party.cpp
+index e6b8020..efa8b19 100644
+--- a/src/game/WowBg3Party.cpp
++++ b/src/game/WowBg3Party.cpp
+@@ -43,6 +43,7 @@
+ #include "Player.h"
+ #include "PlayerBots/PlayerBotAI.h"
+ #include "PlayerBots/PlayerBotMgr.h"
++#include "ReputationMgr.h"
+ #include "SharedDefines.h"
+ #include "Utilities/Random.h"
+ #include "World.h"
+@@ -56,6 +57,7 @@
+ #include <cstdlib>
+ #include <map>
+ #include <mutex>
++#include <set>
+ #include <shared_mutex>
+ #include <string>
+ #include <unordered_map>
+@@ -336,6 +338,119 @@ namespace
+         group->AddMember(bot->GetObjectGuid(), bot->GetName());
+     }
+ 
++    // ---- the party's side (0024) ----
++    //
++    // A party is one WoW side, its owner's (seen in play: Horde guards attacked an orc hero's party
++    // for its Human Shadowheart; "keep race, take the faction of the main character"). A bot of another side
++    // keeps its race, class and quests and, while it is the owner's bot, borrows the owner's side: vmangos'
++    // own Player::SetFactionForRace with the owner's race (team: PvP areas, rest), the owner's faction
++    // template (it differs after `faction`, 0009), the owner's standing and flags (at war, ...) with every
++    // reputation faction (in memory, as vmangos' race change moves them, ChangeReputationsForRace), and the
++    // owner's forced reactions. Guards, towns, attackability and the per-member feed then treat it as the
++    // owner. Its own reputation is kept aside and never saved over (Player::SaveToDB skips the reputation of
++    // a bot that borrows: BorrowsSide); a login starts from its own side, and on the owner's side again it
++    // gets its own back. Forced reactions alone are not enough: a forced neutral rank makes a neutral
++    // faction's NPCs attackable (WorldObject::IsValidAttackTarget skips the at-war check for a forced rank).
++    struct Borrowed
++    {
++        std::map<RepListID, std::pair<int32, uint32>> own;  // the bot's own standing and flags per reputation
++        std::set<uint32> forced;                            // faction ids forced as the owner's are
++    };
++    std::mutex g_sideLock;
++    std::unordered_map<uint64, Borrowed> g_side;            // bot guid -> what it borrowed
++
++    bool OtherSide(Player* owner, Player* bot)
++    {
++        return Player::TeamForRace(bot->GetRace()) != owner->GetTeam() ||
++            owner->GetFactionTemplateId() != Player::GetFactionForRace(owner->GetRace());  // the owner's `faction`
++    }
++
++    void TakeOwnerSide(Player* owner, Player* bot)
++    {
++        uint64 const key = bot->GetObjectGuid().GetRawValue();
++        ReputationMgr& rep = bot->GetReputationMgr();
++        ReputationMgr const& theirs = owner->GetReputationMgr();
++        bool forcedChanged = false, newTeam = false;
++        {
++            std::lock_guard<std::mutex> lock(g_sideLock);
++            auto it = g_side.find(key);
++            if (!OtherSide(owner, bot))
++            {
++                if (it == g_side.end())
++                    return;
++                // Its own side again: its own standings, flags and faction.
++                for (auto const& o : it->second.own)
++                    if (FactionState* st = const_cast<FactionState*>(rep.GetState(o.first)))
++                    {
++                        st->Standing = o.second.first;
++                        st->Flags = o.second.second;
++                        st->needSend = true;
++                    }
++                for (uint32 id : it->second.forced)
++                    rep.ApplyForceReaction(id, REP_NEUTRAL, false);
++                forcedChanged = !it->second.forced.empty();
++                g_side.erase(it);
++                newTeam = bot->GetTeam() != Player::TeamForRace(bot->GetRace());
++                bot->SetFactionForRace(bot->GetRace());
++            }
++            else
++            {
++                if (it == g_side.end())
++                {
++                    it = g_side.emplace(key, Borrowed()).first;
++                    for (auto const& kv : rep.GetStateList())
++                        it->second.own[kv.first] = { kv.second.Standing, kv.second.Flags };
++                }
++                newTeam = bot->GetTeam() != owner->GetTeam();
++                if (newTeam)
++                    bot->SetFactionForRace(owner->GetRace());
++                if (bot->GetFactionTemplateId() != owner->GetFactionTemplateId())
++                    bot->SetFactionTemplateId(owner->GetFactionTemplateId());
++                for (auto const& kv : rep.GetStateList())
++                {
++                    FactionEntry const* f = sObjectMgr.GetFactionEntry(kv.second.ID);
++                    FactionState const* o = f ? theirs.GetState(f) : nullptr;
++                    if (!o)
++                        continue;
++                    // The owner's reputation value: the bot's Standing is counted from its own race's base.
++                    int32 const standing = theirs.GetReputation(f) - rep.GetBaseReputation(f);
++                    if (kv.second.Standing != standing || kv.second.Flags != o->Flags)
++                    {
++                        FactionState* st = const_cast<FactionState*>(&kv.second);
++                        st->Standing = standing;
++                        st->Flags = o->Flags;
++                        st->needSend = true;
++                    }
++                }
++                for (auto const& kv : sObjectMgr.GetFactionMap())
++                {
++                    FactionEntry const& f = kv.second;
++                    if (f.reputationListID < 0)
++                        continue;
++                    ReputationRank const* want = theirs.GetForcedRankIfAny(f.ID);
++                    ReputationRank const* mine = rep.GetForcedRankIfAny(f.ID);
++                    bool const had = it->second.forced.count(f.ID) != 0;
++                    if (want && (!had || !mine || *mine != *want))
++                    {
++                        rep.ApplyForceReaction(f.ID, *want, true);
++                        it->second.forced.insert(f.ID);
++                        forcedChanged = true;
++                    }
++                    else if (!want && had)
++                    {
++                        rep.ApplyForceReaction(f.ID, REP_NEUTRAL, false);
++                        it->second.forced.erase(f.ID);
++                        forcedChanged = true;
++                    }
++                }
++            }
++        }
++        if (forcedChanged)
++            rep.SendForceReactions();
++        if (newTeam && bot->IsInWorld())
++            bot->UpdateZone(bot->GetZoneId(), bot->GetAreaId());    // PvP area and rest by its team now
++    }
++
+     void FollowLevel(Player* owner, Player* bot)
+     {
+         if (!owner || !bot || bot->GetLevel() == owner->GetLevel())
+@@ -769,6 +884,27 @@ namespace
+     }
+ 
+     // near MEMBER [RANGE]
++    // side MEMBER (0024): the member's WoW side as the server holds it now (read only):
++    // `WOWBG3 side MEMBER RACE TEAM FACTION BORROWED` (TEAM alliance|horde|none, FACTION its faction template,
++    // BORROWED how many reputation factions hold its owner's standing: 0 on its own side).
++    void Side(Player* owner, std::string const& name, Out& out)
++    {
++        char const* why = nullptr;
++        Player* m = Member(owner, name, why);
++        if (!m)
++            return out.Add("WOWBG3 side " + name + " refused " + why);
++        size_t forced = 0;
++        {
++            std::lock_guard<std::mutex> lock(g_sideLock);
++            auto const it = g_side.find(m->GetObjectGuid().GetRawValue());
++            if (it != g_side.end())
++                forced = it->second.own.size();
++        }
++        Team const team = m->GetTeam();
++        out.Add(Fmt("WOWBG3 side %s %u %s %u %u", name.c_str(), uint32(m->GetRace()),
++            team == ALLIANCE ? "alliance" : team == HORDE ? "horde" : "none", m->GetFactionTemplateId(), uint32(forced)));
++    }
++
+     void Near(Player* owner, std::vector<std::string> const& a, Out& out)
+     {
+         std::string const head = "WOWBG3 near " + a[2] + " ";
+@@ -1156,6 +1292,28 @@ bool IsPartyBot(WorldSession const* session)
+     return e && e->ai && dynamic_cast<PartyBotPuppetAI*>(e->ai.get()) != nullptr;
+ }
+ 
++bool BorrowsSide(Player const* player)
++{
++    std::lock_guard<std::mutex> lock(g_sideLock);
++    return !g_side.empty() && g_side.count(player->GetObjectGuid().GetRawValue()) != 0;
++}
++
++void OnPartyBotLogin(Player* bot)
++{
++    if (!bot || !IsPartyBot(bot->GetSession()))
++        return;
++    {
++        std::lock_guard<std::mutex> lock(g_sideLock);       // a new Player: nothing borrowed yet
++        g_side.erase(bot->GetObjectGuid().GetRawValue());
++    }
++    ObjectGuid const og = BotOwner(bot);
++    if (Player* owner = og.IsEmpty() ? nullptr : ObjectAccessor::FindPlayer(og))
++        TakeOwnerSide(owner, bot);
++    else
++        sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "WOWBG3: party bot %s logs in without its owner online: its own side until the owner's next tick",
++            bot->GetName());
++}
++
+ bool NearParty(Player* p, WorldObject const* target, float range)
+ {
+     if (p->IsWithinDistInMap(target, range))
+@@ -1210,6 +1368,8 @@ bool ExecuteParty(Player* p, std::vector<std::string> const& a, std::vector<std:
+         View(p, a[2], out);
+     else if (verb == "near" && (a.size() == 3 || a.size() == 4))
+         Near(p, a, out);
++    else if (verb == "side" && a.size() == 3)
++        Side(p, a[2], out);
+     else if (verb == "feed" && a.size() >= 3 && a.size() <= 6)
+         FeedVerb(p, a, out);
+     else if (verb == "health" && a.size() == 5)
+@@ -1524,6 +1684,7 @@ void UpdateParty(uint32 diff)
+                 }
+                 if (owner && m && m->IsInWorld() && !m->IsBeingTeleported())
+                 {
++                    TakeOwnerSide(owner, m);                // the owner's reputation or `faction` changed
+                     if (b.follow)
+                         FollowLevel(owner, m);
+                     if (!m->GetGroup() || m->GetGroup() != owner->GetGroup())
+diff --git a/src/game/WowBg3Party.h b/src/game/WowBg3Party.h
+index ab1d740..a68c67e 100644
+--- a/src/game/WowBg3Party.h
++++ b/src/game/WowBg3Party.h
+@@ -59,6 +59,13 @@ namespace WowBg3
+     // True for a session that runs one of our party bots (saved like a player).
+     bool IsPartyBot(WorldSession const* session);
+ 
++    // A party bot logging in (loaded, not yet on its map): it takes its owner's WoW side (0024).
++    // Nothing for any other character.
++    void OnPartyBotLogin(Player* bot);
++
++    // True while a party bot borrows its owner's side (0024): its own reputation is not saved over.
++    bool BorrowsSide(Player const* player);
++
+     // The owner itself (`self` or its name) or one of its online bots; else nullptr and why
+     // (`unknown`, `offline`).
+     Player* FindMember(Player* owner, std::string const& name, char const*& why);

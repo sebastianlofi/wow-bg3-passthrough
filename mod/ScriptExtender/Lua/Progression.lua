@@ -165,7 +165,6 @@ function M.RefreshWowLevel()
     if v.Level < 1 then return false end
     if pool.WowLevel ~= v.Level then
         log(string.format("WoW level %s -> %d (%s)", tostring(pool.WowLevel), v.Level, tostring(v.Character)))
-        if pool.WowLevel and v.Level > pool.WowLevel then M.ding = true end
         pool.WowLevel = v.Level
         savePool()
     end
@@ -567,14 +566,6 @@ function M.Popup(id)
     savePool()
     log("popup waits: " .. id)
 end
-local function ups(n) return string.format("%d level-up%s", n, n == 1 and "" or "s") end
--- What the next WoW level gives, for the notice below; nil at the top.
-local function nextLine()
-    local l = M.WowLevel()
-    if l >= M.WOW_MAX then return nil end
-    local at = math.max(l + 1, M.FIRST_EARN)
-    return string.format("Next: WoW level %d, %s.", at, ups(isDouble(at) and 2 or 1))
-end
 local dialogs, popupOpen, popupAt, calm = {}, nil, 0, 0
 local CALM = 3   -- checks in a row (30 ticks each) with nothing in the way before one opens
 local STUCK = 900 -- checks after which an open box without BG3's MessageBoxClosed counts as closed: the next opens over it
@@ -622,20 +613,10 @@ function M.PopupTick(party)
     calm = blocked and 0 or calm + 1
     sinceLoad = sinceLoad + 1
     if sinceLoad < AFTER_LOAD then return end
+    -- Only the popups above open here: no notice of the WoW level follows them.
     local id = pool.Queue[1]
-    if calm < CALM then return end
+    if not id or calm < CALM then return end
     local host = q(Osi.GetHostCharacter)
-    if not id then
-        -- A new WoW level, once nothing is in the way: BG3's small notice, no box to close.
-        if M.ding and host then
-            M.ding = false
-            local text = string.format("WoW level %d of %d: %s waiting. %s", M.WowLevel(), M.WOW_MAX,
-                ups(math.max(0, M.Available())), nextLine() or "")
-            log("notice: " .. text)
-            pcall(Osi.ShowNotification, host, text)
-        end
-        return
-    end
     if not host or not POPUPS[id] then
         if not POPUPS[id] then popupDone(id) end
         return
@@ -757,7 +738,6 @@ function M.Start(runId)
             session = true
             readSwitch()
             dialogs, popupOpen, calm, appliedSlots, sinceLoad, overJoin = {}, nil, 0, nil, 0, {}
-            M.ding = false
             for _, r in ipairs(q(function() return Osi.DB_GLO_CompanionSwapDialogue:Get(nil) end) or {}) do SWAP_DIALOGS[uuidOf(r[1])] = true end
             local had = loadPool()
             for _, u in ipairs(players()) do pcall(upsOf, u) end -- every player counted (levels it has)

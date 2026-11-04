@@ -1,0 +1,149 @@
+WOW-BG3 vmangos patch 0026: hold by guid, for exactly the creatures BG3's turn-based mode froze.
+
+BG3 decides per character which ones its turn-based mode takes in (measured in BG3: the IsInFTB tag and
+time factor 0, up to about 40 m but not by distance alone), so the radius hold of 0010 held creatures BG3 left
+free. Now:
+
+- `hold HID guids G1,G2,...` holds those creatures (on the sender's map) under HID, the same hold as the radius
+  form (hidden stun, renewed by every `hold HID`, let go by `unhold HID`, logout or an hour without a
+  renewal); already held ones stay. Reply: `WOWBG3 hold HID ok NEW TOTAL SKIPPED GONE` (GONE: not on the map).
+- `hold HID drop G1,G2,...` lets those go again unless a fight or another of the player's holds has them.
+  Reply: `WOWBG3 hold HID dropped N` or `unknown`.
+- The radius form is unchanged; both share HoldCreatures. A line takes as many guids as fit in 255 characters.
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index f3b881c..f10a1d4 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -50,6 +50,7 @@
+ #include "World.h"
+ #include "WorldSession.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cctype>
+ #include <cmath>
+@@ -1326,6 +1327,8 @@ namespace
+             out.push_back(c);
+     }
+ 
++    void HoldCreatures(Player* p, std::string const& hid, std::vector<Creature*> const& found, std::string const& head, Out& out);
++
+     // hold HID R SPOT [SPOT...]: SPOT is a party member's name or X,Y,Z on the sender's map.
+     // Every living creature and NPC within R yards of a spot is held in place (the hidden stun
+     // of 0008, no AI, patrols stop mid-path) until `unhold HID`, logout or an hour without a
+@@ -1371,7 +1374,13 @@ namespace
+                 CollectAround(m->GetMap(), m->GetPositionX(), m->GetPositionY(), m->GetPositionZ(), float(r), found);
+             }
+         }
++        HoldCreatures(p, hid, found, head, out);
++    }
+ 
++    // 0026: the creatures a hold takes in (`hold HID R ...` round spots, `hold HID guids ...` by guid):
++    // each held in place under HID (the hidden stun), unless another player's fight holds it.
++    void HoldCreatures(Player* p, std::string const& hid, std::vector<Creature*> const& found, std::string const& head, Out& out)
++    {
+         ObjectGuid const pg = p->GetObjectGuid();
+         uint32 const now = WorldTimer::getMSTime();
+         std::vector<Creature*> fresh;
+@@ -1507,6 +1516,90 @@ namespace
+         out.Add("WOWBG3 unhold " + hid + " ok " + std::to_string(releases.size()));
+     }
+ 
++    // 0026: hold HID guids G1,G2,... holds exactly those creatures (BG3's turn-based mode froze their
++    // stand-ins), on the sender's map, under HID: the same hold as the radius form (renewed by every
++    // `hold HID`, let go by `unhold HID`, logout or an hour without a renewal). Already held ones stay.
++    // hold HID drop G1,G2,... lets those go again (BG3 let their stand-ins go), unless a fight or
++    // another of this player's holds has them. A line takes as many guids as fit in a chat line.
++    bool ParseGuidList(std::string const& list, std::vector<ObjectGuid>& out)
++    {
++        for (std::string const& item : Split(list, ','))
++        {
++            ObjectGuid g;
++            if (!ParseGuid(item, g))
++                return false;
++            out.push_back(g);
++        }
++        return !out.empty();
++    }
++
++    void HoldGuids(Player* p, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const hid = a[2];
++        std::string const head = "WOWBG3 hold " + hid + " ";
++        std::vector<ObjectGuid> guids;
++        if (!ValidId(hid) || a.size() != 5 || !ParseGuidList(a[4], guids))
++            return out.Add(head + "refused usage");
++        if (guids.size() > AREA_MAX_MOBS)
++            return out.Add(head + "refused toomany");
++        std::vector<Creature*> found;
++        uint32 gone = 0;
++        for (ObjectGuid g : guids)
++        {
++            Creature* c = p->GetMap()->GetAnyTypeCreature(g);
++            if (c)
++                found.push_back(c);
++            else
++                ++gone;                                     // not on this map (any more)
++        }
++        Out held;
++        HoldCreatures(p, hid, found, head, held);
++        for (std::string& l : held.lines)
++            out.Add(l + " " + std::to_string(gone));
++    }
++
++    void DropGuids(Player* p, std::vector<std::string> const& a, Out& out)
++    {
++        std::string const hid = a[2];
++        std::string const head = "WOWBG3 hold " + hid + " ";
++        std::vector<ObjectGuid> guids;
++        if (!ValidId(hid) || a.size() != 5 || !ParseGuidList(a[4], guids))
++            return out.Add(head + "refused usage");
++        std::vector<Release> releases;
++        bool known = false;
++        {
++            WriteLock lock(g_lock);
++            auto fit = g_fighters.find(p->GetObjectGuid());
++            if (fit != g_fighters.end())
++            {
++                Fighter& f = fit->second;
++                for (Area& x : f.areas)
++                {
++                    if (x.id != hid)
++                        continue;
++                    known = true;
++                    x.last = WorldTimer::getMSTime();
++                    Area dropped;                           // taken out first, so ReleaseArea sees no other hold
++                    for (auto it = x.mobs.begin(); it != x.mobs.end();)
++                    {
++                        if (std::find(guids.begin(), guids.end(), it->guid) != guids.end())
++                        {
++                            dropped.mobs.push_back(*it);
++                            it = x.mobs.erase(it);
++                        }
++                        else
++                            ++it;
++                    }
++                    ReleaseArea(p->GetObjectGuid(), f, dropped, releases);
++                }
++            }
++        }
++        ApplyReleases(releases);
++        if (!known)
++            return out.Add(head + "unknown");
++        out.Add(head + "dropped " + std::to_string(releases.size()));
++    }
++
+     // Held areas of players who left, to thaw at the next tick (logout may run while maps update).
+     std::vector<Release> g_thawLater;
+ 
+@@ -1619,6 +1712,10 @@ namespace
+             Place(p, a[2], a[3], a[4], a[5], a[6], out);
+         else if (verb == "faction" && a.size() == 3 && (a[2] == "horde" || a[2] == "alliance" || a[2] == "own"))
+             Faction(p, a[2], out);
++        else if (verb == "hold" && a.size() >= 5 && a[3] == "guids")
++            HoldGuids(p, a, out);
++        else if (verb == "hold" && a.size() >= 5 && a[3] == "drop")
++            DropGuids(p, a, out);
+         else if (verb == "hold" && a.size() >= 5)
+             HoldArea(p, a, out);
+         else if (verb == "unhold" && a.size() == 3)

@@ -1086,6 +1086,26 @@ local picking = {}
 local PICK_KEEP = 1800 -- ticks a pickpocketing stays open without a success or failure
 -- A ware or loot item that left the stand-in: buy or take it in WoW (once per BG3 item); a ware
 -- pickpocketed from it (thief given): the thief gets it from WoW for free.
+-- Where a member stands now, in WoW's coordinates (world mode's mapping), or nil outside world mode. A take carries the
+-- looter's place at BG3's take (server patch 0025): WoW judges its loot reach from there, since BG3's loot window is
+-- where the item was taken, in reach, and the take reaches WoW a moment later, when the body may have walked on (a
+-- Take All then a walk was refused "far" for the last items, and WoW's own loot window still offered them).
+-- World mode runs in the client's Lua state; this server state reads its mapping from world.json (as Mirrors.lua and
+-- TurnHold.lua do): WoW x = origin x - (z - centre z) / YD, y = origin y + (x - centre x) / YD, z = origin z + (y - centre y) / YD.
+local YD = 0.9144
+local worldMap, worldAt = nil, -1000
+function M.PlaceOf(u)
+    if tick - worldAt >= 30 or worldAt > tick then
+        worldAt = tick
+        local ok, w = pcall(Ext.Json.Parse, Ext.IO.LoadFile(IO .. "world.json") or "")
+        worldMap = (ok and type(w) == "table" and w.Active == true and type(w.Centre) == "table"
+            and type(w.WowOrigin) == "table") and w or nil
+    end
+    local okP, x, y, z = pcall(Osi.GetPosition, u)
+    if not (worldMap and okP and type(x) == "number" and type(y) == "number" and type(z) == "number") then return nil end
+    local C, W = worldMap.Centre, worldMap.WowOrigin
+    return {W[1] - (z - C[3]) / YD, W[2] + (x - C[1]) / YD, W[3] + (y - C[2]) / YD}
+end
 local function askFor(u, tag, count, thief)
     if asked[u] then return end
     local kind, guid, idx = tostring(tag):match("^([LV])(%x+):(%d+)$")
@@ -1114,7 +1134,7 @@ local function askFor(u, tag, count, thief)
             end
         end
     else
-        M.Request({Op = "take", Member = member, Npc = guid, Idx = tonumber(idx), Item = u})
+        M.Request({Op = "take", Member = member, Npc = guid, Idx = tonumber(idx), Item = u, At = M.PlaceOf(member)})
     end
 end
 M.AskFor = askFor
@@ -1154,6 +1174,40 @@ end
 M.SettleWares = settleWares
 
 
+-- A corpse's loot item gone without a trace while its corpse is still there (Mirrors removes a corpse with what it
+-- holds): the player took it and BG3 merged it into a stack of theirs (no RemovedFrom for a merge).
+local sideHolder = {} -- tag -> the stand-in its item was made in
+local corpseGold = {} -- corpse stand-in -> the gold we put there
+local function lootTaken(standin, tag, old)
+    if tostring(tag):sub(1, 1) ~= "L" or not (WOWBG3MirrorOwned or {})[standin] or not q(Ext.Entity.Get, standin) then
+        return false
+    end
+    if not asked[old] then state.LootMerged = (state.LootMerged or 0) + 1 end
+    return true
+end
+-- Looked at every pass, not only when WoW's next list comes (2 s and more): WoW takes it only while the looter's
+-- body is in its loot reach, and a take sent seconds after BG3's was refused "far" once the player had walked on
+-- (seen in play: the item stayed in WoW's corpse, and WoW's own loot window offered it later).
+local function lootMerged()
+    for tag, u in pairs(sideUuid) do
+        local standin = sideHolder[tag]
+        if standin and tag:sub(1, 1) == "L" and not asked[u] and not deleted[u] and not q(Ext.Entity.Get, u)
+            and lootTaken(standin, tag, u) then
+            askFor(u, tag, sideCount[tag])
+        end
+    end
+    -- The corpse's gold taken (BG3's loot window): WoW's money from that corpse.
+    for standin, put in pairs(corpseGold) do
+        local guid = corpseOf[standin]
+        if guid and put > 0 and not M.MoneyAsked and (WOWBG3MirrorOwned or {})[standin] and q(Ext.Entity.Get, standin)
+            and goldOf(standin) < put then
+            M.MoneyAsked = true
+            M.Request({Op = "take", Member = Hero.Uuid(), Npc = guid, Idx = "money", At = M.PlaceOf(Hero.Uuid())})
+        end
+    end
+end
+M.LootMerged = lootMerged
+
 local function fillHolder(standin, prefix, list)
     local have = ours()
     local want, size = {}, {}
@@ -1166,15 +1220,11 @@ local function fillHolder(standin, prefix, list)
         end
         -- Gone without a trace: the player took it and BG3 merged it into a stack of theirs (no
         -- RemovedFrom for a merge, harness). A ware only while its trade is open (a world move or an
-        -- opening trade clears a vendor's stock too); loot while its corpse is still there (Mirrors removes
-        -- a corpse with what it holds). Loot was held to the vendors' rule by mistake: a boar's pelt that
-        -- merged into the looter's pelts never reached WoW and was put back in the corpse, again and again.
+        -- opening trade clears a vendor's stock too); loot while its corpse is still there (lootTaken; it was
+        -- held to the vendors' rule by mistake, and a merged pelt went back in the corpse again and again).
         local old = sideUuid[tag]
         if not have[tag] and old and not deleted[old] and not q(Ext.Entity.Get, old) then
-            local looted = prefix:sub(1, 1) == "L" and (WOWBG3MirrorOwned or {})[standin] ~= nil
-                and q(Ext.Entity.Get, standin) ~= nil
-            if buying(standin) or looted then
-                if looted then state.LootMerged = (state.LootMerged or 0) + 1 end
+            if buying(standin) or lootTaken(standin, tag, old) then
                 askFor(old, tag, sideCount[tag])
             else
                 deleted[old] = true
@@ -1184,7 +1234,7 @@ local function fillHolder(standin, prefix, list)
         if not have[tag] and M.Item(w.Entry) and (not old or asked[old] or deleted[old]) and not (old and pendingItem[old]) then
             local n = M.AmountOf(M.Item(w.Entry), w.Count or (prefix:sub(1, 1) == "V" and M.Item(w.Entry).bc) or 1)
             local ok, made = pcall(M.Create, w.Entry, standin, n, tag)
-            if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = n else note(made) end
+            if ok then M.SideTag[made] = tag; sideUuid[tag] = made; sideCount[tag] = n; sideHolder[tag] = standin else note(made) end
         end
     end
     for tag, u in pairs(have) do
@@ -1212,7 +1262,6 @@ local function fillHolder(standin, prefix, list)
         end
     end
 end
-local corpseGold = {} -- corpse stand-in -> the gold we put there
 -- BG3 won't let a trader buy what it has no gold for ("Insufficient Gold"), and so a merchant holds its purse (Stock.lua)
 -- while its trade is open, and nothing after: gold in a stand-in's pockets could be stolen and would become WoW's money.
 -- From then on BG3's own barter spends and fills it; the look below keeps what it shows, and WoW's money follows BG3's gold
@@ -1390,7 +1439,7 @@ local function fillVendors(inv)
             if corpseGold[standin] and corpseGold[standin] > 0 and g < corpseGold[standin] and not M.MoneyAsked then
                 -- The player took the corpse's gold (BG3's loot window): WoW's money from that corpse.
                 M.MoneyAsked = true
-                M.Request({Op = "take", Member = Hero.Uuid(), Npc = guid, Idx = "money"})
+                M.Request({Op = "take", Member = Hero.Uuid(), Npc = guid, Idx = "money", At = M.PlaceOf(Hero.Uuid())})
             elseif (lt.Money or 0) ~= g and not M.MoneyAsked then
                 setGold(standin, lt.Money or 0)
             end
@@ -1684,6 +1733,8 @@ function M.Start(id)
     end)
     Ext.Events.Tick:Subscribe(function()
         tick = tick + 1
+        -- Every tick: a take's place is where the looter stood at BG3's take (M.PlaceOf), to the frame.
+        if Ext.Utils.GetGameState() == "Running" then pcall(lootMerged) end
         if tick % 10 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         if not made then M.MakeAll() end
         pcall(settleWares)

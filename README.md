@@ -46,11 +46,12 @@ version is mostly complete.
   NPCs, mobs, day and night. WoW's chat, quest log and quest tracker sit beside BG3's interface.
 - **Fighting.** Walk into a WoW mob (or attack one) and a BG3 fight starts: the mob is held on the
   WoW server and fights as a BG3 creature, turn by turn, with BG3's rules. When the fight ends the
-  result goes back to WoW as real damage, XP, loot and quest credit. Neutral (yellow) WoW mobs are BG3
-  enemies that leave you alone until you attack them.
+  result goes back to WoW as real damage, XP, loot and quest credit. Neutral (yellow) WoW mobs are
+  neutral in BG3 too and leave you alone: attack one and BG3 makes it temporarily hostile, as it does
+  for any neutral character, and the fight starts.
 - **Clicking WoW's models.** Every BG3 action aimed at a character (attack, spell, shove, throw, talk)
   works on the WoW model under the pointer: BG3 aims it at that mob's or NPC's BG3 stand-in. A left
-  click on a mob attacks it.
+  click on a hostile (red) mob attacks it.
 - **Looting.** A WoW corpse opens BG3's own loot window with that mob's WoW loot and gold.
 - **Questing and NPCs.** Talking to a quest giver, or to any NPC with WoW dialog, opens WoW's own
   quest and gossip windows, as in vanilla: accept, decline and hand in there. Vendors open BG3's
@@ -167,8 +168,7 @@ past 12 for all four, so the party keeps growing all the way to WoW 60, and to a
 to come: for now, level-ups past 12 wait in the pool unless you add a level mod (see "What you need").
 
 BG3's XP bar on your character shows how far you are into your current WoW level, and its tooltip says how the
-levels work. A small notice gives your WoW level, the level-ups waiting and what the next WoW level gives at each new
-WoW level, and `/wowbg3 pool` lists it all.
+levels work, and `/wowbg3 pool` lists your WoW level, party slots and the level-ups waiting; the table above says what each WoW level gives.
 
 - **We strongly recommend a level mod.** BG3 itself stops at level 12, and WOW-BG3 does not bundle levels
   past it. Without a level mod, level-ups past 12 stay in the pool and a popup tells you which mods unlock

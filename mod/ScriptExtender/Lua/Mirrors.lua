@@ -8,17 +8,16 @@
 --   {Seq, Session, Active, HeroWowMaxHp, Hostile = faction, Neutral = faction, Fight = {guid...},
 --    Mobs = {{Guid, Template, Kind, Hostile, Pos = {x,y,z} BG3, Dir = {fx,fz} BG3 forward, WowHp,
 --             WowMaxHp, WowDamage, BaseDamage, Name}...}}
--- Each listed mob gets one stand-in (Osiris CreateAt of the template, the faction Relations.lua
--- gives it: hostile for WoW's hostile and neutral mobs, so BG3's left click attacks them; neutral
--- for friendly NPCs) with its template's own BG3 max HP at the WoW mob's HP fraction (set in the
--- tick that creates it) and a DamageBonus boost as the world-fights notes says (BG3 still rolls
+-- Each listed mob gets one stand-in (Osiris CreateAt of the template, the hostile or neutral
+-- faction) with its template's own BG3 max HP at the WoW mob's HP fraction (set in the tick that
+-- creates it) and a DamageBonus boost as the world-fights notes says (BG3 still rolls
 -- everything), kept where the mob is (TeleportToPosition with
 -- snap, turned to its facing) and at its HP fraction while out of BG3 combat. Mobs in the
 -- running fight (Fight) are never moved, healed or removed: BG3 runs them. Unlisted stand-ins are
 -- removed. Writes wow-bg3/link/mirror-status.json: per guid its stand-in uuid, BG3 HP, dead, and
 -- whether it is in Tav's BG3 combat; Tav's HP, combat, turn-based mode (Force Turn-Based) and
 -- sneaking. Nothing here is saved; leaving the level or a new bridge session starts over.
--- Guards: the authorized disposable save, at most MAX stand-ins, spawns within RADIUS of Tav.
+-- Guards: the authorized disposable save; spawns only on ground the treadmill placed.
 --
 -- Fixes from playtesting:
 -- - Issue 20 (a stand-in healed to full when Tav opened with her own attack): the out-of-combat HP
@@ -113,18 +112,17 @@ local Hero = Ext.Require("Hero.lua") -- the hero: the character the player contr
 local Party = Ext.Require("Party.lua")
 local Scaling = Ext.Require("Scaling.lua")
 local Death = Ext.Require("Death.lua")
-local Relations = Ext.Require("Relations.lua") -- a stand-in's faction and when it may join a combat
 local KILL_LANDS, REVIVE_AGAIN = 60, 150 -- ticks: ApplyDamage reaching her; between asks for a WoW revive
 local STRIKE_PARTY = 16
 local REGION = Ext.Require("Hero.lua").REGION -- host level (Hero.lua, host.json)
 local DIR = "wow-bg3/link/"
-local MAX, RADIUS = 60, 42.0 -- live stand-ins (fights take up to 50); metres from a party member (horizontal) for a spawn
+-- Which WoW creatures get stand-ins is the bridge's list, WoW's own visible set (no range or count
+-- here: was 60 stand-ins within 42 m of a party member, the bridge's old 45 yd); nearest first.
 -- A dead stand-in stays as BG3's corpse this long after the death (ticks; about a WoW corpse's life)
--- while a party member is within RADIUS, though WoW's mob list (living creatures only) drops it: BG3's
+-- while it is on placed ground, though WoW's mob list (living creatures only) drops it: BG3's
 -- own loot window opens on it (Inventory.lua fills it with the WoW loot; benilla 0060 sends the click
 -- to BG3, the bridge's `c GUID`). Deleted at once, it left only WoW's corpse, and WoW's loot window.
 local CORPSE_KEEP = 9000
--- (RADIUS 42 m: the bridge's MIRROR_RANGE 45 yd; was 34)
 -- Per party member: the bridge mirrors the mobs round every member (each has
 -- its own treadmill), so a spawn may be near any member, and only on ground the treadmill placed
 -- (wow-bg3/floor.json): a stand-in spawned past the ground's edge fell and was made again and again
@@ -325,16 +323,14 @@ function M.Start(runId)
     -- Stand-ins Tav has hurt (a kill outside a fight is hers only then).
     local hitByTav = {}
     -- Group aggro as in WoW: a neutral WoW mob fights only when Tav
-    -- attacks it herself. Its stand-in is hostile in BG3 (Relations.lua: BG3's left click attacks
-    -- it), so BG3 would start a fight when it sees her and pull every neutral stand-in near one she
-    -- attacked; neutral stand-ins cannot join a combat (SetCanJoinCombat 0) until Tav targets or
-    -- hurts that one. Hostile mobs keep BG3's joining. uuid -> tick of the last aim, hit, fight or
-    -- combat: a neutral one out of all of them for Relations.CALM ticks forgets (`NeutralCalmed`).
+    -- attacks it herself. BG3 would pull every neutral stand-in near the one she attacked (one
+    -- shared faction, TEMPORARILY_HOSTILE), so neutral stand-ins cannot join a combat
+    -- (SetCanJoinCombat 0) until Tav targets or hurts that one. Hostile mobs keep BG3's joining.
     local provoked = {}
     local function provoke(uuid)
-        if uuid and M.Owned[uuid] then
-            if not provoked[uuid] then pcall(Osi.SetCanJoinCombat, uuid, 1) end
-            provoked[uuid] = ticks
+        if uuid and M.Owned[uuid] and not provoked[uuid] then
+            provoked[uuid] = true
+            pcall(Osi.SetCanJoinCombat, uuid, 1)
         end
     end
     -- Friendly NPCs (see the header): uuid -> tick of Tav's last aim or hit; its crime reaction is
@@ -756,10 +752,10 @@ function M.Start(runId)
         for _, s in ipairs(KIND_SPELLS[mob.Kind] or {}) do pcall(Osi.AddSpell, uuid, s, 0, 1) end
         pcall(Abilities.Grant, uuid, mob.Entry)
         local plan = readJson("mirror.json") or {}
-        local faction = Relations.FactionOf(mob, plan)
-        if faction and uuidOf(faction) then Osi.SetFaction(uuid, faction) end
+        local faction = mob.Hostile and plan.Hostile or plan.Neutral
+        if type(faction) == "string" and uuidOf(faction) then Osi.SetFaction(uuid, faction) end
         M.Owned[uuid] = mob.Guid
-        if not Relations.JoinsOnSight(mob) then pcall(Osi.SetCanJoinCombat, uuid, 0) end
+        if not mob.Hostile then pcall(Osi.SetCanJoinCombat, uuid, 0) end
         local friendly = mob.Friendly == true
         local outfit, outfitError
         if friendly then
@@ -1111,12 +1107,6 @@ function M.Start(runId)
         return inAny(p[1], p[3]) and inAny(p[1] - 1, p[3]) and inAny(p[1] + 1, p[3])
             and inAny(p[1], p[3] - 1) and inAny(p[1], p[3] + 1)
     end
-    local function nearParty(p, anchors)
-        for _, a in ipairs(anchors) do
-            if hdist(p, a) <= RADIUS then return true end
-        end
-        return false
-    end
 
     -- The calls that last (see the header): every victim alive and fighting calls again; one out of
     -- combat for CALL_QUIET ticks after its last call (or dead, or gone) stops.
@@ -1161,16 +1151,10 @@ function M.Start(runId)
             M.Life.HpSet = string.format("%.0f%% after 60 ticks", 100 * reviveFrac)
             reviveFrac = nil
         end
-        local tavAt = pos(Hero.Uuid())
-        local anchors = {}
-        for _, u in ipairs(Party.Party()) do
-            local p = pos(u)
-            if p then anchors[#anchors + 1] = p end
-        end
-        if tavAt and #anchors == 0 then anchors[1] = tavAt end
-        local want = {}
+        local want, order = {}, {} -- order: the bridge's, nearest to a party member first
         for _, mob in ipairs(plan.Mobs or {}) do
             if type(mob) == "table" and type(mob.Guid) == "string" and type(mob.Pos) == "table" and #mob.Pos == 3 then
+                if not want[mob.Guid] then order[#order + 1] = mob end
                 want[mob.Guid] = mob
             end
         end
@@ -1225,31 +1209,30 @@ function M.Start(runId)
                     m.Dead = true
                     m.DiedAt = m.DiedAt or ticks
                     local p = pos(m.Uuid)
-                    if ticks - m.DiedAt >= CORPSE_KEEP or not (p and nearParty(p, anchors)) then remove(guid) end
+                    if ticks - m.DiedAt >= CORPSE_KEEP or not (p and onGround(p)) then remove(guid) end
                 else
                     remove(guid)
                 end
             end
         end
         local spawned = false
-        local count = 0
-        for _ in pairs(mirrors) do count = count + 1 end
         -- WoW respawned the mob (the bridge: the server confirmed the kill, the mob left mobs.txt and came
         -- back; never a stand-in whose kill has not landed yet). The corpse, knocked out too, gives way.
         local respawned = {}
         for _, g in ipairs(plan.WowRespawned or {}) do respawned[g] = true end
-        for guid, mob in pairs(want) do
+        for _, mob in ipairs(order) do
+            local guid = mob.Guid
             local m = mirrors[guid]
             if m and respawned[guid] and not fight[guid] and (q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid]) then
                 remove(guid)
-                m, count = nil, count - 1
+                m = nil
             end
             if not m then
-                -- One spawn per step spreads the load; only near a party member, on placed ground.
-                if not spawned and count < MAX and nearParty(mob.Pos, anchors) and not fight[guid] and onGround(mob.Pos) then
+                -- One spawn per step spreads the load (nearest first); only on placed ground.
+                if not spawned and not fight[guid] and onGround(mob.Pos) then
                     spawned = true
                     local ok, err = pcall(spawn, mob)
-                    if ok then count = count + 1 else note("spawn " .. guid .. ": " .. tostring(err)) end
+                    if not ok then note("spawn " .. guid .. ": " .. tostring(err)) end
                 end
             else
                 m.Want = mob
@@ -1267,15 +1250,7 @@ function M.Start(runId)
                         combat = nil -- not reported as in Tav's combat, so the bridge does not pull it
                     end
                 end
-                if inFight or (combat and provoked[m.Uuid]) then provoke(m.Uuid) end
-                -- A provoked neutral mob left alone again (the fight over without its death, a miss
-                -- BG3 and WoW let go): it forgets, as a WoW mob that evaded, and does not start a
-                -- fight on sight (Relations.lua).
-                if Relations.Calms(m, provoked[m.Uuid], ticks, inFight, combat and true or false, dead) then
-                    provoked[m.Uuid] = nil
-                    pcall(Osi.SetCanJoinCombat, m.Uuid, 0)
-                    m.NeutralCalmed = (m.NeutralCalmed or 0) + 1
-                end
+                if inFight then provoke(m.Uuid) end
                 -- A friendly stand-in Tav left alone again without a fight: back to blocked
                 -- reactions and out of combats (a heal, a zero-damage warning, a missed aim).
                 if friendlyAimed[m.Uuid] and not inFight and not combat and not dead and not searching[m.Uuid]
@@ -1379,7 +1354,7 @@ function M.Start(runId)
                 Friendly = m.Friendly, Guard = m.Guard, CrimeReady = friendlyAimed[m.Uuid] ~= nil,
                 Searching = searching[m.Uuid] ~= nil,
                 FriendlyReset = m.FriendlyReset,
-                Provoked = provoked[m.Uuid] ~= nil, NeutralCalmed = m.NeutralCalmed, LeftCombat = m.LeftCombat,
+                Provoked = provoked[m.Uuid] == true, LeftCombat = m.LeftCombat,
                 Named = m.Named, NameText = m.NameText, NameError = m.NameError, Aimed = aimed[m.Uuid] and ticks - aimed[m.Uuid] or nil,
                 SpawnHp = m.SpawnHp, SpawnFrac = m.SpawnFrac, HpInit = m.HpInit,
                 Outfit = m.Outfit, OutfitError = m.OutfitError,

@@ -156,7 +156,7 @@ function M.Snapshot()
 end
 -- The party's summons (a familiar, a spirit companion, a raised dead): every eoc::summon::IsSummon whose
 -- Summoner (or Owner) is a party member. They are not in DB_Players, so M.Party() never lists them, but
--- the player walks them like members (the maintainer 2026-11-02: his Find Familiar spider), so world_bridge.py
+-- the player walks them like members (a Find Familiar spider, say), so world_bridge.py
 -- gives each its own treadmill squares from this list. [{Uuid, Name, Summoner, Dead, OnStage, Pos, Region}]
 function M.Summons()
     local members = {}
@@ -336,6 +336,13 @@ function M.Start(runId)
         return nil
     end
 
+    -- Whether BG3's party keeps u in a group of its own, not the hero's (chained members share the hero's view).
+    local function apart(u, hero)
+        local a = q(function() return Ext.Entity.Get(u).PartyMember.ViewUuid end)
+        local b = q(function() return Ext.Entity.Get(hero).PartyMember.ViewUuid end)
+        return a ~= nil and b ~= nil and a ~= b
+    end
+
     local function remove(c)
         local hero = heroOrFail()
         local who = resolve(c.Name)
@@ -352,15 +359,27 @@ function M.Start(runId)
         -- not running (it starts on loading TUT_Avernus_C and ends with the tutorial) the proc has no
         -- rules and does nothing, which is what "BG3 did not dismiss Shadowheart" was in BGO_Main_A.
         local function gone() return not inDbPlayers(u) end
-        if tut and goalRunning("TUT_Misc") then
+        local inTutorial = tut and goalRunning("TUT_Misc")
+        if not inTutorial then
+            local why = dismissRefusal(u)
+            if why then error(string.format("BG3 would not dismiss %s: %s", nameOf(u), why), 0) end
+        end
+        -- Off the hero's group first. BG3's dismiss detaches the companion itself and sends it to camp, but a
+        -- detach takes hold on the next tick (each one's PartyMember.ViewUuid, PartyView), and in the void BG3's
+        -- walk out of sight ends at once: its TeleportTo to camp, linked characters left at their default, took
+        -- the whole group along (measured: hero and companions 2988 m in one tick; a detach and a linked
+        -- teleport in one tick do it in the void and on any ground, a detach before it moves the companion alone).
+        Osi.DetachFromPartyGroup(u)
+        waitFor(function() return apart(u, hero) end, 30, "BG3 did not detach " .. nameOf(u) .. " from the hero's group")
+        if inTutorial then
             Osi.PROC_TUT_Misc_TutorialCompanion_RemoveCompanion(u, "Dismissed", "WOWBG3")
             steps[#steps + 1] = "dismissed (PROC_TUT_Misc_TutorialCompanion_RemoveCompanion)"
         else
-            local why = dismissRefusal(u)
-            if why then error(string.format("BG3 would not dismiss %s: %s", nameOf(u), why), 0) end
             Osi.PROC_GLO_PartyMembers_Remove(u, hero, 1, 0)
             steps[#steps + 1] = "dismissed (PROC_GLO_PartyMembers_Remove" .. (tut and ", a tutorial companion with TUT_Misc not running" or "") .. ")"
         end
+        -- On the log's clock, against Camp.lua's jump lines (which of these teleports took the hero along).
+        Ext.Utils.Print("WOW-BG3 party: Remove " .. nameOf(u) .. ": " .. steps[#steps])
         if not pcall(waitFor, gone, 60, "") then
             error(string.format("BG3 did not dismiss %s (tried: %s)", nameOf(u), table.concat(steps, "; ")), 0)
         end
@@ -368,6 +387,7 @@ function M.Start(runId)
         wait(2)
         if Prog.CampOn() then
             -- Back to camp, as BG3's own dismiss does (Camp.lua's switch aside: nowhere else is home now).
+            Ext.Utils.Print("WOW-BG3 party: Remove " .. nameOf(u) .. ": PROC_DismissToCamp")
             pcall(Osi.PROC_DismissToCamp, u)
             steps[#steps + 1] = "back to camp (PROC_DismissToCamp)"
             return {Removed = nameOf(u), Uuid = u, Steps = steps, Party = M.Snapshot()}
@@ -610,6 +630,13 @@ function M.Start(runId)
     -- `void` off portrait renders (testing saw Tav's respec
     -- portrait come back on green with void on), so the old swap back to the root template's icon
     -- (originPortraits) is gone.
+
+    -- BG3's own dismiss line in a companion's dialog: the rule at that dialog's end runs the same dismiss as
+    -- remove above, so the companion leaves the hero's group as soon as the line is chosen.
+    pcall(Ext.Osiris.RegisterListener, "DB_GLO_PartyMembers_DismissAfterDialog", 2, "after", function(_, member)
+        local u = uuidOf(tostring(member))
+        if u then pcall(Osi.DetachFromPartyGroup, u) end
+    end)
 
     Ext.Events.Tick:Subscribe(function()
         if Ext.Utils.GetGameState() ~= "Running" then

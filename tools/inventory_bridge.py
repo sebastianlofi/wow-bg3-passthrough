@@ -241,6 +241,9 @@ class Fake:
         lt['Items'].remove(row)
         return True, '', {'Guid': g}
 
+    def take_many(self, name, npc, entries):
+        return {str(i): self.take(name, npc, i) for i, _ in entries}
+
 
 class Server:
     """The server's verbs. One console line per call; reply lines start WOWBG3."""
@@ -336,16 +339,59 @@ class Server:
         return self._after_ok(self.call('vendor', 'sell', name, npc, guid, count), 'Money')
 
     def loot(self, npc, name=None):
+        """The corpse's loot, or None with the server's reason when it refused to list it (the member out of
+        reach, the corpse gone): that says nothing about what the corpse holds."""
         out = {'Money': 0, 'Items': []}
         for w in self.call('loot', 'list', name, npc):
+            if 'refused' in w:
+                return None, ' '.join(w[w.index('refused') + 1:]) or 'refused'
             if len(w) >= 6 and w[1] == 'loot' and w[4] == 'begin':
                 out['Money'] = int(w[5])
             elif len(w) >= 8 and w[1] == 'loot' and w[4] == 'item':
                 out['Items'].append({'Idx': int(w[5]), 'Entry': int(w[6]), 'Count': int(w[7])})
-        return out
+        return out, ''
 
     def take(self, name, npc, idx):
         return self._after_ok(self.call('loot', 'take', name, npc, idx), 'Guid')
+
+    @staticmethod
+    def take_token(entries):
+        """`IDX[@X/Y/Z],...` (server patch 0025): the place is the looter's at BG3's take, in WoW's coordinates."""
+        def one(idx, at):
+            ok = isinstance(at, (list, tuple)) and len(at) == 3 and all(isinstance(v, (int, float)) for v in at)
+            return str(idx) + ('@%.2f/%.2f/%.2f' % tuple(at) if ok else '')
+        return ','.join(one(i, at) for i, at in entries)
+
+    TAKE_TOKEN_MAX = 180  # the console reads 255 characters a line (world-console.py: at most 240 for `loot take`)
+
+    def take_chunks(self, entries):
+        """The entries in as few calls as fit a console line."""
+        chunk = []
+        for e in entries:
+            if chunk and len(self.take_token(chunk + [e])) > self.TAKE_TOKEN_MAX:
+                yield chunk
+                chunk = []
+            chunk.append(e)
+        if chunk:
+            yield chunk
+
+    def take_many(self, name, npc, entries):
+        """BG3's takes from one corpse in one call, each judged for WoW's loot reach where BG3 took it (server patch
+        0025). {str(idx): (ok, why, extra)}, one per entry; a refusal of the whole call goes to every entry."""
+        res = {}
+        for chunk in self.take_chunks(entries):
+            out, whole = {}, None
+            for w in self.call('loot', 'take', name, npc, self.take_token(chunk)):
+                if len(w) >= 7 and w[1] == 'loot' and w[4] == 'take':
+                    if 'refused' in w:
+                        out[w[5]] = (False, ' '.join(w[w.index('refused') + 1:]) or 'refused', {})
+                    elif 'ok' in w:
+                        i = w.index('ok')
+                        out[w[5]] = (True, '', {'Guid': w[i + 1]} if len(w) > i + 1 else {})
+                elif 'refused' in w:
+                    whole = ' '.join(w[w.index('refused') + 1:]) or 'refused'
+            res.update({str(i): out.get(str(i), (False, whole or 'no_reply', {})) for i, _ in chunk})
+        return res
 
 
 class Bridge:
@@ -361,6 +407,8 @@ class Bridge:
         self.seq = state.get('Seq', 0)
         self.replies = []
         self.vendors, self.loot = {}, {}
+        self.relist = {}         # corpse -> member: taken from in this step, listed again once after (relist_loot)
+        self.todo, self.taken = [], {}  # this step's requests; a batch's take results by Seq (take_batch)
         self.last_list = 0
         self.not_vendor = {}     # friendly NPCs a list was refused for -> (tries, time of the last)
         self.pockets = set()     # of those, the ones with food on them to steal (pocket())
@@ -434,18 +482,63 @@ class Bridge:
             return be.sell(name, str(req['Npc']), str(req['Guid']), int(req.get('Count', 0)))
         if op == 'loot':
             npc = str(req['Npc'])
-            self.loot[npc] = be.loot(npc) if isinstance(be, Fake) else be.loot(npc, name)
+            lt, why = self.list_loot(npc, name)
+            if lt is None:
+                return False, why, {'Npc': npc}
+            self.loot[npc] = lt
             self.urgent = True
             return True, '', {'Npc': npc}
         if op == 'take':
-            ok, why, extra = be.take(name, str(req['Npc']), req['Idx'])
+            ok, why, extra = self.take_batch(req, name)
             if ok:
-                npc = str(req['Npc'])
-                self.loot[npc] = be.loot(npc) if isinstance(be, Fake) else be.loot(npc, name)
+                # What WoW said it gave is gone from the corpse even if the list after is refused (relist_loot).
+                npc, idx = str(req['Npc']), req['Idx']
+                lt = self.loot.get(npc)
+                if lt is not None:
+                    self.loot[npc] = dict(lt, Money=0) if idx == 'money' else \
+                        dict(lt, Items=[r for r in lt.get('Items', []) if str(r.get('Idx')) != str(idx)])
+                self.relist[npc] = name
             return ok, why, extra
         if op == 'list':
             return True, '', {}
         return False, 'unknown_op', {}
+
+    def take_batch(self, req, name):
+        """A take from a corpse, in one server call with every other take from that corpse for that member in this
+        step (BG3's Take All: one request per item, all in the same moment)."""
+        seq = req.get('Seq')
+        if seq not in self.taken:
+            batch, idxs = [], set()
+            for r in [req] + list(getattr(self, 'todo', [])):
+                if (r.get('Op') == 'take' and r.get('Npc') == req.get('Npc') and r.get('Member') == req.get('Member')
+                        and r.get('Seq', 0) >= (seq or 0) and r.get('Seq') not in self.taken and str(r.get('Idx')) not in idxs):
+                    batch.append(r)
+                    idxs.add(str(r.get('Idx')))
+            res = self.be.take_many(name, str(req['Npc']), [(r['Idx'], r.get('At')) for r in batch])
+            for r in batch:
+                self.taken[r.get('Seq')] = res[str(r['Idx'])]
+        return self.taken.pop(seq)
+
+    def list_loot(self, npc, name):
+        return (self.be.loot(npc), '') if isinstance(self.be, Fake) else self.be.loot(npc, name)
+
+    def relist_loot(self):
+        """The corpses taken from in this step, listed once after all of its takes. A take waits for no list: WoW
+        takes an item only while the looter is in its reach, and BG3's Take All sends one take per item (a list
+        after each held the last one back by seconds, and it was refused "far"). A refused list keeps what was
+        listed before: the corpse still holds it (an empty list in its place emptied the BG3 corpse of loot
+        WoW still had)."""
+        for npc, name in self.relist.items():
+            try:
+                lt, why = self.list_loot(npc, name)
+            except Exception as e:  # noqa: BLE001
+                lt, why = None, 'error %s' % e
+            print('%s relist %s: %s' % (time.strftime('%H:%M:%S'), npc,
+                  json.dumps(lt) if lt is not None else 'refused ' + why), flush=True)
+            if lt is not None:
+                self.loot[npc] = lt
+            self.urgent = True
+        self.relist = {}
 
     def wow_side(self):
         """--fake only: a change made on the WoW side (as if in WoW's own client, a quest reward, ...),
@@ -521,6 +614,8 @@ class Bridge:
         run = str(reqfile.get('RunId', ''))
         last = self.done.get(run, 0)
         changed = False
+        self.todo = [r for r in sorted(reqfile.get('Reqs', []), key=lambda r: r.get('Seq', 0)) if r.get('Seq', 0) > last]
+        self.taken = {}
         for req in sorted(reqfile.get('Reqs', []), key=lambda r: r.get('Seq', 0)):
             if req.get('Seq', 0) <= last:
                 continue
@@ -533,6 +628,7 @@ class Bridge:
             print('%s req %s -> %s' % (time.strftime('%H:%M:%S'), json.dumps(req), json.dumps(rep)), flush=True)
             last = req['Seq']
             changed = True
+        self.relist_loot()
         self.done[run] = last
         # A vendor's wares or a corpse's loot go out at once, with the inventories as last listed.
         if self.urgent and getattr(self, 'last_out', None) is not None:

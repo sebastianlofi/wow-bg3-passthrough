@@ -101,14 +101,24 @@ function M.Start(runId)
 
     -- Fires before the frame's client tick reads the state (server and client share the process, and the
     -- client holds its publish over a jump until it hears: WorldMode.lua).
-    local function onTeleported(who, _, ox, oy, oz, nx, ny, nz, reason)
+    local function onTeleported(who, cause, ox, oy, oz, nx, ny, nz, reason)
         if trip or reason == "RegionSwap" or Waypoints.Hopping() then return end
         local w = worldActive()
         if not w then return end
         local hero = Hero.Uuid()
-        if uuidOf(who) ~= hero then return end
         local dx, dz = nx - ox, nz - oz
-        if math.sqrt(dx * dx + dz * dz) < M.JUMP then return end
+        local jump = math.sqrt(dx * dx + dz * dz)
+        if jump < M.JUMP then return end
+        -- Who made a long jump, on the log's clock: a dismissal sent the hero to camp along with Shadowheart (a test
+        -- soak) and no log said which teleport moved the hero. The hero's and every companion's
+        -- (DB_PartOfTheTeam: a dismissed one is no player any more), with Osiris's cause; linked characters go
+        -- along with a companion's TeleportTo when the story leaves that argument at its default.
+        local u = uuidOf(who)
+        if u == hero or #(q(function() return Osi.DB_PartOfTheTeam:Get(who) end) or {}) > 0 then
+            Ext.Utils.Print(string.format("WOW-BG3 camp: %s jumped %.0f m (%.1f %.1f %.1f to %.1f %.1f %.1f), cause %s, %s",
+                u == hero and "the hero" or tostring(who), jump, ox, oy, oz, nx, ny, nz, tostring(cause), tostring(reason)))
+        end
+        if u ~= hero then return end
         -- Into the void: world mode's own Start. Undoing it put the hero on the host level's spot, inside camp's
         -- ground, about 5 s after each load whose world.json a killed bridge had left Active.
         local c = w.Centre

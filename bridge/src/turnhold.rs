@@ -2,19 +2,21 @@
 //! `link/tools/turnhold.py`, which sent the verbs through the mangosd console: 3.5 to 4.2 s from
 //! BG3's switch to the server's hold, so creatures finished their walk).
 //!
-//! `TurnHold.lua` (BG3 side) writes `link/turnhold.json`: `{Schema 1, RunId, Seq, Tick, Hold, Radius
-//! (WoW yards), Members: [{Name, Wow: [x, y, z]}]}` while any party member is in BG3's turn-based mode
-//! outside combat. The fight bridge turns it into the server's hold-area verbs (patch 0010,
-//! m5-server-handoff.md "Hold area") and sends them through the hero's own client like every
+//! `TurnHold.lua` (BG3 side) writes `link/turnhold.json`: `{Schema 1, RunId, Seq, Tick, Hold, Guids:
+//! [WoW guid, ...], Members: [{Name, Wow: [x, y, z]}]}` while any party member is in BG3's turn-based
+//! mode outside combat; Guids are the creatures whose stand-ins BG3's turn-based mode froze (BG3
+//! decides that per character). The fight bridge turns it into the server's hold verbs (patch 0010's
+//! hold, by guid since patch 0026) and sends them through the hero's own client like every
 //! other `.wowbg3` verb (benilla's server channel, about 0.1 s to the server):
-//! - Hold true: `hold HID R X,Y,Z ...` on every new Seq (members walked, joined, left) and again every
-//!   [`REPEAT_MS`] (the same HID adds creatures that came near since);
+//! - Hold true: `hold HID guids G1,G2,...` ([`GUIDS_PER_LINE`] a line, a chat line's 255 characters)
+//!   for every guid on every new Seq and again every [`REPEAT_MS`] (a held one stays held; the repeat
+//!   renews the hold), and `hold HID drop G1,...` for those sent before that BG3 no longer froze;
 //! - Hold false, a new BG3 session (RunId), a file older than [`STALE_MS`] or a heartbeat (Tick)
 //!   unchanged that long while held (BG3 stopped): `unhold HID` once; creatures go on where they
 //!   stood. The first step of a bridge run sends `unhold all` (holds of an earlier run).
-use crate::handoff::Handoff;
+use crate::handoff::{GUIDS_PER_LINE, Handoff};
 use serde_json::Value;
-use std::{fs, path::Path, time::SystemTime};
+use std::{collections::BTreeSet, fs, path::Path, time::SystemTime};
 
 /// Milliseconds between repeats of a running hold (newcomers near the party are held too).
 pub const REPEAT_MS: u64 = 4_000;
@@ -22,8 +24,6 @@ pub const REPEAT_MS: u64 = 4_000;
 pub const STALE_MS: u64 = 15_000;
 /// Milliseconds between reads of turnhold.json.
 pub const READ_MS: u64 = 100;
-const MAX_SPOTS: usize = 8;
-const MAX_RADIUS: i64 = 200;
 
 #[derive(Debug, Default)]
 pub struct TurnHold {
@@ -37,33 +37,35 @@ pub struct TurnHold {
     sent_at: u64,
     read_at: Option<u64>,
     n: u32,
+    /// The guids held under `held` (sent in `hold HID guids` lines, not dropped since).
+    guids: BTreeSet<String>,
 }
 
 fn party(line: String) -> Handoff {
     Handoff::Party { line }
 }
 
-/// The members' WoW points as `X,Y,Z` (at most 8, the server's limit).
-pub fn spots(d: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for m in d
-        .get("Members")
+/// The creatures BG3 froze: `Guids`, WoW creature guids as 16 hex digits (lower case).
+pub fn frozen(d: &Value) -> BTreeSet<String> {
+    d.get("Guids")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        let Some(w) = m.get("Wow").and_then(Value::as_array) else {
-            continue;
-        };
-        let v: Vec<f64> = w.iter().filter_map(Value::as_f64).collect();
-        if v.len() == 3 && w.len() == 3 && v.iter().all(|x| x.is_finite() && x.abs() < 100_000.0) {
-            out.push(format!("{:.1},{:.1},{:.1}", v[0], v[1], v[2]));
-        }
-        if out.len() == MAX_SPOTS {
-            break;
-        }
-    }
-    out
+        .filter_map(Value::as_str)
+        .filter(|g| g.len() == 16 && g.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// `hold HID VERB G1,G2,...` lines, [`GUIDS_PER_LINE`] guids each.
+fn guid_lines<'a>(h: &str, verb: &str, guids: impl Iterator<Item = &'a String>) -> Vec<Handoff> {
+    let all: Vec<&String> = guids.collect();
+    all.chunks(GUIDS_PER_LINE)
+        .map(|c| {
+            let list: Vec<&str> = c.iter().map(|g| g.as_str()).collect();
+            party(format!("hold {h} {verb} {}", list.join(",")))
+        })
+        .collect()
 }
 
 impl TurnHold {
@@ -100,8 +102,7 @@ impl TurnHold {
         let run = d.get("RunId").and_then(Value::as_str).map(str::to_string);
         let seq = d.get("Seq").and_then(Value::as_i64);
         let want = d.get("Hold") == Some(&Value::Bool(true)) && age_ms < STALE_MS;
-        let points = if want { spots(&d) } else { Vec::new() };
-        let want = want && !points.is_empty();
+        let guids = if want { frozen(&d) } else { BTreeSet::new() };
         let new_run = self.run.is_some() && run != self.run;
         let stale = self.held.is_some() && now.saturating_sub(self.tick_at) > STALE_MS;
         if let Some(h) = self.held.clone()
@@ -109,9 +110,22 @@ impl TurnHold {
         {
             out.push(party(format!("unhold {h}")));
             self.held = None;
+            self.guids.clear();
+        }
+        // BG3 let these go: the server too (only what this hold holds).
+        if let Some(h) = self.held.clone()
+            && want
+            && !stale
+        {
+            let gone: Vec<String> = self.guids.difference(&guids).cloned().collect();
+            out.extend(guid_lines(&h, "drop", gone.iter()));
+            for g in &gone {
+                self.guids.remove(g);
+            }
         }
         if want
             && !stale
+            && !guids.is_empty()
             && (self.held.is_none() || seq != self.seq || now >= self.sent_at + REPEAT_MS)
         {
             let h = match &self.held {
@@ -130,12 +144,8 @@ impl TurnHold {
                     h
                 }
             };
-            let r = d
-                .get("Radius")
-                .and_then(Value::as_i64)
-                .unwrap_or(50)
-                .clamp(1, MAX_RADIUS);
-            out.push(party(format!("hold {h} {r} {}", points.join(" "))));
+            out.extend(guid_lines(&h, "guids", guids.iter()));
+            self.guids = guids;
             self.sent_at = now;
         }
         self.run = run;
@@ -157,27 +167,47 @@ mod tests {
     }
 
     #[test]
-    fn holds_at_once_repeats_and_lets_go() {
+    fn holds_what_bg3_froze_repeats_drops_and_lets_go() {
         let dir = std::env::temp_dir().join(format!("turnhold-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut t = TurnHold::default();
         assert_eq!(lines(t.step(&dir, 0)), vec![".wowbg3 unhold all"]);
-        let on = |seq: i64, tick: i64| {
-            json!({"Schema": 1, "RunId": "5ba0566e-2e4a", "Seq": seq, "Tick": tick, "Hold": true, "Radius": 50,
+        let on = |seq: i64, tick: i64, guids: Value| {
+            json!({"Schema": 1, "RunId": "5ba0566e-2e4a", "Seq": seq, "Tick": tick, "Hold": true, "Guids": guids,
                    "Members": [{"Name": "Gale", "Wow": [-8987.4, -141.6, 83.1]}]})
         };
-        write(&dir, on(1, 6));
-        assert_eq!(
-            lines(t.step(&dir, 200)),
-            vec![".wowbg3 hold tb-5ba0566e-1 50 -8987.4,-141.6,83.1"]
-        );
-        assert!(lines(t.step(&dir, 400)).is_empty());
-        assert_eq!(lines(t.step(&dir, 200 + REPEAT_MS)).len(), 1);
-        write(&dir, on(2, 12));
-        assert_eq!(lines(t.step(&dir, 200 + REPEAT_MS + 200)).len(), 1);
+        // Nothing frozen yet: nothing to hold.
+        write(&dir, on(1, 6, json!([])));
+        assert!(lines(t.step(&dir, 200)).is_empty());
         write(
             &dir,
-            json!({"Schema": 1, "RunId": "5ba0566e-2e4a", "Seq": 3, "Tick": 18, "Hold": false, "Members": []}),
+            on(2, 6, json!(["F130000045013888", "f13000012b01389b", "bad"])),
+        );
+        assert_eq!(
+            lines(t.step(&dir, 400)),
+            vec![".wowbg3 hold tb-5ba0566e-1 guids f130000045013888,f13000012b01389b"]
+        );
+        assert!(lines(t.step(&dir, 600)).is_empty());
+        assert_eq!(lines(t.step(&dir, 400 + REPEAT_MS)).len(), 1);
+        // BG3 let one go: dropped, the other held again.
+        write(&dir, on(3, 12, json!(["f130000045013888"])));
+        assert_eq!(
+            lines(t.step(&dir, 400 + REPEAT_MS + 200)),
+            vec![
+                ".wowbg3 hold tb-5ba0566e-1 drop f13000012b01389b",
+                ".wowbg3 hold tb-5ba0566e-1 guids f130000045013888"
+            ]
+        );
+        // Many guids go out GUIDS_PER_LINE a line, each line within a chat line.
+        let many: Vec<String> = (0..30).map(|i| format!("f1300000450138{i:02x}")).collect();
+        write(&dir, on(4, 18, json!(many)));
+        let l = lines(t.step(&dir, 10_000));
+        assert_eq!(l[0], ".wowbg3 hold tb-5ba0566e-1 drop f130000045013888");
+        assert_eq!(l.len() - 1, 30usize.div_ceil(GUIDS_PER_LINE));
+        assert!(l.iter().all(|x| x.len() <= 255));
+        write(
+            &dir,
+            json!({"Schema": 1, "RunId": "5ba0566e-2e4a", "Seq": 5, "Tick": 18, "Hold": false, "Guids": [], "Members": []}),
         );
         assert_eq!(
             lines(t.step(&dir, 20_000)),
@@ -185,10 +215,10 @@ mod tests {
         );
         assert!(lines(t.step(&dir, 20_200)).is_empty());
         // A heartbeat that stops while held lets go.
-        write(&dir, on(4, 24));
+        write(&dir, on(6, 24, json!(["f130000045013888"])));
         assert_eq!(
             lines(t.step(&dir, 21_000)),
-            vec![".wowbg3 hold tb-5ba0566e-2 50 -8987.4,-141.6,83.1"]
+            vec![".wowbg3 hold tb-5ba0566e-2 guids f130000045013888"]
         );
         let late = 21_000 + STALE_MS + 1;
         assert_eq!(

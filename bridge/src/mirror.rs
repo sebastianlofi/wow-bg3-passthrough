@@ -1,5 +1,5 @@
-//! Mirrored WoW mobs (world fights). In world mode every attackable WoW creature near
-//! the hero has a BG3 stand-in all the time (`Mirrors.lua`), at the mob's position and facing on
+//! Mirrored WoW mobs (world fights). In world mode every WoW creature WoW has loaded round the
+//! party (the WoW client's and the members' bots' visible lists) has a BG3 stand-in all the time (`Mirrors.lua`), at the mob's position and facing on
 //! the treadmill ground, so BG3's own targeting, attacks, throws, spells, sight cones, stealth and
 //! turn-based mode work on WoW's mobs. WoW keeps drawing the mobs (the capture layer's `void` keep
 //! list leaves the stand-ins out of the composite).
@@ -7,14 +7,13 @@
 //! Files in the link directory:
 //! - `mobs.txt` (benilla, every 12 frames): `seq N`, `hero GUID X Y Z O HP MAXHP LEVEL [STATE]`
 //!   (STATE since benilla 0025: 0 alive, 1 dead, 2 a ghost), then one
-//!   `mob GUID ENTRY LEVEL REACTION X Y Z O HP MAXHP FLAGS NAME...` per living creature within
-//!   40 yd (WoW yards, O the WoW orientation in radians, HP as the 1.12 client sees it, REACTION 1
+//!   `mob GUID ENTRY LEVEL REACTION X Y Z O HP MAXHP FLAGS NAME...` per living creature the
+//!   client has loaded (benilla 0114: WoW's own visible set, no distance of ours; WoW yards, O the WoW orientation in radians, HP as the 1.12 client sees it, REACTION 1
 //!   for a mob that aggroes by itself, 0 for a neutral one, 2 (benilla 0027) for a
 //!   friendly NPC the player may not attack in WoW: vendors, quest givers, guards, villagers;
 //!   FLAGS 1 in combat, 2 its target is you).
 //!
-//! Friendly NPCs: they get stand-ins too, after the attackable
-//! mobs (never in their place), within [`FRIENDLY_RANGE`], at most [`MAX_FRIENDLY`] of their own.
+//! Friendly NPCs: they get stand-ins too.
 //! Attacking one is BG3's own flow: BG3's Assault crime makes the stand-in temporarily hostile
 //! (`Mirrors.lua`) and the BG3 combat that follows is the fight; the server then turns that NPC on
 //! the player (`begin`/`join` with `!GUID`, server patch 0006). A hit alone (BG3 started no combat: a 0-damage assault is only a warning there) pulls none.
@@ -39,9 +38,10 @@
 //!
 //! Per party member (party-multiplayer-design.md): mobs are mirrored
 //! round every member, not only the hero. `party-wow.json` (`world_bridge.py`, Format 1) gives each
-//! member's WoW position; a mob within `MIRROR_RANGE` of any member is wanted, and one already
-//! mirrored stays until it is `KEEP_MARGIN` further out (no re-creating a stand-in that walks along
-//! the edge). Where the creatures come from is one function, [`read_feed`]: benilla's view of the
+//! member's WoW position (a mob's height must be near a member's: `Mirror::wanted`). Which
+//! creatures are wanted is WoW's own: every one in the feed, with no range or count of ours (project rule:
+//! what WoW has loaded and shows has an interactable stand-in); one enters and leaves when WoW's
+//! visibility adds and drops it. Where the creatures come from is one function, [`read_feed`]: benilla's view of the
 //! hero (`mobs.txt`) plus any per-member feed files `feed/<member>.txt` in the same `mob ...` line
 //! format (the server's per-member creature feed, lands there).
 //!
@@ -68,26 +68,13 @@ use std::{
     time::Instant,
 };
 
-/// Yards from the hero within which mobs are mirrored (45, was 26, so they
-/// pop in farther away). The treadmill keeps at least 24 m (26 yd) of WoW ground around Tav: a
-/// stand-in past that can stand beyond BG3's ground until she comes closer.
-pub const MIRROR_RANGE: f64 = 45.0;
-/// Stand-ins mirrored at once (the nearest), besides the running fight's, with the hero alone.
-pub const MAX_MIRRORS: usize = 24;
-/// More stand-ins for each other party member with mobs round it, up to [`MAX_MIRRORS_PARTY`]
-/// (`Mirrors.lua` keeps at most 60, fights included).
-pub const MIRRORS_PER_MEMBER: usize = 8;
-pub const MAX_MIRRORS_PARTY: usize = 48;
-/// Yards past `MIRROR_RANGE` a mirrored mob keeps its stand-in (stand-ins at the edge
-/// were re-created often).
-pub const KEEP_MARGIN: f64 = 8.0;
-/// Yards: friendly NPCs are mirrored this close (benilla's `mobs.txt` reaches 40 yd: every NPC the
-/// player sees round the party), so BG3's right click and Talk reach them from where the player
-/// sees them (was 18, BG3's reach for a melee attack, and a quest giver further off had no stand-in).
-pub const FRIENDLY_RANGE: f64 = 40.0;
-/// Friendly NPCs mirrored at once, the nearest, besides the attackable mobs (their own budget, so a
-/// field of wolves does not take the quest giver's stand-in; was 8 within what [`MAX_MIRRORS`] left).
-pub const MAX_FRIENDLY: usize = 16;
+/// No range and no count of ours decides which WoW creatures get stand-ins (was 45 yd and the
+/// nearest 24 to 48, friendlies 40 yd and 16; a mob WoW showed 47 yd off had none, so a click on it
+/// fell through to WoW's own 18 yd pull): the feed is WoW's visible set, benilla's `mobs.txt` (0114)
+/// and each bot's feed. The bot's feed is asked for at the server's ceiling, [`FEED_RANGE`], so the
+/// member's visible list itself decides (WoW's visibility, 100 yd on continents, more in instances).
+/// Yards; patch 0010's `FEED_MAX_RANGE`.
+pub const FEED_RANGE: u32 = 250;
 /// The server holds at most this many mobs per encounter.
 pub const MAX_HELD: usize = 50;
 pub const FLAG_COMBAT: u32 = 1;
@@ -416,7 +403,7 @@ impl PartyLink {
             if !ticking && self.feeds.get(&name).is_none_or(|t| now >= t + 30_000) {
                 self.feeds.insert(name.clone(), now);
                 out.push(Handoff::Party {
-                    line: format!("feed {name} on 100 500"),
+                    line: format!("feed {name} on {FEED_RANGE} 500"),
                 });
             }
         }
@@ -894,43 +881,31 @@ impl Mirror {
             .map(|a| hdist(p, *a))
             .fold(f64::INFINITY, f64::min)
     }
-    /// The mobs to mirror: the running fight's, then the nearest attackable others within
-    /// `MIRROR_RANGE` of any party member (one already mirrored within `MIRROR_RANGE + KEEP_MARGIN`),
-    /// at most `MAX_MIRRORS` (more with members: `MIRRORS_PER_MEMBER` each, up to
-    /// `MAX_MIRRORS_PARTY`), then the nearest friendly NPCs within `FRIENDLY_RANGE` (at most
-    /// `MAX_FRIENDLY`, a budget of their own): friendlies never take an attackable mob's stand-in.
+    /// The mobs to mirror: the running fight's, then every other creature WoW has loaded round the
+    /// party (the feed: WoW's visible set), attackable or friendly, nearest to a member first (the
+    /// order `Mirrors.lua` spawns them in). No range or count of ours: what WoW shows has a stand-in.
+    /// Only a mob whose height is far from every member's (`party_dist`: another storey) is left out.
     pub fn wanted(&self, fight: &[String], now: u64) -> Vec<&WowUnit> {
         let anchors = self.anchors();
         if anchors.is_empty() {
             return Vec::new();
         }
-        let near_of = |friendly: bool, range: f64| {
-            let mut v: Vec<(f64, &WowUnit)> = self
-                .mobs
-                .mobs
-                .iter()
-                .filter(|m| m.friendly == friendly)
-                .filter(|m| !fight.contains(&m.guid) && !self.settled_now(&m.guid, now))
-                .map(|m| (self.party_dist(&anchors, m.pos), m))
-                .filter(|(d, m)| {
-                    *d <= range
-                        || (*d <= range + KEEP_MARGIN && self.status.mobs.contains_key(&m.guid))
-                })
-                .collect();
-            v.sort_by(|a, b| a.0.total_cmp(&b.0));
-            v.into_iter().map(|(_, m)| m).collect::<Vec<_>>()
-        };
-        let cap = (MAX_MIRRORS + MIRRORS_PER_MEMBER * (anchors.len() - 1)).min(MAX_MIRRORS_PARTY);
-        let mut near = near_of(false, MIRROR_RANGE);
-        near.truncate(cap);
-        near.extend(near_of(true, FRIENDLY_RANGE).into_iter().take(MAX_FRIENDLY));
+        let mut near: Vec<(f64, &WowUnit)> = self
+            .mobs
+            .mobs
+            .iter()
+            .filter(|m| !fight.contains(&m.guid) && !self.settled_now(&m.guid, now))
+            .map(|m| (self.party_dist(&anchors, m.pos), m))
+            .filter(|(d, _)| d.is_finite())
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut out: Vec<&WowUnit> = self
             .mobs
             .mobs
             .iter()
             .filter(|m| fight.contains(&m.guid))
             .collect();
-        out.extend(near);
+        out.extend(near.into_iter().map(|(_, m)| m));
         out
     }
     /// `mirror.json` for the mod.

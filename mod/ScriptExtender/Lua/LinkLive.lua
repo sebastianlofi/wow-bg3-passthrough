@@ -415,12 +415,14 @@ local function newBackend(actors, void, runId, session)
             scaled[a.id] = {Adopted = uuid, Kind = specs[a.id] and specs[a.id].Kind, Name = specs[a.id] and specs[a.id].Name,
                 Scale = mirror.Scale, Hp = {mirror.Hp, mirror.MaxHp}}
             -- A neutral mob in the fight was provoked in WoW: BG3 only lets a hostile character
-            -- join (Osiris EnterCombat did nothing for a neutral stand-in in the harness). Mirrors.lua
-            -- spawns WoW-neutral mobs hostile already (Relations.lua); this covers a plan without one.
+            -- join (Osiris EnterCombat did nothing for a neutral stand-in in the harness).
             -- A friendly NPC WoW's rules pulled in (its creature group) turns
             -- on Tav the way BG3 turns someone attacked: a temporary hostile relation, its own
             -- faction kept (the one Tav attacked is in BG3's combat already, its crime flow did it).
-            if mirror.InCombat ~= true and mirror.Friendly == true then
+            -- A neutral one Tav attacked turns the same way: this pull comes while BG3's crime reaction still
+            -- runs, and BG3's TEMPORARILY_HOSTILE (given at the combat's first turn) goes at once from a
+            -- character whose faction is hostile. The faction below is for one Tav did not attack.
+            if mirror.InCombat ~= true and (mirror.Friendly == true or mirror.Provoked == true) then
                 standIn({Action = "TempHostile", Target = uuid, With = Hero.Uuid()})
                 scaled[a.id].Provoked = "temporarily hostile"
             elseif mirror.InCombat ~= true and mirror.Hostile ~= true and void.Faction then

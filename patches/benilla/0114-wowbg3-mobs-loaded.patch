@@ -1,0 +1,51 @@
+WOW-BG3 benilla patch 0114: mobs.txt lists every creature WoW has loaded, not those within 40 yd.
+Project rule: what WoW shows has an interactable BG3 stand-in. A boar WoW drew 47 yd
+off had none (mobs.txt stopped at 40 yd, the bridge at 45), so the click fell to WoW and the 18 yd pull refused
+it. mobs.txt (and wowmobs.bin, which streams what it lists) now holds every living creature in the client's
+object list, the visible set the server sends by its own visibility distance; the bridge mirrors all of them.
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -30,8 +30,9 @@
+ //! or an add joining the running encounter) pulls or joins that mob like a client-seen aggro.
+ //!
+ //! Mirrored mobs (world mode): every 12 frames `mobs.txt` lists the hero and every
+-//! living attackable creature within 40 yards (position, facing, HP, hostile or neutral, combat
+-//! flags) for the bridge, which keeps a BG3 stand-in at each (`bridge/src/mirror.rs`, `Mirrors.lua`).
++//! living creature the client has loaded (patch 0114: WoW's own visible set, which the server sends
++//! by its visibility distance; was those within 40 yards) (position, facing, HP, hostile or neutral,
++//! combat flags) for the bridge, which keeps a BG3 stand-in at each (`bridge/src/mirror.rs`, `Mirrors.lua`).
+ //! `mirrored.txt` (bridge) names the mobs that have one (`m GUID`): BG3 takes clicks on those (its
+ //! own attack, spell, throw or targeting on the stand-in), so the pointer link does not claim them
+ //! for WoW (`claims_hover`). Mobs held by a turn-based freeze (`h GUID`) never pull by their
+@@ -98,8 +99,6 @@ const YOUNG_WOLF: u32 = 299;
+ const PULL_RANGE: f32 = 18.0;
+ /// Yards: mobs in combat with you this close go into the pull or join the fight.
+ const PACK_RANGE: f32 = 30.0;
+-/// Yards: mobs listed in `mobs.txt` for the bridge's mirrors.
+-const MIRROR_RANGE: f32 = 40.0;
+ /// Yards per second for a mob model along BG3's path.
+ const MOB_SPEED: f32 = 7.0;
+ /// Mobs one pull takes (bridge and server take up to 50 per encounter).
+@@ -1116,7 +1115,10 @@ fn fight_tick(
+         f.searching = searching;
+     }
+     let frozen: HashSet<u64> = SHARED.lock().map(|s| s.frozen.clone()).unwrap_or_default();
+-    // The mobs near you for the bridge's mirrors (`mobs.txt`).
++    // The mobs for the bridge's mirrors (`mobs.txt`). Patch 0114: every creature the client has
++    // loaded, WoW's visible set, with no distance of ours (was 40 yd from `seen_from`): what WoW
++    // shows round the party has an interactable stand-in (project rule: a boar
++    // WoW drew 47 yd off had none, so the click fell to the 18 yd pull below).
+     if f.frame % 12 == 5 && player.active {
+         // Patch 0025: the body's state last, 0 alive, 1 dead (a corpse), 2 a ghost.
+         let state = if my_store.0.player_is_ghost() {
+@@ -1138,9 +1140,6 @@ fn fight_tick(
+         );
+         let mut near = HashSet::new();
+         for (g, store, tf) in &units {
+-            if seen_from.distance(tf.translation) > MIRROR_RANGE {
+-                continue;
+-            }
+             let Some(reaction) = reaction(store, my_store, factions.as_deref(), reps) else {
+                 continue;
+             };

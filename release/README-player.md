@@ -112,7 +112,7 @@ character back to where it was in that save.
 WoW levels run to 60, the end goal. The level BG3 shows beside a character is that character's own BG3
 level, not your WoW level. WoW levels 2, 3 and 4 each open a party place; from WoW level 5 each level earns
 one BG3 level-up for one party member, and every 5th earns two. BG3's XP bar shows how far you are into your
-WoW level, and a notice at each new WoW level says the rest.
+WoW level, and `/wowbg3 pool` lists your party slots and the level-ups waiting.
 
 Your characters do not all level together: one WoW level is one level-up for one character of your choice,
 not a level for the whole party. Going from BG3 level 3 to 4 across a party of four takes four level-ups.

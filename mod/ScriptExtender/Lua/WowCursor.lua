@@ -20,9 +20,6 @@
 -- CursorOverrides, and only while BG3's own choice there is the plain Arrow: a spell or throw
 -- being aimed, or a hostile stand-in in a fight, keeps BG3's cursor. CursorOverrides takes the
 -- CursorType numbers (bg3le refuses the names: "number expected, got string"; Melee is 28).
--- Since a WoW-neutral mob's stand-in has BG3's hostile faction (Relations.lua), BG3's own cursor
--- over it is its attack cursor and its left click an attack, as over a hostile one; the Melee
--- override stays for a stand-in BG3 still shows the Arrow for.
 -- Friendly NPCs: a vendor, quest giver, guard or villager with a
 -- stand-in stays WoW's to click (benilla 0027 keeps flag 2: talk, trade, quests, errands) and shows
 -- WoW's cursor, through CursorOverrides as BG3 rewrites its own choice over a picked stand-in. When

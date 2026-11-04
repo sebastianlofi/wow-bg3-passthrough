@@ -2097,68 +2097,128 @@ static const uint8_t* buf_cpu(uint64_t buffer, uint64_t off, uint64_t* left) {
 // vkUpdateDescriptorSets and update templates. Effects keep their object transforms in uniforms.
 typedef struct { uint8_t type; int32_t layout; uint64_t res, off, range, samp; } DescSlot;  // layout: an image's, from its descriptor
 #define DESC_SLOTS 32  // indexed by binding number (BG3's scene set uses bindings up to 30)
-// A set lives from vkAllocateDescriptorSets to vkFreeDescriptorSets, or to the reset or destruction
-// of its pool; its entry goes then, so the table holds the live sets only. Kept forever, as before
-// 2026-11-02, the dead handles filled all 32768 entries within half an hour of the maintainer's session
-// (HUD targets remade 295 times; a level-up and a companion joining): every set made after that
-// was unknown, so the final pass's HUD was not found (BG3's HUD gone) and effects lost their textures.
-// pool: the pool it came from (0: allocated before the hooks); pidx: its place in that pool's list.
-typedef struct { uint64_t h; uint64_t pool; uint32_t pidx; DescSlot slot[DESC_SLOTS]; } SetInfo;
-// Open addressing; a freed entry becomes a tombstone (SET_TOMB), so entries never move under the
-// recording threads that look sets up without the lock (set_find). When live entries and tombstones
-// pass 3/4 of the table, the live ones are copied into a new table (twice the size while they would
-// fill a quarter of it) and the pointer swapped; an old table is freed 2 s later, after any lookup
-// still reading it is long done (at most SET_OLD of them wait). Writers hold g_fxl_lock.
-typedef struct { uint32_t cap, used, tombs; SetInfo e[]; } SetTab;  // used: entries not empty (live + tombstones)
+// A set's entry: made at vkAllocateDescriptorSets, retired at vkFreeDescriptorSets or the reset or
+// destruction of its pool, and let go once BG3 has not bound it for SET_KEEP presents.
+// Retired, not dropped: a bind of a set BG3 has freed would find nothing if the entry went at the
+// free (suspected, not seen, behind missing vision cones, the spider familiar's black
+// effects and a hit's black ring in a 30-minute session; in fresh harness sessions
+// and .68 alike BG3 bound no freed set and all three looked right). The driver keeps a freed set's
+// descriptors until its memory is handed out again, so such a bind still draws right in BG3; the
+// entry lasts as long. Each bind marks its set (set_bound): a retired set BG3 still binds stays, one
+// it no longer binds goes SET_KEEP presents after its last bind or its free; the handle allocated
+// again starts a new entry in its place. Kept forever, as it used to be, the dead
+// handles filled the table within half an hour (BG3's HUD gone). The "sets:" lines count binds of
+// retired sets (and how long after the free) and of sets never seen: the test of that suspicion.
+// pool: the pool of a live set (0: allocated before the hooks, or retired); pidx: its place in
+// that pool's list. Entries never move or get freed (slabs, a free list), so recording threads
+// can read them without the lock; writers hold g_fxl_lock.
+typedef struct SetInfo {
+    uint64_t h, pool;
+    uint32_t pidx, freed;            // freed: retired (BG3 freed it)
+    uint64_t freed_at, bound_at;     // presents (g_req.presents) at the free and at the last bind
+    uint64_t q_at;                   // its place in the retired queue (presents)
+    struct SetInfo *qprev, *qnext;   // retired queue (oldest first); qnext also links the free list
+    DescSlot slot[DESC_SLOTS];
+} SetInfo;
+#define SET_KEEP 300u      // presents a retired set stays after its free or its last bind
+#define SET_SLAB 1024u     // entries per slab
+// The index: handle -> entry, open addressing, a removed handle becomes a tombstone (SET_TOMB), so
+// index slots never move under set_find. When handles and tombstones pass 3/4 of it, the handles
+// are copied into a new index (twice the size while they would fill a quarter of it; 16 bytes a
+// slot, 512 KB at the start) and the pointer swapped; an old index is freed 2 s later, after any
+// lookup still reading it is long done (at most SET_OLD of them wait).
+typedef struct { uint64_t h; SetInfo* s; } SetIdx;
+typedef struct { uint32_t cap, used, tombs, pad; SetIdx e[]; } SetTab;  // used: slots not empty (handles + tombstones)
 #define SET_CAP0 (1u << 15)
 #define SET_TOMB (~0ull)
 static SetTab* volatile g_settab;
 #define SET_OLD 3
 static SetTab* g_settab_old[SET_OLD];
 static double g_settab_old_t[SET_OLD];
+static SetInfo* g_set_free;                    // entries to reuse
+static SetInfo *g_ret_head, *g_ret_tail;       // retired entries, oldest first
+static uint32_t g_set_slabs, g_set_retired;
 // The pools' sets (g_fxl_lock held): sets[pidx] is each live set of the pool.
 typedef struct { uint64_t h; uint64_t* sets; uint32_t n, cap; } PoolInfo;
 #define POOL_CAP (1u << 13)
 static PoolInfo* g_pool;
-static struct { uint64_t allocs, frees, resets, destroys, dropped, rebuilds, unseen, failed, pools_full; } g_sets;
+static struct {
+    uint64_t allocs, frees, resets, destroys, retired, reclaimed, rebuilds, unseen, failed, pools_full;
+    uint64_t bound_freed, bound_freed_age, bound_unknown;  // binds of retired sets (max presents since the free), of unknown ones
+} g_sets;
+static uint64_t sets_now(void) { return __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED); }
 static SetInfo* set_find(uint64_t key) {
     SetTab* t = __atomic_load_n(&g_settab, __ATOMIC_ACQUIRE);
     if (!t || !key || key == SET_TOMB) return NULL;
     uint32_t i = hslot(key, t->cap);
     for (uint32_t n = 0; n < t->cap; n++, i = (i + 1) & (t->cap - 1)) {
         uint64_t h = __atomic_load_n(&t->e[i].h, __ATOMIC_ACQUIRE);
-        if (h == key) return &t->e[i];
+        if (h == key) return __atomic_load_n(&t->e[i].s, __ATOMIC_ACQUIRE);
         if (!h) return NULL;
     }
     return NULL;
 }
-// The entry of `key` in table t, made if missing (g_fxl_lock held; no room check).
-static SetInfo* set_put(SetTab* t, uint64_t key) {
+// A bind of `key` (recording threads, no lock): marks its entry as in use now.
+static SetInfo* set_bound(uint64_t key) {
+    SetInfo* s = set_find(key);
+    if (!s) {
+        if (key && !__atomic_fetch_add(&g_sets.bound_unknown, 1, __ATOMIC_RELAXED))
+            logf_("sets: BG3 bound set %llx, never allocated, updated or copied through the hooks", (unsigned long long)key);
+        return NULL;
+    }
+    uint64_t now = sets_now();
+    __atomic_store_n(&s->bound_at, now, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&s->freed, __ATOMIC_RELAXED)) {
+        uint64_t age = now - __atomic_load_n(&s->freed_at, __ATOMIC_RELAXED), max = __atomic_load_n(&g_sets.bound_freed_age, __ATOMIC_RELAXED);
+        while (age > max && !__atomic_compare_exchange_n(&g_sets.bound_freed_age, &max, age, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        if (!__atomic_fetch_add(&g_sets.bound_freed, 1, __ATOMIC_RELAXED))
+            logf_("sets: BG3 bound set %llx %llu presents after it freed it (kept: its entry is retired, not gone)",
+                  (unsigned long long)key, (unsigned long long)age);
+    }
+    return s;
+}
+// Puts (key, s) into index t (g_fxl_lock held; no room check). 0 when t has no slot left.
+static int set_put(SetTab* t, uint64_t key, SetInfo* s) {
     uint32_t i = hslot(key, t->cap), tomb = UINT32_MAX, n = 0;
     for (; n < t->cap; n++, i = (i + 1) & (t->cap - 1)) {
         uint64_t h = t->e[i].h;
-        if (h == key) return &t->e[i];
+        if (h == key) { __atomic_store_n(&t->e[i].s, s, __ATOMIC_RELEASE); return 1; }
         if (h == SET_TOMB) { if (tomb == UINT32_MAX) tomb = i; continue; }
         if (!h) break;
     }
     if (tomb != UINT32_MAX) { i = tomb; t->tombs--; }
-    else if (n == t->cap) return NULL;
+    else if (n == t->cap) return 0;
     else t->used++;
-    SetInfo* s = &t->e[i];
-    memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
-    __atomic_store_n(&s->h, key, __ATOMIC_RELEASE);
-    return s;
+    __atomic_store_n(&t->e[i].s, s, __ATOMIC_RELEASE);
+    __atomic_store_n(&t->e[i].h, key, __ATOMIC_RELEASE);
+    return 1;
 }
-static uint32_t set_live(const SetTab* t) { return t ? t->used - t->tombs : 0; }
+static void set_unindex(uint64_t key) {  // g_fxl_lock held
+    SetTab* t = g_settab;
+    if (!t) return;
+    uint32_t i = hslot(key, t->cap);
+    for (uint32_t n = 0; n < t->cap; n++, i = (i + 1) & (t->cap - 1)) {
+        uint64_t h = t->e[i].h;
+        if (h == key) { __atomic_store_n(&t->e[i].h, SET_TOMB, __ATOMIC_RELEASE); t->tombs++; return; }
+        if (!h) return;
+    }
+}
+static uint32_t set_count(const SetTab* t) { return t ? t->used - t->tombs : 0; }
 static void sets_log(const char* why) {
     SetTab* t = g_settab;
-    logf_("sets: %s: %u live of %u entries (%u freed), %llu allocated, %llu freed one by one, %llu pool resets, %llu pools destroyed,"
-          " %llu entries dropped, %llu rebuilds, %llu updated with no allocation seen, %llu not stored",
-          why, set_live(t), t ? t->cap : 0, t ? t->tombs : 0, (unsigned long long)g_sets.allocs, (unsigned long long)g_sets.frees,
-          (unsigned long long)g_sets.resets, (unsigned long long)g_sets.destroys, (unsigned long long)g_sets.dropped,
-          (unsigned long long)g_sets.rebuilds, (unsigned long long)g_sets.unseen, (unsigned long long)g_sets.failed);
+    uint32_t n = set_count(t);
+    logf_("sets: %s: %u live and %u retired (index %u of %u slots, %u removed; %u entries made), %llu allocated, %llu freed one by one,"
+          " %llu pool resets, %llu pools destroyed, %llu retired, %llu let go, %llu index rebuilds, %llu updated with no allocation seen,"
+          " %llu not stored; binds of retired sets %llu (at most %llu presents after the free), of unknown sets %llu",
+          why, n - g_set_retired, g_set_retired, t ? t->used : 0, t ? t->cap : 0, t ? t->tombs : 0, g_set_slabs * SET_SLAB,
+          (unsigned long long)g_sets.allocs, (unsigned long long)g_sets.frees, (unsigned long long)g_sets.resets,
+          (unsigned long long)g_sets.destroys, (unsigned long long)g_sets.retired, (unsigned long long)g_sets.reclaimed,
+          (unsigned long long)g_sets.rebuilds, (unsigned long long)g_sets.unseen, (unsigned long long)g_sets.failed,
+          (unsigned long long)__atomic_load_n(&g_sets.bound_freed, __ATOMIC_RELAXED),
+          (unsigned long long)__atomic_load_n(&g_sets.bound_freed_age, __ATOMIC_RELAXED),
+          (unsigned long long)__atomic_load_n(&g_sets.bound_unknown, __ATOMIC_RELAXED));
 }
-// Room for one more entry (g_fxl_lock held).
+// Room in the index for one more handle (g_fxl_lock held).
 static void set_room(void) {
     int ring = -1;
     for (int k = 0; k < SET_OLD; k++) {
@@ -2173,34 +2233,75 @@ static void set_room(void) {
         return;
     }
     if ((uint64_t)t->used * 4 < (uint64_t)t->cap * 3 || ring < 0) return;
-    uint32_t live = set_live(t), cap = t->cap;
-    while ((uint64_t)live * 4 > cap) cap *= 2;
+    uint32_t n = set_count(t), cap = t->cap;
+    while ((uint64_t)n * 4 > cap) cap *= 2;
     SetTab* nt = calloc(1, sizeof *nt + (size_t)cap * sizeof nt->e[0]);
-    if (!nt) { sets_log("no memory for a new table"); return; }
+    if (!nt) { sets_log("no memory for a new index"); return; }
     nt->cap = cap;
-    for (uint32_t i = 0; i < t->cap; i++) {
-        if (!t->e[i].h || t->e[i].h == SET_TOMB) continue;
-        SetInfo* s = set_put(nt, t->e[i].h);
-        if (s) memcpy(&s->pool, &t->e[i].pool, sizeof *s - offsetof(SetInfo, pool));
-    }
+    for (uint32_t i = 0; i < t->cap; i++)
+        if (t->e[i].h && t->e[i].h != SET_TOMB) set_put(nt, t->e[i].h, t->e[i].s);
     __atomic_store_n(&g_settab, nt, __ATOMIC_RELEASE);
     g_settab_old[ring] = t; g_settab_old_t[ring] = now_s();
     g_sets.rebuilds++;
-    sets_log("table rebuilt");
+    if (g_sets.rebuilds <= 4 || !(g_sets.rebuilds & (g_sets.rebuilds - 1))) sets_log("index rebuilt");
+}
+static void ret_unlink(SetInfo* s) {  // g_fxl_lock held
+    if (s->qprev) s->qprev->qnext = s->qnext; else g_ret_head = s->qnext;
+    if (s->qnext) s->qnext->qprev = s->qprev; else g_ret_tail = s->qprev;
+    s->qprev = s->qnext = NULL;
+}
+static void ret_push(SetInfo* s, uint64_t at) {  // g_fxl_lock held
+    s->q_at = at;
+    s->qprev = g_ret_tail; s->qnext = NULL;
+    if (g_ret_tail) g_ret_tail->qnext = s; else g_ret_head = s;
+    g_ret_tail = s;
+}
+// Lets go of retired entries BG3 has neither freed nor bound for SET_KEEP presents (g_fxl_lock held).
+static void sets_reclaim(void) {
+    uint64_t now = sets_now();
+    while (g_ret_head && g_ret_head->q_at + SET_KEEP <= now) {
+        SetInfo* s = g_ret_head;
+        ret_unlink(s);
+        uint64_t b = __atomic_load_n(&s->bound_at, __ATOMIC_RELAXED);
+        if (b + SET_KEEP > now) { ret_push(s, b); continue; }  // still bound: its time runs from that bind
+        set_unindex(s->h);
+        __atomic_store_n(&s->h, 0, __ATOMIC_RELAXED);
+        s->qnext = g_set_free; g_set_free = s;
+        g_set_retired--;
+        g_sets.reclaimed++;
+    }
+}
+// A new entry for `key`, live and empty (g_fxl_lock held).
+static SetInfo* set_new(uint64_t key) {
+    set_room();
+    if (!g_settab) return NULL;
+    SetInfo* s = g_set_free;
+    if (s) g_set_free = s->qnext;
+    else {
+        SetInfo* slab = calloc(SET_SLAB, sizeof *slab);
+        if (!slab) return NULL;
+        g_set_slabs++;
+        for (uint32_t k = 1; k < SET_SLAB; k++) { slab[k].qnext = g_set_free; g_set_free = &slab[k]; }
+        s = &slab[0];
+    }
+    memset(s, 0, sizeof *s);
+    s->h = key;
+    if (!set_put(g_settab, key, s)) { s->h = 0; s->qnext = g_set_free; g_set_free = s; return NULL; }
+    return s;
 }
 // The entry of `key`, made if missing (g_fxl_lock held).
 static SetInfo* set_get(uint64_t key) {
     if (!key || key == SET_TOMB) return NULL;
-    set_room();
-    SetInfo* s = g_settab ? set_put(g_settab, key) : NULL;
-    if (!s && !g_sets.failed++) sets_log("table full, a set not stored");
+    SetInfo* s = set_find(key);
+    if (!s) s = set_new(key);
+    if (!s && !g_sets.failed++) sets_log("index full, a set not stored");
     return s;
 }
 static PoolInfo* pool_info(uint64_t pool, int create) {  // g_fxl_lock held
     if (!pool) return NULL;
     if (!g_pool) g_pool = calloc(POOL_CAP, sizeof *g_pool);
     PoolInfo* p = g_pool ? TABLE_FIND(g_pool, POOL_CAP, pool, create) : NULL;
-    if (!p && create && !g_sets.pools_full++) logf_("sets: pool table full; sets of new pools are dropped only when freed one by one");
+    if (!p && create && !g_sets.pools_full++) logf_("sets: pool table full; sets of new pools are retired only when freed one by one");
     return p;
 }
 // Takes pool p's entry out of its table: the entries after it move back (only writers, under the lock, read it).
@@ -2220,7 +2321,7 @@ static void pool_remove(PoolInfo* p) {
         i = j;
     }
 }
-// Set s (an entry of the current table) leaves its pool's list (g_fxl_lock held).
+// Live set s leaves its pool's list (g_fxl_lock held).
 static void pool_unlist(SetInfo* s) {
     PoolInfo* p = pool_info(s->pool, 0);
     if (!p || s->pidx >= p->n || p->sets[s->pidx] != s->h) return;
@@ -2228,21 +2329,32 @@ static void pool_unlist(SetInfo* s) {
     if (s->pidx < p->n) {
         p->sets[s->pidx] = last;
         SetInfo* m = set_find(last);
-        if (m) m->pidx = s->pidx;
+        if (m && m->pool == s->pool) m->pidx = s->pidx;
     }
 }
-static void set_drop(SetInfo* s) {  // g_fxl_lock held; s in the current table
-    __atomic_store_n(&s->h, SET_TOMB, __ATOMIC_RELEASE);
-    memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
-    g_settab->tombs++;
-    g_sets.dropped++;
+// BG3 freed live set s (its pool list already updated; g_fxl_lock held).
+static void set_retire(SetInfo* s) {
+    uint64_t now = sets_now();
+    s->pool = 0; s->pidx = 0;
+    __atomic_store_n(&s->freed_at, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->freed, 1, __ATOMIC_RELAXED);
+    ret_push(s, now);
+    g_set_retired++;
+    g_sets.retired++;
 }
 static void sets_allocated(uint64_t pool, uint32_t n, const VkDescriptorSet* sets) {  // g_fxl_lock held
+    sets_reclaim();
     for (uint32_t k = 0; k < n; k++) {
         SetInfo* s = set_get((uint64_t)sets[k]);
         if (!s) continue;
-        if (s->pool) pool_unlist(s);  // a set whose end was never seen: a new one now
-        memset(&s->pool, 0, sizeof *s - offsetof(SetInfo, pool));
+        // The handle again: a new set in place of the retired one, or of one whose end was never seen.
+        if (s->freed) { ret_unlink(s); g_set_retired--; }
+        else if (s->pool) pool_unlist(s);
+        s->pool = 0; s->pidx = 0; s->q_at = 0;
+        __atomic_store_n(&s->freed_at, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->bound_at, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->freed, 0, __ATOMIC_RELAXED);
+        memset(s->slot, 0, sizeof s->slot);
         g_sets.allocs++;
         PoolInfo* p = pool_info(pool, 1);
         if (!p) continue;
@@ -2257,21 +2369,23 @@ static void sets_allocated(uint64_t pool, uint32_t n, const VkDescriptorSet* set
     }
 }
 static void sets_freed(uint64_t pool, uint32_t n, const VkDescriptorSet* sets) {  // g_fxl_lock held
+    sets_reclaim();
     for (uint32_t k = 0; k < n; k++) {
         SetInfo* s = set_find((uint64_t)sets[k]);
-        if (!s || (s->pool && pool && s->pool != pool)) continue;
+        if (!s || s->freed || (s->pool && pool && s->pool != pool)) continue;
         pool_unlist(s);
-        set_drop(s);
+        set_retire(s);
         g_sets.frees++;
     }
 }
 static void sets_pool_end(uint64_t pool, int destroyed) {  // g_fxl_lock held
+    sets_reclaim();
     PoolInfo* p = pool_info(pool, 0);
     if (destroyed) g_sets.destroys++; else g_sets.resets++;
     if (!p) return;
     for (uint32_t k = 0; k < p->n; k++) {
         SetInfo* s = set_find(p->sets[k]);
-        if (s && s->pool == pool) set_drop(s);
+        if (s && !s->freed && s->pool == pool) set_retire(s);
     }
     p->n = 0;
     if (destroyed) pool_remove(p);
@@ -2655,7 +2769,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         for (uint32_t k = 0; k < n; k++) {
             uint32_t s = first + k, nd_here = 0;
             if (s < 8) t_cset[s] = (uint64_t)sets[k];
-            SetInfo* si = set_find((uint64_t)sets[k]);
+            SetInfo* si = set_bound((uint64_t)sets[k]);
             for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
                 if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
                     if (s < 8 && nd_here < 8 && di < nd) t_cdyn[s][nd_here] = dyn[di];
@@ -2671,7 +2785,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         for (uint32_t k = 0; k < n; k++) {
             uint32_t s = first + k, nd_here = 0;
             if (s < 8) t_set[s] = (uint64_t)sets[k];
-            SetInfo* si = set_find((uint64_t)sets[k]);
+            SetInfo* si = set_bound((uint64_t)sets[k]);
             for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
                 if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
                     if (s < 8 && nd_here < 8 && di < nd) t_dyn[s][nd_here] = dyn[di];

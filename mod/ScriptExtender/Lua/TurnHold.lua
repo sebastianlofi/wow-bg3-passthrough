@@ -5,7 +5,7 @@
 --
 -- This module only says where to hold (BG3 side of the backend contract, wow-backend-contract.md
 -- "Turn-based hold"): wow-bg3/link/turnhold.json
---   {Schema = 1, RunId, Seq, Tick, Hold = true|false, Radius (WoW yards), Members = [{Uuid, Name,
+--   {Schema = 1, RunId, Seq, Tick, Hold = true|false, Guids = [WoW guid, ...], Members = [{Uuid, Name,
 --    Bg3 = {x, y, z}, Wow = {x, y, z} | nil}]}
 -- Members: every party member (Osiris DB_Players) in turn-based mode (the eoc::ftb::IsInFtbComponent
 -- tag, or the Osiris EnteredForceTurnBased/LeftForceTurnBased events) and in no combat. Hold is true
@@ -16,8 +16,21 @@
 -- held too). Tick is rewritten every M.Keep ticks while held (a heartbeat: a backend releases when it
 -- stops). A new Lua session (a load) starts with Hold = false, and so does any state that is not
 -- Running or a held state (Session.lua: a save or a pause keeps the hold).
--- The backend (today the fight bridge, bridge/src, with the server's hold-area verb) turns it into
--- "hold every creature within Radius of these points" and "release".
+-- The backend (today the fight bridge, bridge/src, with the server's hold verbs, vmangos 0026) turns it
+-- into "hold exactly these creatures", "let these go" and "release".
+-- Guids: the WoW creatures whose stand-ins BG3's own turn-based mode froze (project rule:
+-- "turn based mode should reach as far as it does in BG3"; was every creature within 50 yd), from
+-- WOWBG3MirrorOwned (Mirrors.lua, stand-in uuid -> WoW guid). Seq goes up when that set changes too.
+-- What BG3 freezes was measured (Elwynn, 55 stand-ins and 11 plain BG3 NPCs
+-- spawned 10 to 150 m out, ForceTurnBasedMode on the party): every character BG3 takes into the
+-- party's turn-based mode gets the eoc::ftb::IsInFtbComponent tag (IsInFTB) and ls::TimeFactor 0
+-- (time stopped), the same as the party has the tag with TimeFactor 1. It took in characters 10 to
+-- 35 m out and none past 35 m (none of the inactive ones, past BG3's 41 m activation, at all), but
+-- not by distance alone: one at 24.6 m and one at 29.3 m stayed out. FTBParticipant is on every
+-- character in or out of turn-based mode, and FTBPaused was on none, so neither says frozen. So the
+-- hold goes by guid, not by a radius round the members. Stats.Bg3 records each check: stand-ins, how
+-- many BG3 froze, the farthest frozen and the nearest left free (WoW yards from the nearest member),
+-- and the turn-based zones' fields.
 -- The world's turn (a playtest report: the environment's turn came and nothing in WoW moved): BG3
 -- pauses the world only while the party takes its turns; once every member in turn-based mode has
 -- ended its turn, the turn order shows the environment's turn and the rest of the world runs for that
@@ -32,7 +45,6 @@ local Session = Ext.Require("Session.lua")
 
 local OUT = "wow-bg3/link/turnhold.json"
 local YD = 0.9144
-M.Radius = 50  -- WoW yards around each member (the mirrors reach 45 yd; BG3's view in world mode)
 M.Move = 4.0   -- metres a member walks before the points are sent again
 M.Every = 6    -- ticks between checks
 M.Keep = 150   -- ticks between heartbeats while held (about 5 s)
@@ -67,6 +79,56 @@ local function position(uuid)
     if ok and type(x) == "number" then return {x, y, z} end
 end
 
+-- Whether BG3's turn-based mode froze a stand-in (see the header: IsInFTB, time factor 0); nil: no entity.
+local function ftbOf(uuid)
+    local e = q(Ext.Entity.Get, uuid)
+    if not e then return nil end
+    local tf = q(function() return e.TimeFactor and e.TimeFactor.Value end)
+    return {InFtb = q(function() return e.IsInFTB ~= nil end) == true, Stopped = type(tf) == "number" and tf == 0}
+end
+
+-- The WoW guids of the stand-ins BG3's turn-based mode froze (sorted), and the census behind them
+-- (see the header). Stand-ins: WOWBG3MirrorOwned (Mirrors.lua, uuid -> guid).
+local function bg3Frozen(members)
+    local far, near, census, guids = 0.0, nil, {StandIns = 0, InFtb = 0, Stopped = 0, Frozen = 0}, {}
+    for uuid, guid in pairs(WOWBG3MirrorOwned or {}) do
+        local f, p = ftbOf(uuid), position(uuid)
+        if f and p then
+            census.StandIns = census.StandIns + 1
+            if f.InFtb then census.InFtb = census.InFtb + 1 end
+            if f.Stopped then census.Stopped = census.Stopped + 1 end
+            local d = math.huge
+            for _, m in ipairs(members) do
+                local b = m.Bg3
+                d = math.min(d, math.sqrt((p[1] - b[1]) ^ 2 + (p[2] - b[2]) ^ 2 + (p[3] - b[3]) ^ 2) / YD)
+            end
+            if f.InFtb or f.Stopped then
+                census.Frozen = census.Frozen + 1
+                far = math.max(far, d)
+                if type(guid) == "string" and guid:match("^%x+$") then guids[#guids + 1] = guid end
+            elseif not near or d < near then
+                near = d
+            end
+        end
+    end
+    census.FarthestFrozenYd = census.Frozen > 0 and math.floor(far * 10 + 0.5) / 10 or nil
+    census.NearestFreeYd = near and math.floor(near * 10 + 0.5) / 10 or nil
+    -- The zones themselves (esv::ftb::ZoneComponent; field_1C read 6.0 in the measurement, not the
+    -- 35 m reach: its meaning is unknown, kept in the census).
+    local zones = {}
+    for _, z in ipairs(q(Ext.Entity.GetAllEntitiesWithComponent, "FTBZone") or {}) do
+        local c = q(function() return z.FTBZone end)
+        if c then
+            zones[#zones + 1] = {F1C = q(function() return c.field_1C end), F8 = q(function() return c.field_8 end),
+                F18 = q(function() return c.field_18 end), ByPlayer = q(function() return c.ByPlayer end),
+                Shared = q(function() return c.Shared end)}
+        end
+    end
+    census.Zones = zones
+    table.sort(guids)
+    return guids, census
+end
+
 -- BG3 metres -> WoW yards, world mode's mapping (WorldMode.lua toWow); nil when world mode is off.
 local function toWow(world, p)
     if not world then return nil end
@@ -95,10 +157,11 @@ function M.Start(runId)
         return events[uuid] == true
     end
 
+    local frozen, frozenKey = {}, "" -- the guids last written, and them joined (to see a change)
     local function write(members)
         lastWrite = ticks
         Ext.IO.SaveFile(OUT, Ext.Json.Stringify({Schema = 1, RunId = runId, Seq = seq, Tick = ticks, Hold = held,
-            Radius = M.Radius, Members = members, Stats = stats}))
+            Guids = held and frozen or {}, Members = members, Stats = stats}))
     end
 
     -- Whether the members differ from what was last sent (membership, or one moved more than M.Move).
@@ -170,7 +233,12 @@ function M.Start(runId)
                 release("the world's turn")
                 return
             end
-            if not held or changed(members) then
+            local guids, census = bg3Frozen(members)
+            stats.Bg3 = census
+            local key = table.concat(guids, ",")
+            local other = key ~= frozenKey
+            frozen, frozenKey = guids, key
+            if not held or changed(members) or other then
                 local first = not held
                 held, sent, seq = true, members, seq + 1
                 if first then stats.Holds = stats.Holds + 1 else stats.Updates = stats.Updates + 1 end
@@ -178,7 +246,7 @@ function M.Start(runId)
                 if first then
                     local names = {}
                     for _, m in ipairs(members) do names[#names + 1] = tostring(m.Name) end
-                    Ext.Utils.Print(string.format("WOW-BG3 turnhold: hold %d yd round %s", M.Radius, table.concat(names, ", ")))
+                    Ext.Utils.Print(string.format("WOW-BG3 turnhold: hold %d creatures BG3 froze round %s", #guids, table.concat(names, ", ")))
                 end
             elseif ticks - lastWrite >= M.Keep then
                 write(sent)

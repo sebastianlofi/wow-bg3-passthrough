@@ -475,8 +475,13 @@ class FillHolder(unittest.TestCase):
         self.L = L = rt()
         L.execute(r'''
           tick, pendingItem, deleted, sideUuid, sideCount, asked, made, gone = 1000, {}, {}, {}, {}, {}, {}, {}
+          state, WOWBG3MirrorOwned, taken, corpseOf, golds = {}, {boar = "c1"}, {}, {boar = "c1"}, {boar = 0}
+          function goldOf(u) return golds[u] or 0 end
+          Hero = {Uuid = function() return "hero" end}
+          M_requests = {}
           holders, stacks, ents, inv, nextId = {}, {}, {}, {}, 0
           M = {Refused = {}, SideTag = {}, Suppress = function() end, Item = function(e) return ({[117] = {bc = 5}})[e] end,
+               Request = function(r) M_requests[#M_requests + 1] = r end, PlaceOf = function() return {1, 2, 3} end,
                AmountOf = function(row, count) return row.s == "Thrown" and 1 or count end}
           M.Create = function(e, standin, n, tag)
             nextId = nextId + 1; local u = "u" .. nextId
@@ -486,15 +491,17 @@ class FillHolder(unittest.TestCase):
           function holderOf(u) return holders[u] end
           function note() end
           function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
-          function buying() return true end
-          function askFor() end
+          function buying(standin) return standin ~= "boar" end -- a vendor's trade is open; a corpse has none
+          function askFor(u, tag) if not asked[u] then asked[u] = true; taken[#taken + 1] = tag end end
           Ext = {Entity = {Get = function(u) return ents[u] end}}
+          ents.boar = true
           Osi = {RequestDelete = function(u) gone[#gone + 1] = u; for t, x in pairs(inv) do if x == u then inv[t] = nil end end; ents[u] = nil end,
                  GetStackAmount = function(u) return stacks[u] end, SetStackAmount = function(u, n) stacks[u] = n end,
                  ToInventory = function() end}
         ''')
         text = (LUA / 'Inventory.lua').read_text()
-        L.execute(section(text, 'local function fillHolder', 'local corpseGold').replace('local function', 'function'))
+        L.execute(section(text, 'local sideHolder', "-- BG3 won't let a trader buy").replace('local function', 'function')
+                  .replace('local sideHolder', 'sideHolder').replace('local corpseGold', 'corpseGold'))
 
     def test_sold_out_leaves_the_stand_in(self):
         self.L.execute('fillHolder("farley", "Vf1:", {{Idx = 0, Entry = 117, Count = 5}}); fillHolder("farley", "Vf1:", {})')
@@ -519,6 +526,32 @@ class FillHolder(unittest.TestCase):
           inv["Vf1:0"] = nil; ents.u1 = nil; asked.u1 = true
           fillHolder("farley", "Vf1:", {{Idx = 0, Entry = 117, Count = 5}})''')
         self.assertEqual(self.L.eval('#made'), 2)
+
+    # A corpse's loot (the boar's stand-in is mirrored, WOWBG3MirrorOwned): merged into the looter's stack, it is
+    # gone without a trace and is a take; made again only when its corpse is gone with it.
+    def test_merged_loot_is_a_take_not_made_again(self):
+        self.L.execute('''fillHolder("boar", "Lc1:", {{Idx = 0, Entry = 117, Count = 2}})
+          inv["Lc1:0"] = nil; ents.u1 = nil; pendingItem.u1 = 1000
+          fillHolder("boar", "Lc1:", {{Idx = 0, Entry = 117, Count = 2}})''')
+        self.assertEqual((self.L.eval('#made'), self.L.eval('taken[1]'), self.L.eval('state.LootMerged')), (1, 'Lc1:0', 1))
+
+    def test_merged_loot_is_seen_before_the_next_list(self):
+        self.L.execute('''fillHolder("boar", "Lc1:", {{Idx = 0, Entry = 117, Count = 2}})
+          inv["Lc1:0"] = nil; ents.u1 = nil
+          lootMerged(); lootMerged()''')
+        self.assertEqual((self.L.eval('#taken'), self.L.eval('state.LootMerged')), (1, 1))
+
+    def test_corpse_gold_taken_is_a_money_take_with_the_place(self):
+        self.L.execute('''corpseGold.boar = 37; golds.boar = 0; lootMerged(); lootMerged()''')
+        self.assertEqual(self.L.eval('#M_requests'), 1)
+        self.assertEqual((self.L.eval('M_requests[1].Idx'), self.L.eval('M_requests[1].At[3]')), ('money', 3))
+
+    def test_loot_of_a_removed_corpse_is_no_take(self):
+        self.L.execute('''fillHolder("boar", "Lc1:", {{Idx = 0, Entry = 117, Count = 2}})
+          inv["Lc1:0"] = nil; ents.u1 = nil; ents.boar = nil; WOWBG3MirrorOwned.boar = nil
+          lootMerged()
+          fillHolder("boar", "Lc1:", {{Idx = 0, Entry = 117, Count = 2}})''')
+        self.assertEqual((self.L.eval('#taken'), self.L.eval('state.LootRemade')), (0, 1))
 
 
 class Server(unittest.TestCase):

@@ -586,13 +586,15 @@ function M.Start(runId)
         end
         local okPick, errPick = pcall(arena, {Action = "PickRegion", Seconds = MAX_SECONDS})
         if not okPick then Ext.Log.Print("WOW-BG3 world: picking region map left alone: " .. tostring(errPick)) end
-        arena({Action = "Place", Cells = c.Cells, Seconds = MAX_SECONDS})
+        -- Near: the squares go around the Centre the hero is teleported to below, not around where the save left
+        -- the hero (BG3's camp is 3 km from the void).
+        arena({Action = "Place", Cells = c.Cells, Near = c.Centre, Seconds = MAX_SECONDS})
         placed = {}
         notePlaced(c.Cells)
         arena({Action = "Rays", Void = true, Mask = 2096, SkipContexts = 0, Seconds = MAX_SECONDS})
         -- The hero at Start goes to the void; Stop brings that one back (Hero.lua: the controlled character).
         state.Hero = Hero.Assert()
-        standIn({Action = "Teleport", Target = state.Hero, Position = {c.Centre[1], c.Centre[2] + 1, c.Centre[3]}})
+        standIn({Action = "Teleport", Target = state.Hero, Position = {c.Centre[1], c.Centre[2] + 1, c.Centre[3]}, Near = c.Centre})
         wait(30)
         pcall(standIn, {Action = "Away"})
         -- A move keeps BG3's Centre: nothing left there comes along to the new WoW place.
@@ -682,12 +684,12 @@ function M.Start(runId)
         for first = 1, #c.Cells, 12 do
             local part = {}
             for i = first, math.min(first + 11, #c.Cells) do part[#part + 1] = c.Cells[i] end
-            arena({Action = "Place", Cells = part, Seconds = MAX_SECONDS})
+            arena({Action = "Place", Cells = part, Near = state.Centre, Seconds = MAX_SECONDS}) -- the hero goes there below
             notePlaced(part)
         end
         arena({Action = "Rays", Void = true, Mask = 2096, SkipContexts = 0, Seconds = MAX_SECONDS})
         local C = state.Centre
-        standIn({Action = "Teleport", Target = state.Hero, Position = {C[1], C[2] + 1, C[3]}})
+        standIn({Action = "Teleport", Target = state.Hero, Position = {C[1], C[2] + 1, C[3]}, Near = C})
         wait(30)
         pcall(standIn, {Action = "ClearSurfaces", Target = state.Hero})
         local okParty, errParty = pcall(party, {Action = "Gather", Upkeep = true, Position = {C[1], C[2] + 1, C[3]}})

@@ -19,9 +19,10 @@
 --   Pool    {Layer, Layers, Count}           world mode's treadmill: take whole plain subgrids of the
 --                                            out-of-bounds layer (snapshots; native-<side>-pool.json);
 --                                            Layers: several layers' heights at once (plugin 0.2.9)
---   Place   {Cells = {{K, MinX, MinZ, BaseY}...}, Seconds}  move pool subgrid K to that 64 m square
+--   Place   {Cells = {{K, MinX, MinZ, BaseY}...}, Near, Seconds}  move pool subgrid K to that 64 m square
 --                                            with WoW ground from wow-bg3/section-<K>.bin (Restore and
---                                            leaving the level put every pool subgrid back)
+--                                            leaving the level put every pool subgrid back); within 3 km
+--                                            of the hero, or of Near (where the hero is teleported next)
 --   PickRegion {Seconds}                     client: BG3's cursor picks characters anywhere in the void
 --                                            (the level's region map emptied, plugin op 28); Restore
 --   PickRegionOff                            client: the map back, for BG3's own level (a trip to camp)
@@ -667,10 +668,18 @@ function M.Start(runId)
                 return {Busy = busy, Seen = seen}
             end
             if c.Action == "Place" then
-                -- World mode's treadmill: pool subgrids to 64 m squares of WoW ground near Tav (or, at
-                -- Start, near the void spot she is about to be teleported to: within 3 km).
+                -- World mode's treadmill: pool subgrids to 64 m squares of WoW ground within 3 km of Tav, or of
+                -- Near: the void spot she is teleported to right after the Place (world mode's Start and a move
+                -- send its Centre). Before that teleport she stands wherever the save or the walk left her, and
+                -- the host level reaches farther from the void than 3 km: a save made at BG3's camp (about 384,
+                -- 6, -752) is 3.02 km from the Start squares, and its Start failed here.
                 assert(type(c.Cells) == "table" and #c.Cells >= 1 and #c.Cells <= 12, "Cells (1 to 12) required")
-                local p = host.Transform.Transform.Translate
+                local p, from = host.Transform.Transform.Translate, "the disposable character"
+                if c.Near ~= nil then
+                    local n = c.Near
+                    assert(type(n) == "table" and #n == 3 and tonumber(n[1]) and tonumber(n[3]), "Near is a point {X, Y, Z}")
+                    p, from = {tonumber(n[1]), tonumber(n[2]) or 0, tonumber(n[3])}, "Near"
+                end
                 local placed = {}
                 -- Tracked before the first move, so a refused cell still leaves a pool to restore.
                 pool = pool or {At = now()}
@@ -681,7 +690,7 @@ function M.Start(runId)
                     assert(k and minX and minZ and baseY, "a cell is {K, MinX, MinZ, BaseY, Serial}")
                     assert(serial >= 0 and serial < 4096, "Serial out of range")
                     local dx, dz = minX + 32 - p[1], minZ + 32 - p[3]
-                    assert(math.sqrt(dx * dx + dz * dz) <= 3000, "Cell too far from the disposable character")
+                    assert(math.sqrt(dx * dx + dz * dz) <= 3000, "Cell too far from " .. from)
                     local out = N.Must(N.Op.Place, k, minX, minZ, baseY, serial)
                     placed[#placed + 1] = {K = k, Patches = out.R[1]}
                 end

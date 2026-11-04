@@ -62,7 +62,7 @@ PY="$ROOT/../python/bin/python3"; [ -x "$PY" ] || PY=python3
 # finished process (gone, or a zombie with no command line) is not ours.
 ours() {
     local cmd
-    cmd=$(tr '\0' ' ' < "/proc/$2/cmdline" 2>/dev/null) || return 1
+    cmd=$(tr '\0' ' ' 2>/dev/null < "/proc/$2/cmdline") || return 1   # 2> first: a gone pid's error stays out of the log
     case "$1:$cmd" in
         mangosd:*"$ROOT/bin/mangosd -c $V/etc/mangosd.conf "*) return 0 ;;
         realmd:*"$ROOT/bin/realmd -c $V/etc/realmd.conf "*) return 0 ;;

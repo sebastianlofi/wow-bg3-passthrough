@@ -1,0 +1,332 @@
+WOW-BG3 vmangos patch 0025: a loot BG3 took is booked in WoW, its reach judged where BG3 took it.
+
+BG3's loot window is where the player takes a WoW corpse's item, in reach. `loot take` reached WoW a moment
+later (the inventory bridge's round trip, one call per item of a Take All), and WoW's loot handlers measure
+the reach from where the body is then: a player who walked on at once was refused `far` for the last items,
+and WoW's own loot window on that corpse still offered them (a playtest report). Now:
+
+- `loot take CHAR NPC ENTRY[,ENTRY...]` takes several entries in one call (the bridge's batch of BG3's takes
+  from one corpse); ENTRY is IDX, money or all, with `@X/Y/Z` when BG3 sends the looter's place at its take.
+- While an entry with a place is booked, WowBg3::InLootReach measures WoW's loot reach
+  (GetMaxLootDistance, as before) from that place, in WoW's own loot handlers (opening the loot, items,
+  money). Everywhere else, a WoW client's own loot included, it is the looter's place now, as before.
+- One reply line per entry: `take IDX ok GUID MONEY`, `take money ok|refused nothing DELTA`,
+  `take ENTRY refused far|notyours|gone|full`. `loot list` is unchanged.
+
+diff --git a/src/game/Handlers/LootHandler.cpp b/src/game/Handlers/LootHandler.cpp
+index 1e18928..2dc6e6a 100644
+--- a/src/game/Handlers/LootHandler.cpp
++++ b/src/game/Handlers/LootHandler.cpp
+@@ -38,6 +38,7 @@
+ #include "ScriptMgr.h"
+ #include "Util.h"
+ #include "Anticheat.h"
++#include "WowBg3Items.h"
+ #include "Utilities/Random.h"
+ 
+ void WorldSession::HandleAutostoreLootItemOpcode(WorldPackets::Loot::AutoStoreLootItem const& packet)
+@@ -126,7 +127,7 @@ void WorldSession::HandleAutostoreLootItemOpcode(WorldPackets::Loot::AutoStoreLo
+             }
+             else
+             {
+-                if (!pCreature->IsWithinDistInMap(_player, _player->GetMaxLootDistance(pCreature), true, SizeFactor::None))
++                if (!WowBg3::InLootReach(_player, pCreature)) // WOW-BG3 0025: or the looter's place at BG3's take
+                 {
+                     player->SendLootError(lguid, LOOT_ERROR_TOO_FAR);
+                     return;
+@@ -286,7 +287,7 @@ void WorldSession::HandleLootMoneyOpcode(NullClientPacket const& /*packet*/)
+                 shareMoneyWithGroup = false;
+             bool ok_loot = pCreature && pCreature->IsAlive() == (player->GetClass() == CLASS_ROGUE && pCreature->lootForPickPocketed);
+ 
+-            if (ok_loot && pCreature->IsWithinDistInMap(_player, _player->GetMaxLootDistance(pCreature), true, SizeFactor::None))
++            if (ok_loot && WowBg3::InLootReach(_player, pCreature)) // WOW-BG3 0025: or the looter's place at BG3's take
+                 pLoot = &pCreature->loot ;
+ 
+             break;
+diff --git a/src/game/Objects/Player.cpp b/src/game/Objects/Player.cpp
+index 9f641cc..b6e3bd0 100644
+--- a/src/game/Objects/Player.cpp
++++ b/src/game/Objects/Player.cpp
+@@ -24,6 +24,7 @@
+ #include <sstream>
+ 
+ #include "Player.h"
+ #include "WowBg3Fights.h"
++#include "WowBg3Items.h"
+ #include "Bag.h"
+ #include "Language.h"
+@@ -7822,7 +7823,8 @@ void Player::SendLoot(ObjectGuid guid, LootType lootType, Player const* pVictim)
+             }
+ 
+             // skinning range already checked during spell cast
+-            if (lootType != LOOT_SKINNING && !creature->IsWithinDistInMap(this, GetMaxLootDistance(creature), true, SizeFactor::None))
++            // WOW-BG3 0025: or the looter's place at BG3's take (WowBg3::InLootReach)
++            if (lootType != LOOT_SKINNING && !WowBg3::InLootReach(this, creature))
+             {
+                 SendLootError(guid, LOOT_ERROR_TOO_FAR);
+                 return;
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index d7f03e3..d5928a8 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -90,6 +90,37 @@ namespace
+     }
+ 
+     // A 16-digit hex guid (as the `item` and `cr` lines print them) of the wanted kind.
++    bool ParseFloat(std::string const& s, float& out)
++    {
++        char const* p = s.c_str();
++        char* end = nullptr;
++        float const v = strtof(p, &end);
++        if (!end || *end || end == p || !std::isfinite(v))
++            return false;
++        out = v;
++        return true;
++    }
++
++    // 0025: the looter's place at BG3's take, for InLootReach while one entry of a `loot take` is booked
++    // (this thread only, so a WoW client's own loot on another map thread never sees it).
++    struct ReachFrom
++    {
++        ObjectGuid looter, loot;
++        float x, y, z;
++    };
++    thread_local ReachFrom const* tReachFrom = nullptr;
++    struct ReachScope
++    {
++        ReachFrom from;
++        ReachFrom const* outer;
++        ReachScope(bool on, ReachFrom const& f) : from(f), outer(tReachFrom)
++        {
++            if (on)
++                tReachFrom = &from;
++        }
++        ~ReachScope() { tReachFrom = outer; }
++    };
++
+     bool ParseGuid(std::string const& s, ObjectGuid& out)
+     {
+         if (s.empty() || s.size() > 18)
+@@ -829,21 +860,25 @@ namespace
+             return out.Add(head + "refused missing");
+         if (c->IsAlive())
+             return out.Add(head + "refused notlootable");
+-        if (!m->IsWithinDistInMap(c, INTERACTION_DISTANCE))
+-            return out.Add(head + "refused far");
+         WorldSession* s = m->GetSession();
+-        if (m->GetLootGuid() != g)
+-        {
+-            WorldPackets::Loot::LootUnit lu;
+-            lu.guid = g;
+-            s->HandleLootOpcode(lu);
+-            if (m->GetLootGuid() != g)
+-                return out.Add(head + "refused notyours");
+-        }
+         Loot& loot = c->loot;
+         uint32 const low = m->GetGUIDLow();
++        // WoW's loot window for the member on that corpse (WoW's own checks, the reach among them).
++        auto open = [&]() {
++            if (m->GetLootGuid() != g)
++            {
++                WorldPackets::Loot::LootUnit lu;
++                lu.guid = g;
++                s->HandleLootOpcode(lu);
++            }
++            return m->GetLootGuid() == g;
++        };
+         if (sub == "list")
+         {
++            if (!m->IsWithinDistInMap(c, INTERACTION_DISTANCE))
++                return out.Add(head + "refused far");
++            if (!open())
++                return out.Add(head + "refused notyours");
+             std::vector<std::string> items;
+             uint32 const max = loot.GetMaxSlotInLootFor(low);
+             for (uint32 i = 0; i < max; ++i)
+@@ -861,56 +896,111 @@ namespace
+                 out.Add(l);
+             return out.Add(head + "end " + std::to_string(items.size()));
+         }
+-        // take IDX|money|all
++        // take ENTRY[,ENTRY...] (0025: several in one call, the bridge's batch of BG3's takes from this corpse).
++        // ENTRY: IDX, money or all, with `@X/Y/Z` when BG3 sends the looter's place at its take: WoW's loot reach is
++        // measured from there (InLootReach). Each entry is booked through WoW's own loot handlers. One line per
++        // entry: `take IDX|all ok GUID|- MONEY`, `take money ok|refused nothing DELTA`, `take ENTRY refused WHY`.
+         if (a.size() != 6)
+             return out.Add(head + "refused usage");
+-        std::string const what = a[5];
+-        auto const before = Snapshot(m);
+-        uint32 const money = m->GetMoney();
+-        if (what == "money" || what == "all")
++        struct Entry
+         {
+-            NullClientPacket none(CMSG_LOOT_MONEY);
+-            s->HandleLootMoneyOpcode(none);
+-        }
+-        uint32 idx = 0;
+-        if (what == "all")
++            std::string what;
++            bool at;
++            ReachFrom from;
++        };
++        std::vector<Entry> entries;
++        std::string const& list = a[5];
++        for (size_t at = 0; at <= list.size();)
+         {
+-            uint32 const max = loot.GetMaxSlotInLootFor(low);
+-            for (uint32 i = 0; i < max && i < 64; ++i)
++            size_t const comma = std::min(list.find(',', at), list.size());
++            std::string const tok = list.substr(at, comma - at);
++            at = comma + 1;
++            Entry e{ tok, false, { m->GetObjectGuid(), g, 0.0f, 0.0f, 0.0f } };
++            size_t const sign = tok.find('@');
++            if (sign != std::string::npos)
+             {
+-                WorldPackets::Loot::AutoStoreLootItem p;
+-                p.lootSlot = uint8(i);
+-                s->HandleAutostoreLootItemOpcode(p);
++                e.what = tok.substr(0, sign);
++                std::string const p = tok.substr(sign + 1);
++                size_t const s1 = p.find('/'), s2 = s1 == std::string::npos ? s1 : p.find('/', s1 + 1);
++                if (s2 == std::string::npos || !ParseFloat(p.substr(0, s1), e.from.x) ||
++                    !ParseFloat(p.substr(s1 + 1, s2 - s1 - 1), e.from.y) || !ParseFloat(p.substr(s2 + 1), e.from.z))
++                    return out.Add(head + "refused usage");
++                e.at = true;
+             }
+-        }
+-        else if (what != "money")
+-        {
+-            if (!ParseUInt(what, idx, 255))
++            uint32 idx = 0;
++            if (e.what != "money" && e.what != "all" && !ParseUInt(e.what, idx, 255))
++                return out.Add(head + "refused usage");
++            entries.push_back(e);
++            if (entries.size() > 64)
+                 return out.Add(head + "refused usage");
+-            WorldPackets::Loot::AutoStoreLootItem p;
+-            p.lootSlot = uint8(idx);
+-            s->HandleAutostoreLootItemOpcode(p);
+         }
+-        // New or grown stacks.
+-        std::string guid;
+-        for (Held const& h : Carried(m))
++        for (Entry const& e : entries)
+         {
+-            auto o = before.find(h.item->GetObjectGuid().GetRawValue());
+-            if (o == before.end() || o->second.count != h.item->GetCount())
+-                guid = Hex(h.item->GetObjectGuid());
++            ReachScope scope(e.at, e.from);
++            std::string const what = e.what;
++            if (!InLootReach(m, c))
++            {
++                out.Add(head + "take " + what + " refused far");
++                continue;
++            }
++            if (!open())
++            {
++                out.Add(head + "take " + what + " refused notyours");
++                continue;
++            }
++            auto const before = Snapshot(m);
++            uint32 const money = m->GetMoney();
++            if (what == "money" || what == "all")
++            {
++                NullClientPacket none(CMSG_LOOT_MONEY);
++                s->HandleLootMoneyOpcode(none);
++            }
++            if (what == "all")
++            {
++                uint32 const max = loot.GetMaxSlotInLootFor(low);
++                for (uint32 i = 0; i < max && i < 64; ++i)
++                {
++                    WorldPackets::Loot::AutoStoreLootItem p;
++                    p.lootSlot = uint8(i);
++                    s->HandleAutostoreLootItemOpcode(p);
++                }
++            }
++            else if (what != "money")
++            {
++                uint32 idx = 0;
++                ParseUInt(what, idx, 255);
++                QuestItem* q = nullptr; QuestItem* ffa = nullptr; QuestItem* cond = nullptr;
++                LootItem* li = loot.LootItemInSlot(idx, low, &q, &ffa, &cond);
++                if (!li || li->is_looted || (q && q->is_looted) || (ffa && ffa->is_looted) || (cond && cond->is_looted))
++                {
++                    out.Add(head + "take " + what + " refused gone");
++                    continue;
++                }
++                WorldPackets::Loot::AutoStoreLootItem p;
++                p.lootSlot = uint8(idx);
++                s->HandleAutostoreLootItemOpcode(p);
++            }
++            // New or grown stacks.
++            std::string guid;
++            for (Held const& h : Carried(m))
++            {
++                auto o = before.find(h.item->GetObjectGuid().GetRawValue());
++                if (o == before.end() || o->second.count != h.item->GetCount())
++                    guid = Hex(h.item->GetObjectGuid());
++            }
++            if (what == "money")
++                out.Add(head + "take money " + (m->GetMoney() != money ? "ok " : "refused nothing ") + std::to_string(m->GetMoney() - money));
++            else if (guid.empty() && m->GetMoney() == money)
++                out.Add(head + "take " + what + " refused full");
++            else
++                out.Add(head + "take " + what + " ok " + (guid.empty() ? std::string("-") : guid) + " " + std::to_string(m->GetMoney()));
+         }
+-        bool const done = loot.isLooted();
+-        if (done)
++        if (m->GetLootGuid() == g && loot.isLooted())
+         {
+             WorldPackets::Loot::LootRelease rel;
+             rel.guid = g;
+             s->HandleLootReleaseOpcode(rel);
+         }
+-        if (what == "money")
+-            return out.Add(head + "take money " + (m->GetMoney() != money ? "ok " : "refused nothing ") + std::to_string(m->GetMoney() - money));
+-        if (guid.empty() && m->GetMoney() == money)
+-            return out.Add(head + "take " + what + " refused full");
+-        out.Add(head + "take " + what + " ok " + (guid.empty() ? std::string("-") : guid) + " " + std::to_string(m->GetMoney()));
+     }
+ 
+     void ShapeVendor(Player* m, std::string const& name, std::vector<std::string> const& a, Out& out)
+@@ -1115,4 +1205,13 @@ bool ExecuteItems(Player* owner, std::vector<std::string> const& a, std::vector<
+         Sell(m, member, a, out);
+     return true;
+ }
++
++bool InLootReach(Player const* looter, Creature const* c)
++{
++    float const reach = looter->GetMaxLootDistance(c);
++    ReachFrom const* f = tReachFrom;
++    if (f && f->looter == looter->GetObjectGuid() && f->loot == c->GetObjectGuid())
++        return c->IsWithinDist3d(f->x, f->y, f->z, reach, SizeFactor::None);
++    return c->IsWithinDistInMap(looter, reach, true, SizeFactor::None);
++}
+ }
+diff --git a/src/game/WowBg3Items.h b/src/game/WowBg3Items.h
+index f2e14bb..6abe349 100644
+--- a/src/game/WowBg3Items.h
++++ b/src/game/WowBg3Items.h
+@@ -26,6 +26,7 @@
+ #include <vector>
+ 
+ class Player;
++class Creature;
+ 
+ namespace WowBg3
+ {
+@@ -35,6 +36,13 @@ namespace WowBg3
+     // 0013, the inventory bridge's shape (`inv|loot|vendor SUB CHAR ...`): owner nullptr = the console
+     // (CHAR any online character). False: not that shape.
+     bool ExecuteItemsShape(Player* owner, std::vector<std::string> const& a, std::vector<std::string>& out);
++
++    // 0025: whether the looter is within WoW's loot reach of the dead creature (GetMaxLootDistance, as
++    // WoW's loot handlers measure it). Inside a `loot take` that carries the looter's place at BG3's
++    // take, that place is where the reach is measured from: BG3's loot window is where the item was
++    // taken, in reach, and the take reaches WoW a moment later, when the body may have walked on.
++    // Everywhere else (a WoW client's own loot) the looter's place now, as before.
++    bool InLootReach(Player const* looter, Creature const* c);
+ }
+ 
+ #endif

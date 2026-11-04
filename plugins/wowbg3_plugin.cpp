@@ -3129,6 +3129,7 @@ struct CamClear {
         bool Moved = false;
         bool Tested = false;      // WoW's ground was there to test it against
         bool Easing = false;      // held in by the ease out: computed again next frame
+        bool Rigid = false;       // the rigid orbit's pose: the one pose of its frame (see clear_pose)
         std::uint64_t Frame = 0;  // g_clear.Frame when computed
         CamPose Pose;
     };
@@ -3610,9 +3611,18 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     const glm::vec3 eye0 = x->Translate;
     auto& ring = g_clear.Ring[slot];
     const std::uint64_t frame = g_clear.Frame.load(std::memory_order_acquire);
+    // The rigid orbit: one pose per frame (lead_frame's count), the first one asked for, whoever asks. BG3's render
+    // (its main thread) asks first, about 20 ms after lead_frame, and always reads the newest campose.bin of a whole
+    // tick; BG3's GameThread and lead_frame ask 10 to 13 ms later, close to the client Lua tick that writes the file,
+    // and computed it again whenever Tav's generation or BG3's own eye had changed. Measured in release mode slot B,
+    // zoomed in, walking at 30 fps: the poses BG3 rendered advanced one campose record per frame, those lead_frame
+    // sent benilla 0, 1, 2, 0, 1, 2 (a period of three), so one rendered frame in three had no camera record, its
+    // packet took the newest (a frame ahead of her pose) and she shook against the camera by a frame's step.
+    // Held for the frame, what BG3 renders and the record lead_frame writes are the same pose.
     auto cached = [&](int i) {
-        return i >= 0 && ring[i].Controller == self && ring[i].Gen == gen && ring[i].Key == eye0
-            && (!ring[i].Easing || ring[i].Frame == frame);
+        if (i < 0 || ring[i].Controller != self) return false;
+        if (ring[i].Rigid) return ring[i].Frame == frame;
+        return ring[i].Gen == gen && ring[i].Key == eye0 && (!ring[i].Easing || ring[i].Frame == frame);
     };
     auto found = [&](int i) -> CamPose const* {
         if (tested != nullptr) *tested = ring[i].Tested;
@@ -3682,6 +3692,7 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     e.Moved = moved;
     e.Tested = wasTested;
     e.Easing = easing;
+    e.Rigid = rigid;
     e.Frame = frame;
     if (tested != nullptr) *tested = wasTested;
     if (moved) {

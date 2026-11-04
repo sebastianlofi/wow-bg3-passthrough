@@ -102,7 +102,7 @@ fn plan_lists_near_mobs_fight_members_and_wow_numbers() {
     assert_eq!(plan["HeroWowMaxHp"], 52);
     let mobs = plan["Mobs"].as_array().unwrap();
     let guids: Vec<&str> = mobs.iter().map(|v| v["Guid"].as_str().unwrap()).collect();
-    // The fight's mob first (whatever its distance), then the near ones.
+    // The fight's mob first, then the others.
     assert_eq!(guids[0], "f130000000012b04");
     assert_eq!(guids.len(), 4);
     let wolf = mobs
@@ -122,12 +122,22 @@ fn plan_lists_near_mobs_fight_members_and_wow_numbers() {
         (Some("goblin"), Some(false))
     );
     assert_eq!(plan["Fight"][0], "f130000000012b04");
+    // Out of a fight the wolf 70 yd off is mirrored too: WoW has it loaded (no range of ours).
+    let plan = m.plan(4, "s1", &[], Some(&s), "wolf-t", None, "neutral-f", 0);
+    let guids: Vec<&str> = plan["Mobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["Guid"].as_str().unwrap())
+        .collect();
+    assert_eq!(guids.len(), 4);
+    assert_eq!(guids[3], "f130000000012b04", "nearest first");
     // Settled mobs (an ended fight's) are not mirrored for a while.
     m.settle(["f130000000012b01".to_string()], 0);
     let plan = m.plan(4, "s1", &[], Some(&s), "wolf-t", None, "neutral-f", 1000);
-    assert_eq!(plan["Mobs"].as_array().unwrap().len(), 2);
-    let plan = m.plan(5, "s1", &[], Some(&s), "wolf-t", None, "neutral-f", 61_000);
     assert_eq!(plan["Mobs"].as_array().unwrap().len(), 3);
+    let plan = m.plan(5, "s1", &[], Some(&s), "wolf-t", None, "neutral-f", 61_000);
+    assert_eq!(plan["Mobs"].as_array().unwrap().len(), 4);
     // Without world mode nothing is mirrored.
     m.mapping = None;
     assert_eq!(
@@ -455,27 +465,30 @@ mob f130000000013c02 1642 55 2 -8920 73 132 0 100 100 0 Northshire Guard\n\
 mob f130000000013c03 1642 55 2 -8920 103 132 0 100 100 0 Northshire Guard\n";
 
 #[test]
-fn friendly_npcs_are_mirrored_after_attackable_mobs_within_their_range_and_budget() {
+fn every_loaded_creature_is_mirrored_nearest_first() {
     let mut m = mirror();
     m.mobs = parse_mobs(&format!("{MOBS}{FRIENDLY}"));
     let g = m.unit("f130000000013c01").unwrap();
     assert!(g.friendly && !g.hostile);
     assert!(m.unit("f130000000012b01").is_some_and(|u| !u.friendly));
-    // The guard 20 yd away is within FRIENDLY_RANGE; the one 50 yd away is not. Friendlies come last.
+    // Every friendly NPC WoW lists has one, the guard 50 yd away too; all nearest first, so the
+    // quest giver 2 yd off comes before the wolf 5 yd off and the wolf 70 yd off after the guard.
     let wanted: Vec<String> = m.wanted(&[], 0).iter().map(|u| u.guid.clone()).collect();
-    let n = wanted.len();
-    assert_eq!(&wanted[n - 2..], ["f130000000013c01", "f130000000013c02"]);
-    assert!(!wanted.iter().any(|g| g == "f130000000013c03"));
-    // MAX_MIRRORS attackable mobs still leave the friendlies their own budget.
+    let at = |g: &str| wanted.iter().position(|w| w == g).unwrap();
+    assert_eq!(at("f130000000013c01"), 0);
+    assert!(at("f130000000013c01") < at("f130000000012b01"));
+    assert!(at("f130000000013c02") < at("f130000000013c03"));
+    assert!(at("f130000000013c03") < at("f130000000012b04"));
+    // No count of ours: a field of 80 wolves leaves no creature WoW has without a stand-in.
     let mut text = String::from(MOBS);
-    for i in 0..wow_bg3_link::mirror::MAX_MIRRORS {
+    for i in 0..80 {
         text += &format!("mob f1300000000140{i:02x} 299 1 1 -8919 53 132 0 100 100 0 Young Wolf\n");
     }
     text += FRIENDLY;
     m.mobs = parse_mobs(&text);
     let wanted = m.wanted(&[], 0);
-    assert_eq!(wanted.len(), wow_bg3_link::mirror::MAX_MIRRORS + 2);
-    assert_eq!(wanted.iter().filter(|u| u.friendly).count(), 2);
+    assert_eq!(wanted.len(), m.mobs.mobs.len());
+    assert_eq!(wanted.iter().filter(|u| u.friendly).count(), 3);
 }
 
 #[test]
@@ -554,18 +567,19 @@ fn friendly_npcs_fight_only_through_bg3_combat_and_as_provoked_for_the_server() 
 }
 
 #[test]
-fn mobs_round_every_party_member_are_mirrored_and_kept_past_the_edge() {
-    use wow_bg3_link::mirror::{KEEP_MARGIN, MIRROR_RANGE, parse_members};
+fn mobs_round_every_party_member_are_mirrored_at_any_distance_wow_lists() {
+    use wow_bg3_link::mirror::parse_members;
     let mut m = mirror();
     let hero = m.hero().unwrap().pos;
-    // A companion 600 yd north of the hero, with a mob 10 yd from it and one 50 yd from it.
-    let far = (hero.0 + 600.0, hero.1, hero.2);
+    // A companion 600 yd north of the hero and 40 yd higher (no member stands at that height yet),
+    // with a mob 10 yd from it and one 90 yd from it (WoW's visibility reaches 100 yd).
+    let far = (hero.0 + 600.0, hero.1, hero.2 + 40.0);
     let text = format!(
         "{MOBS}mob f130000000099001 299 5 1 {} {} {} 0.0 50 50 0 Far Wolf\nmob f130000000099002 299 5 1 {} {} {} 0.0 50 50 0 Edge Wolf\n",
         far.0 + 10.0,
         far.1,
         far.2,
-        far.0 + MIRROR_RANGE + KEEP_MARGIN / 2.0,
+        far.0 + 90.0,
         far.1,
         far.2
     );
@@ -591,14 +605,9 @@ fn mobs_round_every_party_member_are_mirrored_and_kept_past_the_edge() {
         "the mob near the companion is mirrored"
     );
     assert!(
-        !w.contains(&"f130000000099002".to_string()),
-        "the one past the range is not, until mirrored"
+        w.contains(&"f130000000099002".to_string()),
+        "and the one 90 yd from it: WoW lists it, so no range of ours leaves it out"
     );
-    // Once it has a stand-in, it keeps it within the margin.
-    m.status = parse_status(
-        &serde_json::json!({"Mobs": {"f130000000099002": {"Uuid": "x-1-2-3-4", "Hp": 5}}}),
-    );
-    assert!(wanted(&m).contains(&"f130000000099002".to_string()));
 }
 
 #[test]
@@ -693,7 +702,7 @@ fn the_servers_feed_adds_creatures_and_the_party_link_moves_bots() {
         lines(p.step(&dir, &dir, 0, 1000, &none)),
         vec![
             ".wowbg3 move Astarion -8330.00 53.00 132.00 0",
-            ".wowbg3 feed Astarion on 100 500"
+            ".wowbg3 feed Astarion on 250 500"
         ]
     );
     assert!(p.step(&dir, &dir, 0, 1500, &none).is_empty());
