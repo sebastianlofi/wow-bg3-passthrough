@@ -364,18 +364,32 @@ class Life:
         were named (BG3's start-of-game autosave, written before WoW was up) takes the characters its
         snapshot holds, not the launcher's WOW_CHAR or a new one. Only the hero's
         is made, by the benilla start that logs it in (create()); a companion's is only named here: the
-        server's `bot add` makes it on the bot's own account when it logs in (a character made on the
-        player's account would be `taken`)."""
+        server's `bot add` makes it on the bot's own account when it logs in (a character on any other
+        account is `taken`: a companion never gets one, whatever a save or snapshot names, wowchar.bot_name)."""
         out, taken, make_ = {}, set(), set()
+        owners = None
+
+        def can_be_bot(char):
+            own = owners.get(char, '') if char in owners else None
+            return own is None or wowchar.is_bot_account(own)
+
         for m in members:
             u, have, hero = m['Uuid'], m.get('Char'), bool(m.get('Hero'))
+            if not hero and owners is None:
+                names = wowsave.all_names()
+                owners = dict.fromkeys(names, '')
+                owners.update(wowsave.accounts(names))
+            if have and not hero and not can_be_bot(have):
+                log('%s: WoW character %s is on the account %s, which no bot can use: another name' % (
+                    m.get('Name'), have, owners[have] or '(none)'))
+                have = None
             if have and (wowsave.exists(have) or not hero):
                 out[u] = have
                 taken.add(have)
                 continue
             name, make = None, False
             got = (snap or {}).get(u)
-            if not have and got and got not in taken and wowsave.exists(got):
+            if not have and got and got not in taken and wowsave.exists(got) and (hero or can_be_bot(got)):
                 out[u] = got
                 taken.add(got)
                 continue
@@ -386,8 +400,10 @@ class Life:
                 make = not wowsave.exists(name)
             else:
                 base = wowchar.wow_name(m.get('Name'))
-                if not new_game and base not in taken and wowsave.exists(base):
-                    name = base  # an older save of this hero or companion: its character
+                if not hero and not new_game:
+                    name = wowchar.bot_name(base, taken, owners)  # an older save's bot, or free: `bot add` makes it
+                elif not new_game and base not in taken and wowsave.exists(base):
+                    name = base  # an older save of this hero: its character
                 else:
                     name = wowchar.free_name(base, taken | set(wowsave.all_names()))
                     make = hero

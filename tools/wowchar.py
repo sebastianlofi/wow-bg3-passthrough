@@ -12,7 +12,7 @@ Mapping (the plug-and-play-plan notes, "More decisions"):
   wowchar.py [HERO_JSON]        print the mapping as JSON (default: the private BG3's hero.json)
   wowchar.py --spec [HERO_JSON] print benilla's WOW_BG3_CREATE spec (patch 0048): name,race,class,gender
   wowchar.py --test             check every BG3 race x class gives a legal vanilla pair
-Reads only. link/tools/lifecycle.py uses mapping() and free_name() for every party member's WoW
+Reads only. link/tools/lifecycle.py uses mapping(), free_name() and bot_name() for every party member's WoW
 character (the hero at a new game's first world-mode start, companions as they join).
 """
 import json, re, sys
@@ -58,6 +58,9 @@ BG3_CLASS = {
 }
 
 
+BOT_ACCOUNT_PREFIX = "WB3B"  # server patch 0010, BOT_ACCOUNT_PREFIX
+
+
 def key(s):
     return re.sub(r"[^a-z]", "", str(s or "").lower())
 
@@ -70,14 +73,10 @@ def wow_name(name):
     return letters[0].upper() + letters[1:].lower()
 
 
-def free_name(base, taken):
-    """base as a legal WoW name, or with letters added (a, b, ... then aa, ab, ...) until no name in
-    taken (case-insensitive) has it: a new game's hero gets a character of its own even when an older
-    playthrough's hero had the same name."""
+def names_from(base):
+    """base as a legal WoW name, then with letters added (a, b, ... then aa, ab, ...)."""
     base = wow_name(base)
-    low = {t.lower() for t in taken}
-    if base.lower() not in low:
-        return base
+    yield base
     letters = "abcdefghijklmnopqrstuvwxyz"
     for n in (1, 2):
         stem = base[:12 - n]
@@ -85,8 +84,36 @@ def free_name(base, taken):
             tail, k = "", i
             for _ in range(n):
                 tail, k = letters[k % 26] + tail, k // 26
-            if (stem + tail).lower() not in low:
-                return stem + tail
+            yield stem + tail
+
+
+def free_name(base, taken):
+    """The first of names_from(base) that no name in taken (case-insensitive) has: a new game's hero gets
+    a character of its own even when an older playthrough's hero had the same name."""
+    low = {t.lower() for t in taken}
+    for name in names_from(base):
+        if name.lower() not in low:
+            return name
+    raise ValueError("no free WoW name for %s" % base)
+
+
+def is_bot_account(account):
+    """Whether a WoW account is a bot's (server patch 0010: WB3B + character name). The server's `bot add`
+    logs in an existing character only from such an account and answers `refused taken` for any other."""
+    return str(account or "").upper().startswith(BOT_ACCOUNT_PREFIX)
+
+
+def bot_name(base, taken, owners):
+    """The WoW character for a companion called base: the first of names_from(base) that this party does
+    not use (taken) and that is either a bot's character already or free. owners: {every character's name:
+    its account}. A name on another account stays with its owner: a hero of an older playthrough called
+    Gale keeps Gale, for that playthrough's saves, and companion Gale is Galea, again at every later load."""
+    low = {t.lower() for t in taken}
+    who = {str(n).lower(): a for n, a in owners.items()}
+    for name in names_from(base):
+        k = name.lower()
+        if k not in low and (k not in who or is_bot_account(who[k])):
+            return name
     raise ValueError("no free WoW name for %s" % base)
 
 
@@ -123,6 +150,12 @@ def main(argv):
                  free_name("Laezel", ["Laezel", "Laezela"]), free_name("Lae'zel", [])]
         if names != ["Tav", "Tava", "Shadowhearta", "Laezelb", "Laezel"]:
             bad.append(("free_name", names))
+        bots = [bot_name("Gale", [], {}), bot_name("Gale", [], {"Gale": "WB3PAAAAAAAA"}),
+                bot_name("Gale", [], {"Gale": "WB3PAAAAAAAA", "Galea": "WB3BGALEA"}),
+                bot_name("Gale", [], {"Gale": "WB3PAAAAAAAA", "Galea": "WB3PBBBBBBBB"}),
+                bot_name("Gale", ["Gale"], {"Gale": "WB3BGALE"})]
+        if bots != ["Gale", "Galea", "Galea", "Galeb", "Galea"]:
+            bad.append(("bot_name", bots))
         print("ok" if not bad else "illegal: %s" % bad)
         return 0 if not bad else 1
     spec = argv[:1] == ["--spec"]
