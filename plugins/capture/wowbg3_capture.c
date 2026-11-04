@@ -405,6 +405,7 @@ static void pace_submit(uint32_t n, const VkCommandBuffer* cbs);
 // WoW's ground in BG3's G-buffer (wowbg3_ground.inc.c, included at the end).
 static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint8_t* load, const int32_t* fin, uint32_t w, uint32_t h);
 static void ground_bind(VkCommandBuffer cb);
+static void ground_view_seen(void);
 static void ground_end(DeviceData* d, VkCommandBuffer cb);
 static void ground_submit(uint32_t n, const VkCommandBuffer* cbs);
 static void ground_forget_image(DeviceData* d, VkImage img);
@@ -2795,6 +2796,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         }
         pace_bind(cb);
         ground_bind(cb);
+        ground_view_seen();
     }
     d->CmdBindDescriptorSets(cb, bp, lay, first, n, sets, nd, dyn);
 }

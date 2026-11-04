@@ -79,6 +79,7 @@ static struct {
     struct { uint64_t cb; int pre; uint64_t serial; } map[GR_MAP];
     uint32_t map_next;
     int pending_pre, framed_pre;     // the last injected frame submitted / the one of the frame presented next
+    int pending_new;                 // an injection was submitted since the last final pass
     uint64_t serial;
     uint64_t pending_serial, framed_serial;  // the same as injection serials (the surfaces' slots)
     // geometry file
@@ -87,6 +88,8 @@ static struct {
     uint32_t tris, tris_kept;
     // statistics since the last log
     uint64_t passes, drawn, nocam, nogeo, nofb, gpu_ns, gpu_n, gpu_max, pre_used, pre_missed, loads;
+    uint64_t frames_bare;            // frames presented without an injection, since the last log
+    uint64_t cam_elsewhere;          // G-buffer passes that bound nothing, injected with a view block bound elsewhere
     uint64_t presents;
     uint32_t extra_dynamic;          // dynamic states (bit = VkDynamicState < 32) BG3's pipelines have besides viewport and scissor
     uint64_t binds, nobind, badview; // descriptor binds seen in G-buffer passes, without a mapped view block, rejected blocks
@@ -131,9 +134,7 @@ static void ground_note_pipeline(const VkGraphicsPipelineCreateInfo* ci) {
 
 // BG3's per-view block (set 0 binding 2, 224 bytes) as bound on this thread now: a camera record when
 // it is a perspective reverse-Z one (as rebase_view in benilla checks it).
-static int ground_view_record(GrRec* out) {
-    const float* f = (const float*)fxc_slot_cpu(0, 2, 224);
-    if (!f) { g_gr.nobind++; return 0; }
+static int ground_view_parse(const float* f, GrRec* out) {
     // floats 50, 51 and 55 are not the camera's (55 is an int)
     for (int i = 0; i < 55; i++) if (i != 50 && i != 51 && !isfinite(f[i])) { g_gr.badview++; return 0; }
     if (f[16 + 2 * 4 + 3] != 1.0f || f[16 + 3 * 4 + 3] != 0.0f || !(f[16] > 0.0f) || !(f[16 + 5] > 0.0f) || !(f[48] > 0.0f)) {
@@ -146,6 +147,70 @@ static int ground_view_record(GrRec* out) {
     for (int i = 0; i < 3; i++) { out->right[i] = f[i * 4 + 0]; out->up[i] = f[i * 4 + 1]; out->fwd[i] = f[i * 4 + 2]; }
     out->right[3] = out->up[3] = out->fwd[3] = 0.0f;
     return 1;
+}
+static int ground_view_record(GrRec* out) {
+    const float* f = (const float*)fxc_slot_cpu(0, 2, 224);
+    if (!f) { g_gr.nobind++; return 0; }
+    return ground_view_parse(f, out);
+}
+
+// With nothing of BG3's in view (Tav out of frame, a stand-in not drawn yet) its G-buffer pass makes no
+// descriptor bind, so the pass itself names no camera; BG3's decal and forward passes of the frame still
+// bind the view block, on other threads, often before. So every view block bound anywhere is remembered,
+// as its buffer and offset (BG3 may free a buffer; buf_cpu then finds nothing), newest last. Shadow views
+// are blocks too: a block is the camera's when its eye is one of the plugin's camera records.
+#define GR_VIEWS 24
+static struct { uint64_t res, off, clock; } g_gr_views[GR_VIEWS];
+static uint32_t g_gr_views_next;
+static uint64_t g_gr_views_clock;
+static pthread_mutex_t g_gr_views_m = PTHREAD_MUTEX_INITIALIZER;
+static __thread uint64_t t_gr_view_res, t_gr_view_off;
+
+// A graphics descriptor bind on this thread, in any pass.
+static void ground_view_seen(void) {
+    if (!g_cc.ground || !t_set[0]) return;
+    SetInfo* si = set_find(t_set[0]);
+    if (!si) return;
+    DescSlot* sl = &si->slot[2];
+    if (!sl->res) return;
+    uint64_t off = sl->off;
+    if (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
+        uint32_t at = 0;
+        for (uint32_t b = 0; b < 2; b++)
+            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
+        if (at < t_ndyn[0] && at < 8) off += t_dyn[0][at];
+    }
+    if (sl->res == t_gr_view_res && off == t_gr_view_off) return;
+    t_gr_view_res = sl->res;
+    t_gr_view_off = off;
+    pthread_mutex_lock(&g_gr_views_m);
+    int k = -1;
+    for (int i = 0; i < GR_VIEWS && k < 0; i++) if (g_gr_views[i].res == sl->res && g_gr_views[i].off == off) k = i;
+    if (k < 0) { k = (int)g_gr_views_next; g_gr_views_next = (g_gr_views_next + 1) % GR_VIEWS; }
+    g_gr_views[k].res = sl->res; g_gr_views[k].off = off; g_gr_views[k].clock = ++g_gr_views_clock;
+    pthread_mutex_unlock(&g_gr_views_m);
+}
+
+// The camera of a G-buffer pass that bound nothing: the newest view block whose eye is a camera record's.
+// It is this frame's when another pass of the frame has bound it already, else the frame before's.
+static int ground_view_elsewhere(GrRec* out) {
+    __typeof__(g_gr_views[0]) v[GR_VIEWS];
+    pthread_mutex_lock(&g_gr_views_m);
+    memcpy(v, g_gr_views, sizeof v);
+    pthread_mutex_unlock(&g_gr_views_m);
+    for (int n = 0; n < GR_VIEWS; n++) {
+        int k = -1;
+        for (int i = 0; i < GR_VIEWS; i++) if (v[i].res && (k < 0 || v[i].clock > v[k].clock)) k = i;
+        if (k < 0) return 0;
+        uint64_t left = 0;
+        const float* f = (const float*)buf_cpu(v[k].res, v[k].off, &left);
+        v[k].res = 0;
+        if (!f || left < 224 || !ground_view_parse(f, out)) continue;
+        uint32_t seq = 0;
+        float err = -1, err2 = -1;
+        if (pace_match(out->eye, &seq, &err, &err2) && err < 0.05f) return 1;
+    }
+    return 0;
 }
 
 // begin_pass found a pass at swapchain size (g_trace_lock held): BG3's G-buffer pass is the scene
@@ -346,7 +411,11 @@ static void ground_inject(DeviceData* d, VkCommandBuffer cb) {
     t_gr_cb = VK_NULL_HANDLE;
     if (!g_cc.on || !g_cc.ground || !d) return;
     __atomic_add_fetch(&g_gr.passes, 1, __ATOMIC_RELAXED);
-    if (!t_gr_cam) { __atomic_add_fetch(&g_gr.nocam, 1, __ATOMIC_RELAXED); return; }
+    if (!t_gr_cam) {
+        if (!ground_view_elsewhere(&t_gr_rec)) { __atomic_add_fetch(&g_gr.nocam, 1, __ATOMIC_RELAXED); return; }
+        t_gr_cam = 1;
+        __atomic_add_fetch(&g_gr.cam_elsewhere, 1, __ATOMIC_RELAXED);
+    }
     VkFormat fmt[4];
     int32_t lay[4];
     pthread_mutex_lock(&g_trace_lock);
@@ -445,7 +514,11 @@ static void ground_end(DeviceData* d, VkCommandBuffer cb) {
 }
 
 // Submission order (from role_submit, g_trace_lock held): an injected frame becomes pending; the
-// final pass that follows makes it the frame presented next.
+// final pass that follows makes it the frame presented next. A final pass with no injection since the
+// last one is a frame without WoW's ground in it, and nothing of an older frame may stand in for it:
+// no depth copy (the compositor reads BG3's depth image, which has no ground to exclude) and no
+// surface slot. Its A1 and H say nothing about the ground (no ground there, H holds BG3's sky), and
+// pairing them with an older frame's A0 and Z whitened all of WoW's ground for as long as it lasted.
 static void ground_submit(uint32_t n, const VkCommandBuffer* cbs) {
     if (!g_cc.ground) return;
     pthread_mutex_lock(&g_gr.m);
@@ -453,12 +526,19 @@ static void ground_submit(uint32_t n, const VkCommandBuffer* cbs) {
         uint64_t h = (uint64_t)(uintptr_t)cbs[i];
         uint64_t best = 0;
         for (uint32_t k = 0; k < GR_MAP; k++)
-            if (g_gr.map[k].cb == h && g_gr.map[k].serial > best) {
-                best = g_gr.map[k].serial; g_gr.pending_pre = g_gr.map[k].pre; g_gr.pending_serial = best;
+            if (g_gr.map[k].cb == h) {
+                if (g_gr.map[k].serial > best) { best = g_gr.map[k].serial; g_gr.pending_pre = g_gr.map[k].pre; g_gr.pending_serial = best; }
+                g_gr.map[k].cb = 0;  // BG3 re-records this handle: a later frame on it may have no injection
+                g_gr.pending_new = 1;
             }
         surf_submit_cb(h, g_gr.pending_serial);
         CbRole* r = TABLE_FIND(g_cbrole, CBROLE_CAP, h, 0);
-        if (r && r->init && r->fin_ui) { g_gr.framed_pre = g_gr.pending_pre; g_gr.framed_serial = g_gr.pending_serial; }
+        if (r && r->init && r->fin_ui) {
+            g_gr.framed_pre = g_gr.pending_new ? g_gr.pending_pre : -1;
+            g_gr.framed_serial = g_gr.pending_new ? g_gr.pending_serial : 0;
+            if (!g_gr.pending_new) g_gr.frames_bare++;
+            g_gr.pending_new = 0;
+        }
     }
     pthread_mutex_unlock(&g_gr.m);
 }
@@ -582,16 +662,16 @@ static void ground_present(void) {
     if (g_gr.presents % 300 == 0) {
         pthread_mutex_lock(&g_gr.m);
         const uint32_t extra = g_gr.extra_dynamic & ~0x1fcu;  // beyond those the injection keeps dynamic (2..8)
-        logf_("ground: %llu G-buffer passes, %llu drawn (%u of %u WoW triangles; %llu loads), %llu without BG3's camera (%llu binds, %llu unmapped,"
+        logf_("ground: %llu G-buffer passes, %llu drawn (%u of %u WoW triangles; %llu loads), %llu without BG3's camera, %llu with one bound elsewhere (%llu binds, %llu unmapped,"
               " %llu rejected), %llu without triangles, %llu without a framebuffer; GPU %.3f ms each (max %.3f, %llu timed); compositor took BG3's"
-              " own depth %llu times, missed %llu; BG3 dynamic states %#x%s",
+              " own depth %llu times, missed %llu; %llu frames presented without an injection; BG3 dynamic states %#x%s",
               (unsigned long long)g_gr.passes, (unsigned long long)g_gr.drawn, g_gr.tris_kept, g_gr.tris, (unsigned long long)g_gr.loads,
-              (unsigned long long)g_gr.nocam, (unsigned long long)g_gr.binds, (unsigned long long)g_gr.nobind, (unsigned long long)g_gr.badview,
+              (unsigned long long)g_gr.nocam, (unsigned long long)g_gr.cam_elsewhere, (unsigned long long)g_gr.binds, (unsigned long long)g_gr.nobind, (unsigned long long)g_gr.badview,
               (unsigned long long)g_gr.nogeo, (unsigned long long)g_gr.nofb,
               g_gr.gpu_n ? g_gr.gpu_ns / 1e6 / g_gr.gpu_n : 0.0, g_gr.gpu_max / 1e6, (unsigned long long)g_gr.gpu_n,
-              (unsigned long long)g_gr.pre_used, (unsigned long long)g_gr.pre_missed, g_gr.extra_dynamic,
+              (unsigned long long)g_gr.pre_used, (unsigned long long)g_gr.pre_missed, (unsigned long long)g_gr.frames_bare, g_gr.extra_dynamic,
               extra ? " (NOTE: some the injection's pipeline sets statically)" : "");
-        g_gr.passes = g_gr.drawn = g_gr.nocam = g_gr.nogeo = g_gr.nofb = g_gr.gpu_ns = g_gr.gpu_n = g_gr.gpu_max = g_gr.pre_used = g_gr.pre_missed = 0;
+        g_gr.passes = g_gr.drawn = g_gr.nocam = g_gr.nogeo = g_gr.nofb = g_gr.gpu_ns = g_gr.gpu_n = g_gr.gpu_max = g_gr.pre_used = g_gr.pre_missed = g_gr.frames_bare = g_gr.cam_elsewhere = 0;
         g_gr.loads = g_gr.binds = g_gr.nobind = g_gr.badview = 0;
         pthread_mutex_unlock(&g_gr.m);
     }

@@ -132,14 +132,72 @@ local function combatOf(u)
     if q(Osi.IsInCombat, u) ~= 1 then return nil end
     return q(Osi.CombatGetGuidFor, u)
 end
--- The party's BG3 combat: the hero's, else the first companion's in one (a stand-in that spotted a
--- companion starts a fight too).
+-- The party's side: every member and every summon of a member (a familiar, a spirit companion, a raised
+-- dead). Each fights in BG3 as itself: a fight it starts is its own, whoever else is far away.
+-- By UUID, members first. Cached per tick.
+local fightersTick, fighters = -1, nil
+function M.Fighters()
+    if fightersTick == tick and fighters then return fighters end
+    local list, seen = {}, {}
+    for _, u in ipairs(M.Party()) do list[#list + 1] = u; seen[u] = true end
+    pcall(function()
+        for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("IsSummon")) do
+            local okU, u = pcall(function() return e.Uuid.EntityUuid end)
+            local okS, by = pcall(function() return e.IsSummon.Summoner.Uuid.EntityUuid end)
+            local okO, owner = pcall(function() return e.IsSummon.Owner.Uuid.EntityUuid end)
+            if okU and u and not seen[u] and ((okS and seen[by]) or (okO and seen[owner])) then
+                list[#list + 1] = u
+                seen[u] = true
+            end
+        end
+    end)
+    fighters, fightersTick = list, tick
+    return list
+end
+-- Whether a UUID or GUIDSTRING names one of the party's side.
+function M.IsFighter(s)
+    if type(s) ~= "string" then return false end
+    for _, u in ipairs(M.Fighters()) do if s:find(u, 1, true) then return true end end
+    return false
+end
+-- The party's BG3 combat: the first of the party's side in one (the hero's, a companion's or a summon's,
+-- with a stand-in it attacked or one that spotted it).
 function M.Combat()
-    for _, u in ipairs(M.Party()) do
+    for _, u in ipairs(M.Fighters()) do
         local c = combatOf(u)
         if c then return c end
     end
     return nil
+end
+-- Who a stand-in fights when something outside BG3's own flow joins it to a combat (M.Opponent):
+-- the one of the party's side that last attacked it. target uuid -> {Who, At}.
+local ATTACKER_KEEP = 30000 -- ms: an attack this long ago no longer says who it fights
+local attackers = {}
+function M.NoteAttack(target, who)
+    if target and who then attackers[target] = {Who = who, At = Ext.Utils.MonotonicTime()} end
+end
+function M.ForgetAttacks(target) attackers[target] = nil end
+-- The one of the party's side a stand-in fights: its attacker; else the nearest in a BG3 combat (a pack
+-- that joins someone's fight); else the nearest (WoW's aggro on whoever walked by). Never the hero by
+-- title: BG3 takes whoever is named into the combat, however far away they are.
+function M.Opponent(target)
+    local a = attackers[target]
+    if a and Ext.Utils.MonotonicTime() - a.At <= ATTACKER_KEEP and Ext.Entity.Get(a.Who) and q(Osi.IsDead, a.Who) ~= 1 then
+        return a.Who
+    end
+    local at = pos(target)
+    local best, bestD, bestIn
+    for _, u in ipairs(M.Fighters()) do
+        local p = q(Osi.IsDead, u) ~= 1 and pos(u)
+        if p then
+            local d = at and (p[1] - at[1]) ^ 2 + (p[3] - at[3]) ^ 2 or 0
+            local inCombat = combatOf(u) ~= nil
+            if not best or (inCombat and not bestIn) or (inCombat == bestIn and d < bestD) then
+                best, bestD, bestIn = u, d, inCombat
+            end
+        end
+    end
+    return best or Hero.Uuid()
 end
 local function member(u, hero)
     local e = Ext.Entity.Get(u)

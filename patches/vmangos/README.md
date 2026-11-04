@@ -32,6 +32,7 @@ fights, party members and the merged inventory.
 | 0024 bots-on-hero-side | a party is one WoW side, its owner's: a bot of another side keeps its race and class and, while it is the owner's bot (login and every party tick), borrows the owner's team and faction template (vmangos' `SetFactionForRace` with the owner's race), the owner's standing and flags with every reputation faction (in memory, its own never saved over) and forced reactions, so guards, towns, attackability, PvP areas and REACT treat it as the owner; `side MEMBER` shows race, team, template and how many factions are borrowed |
 | 0025 loot-take-at-bg3s-reach | `loot take` books several entries in one call (the bridge's batch of BG3's takes from one corpse), each with `@X/Y/Z`, the looter's place at BG3's take: WoW's own loot handlers measure their loot reach from there (`WowBg3::InLootReach`), so a take BG3 allowed is not refused `far` because the body walked on before it reached WoW; one reply line per entry |
 | 0026 hold-by-guid | `hold HID guids G1,G2,...` holds exactly those creatures (the ones whose stand-ins BG3's turn-based mode froze) with the same hold as the radius form, `hold HID drop G1,...` lets them go again; the radius form is unchanged |
+| 0027 pack-at-fight-start | WoW's pack pull (0015) runs once per encounter, at its start, for the mobs it began with; a mob that wanders up later joins only through BG3's combat (the bridge's `join`) |
 
 Upstream `Unit.cpp` uses CRLF line endings, so some hunks are CRLF: never convert line endings in
 these files.

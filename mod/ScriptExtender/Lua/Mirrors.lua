@@ -562,18 +562,17 @@ function M.Start(runId)
         local uuid = uuidOf(tostring(defender))
         local kind = tostring(damageType or "")
         local typed = kind ~= "" and kind ~= "None"
-        if uuid and M.Owned[uuid] and (Party.IsMember(tostring(owner)) or Party.IsMember(tostring(attacker))) then
+        if uuid and M.Owned[uuid] and (Party.IsFighter(tostring(owner)) or Party.IsFighter(tostring(attacker))) then
             hitByTav[uuid] = true
             provoke(uuid)
             aimFriendly(uuid)
-            if friendlyOf(uuid) then
-                local a = uuidOf(tostring(attacker))
-                if not (a and Party.IsMember(a)) then a = uuidOf(tostring(owner)) end
-                pcall(callHelp, uuid, a)
-            end
+            local by = uuidOf(tostring(attacker))
+            if not (by and Party.IsFighter(by)) then by = uuidOf(tostring(owner)) end
+            Party.NoteAttack(uuid, by)
+            if friendlyOf(uuid) then pcall(callHelp, uuid, by) end
             local h = hp(uuid)
             pcall(strike, uuid, 2 | (typed and 1 or 0) | ((h and h[1] <= 0) and 4 or 0), damage)
-        elseif uuid and Party.IsMember(uuid) then
+        elseif uuid and Party.IsFighter(uuid) then
             local a = uuidOf(tostring(attacker))
             if not (a and M.Owned[a]) then a = uuidOf(tostring(owner)) end
             if a and M.Owned[a] then
@@ -588,7 +587,7 @@ function M.Start(runId)
     -- A miss on the party needs nothing here: every party member is drawn with BG3's own figure and BG3's reaction.
     local okMiss, errMiss = pcall(Ext.Osiris.RegisterListener, "MissedBy", 4, "after", function(defender, owner, attacker)
         local uuid = uuidOf(tostring(defender))
-        if uuid and M.Owned[uuid] and (Party.IsMember(tostring(owner)) or Party.IsMember(tostring(attacker))) then
+        if uuid and M.Owned[uuid] and (Party.IsFighter(tostring(owner)) or Party.IsFighter(tostring(attacker))) then
             pcall(strike, uuid, STRIKE_WOUND | STRIKE_DODGE, 0)
         end
     end)
@@ -596,11 +595,14 @@ function M.Start(runId)
     -- Before the action lands (attack, spell, Shove, Throw at it): it may join the combat.
     pcall(Ext.Osiris.RegisterListener, "UsingSpellOnTarget", 6, "after", function(caster, target, spell)
         local c, t = uuidOf(tostring(caster)), uuidOf(tostring(target))
-        if c and Party.IsMember(c) then
+        if c and Party.IsFighter(c) then
             provoke(t)
             aimFriendly(t)
-            if t and M.Owned[t] then aimed[t] = ticks end
-        elseif c and M.Owned[c] and t and Party.IsMember(t) then
+            if t and M.Owned[t] then
+                aimed[t] = ticks
+                Party.NoteAttack(t, c)
+            end
+        elseif c and M.Owned[c] and t and Party.IsFighter(t) then
             local okB, base = pcall(function() return Ext.Require("Abilities.lua").BaseOf(tostring(spell)) end)
             local name = okB and base or tostring(spell)
             attacking[c] = {At = ticks, Struck = false, Party = t ~= Hero.Uuid(), Thrown = name:find("Javelin") ~= nil or name:find("Throw") ~= nil}
@@ -688,6 +690,7 @@ function M.Start(runId)
         M.Owned[m.Uuid] = nil
         M.KnockedOut[m.Uuid] = nil
         hitByTav[m.Uuid] = nil
+        Party.ForgetAttacks(m.Uuid)
         provoked[m.Uuid] = nil
         friendlyAimed[m.Uuid] = nil
         aimed[m.Uuid], attacking[m.Uuid] = nil, nil
@@ -1162,43 +1165,13 @@ function M.Start(runId)
             end
         end
         M.WantNow = want
-        -- The switch `scaling`: the usual fight is a pack. Hostile stand-ins chained within reach of a mob in the
-        -- fight join it (BG3's combat, so the bridge pulls them), which BG3's ally join mostly does by itself. No limit
-        -- but the stand-ins there are.
-        if Scaling.On() and plan and plan.Active == true then
-            local chain = {}
-            for g in pairs(fight) do
-                if want[g] then chain[#chain + 1] = want[g] end
-            end
-            if next(fight) then
-                local r2, hero = Scaling.REACH_M ^ 2, Hero.Uuid()
-                local i = 1
-                while i <= #chain do
-                    local a = chain[i]
-                    for guid, mob in pairs(want) do
-                        local m = mirrors[guid]
-                        if m and mob.Hostile and not fight[guid] and not m.PackJoin and m.Stage ~= "spawned" then
-                            local dx, dz = a.Pos[1] - mob.Pos[1], a.Pos[3] - mob.Pos[3]
-                            if dx * dx + dz * dz <= r2 and q(Osi.IsDead, m.Uuid) ~= 1 then
-                                m.PackJoin = ticks
-                                pcall(Osi.EnterCombat, m.Uuid, hero)
-                                chain[#chain + 1] = mob
-                            end
-                        end
-                    end
-                    i = i + 1
-                end
-            else
-                for _, m in pairs(mirrors) do m.PackJoin = nil end
-            end
-        end
-        -- The party's BG3 combat: the hero's, else a companion's (a stand-in spotted a companion).
+        -- The party's BG3 combat: the hero's, else a companion's or a summon's.
         local tavCombat = Party.Combat()
-        -- Every party member's combat: a stand-in fighting a companion in
+        -- Every combat of the party's side: a stand-in fighting a companion or a summon in
         -- another BG3 combat than the hero's is in the party's fight too, so the bridge pulls it and
         -- its WoW mob is held (before, it fought in BG3 while its WoW mob walked on).
         local partyCombats = {}
-        for _, u in ipairs(Party.Party()) do
+        for _, u in ipairs(Party.Fighters()) do
             local c = combatOf(u)
             if c then partyCombats[c] = true end
         end
@@ -1392,7 +1365,7 @@ function M.Start(runId)
             if Ext.Entity.Get(uuid) then
                 if not partyCombats then
                     partyCombats = {}
-                    for _, u in ipairs(Party.Party()) do
+                    for _, u in ipairs(Party.Fighters()) do
                         local c = combatOf(u)
                         if c then partyCombats[c] = true end
                     end

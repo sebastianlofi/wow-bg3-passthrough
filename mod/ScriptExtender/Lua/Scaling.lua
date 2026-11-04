@@ -63,8 +63,6 @@ M.RANKS = {
 M.TURNS_CAP = 36
 -- BG3's AI needs an average hit of 1 (Boosts). Below that the shortfall comes off to-hit, about 9 points for all of it.
 M.MISS = 9
--- The reach: 40 yd chained.
-M.REACH_M = 36.6
 M.DIFFICULTY = {
     explorer = {HP = 0.7, Hit = -1, DC = -1, Damage = 0.8},
     balanced = {HP = 1, Hit = 0, DC = 0, Damage = 1},

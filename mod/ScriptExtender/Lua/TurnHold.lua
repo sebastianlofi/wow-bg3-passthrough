@@ -18,19 +18,22 @@
 -- Running or a held state (Session.lua: a save or a pause keeps the hold).
 -- The backend (today the fight bridge, bridge/src, with the server's hold verbs, vmangos 0026) turns it
 -- into "hold exactly these creatures", "let these go" and "release".
--- Guids: the WoW creatures whose stand-ins BG3's own turn-based mode froze (project rule:
--- "turn based mode should reach as far as it does in BG3"; was every creature within 50 yd), from
--- WOWBG3MirrorOwned (Mirrors.lua, stand-in uuid -> WoW guid). Seq goes up when that set changes too.
--- What BG3 freezes was measured (Elwynn, 55 stand-ins and 11 plain BG3 NPCs
--- spawned 10 to 150 m out, ForceTurnBasedMode on the party): every character BG3 takes into the
--- party's turn-based mode gets the eoc::ftb::IsInFtbComponent tag (IsInFTB) and ls::TimeFactor 0
--- (time stopped), the same as the party has the tag with TimeFactor 1. It took in characters 10 to
--- 35 m out and none past 35 m (none of the inactive ones, past BG3's 41 m activation, at all), but
--- not by distance alone: one at 24.6 m and one at 29.3 m stayed out. FTBParticipant is on every
--- character in or out of turn-based mode, and FTBPaused was on none, so neither says frozen. So the
--- hold goes by guid, not by a radius round the members. Stats.Bg3 records each check: stand-ins, how
--- many BG3 froze, the farthest frozen and the nearest left free (WoW yards from the nearest member),
--- and the turn-based zones' fields.
+-- Guids: every WoW creature the party's world has loaded (mirror.json Mobs, WoW's own visible set
+-- round the members, the list stand-ins are made from; no distance of ours) and every creature whose
+-- stand-in BG3's turn-based mode froze (WOWBG3MirrorOwned, Mirrors.lua: stand-in uuid -> WoW guid).
+-- A creature in a fight stays the fight's. Seq goes up when that set changes too.
+-- Why not BG3's list alone: its tag covers only what is close. What BG3 freezes was measured: every
+-- character it takes into the party's turn-based mode gets the eoc::ftb::IsInFtbComponent tag (IsInFTB,
+-- GetAllEntitiesWithComponent lists them) and ls::TimeFactor 0 (time stopped), the same as the party
+-- has the tag with TimeFactor 1. It takes a character within about 18 m of a member or of a character
+-- it already took, and so spreads along a chain (Durotar: 11.7 and 17.4 m in, 21.5 m out; one in at
+-- 29.4 m, 12.2 m from a frozen boar; Elwynn: in up to 35 m, one out at 24.6 m). So in an open field
+-- it froze 1 to 4 of 29 boars, and the rest walked on in WoW's picture. SightRangeOverride on the
+-- member or the stand-ins, Sight.Sight, ForceTurnBasedMode on a stand-in and
+-- ZoneSystem.EnterExistingSharedFTB widened nothing. FTBParticipant is on every character in or out
+-- of turn-based mode, and FTBPaused was on none, so neither says frozen. Stats.Bg3 records each check:
+-- stand-ins, how many BG3 froze, the farthest frozen and the nearest left free (WoW yards from the
+-- nearest member), and the turn-based zones' fields; Stats.Loaded how many creatures mirror.json lists.
 -- The world's turn (a playtest report: the environment's turn came and nothing in WoW moved): BG3
 -- pauses the world only while the party takes its turns; once every member in turn-based mode has
 -- ended its turn, the turn order shows the environment's turn and the rest of the world runs for that
@@ -127,6 +130,26 @@ local function bg3Frozen(members)
     census.Zones = zones
     table.sort(guids)
     return guids, census
+end
+
+-- What the hold takes (see the header): the creatures BG3 froze plus WoW's loaded ones outside a fight;
+-- sorted, so the key below only changes when the set does. Second value: how many WoW has loaded.
+local function heldGuids(frozen)
+    local seen, out = {}, {}
+    local function add(g)
+        if not seen[g] then seen[g] = true; out[#out + 1] = g end
+    end
+    for _, g in ipairs(frozen) do add(g) end
+    local plan = readJson("wow-bg3/link/mirror.json")
+    local mobs = plan and plan.Active == true and type(plan.Mobs) == "table" and plan.Mobs or {}
+    local fight = {}
+    for _, g in ipairs(plan and type(plan.Fight) == "table" and plan.Fight or {}) do fight[g] = true end
+    for _, m in ipairs(mobs) do
+        local g = m.Guid
+        if type(g) == "string" and g:match("^%x+$") and not fight[g] then add(g) end
+    end
+    table.sort(out)
+    return out, #mobs
 end
 
 -- BG3 metres -> WoW yards, world mode's mapping (WorldMode.lua toWow); nil when world mode is off.
@@ -233,8 +256,10 @@ function M.Start(runId)
                 release("the world's turn")
                 return
             end
-            local guids, census = bg3Frozen(members)
+            local bg3, census = bg3Frozen(members)
             stats.Bg3 = census
+            local guids, loaded = heldGuids(bg3)
+            stats.Loaded = loaded
             local key = table.concat(guids, ",")
             local other = key ~= frozenKey
             frozen, frozenKey = guids, key
@@ -246,7 +271,7 @@ function M.Start(runId)
                 if first then
                     local names = {}
                     for _, m in ipairs(members) do names[#names + 1] = tostring(m.Name) end
-                    Ext.Utils.Print(string.format("WOW-BG3 turnhold: hold %d creatures BG3 froze round %s", #guids, table.concat(names, ", ")))
+                    Ext.Utils.Print(string.format("WOW-BG3 turnhold: hold %d creatures (BG3 froze %d) round %s", #guids, #bg3, table.concat(names, ", ")))
                 end
             elseif ticks - lastWrite >= M.Keep then
                 write(sent)

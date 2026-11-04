@@ -1,0 +1,33 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index f10a1d4..cf80f29 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -110,6 +110,7 @@ namespace
+         uint32 started = 0;
+         uint32 last = 0;
+         bool provoked = false;                              // has an NPC the player provoked (begin/join `!GUID`)
++        bool packPulled = false;                            // 0027: WoW's pack pull ran (once, at the fight's start)
+         std::vector<Mob> mobs;
+ 
+         Mob* Find(ObjectGuid guid)
+@@ -1627,12 +1628,16 @@ namespace
+         };
+         std::vector<Want> wants;
+         {
+-            ReadLock lock(g_lock);
+-            for (auto const& kv : g_fighters)
++            // 0027: once per encounter, at its start, for the mobs it began with. In WoW attacking a mob
++            // next to another pulls both; later a wandering mob joins only if BG3 says it saw the fight
++            // (its stand-in in BG3's combat, the bridge's `join`), so hiding and invisibility hold there.
++            WriteLock lock(g_lock);
++            for (auto& kv : g_fighters)
+             {
+-                Encounter const* e = kv.second.active.get();
+-                if (!e || !e->Alive() || e->mobs.size() >= MAX_MOBS)
++                Encounter* e = kv.second.active.get();
++                if (!e || e->packPulled || !e->Alive() || e->mobs.size() >= MAX_MOBS)
+                     continue;
++                e->packPulled = true;
+                 Want w{ kv.first, e->id, e->map, e->instance, {} };
+                 for (Mob const& m : e->mobs)
+                     if (!m.killed)

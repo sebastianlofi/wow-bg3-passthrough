@@ -4,8 +4,8 @@
 //!
 //! `TurnHold.lua` (BG3 side) writes `link/turnhold.json`: `{Schema 1, RunId, Seq, Tick, Hold, Guids:
 //! [WoW guid, ...], Members: [{Name, Wow: [x, y, z]}]}` while any party member is in BG3's turn-based
-//! mode outside combat; Guids are the creatures whose stand-ins BG3's turn-based mode froze (BG3
-//! decides that per character). The fight bridge turns it into the server's hold verbs (patch 0010's
+//! mode outside combat; Guids are the creatures to stop: those WoW has loaded and those whose
+//! stand-ins BG3 froze (`TurnHold.lua` says why). The fight bridge turns it into the server's hold verbs (patch 0010's
 //! hold, by guid since patch 0026) and sends them through the hero's own client like every
 //! other `.wowbg3` verb (benilla's server channel, about 0.1 s to the server):
 //! - Hold true: `hold HID guids G1,G2,...` ([`GUIDS_PER_LINE`] a line, a chat line's 255 characters)
@@ -45,7 +45,7 @@ fn party(line: String) -> Handoff {
     Handoff::Party { line }
 }
 
-/// The creatures BG3 froze: `Guids`, WoW creature guids as 16 hex digits (lower case).
+/// The creatures to stop: `Guids`, WoW creature guids as 16 hex digits (lower case).
 pub fn frozen(d: &Value) -> BTreeSet<String> {
     d.get("Guids")
         .and_then(Value::as_array)

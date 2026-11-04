@@ -395,6 +395,13 @@ local function newBackend(actors, void, runId, session)
         if type(m) == "table" and type(m.Uuid) == "string" and m.Dead ~= true then return m end
         return false
     end
+    -- Who a stand-in joining the fight fights. World mode: the server's word (Party.Opponent, nil here),
+    -- the one of the party's side that attacked it or is near it, as in BG3; naming the hero took a hero
+    -- any distance away into a fight a companion or a summon started, and left the one who started it out.
+    local function opponent()
+        if inWorld then return nil end
+        return Hero.Uuid()
+    end
     -- Spawn, scale and (unless setup joins later) join one stand-in for a protocol actor; in world
     -- mode a mirrored mob's existing stand-in is adopted instead. got (optional) learns the stand-in
     -- as soon as there is one (Uuid, Mirror), so a join that fails later knows what BG3 may hold.
@@ -423,13 +430,13 @@ local function newBackend(actors, void, runId, session)
             -- runs, and BG3's TEMPORARILY_HOSTILE (given at the combat's first turn) goes at once from a
             -- character whose faction is hostile. The faction below is for one Tav did not attack.
             if mirror.InCombat ~= true and (mirror.Friendly == true or mirror.Provoked == true) then
-                standIn({Action = "TempHostile", Target = uuid, With = Hero.Uuid()})
+                standIn({Action = "TempHostile", Target = uuid, With = opponent()})
                 scaled[a.id].Provoked = "temporarily hostile"
             elseif mirror.InCombat ~= true and mirror.Hostile ~= true and void.Faction then
                 standIn({Action = "Faction", Target = uuid, Faction = void.Faction})
                 scaled[a.id].Provoked = true
             end
-            if joinCombat and mirror.InCombat ~= true then standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
+            if joinCombat and mirror.InCombat ~= true then standIn({Action = "Join", Target = uuid, With = opponent()}) end
             rest[a.id] = positionOf(uuid)
             enemies[#enemies + 1] = a
             return uuid
@@ -451,7 +458,7 @@ local function newBackend(actors, void, runId, session)
         scaleStandIn(a.id, uuid)
         if scaled[a.id] then scaled[a.id].Uuid = uuid end -- Silence.lua: its BG3 sounds off too
         if void.Faction then standIn({Action = "Faction", Target = uuid, Faction = void.Faction}) end
-        if joinCombat then standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
+        if joinCombat then standIn({Action = "Join", Target = uuid, With = opponent()}) end
         rest[a.id] = positionOf(uuid)
         enemies[#enemies + 1] = a
         return uuid
@@ -724,9 +731,9 @@ local function newBackend(actors, void, runId, session)
             end
             Ext.Utils.Print(string.format("WOW-BG3 turns: fight begins, BG3 combat already running %s, hero entered at seq %s, reading from seq %d",
                 tostring(already), tostring(entered), seen))
-            for _, uuid in ipairs(made) do standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
+            for _, uuid in ipairs(made) do standIn({Action = "Join", Target = uuid, With = opponent()}) end
             for uuid, how in pairs(adopted) do
-                if how == "joins" then standIn({Action = "Join", Target = uuid, With = Hero.Uuid()}) end
+                if how == "joins" then standIn({Action = "Join", Target = uuid, With = opponent()}) end
             end
             if not inWorld and void.Follow ~= false and Ext.IO.LoadFile("wow-bg3/link/camera.bin") then
                 local w = b.wow_origin
@@ -745,10 +752,11 @@ local function newBackend(actors, void, runId, session)
                         end
                     end
                 end
-                -- She entered BG3's combat after the status above was written: her TurnStarted can
-                -- be at or before seen, and no other turn comes until she ends hers.
+                -- World mode: the party's side is in BG3's combat, so it runs, whoever's turn comes first
+                -- (the first turn may be a companion's or a summon's, and lasts as long as its player likes;
+                -- the turn events above know only the hero and the mobs).
                 local now = inWorld and mirrorStatus()
-                return now and now.Tav and now.Tav.InCombat == true and reportTurn(r) or false
+                return now and now.Tav and now.Tav.InCombat == true or false
             end, 600, "combat did not start") end
             -- The new combat's turns arrive as TurnStarted events (seen was taken before Join).
             mode, lastTurn = "combat", true

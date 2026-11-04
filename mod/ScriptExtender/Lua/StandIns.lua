@@ -20,7 +20,8 @@
 --   Faction  {Target, From | Faction}            copy another character's faction, or set a
 --                                                faction id read earlier from Inspect (setup)
 --   Join     {Target, With}                      enter the combat of With (setup); also a mirrored mob's
---                                                stand-in (Mirrors.lua), which a fight adopts
+--                                                stand-in (Mirrors.lua), which a fight adopts. No With:
+--                                                the one of the party's side it fights (Party.Opponent)
 --   TempHostile {Target, With}                   a mirrored friendly NPC's stand-in the WoW fight holds
 --                                                (WoW's rules pulled it in, its
 --                                                creature group) turns on With the way BG3 turns
@@ -365,14 +366,16 @@ function M.Start(runId)
                 return {Total = total, Matches = out}
             elseif c.Action == "Join" then
                 local uuid = live(c.Target)
-                assert(type(c.With) == "string" and Ext.Entity.Get(c.With), "With must be an existing character")
-                Osi.EnterCombat(uuid, c.With)
+                local with = c.With or Ext.Require("Party.lua").Opponent(uuid)
+                assert(type(with) == "string" and Ext.Entity.Get(with), "With must be an existing character")
+                Osi.EnterCombat(uuid, with)
                 return inspect(uuid)
             elseif c.Action == "TempHostile" then
                 local uuid = live(c.Target)
-                assert(type(c.With) == "string" and Ext.Entity.Get(c.With), "With must be an existing character")
+                local with = c.With or Ext.Require("Party.lua").Opponent(uuid)
+                assert(type(with) == "string" and Ext.Entity.Get(with), "With must be an existing character")
                 Osi.SetCanJoinCombat(uuid, 1)
-                Osi.SetRelationTemporaryHostile(uuid, c.With)
+                Osi.SetRelationTemporaryHostile(uuid, with)
                 return inspect(uuid)
             elseif c.Action == "Remove" then
                 local uuid = live(c.Target)
