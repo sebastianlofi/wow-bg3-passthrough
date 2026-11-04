@@ -748,6 +748,9 @@ function M.Start(runId)
         -- stand-in before its health is set, the way BG3's own story does it. The whole GUIDSTRING
         -- CreateAt gave, since the story keeps the character in a database of its own.
         if M.SelfHeal ~= true then pcall(Osi.PROC_SelfHealing_Disable, made) end
+        -- A vision cone on every mob: BG3 draws none for a template with SpotSneakers off (its boar,
+        -- rat and other animals), so the stand-in gets BG3's own flag whatever its template.
+        pcall(Osi.SetCanSpotSneakers, uuid, 1)
         if frac and frac < 1 then pcall(Osi.SetHitpointsPercentage, uuid, 100.0 * frac) end
         for _, s in ipairs(KIND_SPELLS[mob.Kind] or {}) do pcall(Osi.AddSpell, uuid, s, 0, 1) end
         pcall(Abilities.Grant, uuid, mob.Entry)

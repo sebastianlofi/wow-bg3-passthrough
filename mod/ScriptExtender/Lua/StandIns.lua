@@ -325,6 +325,8 @@ function M.Start(runId)
                 -- (the story's self-healing; Mirrors.lua, HP guard): off for a stand-in before its
                 -- health is set, the way BG3's own story does it for a character it sets lower.
                 if M.SelfHeal ~= true then pcall(Osi.PROC_SelfHealing_Disable, made) end
+                -- A vision cone on every mob (Mirrors.lua, spawn): BG3's own flag, off in some templates.
+                pcall(Osi.SetCanSpotSneakers, uuid, 1)
                 if c.Percent ~= nil and c.Percent < 100 then
                     pcall(Osi.SetHitpointsPercentage, uuid, c.Percent * 1.0)
                     hpDue[uuid] = {Percent = c.Percent, Tick = ticks}
