@@ -1,0 +1,49 @@
+WOW-BG3 benilla patch 0121: the pacing waits on the main thread (on top of 0001-0120).
+
+wait_packet (0013) and idle_limit (0039) sleep inside a Bevy system. Bevy's render thread, while it waits
+for the next render app, runs main-world tasks from the compute pool; when it took wait_packet it slept until
+BG3's next packet before rendering the frame BG3 was waiting for. BG3's lockstep (wdlock) then timed out at
+40 ms on about one frame in nine and showed the WoW frame before: the jerk when the camera turns. A
+NonSendMarker keeps both waits on the main thread.
+
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -174,7 +174,14 @@
+ }
+ 
+ /// Start of a frame: wait for the next packet while packets come.
+-fn wait_packet(mut p: ResMut<Pace>) {
++///
++/// Patch 0121: on the main thread only. Bevy's render thread, while it waits for the next render
++/// app, runs main-world tasks from the compute pool (`pipelined_rendering`: "allow main world to use
++/// this thread"). When it took this one, it slept here until BG3's next packet before it could render
++/// the frame BG3 was waiting for, so BG3 timed out (40 ms) on about one frame in nine and showed the
++/// WoW frame before (slot A, 3440x1440, real orbit: the frame for packet f published 52 ms after BG3's
++/// present instead of 9 ms, 8 ms after packet f+1). The marker keeps the wait off the pool's threads.
++fn wait_packet(mut p: ResMut<Pace>, _main_thread: bevy::ecs::system::NonSendMarker) {
+     let now = Instant::now();
+     if let Some(at) = p.stats.frame_at {
+         let us = now.duration_since(at).as_micros() as u64;
+diff --git a/crates/benilla-app/src/wowbg3_offscreen.rs b/crates/benilla-app/src/wowbg3_offscreen.rs
+--- a/crates/benilla-app/src/wowbg3_offscreen.rs
++++ b/crates/benilla-app/src/wowbg3_offscreen.rs
+@@ -31,6 +31,7 @@
+ 
+ use bevy::app::PluginGroupBuilder;
+ use bevy::camera::{ImageRenderTarget, RenderTarget};
++use bevy::ecs::system::NonSendMarker;
+ use bevy::prelude::*;
+ use bevy::render::render_resource::{TextureFormat, TextureUsages};
+ use wgpu::SubmissionIndex;
+@@ -165,7 +166,9 @@
+ }
+ 
+ /// Out of lockstep, hold the loop to the idle rate (a window's vsync did this before).
+-fn idle_limit(mut limit: ResMut<IdleLimit>) {
++/// Patch 0121: on the main thread only, as `wowbg3_pace::wait_packet`: a sleep on a compute-pool
++/// thread can be taken by the render thread and hold up the frame it is about to render.
++fn idle_limit(mut limit: ResMut<IdleLimit>, _main_thread: NonSendMarker) {
+     let now = Instant::now();
+     if !LOCKSTEP.load(Ordering::Relaxed) {
+         if let Some(last) = limit.last {
