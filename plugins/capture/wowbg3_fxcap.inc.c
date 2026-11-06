@@ -1027,6 +1027,7 @@ static int fxc_near_tav(const Recipe* r, uint32_t fi) {
     float at[3], rad = fxc_radius();
     int how = fxc_place(r, fi, at, NULL);
     if (how == 3 || how == 4) return 2;
+    if (how == 0 && g_cc.fxdrop) return 1;
     if (how <= 0) return 0;
     float dx = at[0] - g_tav_root[0], dy = at[1] - g_tav_root[1], dz = at[2] - g_tav_root[2];
     if (dx * dx + dy * dy + dz * dz < rad * rad) return 1;
@@ -1415,10 +1416,12 @@ static int fxc_draw(VkCommandBuffer cb, int indexed, uint32_t count, uint32_t in
         const int solid = fxc_solid(r);
         const int ghost = g_cc.fxglow && ghost_recipe(r);
         if (ghost) t_fxc_glow = 1;  // its virtual texture binding, as a glow's
-        if (!solid && !ghost && (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite)) return 'N';
+        // fx-route prototype "fxdrop": kept unless it has no depth test (full-screen level haze and BG3's
+        // surface grid, which surf carries) or draws nothing.
+        if (g_cc.fxdrop ? (!r->ncolor || !r->ztest || t_fx_surf) : (!solid && !ghost && (!r->ncolor || !r->blend[0][0] || !r->ztest || r->zwrite))) return 'N';
         // A character's or the level's mesh. A spell's solid piece shares its slice with the depth and
         // G-buffer passes BG3 draws it in as well, so this test is for the blended draws.
-        if (!solid && !ghost && indexed && t_ib_cb == cb && mesh_draw(count, first, vo)) return 'M';
+        if (g_cc.fxdrop ? (indexed && t_ib_cb == cb && hide_has(t_ib)) : (!solid && !ghost && indexed && t_ib_cb == cb && mesh_draw(count, first, vo))) return 'M';
         // Skinning tells a spell's solid piece from a body, not from what a stand-in holds: a sword or a
         // shield is rigid (unskinned) too. The hide list names those by their index buffers.
         if (solid && indexed && t_ib_cb == cb && hide_has(t_ib)) return 'M';
@@ -2287,8 +2290,9 @@ static void sight_note(void) {  // g_fxl_lock held
     g_sight_lines--;
 }
 
+static void fb_exposure(const DescSlot* a, uint64_t o0, const DescSlot* b, uint64_t o1);
 static void fxp_draw(VkCommandBuffer cb) {
-    if (!g_fxc_on || t_bind_cb != cb || !t_pipe) return;
+    if ((!g_fxc_on && !g_cc.fxbg) || t_bind_cb != cb || !t_pipe) return;
     if (t_post_pipe != t_pipe) {
         t_post_pipe = t_pipe; t_post_key = 0;
         RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
@@ -2296,6 +2300,13 @@ static void fxp_draw(VkCommandBuffer cb) {
             if (ri->r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) t_post_key = ri->r->st[s].key;
     }
     uint64_t k = t_post_key;
+    if (k == POST_BLOOM_IN && g_cc.wdbloom && t_any_cb == cb && t_any_img0) { t_blc_cb = cb; t_blc_img = t_any_img0; t_blc_lay = t_any_fin0; }
+    if (k == POST_BLOOM_IN && g_cc.wdbloomlog) {
+        static uint64_t nb;
+        float u[4];
+        if (!(nb++ % 600) && post_bytes(t_set, t_dyn, t_ndyn, 1, 0, u, 16))
+            logf_("wdbloomlog: bloom prefilter threshold %g ramp %g (%g %g)", u[0], u[1], u[2], u[3]);
+    }
     if (k == SIGHT_FS && g_sight_lines > 0) { pthread_mutex_lock(&g_fxl_lock); sight_note(); pthread_mutex_unlock(&g_fxl_lock); }
     if (k != POST_EXPOSURE && k != POST_BLOOM_IN && k != POST_BLOOM_UP && k != POST_GRADE) return;
     pthread_mutex_lock(&g_fxl_lock);
@@ -2303,11 +2314,13 @@ static void fxp_draw(VkCommandBuffer cb) {
         uint64_t o0 = 0, o1 = 0;
         const DescSlot* a = post_slot(t_set, t_dyn, t_ndyn, 1, 0, &o0);
         const DescSlot* b = post_slot(t_set, t_dyn, t_ndyn, 1, 1, &o1);
-        if (a && b) {
+        if (a && b) fb_exposure(a, o0, b, o1);
+        if (a && b && g_fxc_on) {
             g_post.exp_blob[0] = fxc_range_raw(a->res, o0, 16);
             g_post.exp_blob[1] = fxc_range_raw(b->res, o1, 16);
             g_post.have |= 1;
         }
+    } else if (!g_fxc_on) {
     } else if (k == POST_BLOOM_IN && !(g_post.have & 2)) {
         if (post_bytes(t_set, t_dyn, t_ndyn, 1, 0, g_post.bloom_in, 16)) g_post.have |= 2;
     } else if (k == POST_BLOOM_UP && !(g_post.have & 4)) {
@@ -2320,6 +2333,64 @@ static void fxp_draw(VkCommandBuffer cb) {
         }
     }
     pthread_mutex_unlock(&g_fxl_lock);
+}
+static int wd_skip_cs(VkCommandBuffer cb) {
+    static uint64_t n;
+    if (!g_cc.wdskip || t_cbind_cb != cb || !t_cpipe) return 0;
+    CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL;
+    if (!p || p->spv != g_cc.wdskip) return 0;
+    if (++n % 300 == 1) logf_("wdskip: %llu dispatches of %llx skipped", (unsigned long long)n, (unsigned long long)g_cc.wdskip);
+    return 1;
+}
+static void wd_light_log(VkCommandBuffer cb) {
+    static uint64_t n;
+    if (!g_cc.wdlightlog || t_cbind_cb != cb || !t_cpipe) return;
+    CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL;
+    if (!p || p->spv != 0x5d296275c7a70f1eull || n++ % 600) return;
+    SetInfo* si = t_cset[1] ? set_find(t_cset[1]) : NULL;
+    if (!si) { logf_("wdlightlog: classifier set 1 not known"); return; }
+    DescSlot* sl = &si->slot[3];
+    uint64_t dyn = 0;
+    if (sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+        uint32_t idx = 0;
+        for (uint32_t k = 0; k < 3; k++) if (si->slot[k].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || si->slot[k].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) idx++;
+        dyn = idx < t_cndyn[1] ? t_cdyn[1][idx] : 0;
+    }
+    uint64_t left = 0;
+    const uint32_t* t = (const uint32_t*)buf_cpu(sl->res, sl->off + dyn, &left);
+    if (!t || left < 1024) { logf_("wdlightlog: table not readable (type %d left %llu)", sl->type, (unsigned long long)left); return; }
+    char line[2048]; int o = 0;
+    for (int m = 0; m < 256 && o < 1900; m++) if (t[m]) o += snprintf(line + o, sizeof line - o, " %d:%u", m, t[m]);
+    logf_("wdlightlog: mask -> permutation:%s", line);
+}
+static void wd_light_ind(VkCommandBuffer cb, VkDeviceSize o) {
+    static uint64_t seen[32]; static int ns;
+    if (!g_cc.wdlightlog || t_cbind_cb != cb || !t_cpipe) return;
+    CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL;
+    int have = 0;
+    for (int k = 0; p && k < ns; k++) have |= seen[k] == p->spv;
+    if (p && !have && ns < 32) { seen[ns++] = p->spv; logf_("wdlightlog: indirect %d cs %llx at offset %llu", ns, (unsigned long long)p->spv, (unsigned long long)o); }
+}
+static void wd_eye_log(VkCommandBuffer cb) {
+    static uint64_t n;
+    if (t_cbind_cb != cb || !t_cpipe) return;
+    CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL;
+    if (!p || p->spv != 0x7387a4a6b28ed0d9ull) return;
+    if (n++ % 600) return;
+    for (int s = 0; s < 4; s++) {
+        if (!t_cset[s]) continue;
+        SetInfo* si = set_find(t_cset[s]);
+        if (!si) { logf_("wdeyelog: set %d %llx unknown", s, (unsigned long long)t_cset[s]); continue; }
+        for (int b = 0; b < 8; b++) {
+            DescSlot* sl = &si->slot[b];
+            if (!sl->res) continue;
+            ViewInfo* v = TABLE_FIND(g_view, VIEW_CAP, sl->res, 0);
+            ImgInfo* im = (v && v->image) ? TABLE_FIND(g_img, IMG_CAP, v->image, 0) : NULL;
+            if (im) logf_("wdeyelog: set %d binding %d type %d view %llx image %llx format %d %ux%ux%u mips %u usage %#x layout %d",
+                          s, b, sl->type, (unsigned long long)sl->res, (unsigned long long)v->image, (int)im->fmt, im->w, im->hgt, im->depth, im->mips, (unsigned)im->usage, sl->layout);
+            else logf_("wdeyelog: set %d binding %d type %d res %llx off %llu range %llu", s, b, sl->type, (unsigned long long)sl->res, (unsigned long long)sl->off, (unsigned long long)sl->range);
+        }
+    }
 }
 static void fxp_dispatch(VkCommandBuffer cb) {
     if (!g_fxc_on || t_cbind_cb != cb || !t_cpipe) return;
@@ -3045,6 +3116,8 @@ static void void_say(const char* what, const Recipe* r, uint32_t count, uint32_t
           g_tav_root[0], g_tav_root[1], g_tav_root[2], (int)g_screen_dialog, (long long)ts.tv_sec, ts.tv_nsec / 1000000);
 }
 // An indexed draw in such a pass: skip it unless it is a character's or an effect near Tav.
+#define FXC_KEEP_RADIUS 300.0f
+static uint64_t g_keep_how[6];
 static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t first, int32_t vo) {
     t_prop_cb = VK_NULL_HANDLE;
     if (t_mesh_cb == cb && t_ib_cb == cb && t_ib) mesh_add(mesh_key(count, first, vo));
@@ -3056,6 +3129,23 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
     if (g_screen && g_cc.screenlevel && !g_screen_dialog) return 0;
     if (t_void_cb != cb || !g_cc.void_ || !g_keep_active || t_ib_cb != cb || !t_ib) return 0;
     if (keep_has(t_ib)) return 0;
+    if (g_cc.fxkeep && t_dec_cb != cb) {  // not BG3's deferred decal pass: surf_draw keeps its surfaces, and a kept decal paints BG3's albedo
+        // fx-route prototype: only the level goes, known by where it is (a kilometre from everyone in
+        // the void), and the stand-ins' bodies, which WoW's models replace. Everything else stays.
+        if (hide_has(t_ib)) return 1;
+        RecInfo* kri = t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
+        Recipe* kr = kri ? kri->r : NULL;
+        if (!kr) return 0;
+        float kat[3];
+        int khow = fxc_place(kr, fi, kat, NULL);
+        g_keep_how[khow + 1 >= 0 && khow + 1 < 6 ? khow + 1 : 5]++;
+        if (khow == -1) return 1;
+        if (khow != 1 && khow != 2) return 0;
+        const float* keye = (const float*)fxc_slot_cpu(0, 1, 112);
+        if (!keye) return 0;
+        float kx = kat[0] - keye[24], ky = kat[1] - keye[25], kz = kat[2] - keye[26];
+        return kx * kx + ky * ky + kz * kz > FXC_KEEP_RADIUS * FXC_KEEP_RADIUS;
+    }
     // A spell's 3D props (word "fxprops"): kept while their mesh is young, so BG3 draws them and the
     // compositor shows them where BG3's geometry is nearer than WoW's ground.
     // Aged before the other tests, so a character's slices grow old with it and one that leaves the

@@ -787,7 +787,7 @@ static const Hook HOOKS[] = {
     {"vkCmdBeginRenderPass", (void*)hk_begin_rp}, {"vkCmdBeginRenderPass2", (void*)hk_begin_rp2},
     {"vkCmdBeginRenderPass2KHR", (void*)hk_begin_rp2}, HK(CmdEndRenderPass), HK(CmdEndRenderPass2),
     HK(CmdBeginRendering), HK(CmdBeginRenderingKHR), HK(CmdEndRendering), HK(CmdEndRenderingKHR),
-    HK(CmdDraw), HK(CmdDrawIndexed), HK(CmdDrawIndirect), HK(CmdDrawIndexedIndirect), HK(CmdDispatch),
+    HK(CmdDraw), HK(CmdDrawIndexed), HK(CmdDrawIndirect), HK(CmdDrawIndexedIndirect), HK(CmdDispatch), HK(CmdDispatchIndirect),
     HK(CmdCopyImage), HK(CmdBlitImage), HK(CmdResolveImage), HK(CmdExecuteCommands),
     HK(QueueSubmit), HK(QueueSubmit2), HK(QueueSubmit2KHR),
     HK(CmdPipelineBarrier), HK(CmdPipelineBarrier2), HK(CmdPipelineBarrier2KHR), HK(DestroyImage),

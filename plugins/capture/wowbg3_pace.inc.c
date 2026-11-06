@@ -226,6 +226,8 @@ static void pace_trailer(uint8_t* p, uint32_t frame) {
         }
         pthread_mutex_unlock(&g_pc.m);
     }
+    { extern int g_wdg_pending_; extern uint8_t g_wdg_cam_[96]; if (g_wdg_pending_) { memcpy(cam, g_wdg_cam_, 96); memcpy(&seq, cam + 4, 4); ok = 1; g_wdg_pending_ = 0; } }
+    { extern uint32_t g_lk_seq_; g_lk_seq_ = seq; }
     double t = now_ns() * 1e-9;
     uint64_t idx = g_req.presents;
     memcpy(p, "TVC1", 4);

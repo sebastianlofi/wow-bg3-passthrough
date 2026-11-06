@@ -1,0 +1,58 @@
+WOW-BG3 benilla patch 0122: no second party figure when BG3 draws the party (on top of 0001-0121).
+
+With the render plugin's compose word "bg3tav" BG3 draws the hero and companions in its own frame; the plugin then flags
+every pose record with 8 ("BG3 draws this figure"), in tavpose.bin and in the lockstep packet alike. benilla hides its
+copies of the figures while every record carries the flag, as patch 0070 hides them for a companion's dialog, and shows
+them again when a pose comes without it. Both changes are logged.
+
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index 020d60f..1618047 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -856,6 +856,8 @@ struct TavDraw {
+     trace_root: (Vec3, u64),
+     /// Patch 0070: a companion's dialog is BG3's own picture: the figures hidden meanwhile.
+     in_dialog: bool,
++    /// Patch 0122: the pose says BG3 draws the party itself (compose word "bg3tav", pose flag 8).
++    bg3_draws: bool,
+     /// The alpha test of her cut-out materials ([`BG3_CUTOFF`], `WOW_BG3_TAV_CUTOFF`).
+     cutoff: f32,
+     cache: MaterialCache,
+@@ -1044,6 +1046,7 @@ pub(crate) fn build(app: &mut App) {
+         skin_cost: (0, 0),
+         trace_root: (Vec3::ZERO, 0),
+         in_dialog: false,
++        bg3_draws: false,
+         cutoff,
+         cache: MaterialCache::default(),
+         material: None,
+@@ -2149,6 +2152,29 @@ fn apply_pose(
+     let packet = pace.as_deref().and_then(|p| p.current.as_ref()).map(|k| k.pose.clone());
+     let raw = if packet.is_some() { None } else { std::fs::read(d.dir.join("tavpose.bin")).ok() };
+     let pose = packet.as_deref().map(|v| v.as_slice()).or(raw.as_deref()).and_then(decode_pose);
++    // Patch 0122: the render plugin's compose word "bg3tav" has BG3 draw the party in its own frame; every pose record
++    // then carries flag 8 (BG3 draws this figure), and WoW's copy would be a second, untextured figure behind BG3's.
++    // Hidden as for a dialog (patch 0070); a pose without the flag shows them again.
++    if pose.as_ref().is_some_and(|p| !p.recs.is_empty() && p.recs.iter().all(|r| r.flags & 8 != 0)) {
++        let figs: Vec<Entity> = std::iter::once(root).chain(d.figs.iter().map(|f| f.root)).collect();
++        for e in figs {
++            if let Ok((_, mut vis)) = roots.get_mut(e) {
++                if *vis != Visibility::Hidden {
++                    *vis = Visibility::Hidden;
++                }
++            }
++        }
++        if !d.bg3_draws {
++            info!("wowbg3 tav: BG3 draws the party itself (pose flag 8): WoW's figures hidden");
++            d.bg3_draws = true;
++        }
++        d.track.drawn = None;
++        return;
++    }
++    if d.bg3_draws {
++        info!("wowbg3 tav: the pose no longer says BG3 draws the party: WoW's figures shown");
++        d.bg3_draws = false;
++    }
+     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |t| t.as_secs_f64());
+     // Patch 0020: a pose fits the figure by its plan number or by mesh key ([`pose_fits`]).
+     let recent = pose.as_ref().filter(|p| (now - p.time).abs() < STALE_SECS);

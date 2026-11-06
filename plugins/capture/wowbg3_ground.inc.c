@@ -99,10 +99,15 @@ static struct {
 static VkImageView surf_inject(DeviceData* d, VkCommandBuffer cb, uint64_t serial, const GrRec* rec, uint32_t w, uint32_t h,
                                uint64_t alb_img, VkFormat alb_fmt, int32_t alb_lay);
 static void surf_submit_cb(uint64_t cb, uint64_t pending_serial);
+static int wd_draw(DeviceData* d, VkCommandBuffer cb, const GrRec* rec, uint32_t w, uint32_t h, VkRenderPass rp);
+static void wd_restore(DeviceData* d, VkCommandBuffer cb);
+static void wd_mask_copy(DeviceData* d, VkCommandBuffer cb, uint64_t serial, uint32_t w, uint32_t h);
+static void wd_mark(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkBuffer vbuf, VkBuffer recb, VkDeviceSize recoff, uint32_t verts);
 
 // The G-buffer pass being recorded on this thread: its command buffer, images, size; the frame's camera.
 static __thread VkCommandBuffer t_gr_cb;
 static __thread uint64_t t_gr_img[4];
+static uint64_t g_gb_alb, g_gb_surf;  // BG3's G-buffer albedo and surface images (wdbare)
 static __thread int32_t t_gr_lay[4];
 static __thread uint32_t t_gr_w, t_gr_h;
 static __thread int t_gr_cam;
@@ -238,6 +243,7 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
     if (!i0 || !i1 || !i2 || i0->fmt != VK_FORMAT_R16G16_SFLOAT || i0->samples > 1) return;
     t_gr_cb = cb;
     t_gr_img[0] = g_role.depth; t_gr_img[1] = col[0]; t_gr_img[2] = col[1]; t_gr_img[3] = col[2];
+    g_gb_alb = col[1]; g_gb_surf = col[2];
     t_gr_lay[0] = dfin; t_gr_lay[1] = cfin[0]; t_gr_lay[2] = cfin[1]; t_gr_lay[3] = cfin[2];
     t_gr_w = w; t_gr_h = h;
     t_gr_cam = t_bind_cb == cb ? ground_view_record(&t_gr_rec) : 0;
@@ -485,16 +491,26 @@ static void ground_inject(DeviceData* d, VkCommandBuffer cb) {
     memset(clear, 0, sizeof clear);  // only Z (attachment 4) is cleared
     VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rpass, fb, {{0, 0}, {t_gr_w, t_gr_h}}, 5, clear};
     d->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = {0, 0, (float)t_gr_w, (float)t_gr_h, 0.0f, 1.0f};
     VkRect2D sc = {{0, 0}, {t_gr_w, t_gr_h}};
+    int wdrawn = 0;
+    if (g_cc.wdepth) {
+        d->CmdSetViewport(cb, 0, 1, &vp);
+        d->CmdSetScissor(cb, 0, 1, &sc);
+        wdrawn = wd_draw(d, cb, &t_gr_rec, t_gr_w, t_gr_h, rpass);
+        if (wdrawn) wd_mark(d, cb, rpass, vbuf, recb, (VkDeviceSize)ri * sizeof(GrRec), verts);
+    }
+    if (!wdrawn) {
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     d->CmdSetViewport(cb, 0, 1, &vp);
     d->CmdSetScissor(cb, 0, 1, &sc);
     VkBuffer bufs[2] = {vbuf, recb};
     VkDeviceSize offs[2] = {0, (VkDeviceSize)ri * sizeof(GrRec)};
     d->CmdBindVertexBuffers(cb, 0, 2, bufs, offs);
     d->CmdDraw(cb, verts, 1, 0, 0);
+    }
     d->CmdEndRenderPass(cb);
+    if (wdrawn) { wd_restore(d, cb); wd_mask_copy(d, cb, serial, t_gr_w, t_gr_h); }
     if (timed) d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * qi + 1);
     // BG3's state as it was: its graphics pipeline, vertex buffers 0 and 1, viewport and scissor.
     if (t_bind_cb == cb) {

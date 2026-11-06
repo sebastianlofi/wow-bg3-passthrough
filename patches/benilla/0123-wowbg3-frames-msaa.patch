@@ -1,0 +1,168 @@
+WOW-BG3 benilla patch 0123: WoW's own MSAA with the frame export (on top of 0001-0122).
+
+0003 refused a multisampled world camera (copy_texture_to_buffer cannot copy a multisampled depth texture) and the
+launcher forced WOW_MSAA=off. With the render plugin putting WoW's world in after BG3's TAA, WoW's edges are smoothed
+by WoW's own multisampling instead. The colour already comes from the resolved main texture (Bevy resolves the
+multisampled target into it at the end of the main passes); the depth is now resolved by a compute pass: per pixel
+the nearest sample (reverse-Z: the largest), written in the readback's row layout and copied into the slot.
+
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -12,7 +12,8 @@
+ //! near / depth), depth offset f32 at 32 (yards to add to WoW's view z for the distance from
+ //! BG3's eye: the lead camera's ground lock and clearance move WoW's eye), seq again at 56, pad.
+ //! A reader copies while seq == seq2 before and after.
+-//! MSAA must be off (`WOW_MSAA=off`); a multisampled frame is not copied.
++//! Patch 0123: a multisampled world (WoW's `gxMultisample`, `$WOW_MSAA`) exports too: the colour is the resolved
++//! main texture, the depth the nearest of each pixel's samples (`resolve_depth`).
+ //!
+ //! Patch 0013 (frame pacing, `wowbg3_pace`): bytes 36..56 say what the frame was drawn from:
+ //! packet u32 at 36 (the BG3 present whose camera and pose it shows, 0 none), camera record seq
+@@ -218,6 +219,8 @@
+     /// Frames to the writer thread.
+     jobs: Option<mpsc::Sender<Job>>,
+     stats: Arc<Mutex<ExportStats>>,
++    /// 0123: the multisampled depth's resolve (pipeline and its storage buffer), made on first use.
++    msd: Option<MsDepth>,
+ }
+ 
+ /// One readback buffer pair. `state`: 0 free, 1 copied into this frame, 2 with the writer.
+@@ -264,6 +267,7 @@
+                 ui_source: true,
+                 jobs: None,
+                 stats: Arc::new(Mutex::new(ExportStats::default())),
++                msd: None,
+             })),
+         }
+     }
+@@ -310,12 +314,12 @@
+     let Ok((entity, mut camera, msaa)) = cam.single_mut() else {
+         return;
+     };
++    // 0123: multisampled frames export too (the resolved colour; the depth through `resolve_depth`, which binds it).
+     if *msaa != Msaa::Off {
+-        error!("wowbg3 frames: MSAA is {msaa:?}; run with WOW_MSAA=off. No frames are exported.");
+-        *done = true;
+-        return;
++        info!("wowbg3 frames: MSAA {msaa:?}: exporting the resolved colour and each pixel's nearest depth sample");
+     }
+-    camera.depth_texture_usages = (TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC).into();
++    camera.depth_texture_usages =
++        (TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING).into();
+     commands.entity(entity).insert((
+         FrameExportView,
+         bevy::camera::CameraMainTextureUsages::default().with(TextureUsages::COPY_SRC),
+@@ -412,14 +416,22 @@
+         }
+         let Some((buffer, bpr)) = s.cur.map(|i| (s.slots[i].depth.0.clone(), s.slots[i].depth.1)) else { return Ok(()) };
+         let size = depth.texture.size();
+-        rc.command_encoder().copy_texture_to_buffer(
+-            TexelCopyTextureInfo { texture: &depth.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::DepthOnly },
+-            TexelCopyBufferInfo {
+-                buffer: &buffer,
+-                layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(size.height) },
+-            },
+-            Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
+-        );
++        if depth.texture.sample_count() > 1 {
++            // 0123: no copy from a multisampled texture; resolve it.
++            let device = world.resource::<RenderDevice>();
++            if !resolve_depth(&mut s, rc, device, depth, &buffer, bpr) {
++                return Ok(());
++            }
++        } else {
++            rc.command_encoder().copy_texture_to_buffer(
++                TexelCopyTextureInfo { texture: &depth.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::DepthOnly },
++                TexelCopyBufferInfo {
++                    buffer: &buffer,
++                    layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(size.height) },
++                },
++                Extent3d { width: size.width, height: size.height, depth_or_array_layers: 1 },
++            );
++        }
+         s.depth_copied = true;
+         Ok(())
+     }
+@@ -465,6 +477,82 @@
+     }
+ }
+ 
++/// 0123: the multisampled depth to the readback rows (`bpr` bytes each): per pixel the nearest sample (reverse-Z: the
++/// largest), one compute pass into a storage buffer laid out as the readback, then copied into the slot's buffer.
++const MS_DEPTH_WGSL: &str = r#"
++@group(0) @binding(0) var d: texture_depth_multisampled_2d;
++@group(0) @binding(1) var<storage, read_write> o: array<f32>;
++@compute @workgroup_size(8, 8)
++fn main(@builtin(global_invocation_id) g: vec3<u32>) {
++    let dim = textureDimensions(d);
++    if (g.x >= dim.x || g.y >= dim.y) { return; }
++    var m = 0.0;
++    let n = i32(textureNumSamples(d));
++    for (var s = 0; s < n; s++) { m = max(m, textureLoad(d, vec2<i32>(g.xy), s)); }
++    let stride = ((dim.x * 4u + 255u) / 256u) * 64u;
++    o[g.y * stride + g.x] = m;
++}
++"#;
++
++struct MsDepth {
++    pipe: wgpu::ComputePipeline,
++    buf: Buffer,
++    size: u64,
++}
++
++fn resolve_depth(s: &mut SinkState, rc: &mut RenderContext, device: &RenderDevice, depth: &ViewDepthTexture, dst: &Buffer, bpr: u32) -> bool {
++    let size = depth.texture.size();
++    if bpr != RenderDevice::align_copy_bytes_per_row(size.width as usize * 4) as u32 {
++        return false;
++    }
++    let bytes = u64::from(bpr) * u64::from(size.height);
++    let dev = device.wgpu_device();
++    if s.msd.as_ref().map_or(true, |m| m.size != bytes) {
++        let pipe = match s.msd.take() {
++            Some(m) => m.pipe,
++            None => {
++                let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
++                    label: Some("wowbg3_ms_depth"),
++                    source: wgpu::ShaderSource::Wgsl(MS_DEPTH_WGSL.into()),
++                });
++                dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
++                    label: Some("wowbg3_ms_depth"),
++                    layout: None,
++                    module: &module,
++                    entry_point: Some("main"),
++                    compilation_options: Default::default(),
++                    cache: None,
++                })
++            }
++        };
++        let buf = device.create_buffer(&BufferDescriptor {
++            label: Some("wowbg3_ms_depth"),
++            size: bytes,
++            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
++            mapped_at_creation: false,
++        });
++        s.msd = Some(MsDepth { pipe, buf, size: bytes });
++    }
++    let m = s.msd.as_ref().unwrap();
++    let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
++        label: Some("wowbg3_ms_depth"),
++        layout: &m.pipe.get_bind_group_layout(0),
++        entries: &[
++            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth.view()) },
++            wgpu::BindGroupEntry { binding: 1, resource: m.buf.as_entire_binding() },
++        ],
++    });
++    let enc = rc.command_encoder();
++    {
++        let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("wowbg3_ms_depth"), timestamp_writes: None });
++        p.set_pipeline(&m.pipe);
++        p.set_bind_group(0, &bg, &[]);
++        p.dispatch_workgroups(size.width.div_ceil(8), size.height.div_ceil(8), 1);
++    }
++    enc.copy_buffer_to_buffer(&m.buf, 0, dst, 0, bytes);
++    true
++}
++
+ fn copy_color(s: &mut SinkState, rc: &mut RenderContext, target: &ViewTarget) {
+     let tex = target.main_texture();
+     if !tex.usage().contains(TextureUsages::COPY_SRC) {

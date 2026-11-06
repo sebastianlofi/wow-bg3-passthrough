@@ -372,6 +372,26 @@ def client_running():
         return False
 
 
+def seed_msaa(cfg):
+    """WoW's own multisampling (its gxMultisample CVar in benilla's config.toml) at 4x for a player who never set it: the
+    render plugin puts WoW's world in after BG3's TAA, so WoW's edges are smoothed by WoW's MSAA (benilla 0123 exports
+    the resolved frame). A value the player chose stays."""
+    try:
+        t = cfg.read_text() if cfg.exists() else ''
+    except OSError:
+        return
+    if re.search(r'(?m)^\s*gxMultisample\s*=', t):
+        return
+    if not re.search(r'(?m)^\[cvars\]\s*$', t):
+        t += ('' if not t or t.endswith('\n') else '\n') + '[cvars]\n'
+    t = re.sub(r'(?m)^\[cvars\]\s*$\n?', '[cvars]\ngxMultisample = "4"\n', t, count=1)
+    try:
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(t)
+    except OSError:
+        pass
+
+
 # ---- the lc actions ----
 class Release:
     def __init__(self):
@@ -382,6 +402,7 @@ class Release:
         self.tav_index = DATA / 'cache/bg3index.json'
 
     def benilla_env(self, char=None, spec=None, account=None):
+        seed_msaa(DATA / 'benilla' / 'config.toml')
         user, pw = credentials(account)
         e = os.environ.copy()
         for k in ('WAYLAND_DISPLAY', 'DISPLAY', 'WOW_CHAR', 'WOW_BG3_CREATE'):
@@ -390,7 +411,7 @@ class Release:
                   'WOW_BG3_FRAMES': str(SHM / 'wowframe.bin'),
                   'WOW_BG3_TAV_DIR': os.environ.get('WOWBG3_TAV_DIR') or str(SHM / 'tav'),
                   'WOW_BG3_FX_DIR': str(CAPTURE / 'fx'),  # BG3's effects library (render plugin)
-                  'WOW_BG3_M5': '1', 'WOW_MSAA': 'off', 'WOW_WIN': '%dx%d' % self.size, 'WOW_NOVSYNC': '1',
+                  'WOW_BG3_M5': '1', 'WOW_WIN': '%dx%d' % self.size, 'WOW_NOVSYNC': '1',
                   'WOW_BG3_TAV_OUT': 'gamma', 'WOW_HOST': '127.0.0.1:%s' % ports()['AUTH_PORT'],
                   'WOW_DATA': str(WOW / 'Data'), 'BENILLA_HOME': str(DATA / 'benilla'), 'WOW_GM': 'off',
                   'WOW_GOD': 'off', 'WOW_USER': user, 'WOW_PASS': pw})

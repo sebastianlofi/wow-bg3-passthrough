@@ -214,6 +214,7 @@ typedef struct {
     PFN_vkCmdDrawIndirect CmdDrawIndirect;
     PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdDispatchIndirect CmdDispatchIndirect;
     PFN_vkCmdCopyImage CmdCopyImage;
     PFN_vkCmdBlitImage CmdBlitImage;
     PFN_vkCmdClearColorImage CmdClearColorImage;
@@ -237,6 +238,7 @@ typedef struct {
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkUnmapMemory UnmapMemory;
     PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
+    PFN_vkCmdSetBlendConstants CmdSetBlendConstants;
     PFN_vkUpdateDescriptorSetWithTemplate UpdateDescriptorSetWithTemplate;
     PFN_vkCreateDescriptorUpdateTemplate CreateDescriptorUpdateTemplate;
     PFN_vkCreateShaderModule CreateShaderModule;
@@ -354,6 +356,11 @@ static inline uint32_t tav_hash(uint64_t h) {
     return (uint32_t)h & (TAV_HIDE_CAP - 1);
 }
 static volatile int g_tav_hide;
+// wdbloom (patch28): every render pass's first attachment (any size), the prefilter pass seen, the composite seen.
+static __thread VkCommandBuffer t_any_cb, t_blc_cb, t_blm_cb;
+static __thread uint64_t t_any_img0, t_blc_img, t_blm_img, t_blm_b1;
+static __thread int32_t t_any_fin0, t_blc_lay, t_blm_lay, t_blm_b1lay;
+static uint64_t g_blv_alb, g_blv_surf; static int32_t g_blv_lalb, g_blv_lsurf;  // BG3's G-buffer albedo and surface views (bare_draw, this frame)
 static volatile int g_fxl_frames;  // effects research log (see fxl_pass)
 static volatile int g_fxw_frames;  // draw decisions research log (request "fxwhy<N>", see fxw_draw)
 static volatile int g_sight_lines;  // BG3's sight overlay research log (request "sight<N>", see sight_note)
@@ -458,7 +465,7 @@ static void check_request(void) {
     char tag[48] = {0};
     int n = fscanf(f, "%d %d %47s", &count, &every, tag);
     fclose(f);
-    if (n != 3 || count < 1 || count > 240 || every < 1 || every > 60) {
+    if (n != 3 || count < 1 || count > 1500 || every < 1 || every > 60) {
         logf_("request ignored: fields %d count %d every %d", n, count, every);
         return;
     }
@@ -1046,6 +1053,8 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, fbstale, wdtime, wdpostdbg; float wdexp, wdocc; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
     int fxwib;      // fxwhy groups a draw by its index buffer too, so each mesh is its own group (word "fxwib")
@@ -1163,6 +1172,36 @@ static void compose_config(void) {
     g_cc.surfdbg = has_word(line, "surfdbg");
     g_cc.surfpix = has_word(line, "surfpix");
     g_cc.surfscene = has_word(line, "surfscene");
+    g_cc.fxbg = has_word(line, "fxbg");
+    g_cc.fxcal = has_word(line, "fxcal");
+    g_cc.fxbgmax = has_word(line, "fxbgmax");
+    g_cc.fxbgpass = has_word(line, "fxbgraw");  // BG3's final picture as it is, not only what its effects changed
+    g_cc.fxdrop = has_word(line, "fxdrop");
+    g_cc.fxkeep = (has_word(line, "fxkeep") || g_cc.fxdrop || g_cc.fxbg) && !has_word(line, "fxnokeep");
+    g_cc.fxbgfwd = has_word(line, "fxbgfwd");
+    g_cc.wdepth = has_word(line, "wdepth");
+    g_cc.wdfeed = has_word(line, "wdfeed");
+    g_cc.wdfog = has_word(line, "wdfog");
+    g_cc.wdfogst = has_word(line, "wdfogst");
+    g_cc.wdlightlog = has_word(line, "wdlightlog");
+    g_cc.wdbloomlog = has_word(line, "wdbloomlog");
+    g_cc.wdbloom = has_word(line, "wdbloom");
+    g_cc.wdbare = has_word(line, "wdbare");
+    g_cc.fbstale = has_word(line, "fbstale");
+    g_cc.wdjit = has_word(line, "wdjit");
+    g_cc.wdpost = has_word(line, "wdpost");
+    g_cc.wdpostcas = has_word(line, "wdpostcas");
+    g_cc.wdpostdbg = has_word(line, "wdpostdbg");
+    { const char* oc = strstr(line, "wdocc="); g_cc.wdocc = oc ? strtof(oc + 6, NULL) : 1.0f; if (!(g_cc.wdocc >= 0.0f && g_cc.wdocc <= 1.0f)) g_cc.wdocc = 1.0f; }
+    { const char* fd = strstr(line, "wdfogdbg="); g_cc.wdfogdbg = fd ? atoi(fd + 9) : 0; }
+    g_cc.wdlog = has_word(line, "wdlog");
+    g_cc.wdlock = has_word(line, "wdlock");
+    g_cc.wdgcam = has_word(line, "wdgcam");
+    g_cc.wdeyelog = has_word(line, "wdeyelog");
+    g_cc.wdtime = has_word(line, "wdtime");
+    { const char* ws = strstr(line, "wdskip="); g_cc.wdskip = ws ? strtoull(ws + 7, NULL, 16) : 0; }
+    { const char* we = strstr(line, "wdexp="); g_cc.wdexp = we ? (float)atof(we + 6) : 0.0f; }
+    if (g_cc.wdepth) { g_cc.fxbg = 1; g_cc.fxbgpass = 1; g_cc.fxbgfwd = 1; }
     g_cc.surfpost = has_word(line, "surfpost");
     g_cc.fxwib = has_word(line, "fxwib");
     g_cc.fxprops = has_word(line, "fxprops");
@@ -1871,12 +1910,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(VkDevice device, const V
     }
     return r;
 }
+static void fb_forget_image(DeviceData* d, VkImage img);  // wowbg3_fxbg.inc.c (patch35)
 static VKAPI_ATTR void VKAPI_CALL layer_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* alloc) {
     DeviceData* d = device_for(device);
     if (!d) return;
     gc_retire_image(image);  // the compositor's copies of it finish first
     ground_forget_image(d, image);
     surf_forget_image(d, image);
+    fb_forget_image(d, image);
     pthread_mutex_lock(&g_trace_lock);
     role_forget(image);
     pthread_mutex_unlock(&g_trace_lock);
@@ -2024,6 +2065,7 @@ static __thread uint32_t t_ibt, t_pc, t_dyn[8][8], t_ndyn[8];
 static __thread VkCommandBuffer t_cbind_cb;  // compute descriptor sets (research: post-processing)
 static __thread uint64_t t_cset[8];
 static __thread uint64_t t_cpipe;  // bound compute pipeline (with t_cbind_cb)
+static __thread uint64_t t_clayout;  // the layout BG3 last bound compute sets with (wdpostcas binds them again)
 static void trace_draw_reads(CbLog* c, VkCommandBuffer cb);
 static void trace_dispatch_reads(CbLog* c, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z);
 
@@ -2528,7 +2570,15 @@ static __thread int t_fx_surf;  // this draw is one of BG3's ground surfaces (su
 static void fxw_pass(VkCommandBuffer cb, const char* what, uint32_t n, const uint64_t* imgs, const uint8_t* load);
 static void fxw_draw(VkCommandBuffer cb, char kind, uint32_t count, uint32_t inst, uint32_t first, int32_t vo, uint32_t fi, int why);
 static void fxp_dispatch(VkCommandBuffer cb);
+static int wd_skip_cs(VkCommandBuffer cb);
+static void wd_eye_log(VkCommandBuffer cb);
+static void wd_eye_after(DeviceData* d, VkCommandBuffer cb);
+static void post_cas(DeviceData* d, VkCommandBuffer cb);
 static void fxc_copy(uint64_t src, uint64_t dst);
+static void fb_copy_hook(DeviceData* d, VkCommandBuffer cb, uint64_t s, uint64_t t, VkImageLayout sl);
+static void fog_draw(VkCommandBuffer cb);
+static void wd_light_log(VkCommandBuffer cb);
+static void wd_light_ind(VkCommandBuffer cb, VkDeviceSize o);
 static __thread uint32_t t_cdyn[8][8], t_cndyn[8];  // compute dynamic offsets per set
 static __thread uint8_t t_pcb[256];
 static void recipe_record(const VkGraphicsPipelineCreateInfo* ci, VkPipeline out);
@@ -2536,7 +2586,7 @@ static void recipe_record(const VkGraphicsPipelineCreateInfo* ci, VkPipeline out
 static void fxl_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint8_t* load) {
     t_fxl_cb = VK_NULL_HANDLE;
     t_dec_cb = VK_NULL_HANDLE;
-    if ((g_fxl_frames <= 0 && !g_fxc_on) || !g_role.depth) return;
+    if ((g_fxl_frames <= 0 && !g_fxc_on && !g_cc.fxbg) || !g_role.depth) return;
     int depth = 0, colors = 0, at = -1, gbuf = 0, loaded = 1;
     for (uint32_t k = 0; k < n; k++) {
         if (imgs[k] == g_role.depth) { depth = 1; continue; }
@@ -2767,6 +2817,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
     if (!d) return;
     if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) {
         if (t_cbind_cb != cb) { t_cbind_cb = cb; t_cpipe = 0; memset(t_cset, 0, sizeof t_cset); }
+        t_clayout = (uint64_t)lay;
         uint32_t di = 0;
         for (uint32_t k = 0; k < n; k++) {
             uint32_t s = first + k, nd_here = 0;
@@ -2829,6 +2880,16 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         uint64_t imgs[8];
         for (uint32_t k = 0; k < n; k++) imgs[k] = view_image(il ? (uint64_t)il->pAttachments[k] : f->views[k]);
         void_pass(cb, n, imgs);
+        pthread_mutex_unlock(&g_trace_lock);
+    }
+    if (g_cc.on && g_cc.wdbloom && g_img) {  // patch28: any pass's first attachment (the bloom prefilter's is half size)
+        trace_lock_timed();
+        RpInfo* p0 = TABLE_FIND(g_rp, RP_CAP, (uint64_t)rp, 0);
+        FbInfo* f0 = TABLE_FIND(g_fb, FB_CAP, (uint64_t)fb, 0);
+        uint32_t n0 = il ? il->attachmentCount : (f0 ? f0->n : 0);
+        t_any_cb = cb;
+        t_any_img0 = n0 ? view_image(il ? (uint64_t)il->pAttachments[0] : f0->views[0]) : 0;
+        t_any_fin0 = (p0 && p0->n) ? p0->final[0] : -1;
         pthread_mutex_unlock(&g_trace_lock);
     }
     if (g_cc.on && g_img && w == g_role.ew && h == g_role.eh) {
@@ -3067,6 +3128,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(VkCommandBuffer cb, uint32_t v, 
     if (g_fxw_frames > 0) fxw_draw(cb, 'D', v, i, fv, 0, fi, why);
     fxp_draw(cb);
     pv_draw(cb);
+    fog_draw(cb);
     COUNT_DRAW(cb, (uint64_t)v * i);
     d->CmdDraw(cb, v, i, fv, fi);
 }
@@ -3085,12 +3147,13 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(VkCommandBuffer cb, uint3
     if (!d) return;
     if (t_tavd_cb == cb && t_ib_cb == cb) tavd_note(cb, t_ib, fin);
     t_fxc_glow = 0;
-    if (tav_hidden_draw(cb) && !fxc_figure_extra(cb)) {
+    if (tav_hidden_draw(cb) && !fxc_figure_extra(cb) && !(g_cc.fxdrop && t_fxl_cb == cb)) {
         if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'H');
         return;
     }
     // BG3's ground surfaces stay drawn in the void (they lie on WoW's ground; wowbg3_surf.inc.c).
     int surf = g_cc.surf ? surf_draw(cb) : 0;
+    if (g_cc.fxbg && surf == 2 && !g_cc.fxbgfwd) return;  // fx-route prototype: BG3's forward surface layer would blend over the fed WoW picture; surf carries surfaces
     // ... and the effects capture must not take them as well: a surface is an unblended mesh of the
     // effects pass like a spell's solid pieces (fxc_solid), and replaying one put a black quad the
     // size of the puddle over the ground Grease had just drawn properly.
@@ -3127,7 +3190,19 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(VkCommandBuffer cb, uint32_t
     if (!d) return;
     if (g_trace_armed) { CbLog* c = trace_cb(cb); if (c) { c->dispatches++; trace_dispatch_reads(c, cb, x, y, z); pthread_mutex_unlock(&g_trace_lock); } }
     fxp_dispatch(cb);
+    if (wd_skip_cs(cb)) return;
+    if (g_cc.wdeyelog) wd_eye_log(cb);
+    wd_light_log(cb);
     d->CmdDispatch(cb, x, y, z);
+    if (g_cc.wdeyelog) wd_eye_after(d, cb);
+    if (g_cc.wdpostcas) post_cas(d, cb);
+}
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o) {
+    DeviceData* d = device_for(cb);
+    if (!d || !d->CmdDispatchIndirect) return;
+    if (g_trace_armed) { CbLog* c = trace_cb(cb); if (c) { c->dispatches++; trace_dispatch_reads(c, cb, 0, 0, 0); pthread_mutex_unlock(&g_trace_lock); } }
+    wd_light_ind(cb, o);
+    d->CmdDispatchIndirect(cb, b, o);
 }
 static void log_transfer(VkCommandBuffer cb, const char* what, uint64_t src, uint64_t dst) {
     CbLog* c = trace_cb(cb);
@@ -3145,6 +3220,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdCopyImage(VkCommandBuffer cb, VkImage
     if (!d) return;
     if (g_trace_armed) log_transfer(cb, "COPY", (uint64_t)s, (uint64_t)t);
     fxc_copy((uint64_t)s, (uint64_t)t);
+    fb_copy_hook(d, cb, (uint64_t)s, (uint64_t)t, sl);
     d->CmdCopyImage(cb, s, sl, t, tl, n, r);
 }
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLayout sl, VkImage t,
@@ -3299,10 +3375,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(VkQueue queue, uint32_t 
     }
     return d->QueueSubmit(queue, count, infos, fence);
 }
+static void wd_lock_submit(DeviceData* d, VkQueue queue, uint32_t family);
 static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence) {
     QueueData* q = queue_data(queue);
     DeviceData* d = q ? q->dev : device_for(queue);
     if (!d || !d->QueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
+    if (g_cc.on && g_cc.wdlock && q && q->family == 0) wd_lock_submit(d, queue, q->family);
+    { static uint64_t lastp; extern void wd_eye_readback_(DeviceData*, VkQueue, uint32_t); uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+      if (g_cc.on && g_cc.wdeyelog && q && q->family == 0 && pr != lastp) { lastp = pr; wd_eye_readback_(d, queue, q->family); } }
     if (g_cc.on && g_img) {
         uint64_t t = now_ns();
         trace_lock_timed();
@@ -3375,7 +3455,7 @@ static void trace_arm(const char* tag) {
 //     line's LOD, 0 the finest; 0 before); then the four blobs in that order.
 //   tavpose.bin: "TVP1", plan seq, frame, mesh count (u32), wall time f64; per mesh: key u64,
 //     bone count u32, flags u32 (1: read; 2 BG3 drew it in this frame's G-buffer pass, 4 draw
-//     tracking valid this frame, on every record), world transform 10 f32 (quat xyzw, translate, scale),
+//     tracking valid this frame, on every record; 8 BG3 draws it itself, patch27), world transform 10 f32 (quat xyzw, translate, scale),
 //     then bone count x 12 f32 (3x4 rows).
 // Memory is read with process_vm_readv on our own process: a pointer gone stale since the plan
 // fails the read instead of faulting.
@@ -3697,6 +3777,7 @@ static size_t tav_pose_records(uint8_t* p) {
         float wt[10] = {0};
         uint8_t* rec = p + at;
         if (tav_rd(m->wt, wt, sizeof wt)) flags = 1;
+        if (!g_tav_hide) flags |= 8;  // patch27: BG3 draws this figure itself (bg3tav): benilla 0122 hides its copy
         if (flags && m->kind == 0) {
             uint64_t pal = 0;
             uint16_t count = 0;
@@ -3856,7 +3937,7 @@ static void tav_present(QueueData* q) {
     if (g_tav.seq == 0 && g_tav.frame == 0) return;
     if (g_tav.n && !g_tav.mesh_ok && g_req.presents >= g_tav.retry_at) tav_copy_meshes(q);
     // An empty plan still writes one: Tav left, benilla hides her.
-    if (g_tav.mesh_ok || !g_tav.n) tav_write_pose();
+    { extern int g_lk_sent_; if (!g_lk_sent_ && (g_tav.mesh_ok || !g_tav.n)) tav_write_pose(); g_lk_sent_ = 0; }
     tav_publish_hide();
 }
 
@@ -3882,6 +3963,13 @@ static void pipe_watch(const VkGraphicsPipelineCreateInfo* ci) {
 #include "wowbg3_ground.inc.c"
 #include "wowbg3_surf.inc.c"
 #include "wowbg3_preview.inc.c"
+__attribute__((visibility("hidden"))) int g_lk_sent_;
+__attribute__((visibility("hidden"))) uint32_t g_lk_seq_;
+__attribute__((visibility("hidden"))) int g_wdg_pending_;
+__attribute__((visibility("hidden"))) uint8_t g_wdg_cam_[96];
+static struct { GBuf b; __typeof__(g_sf.wcm[0]) m; float tx, ty; int have; } g_lk;
+#include "wowbg3_fxbg.inc.c"
+#include "wowbg3_wd.inc.c"
 
 // A G-buffer draw from an index buffer that several planned meshes share (tavd_note;
 // recording thread, no lock): marks the one nearest to where BG3 places the draw, and any within 0.3 m
@@ -4115,13 +4203,13 @@ static void device_fns(DeviceData* d, VkDevice dev, PFN_vkGetDeviceProcAddr gdpa
     DEV_FN(CreateRenderPass2); DEV_FN(CmdBeginRenderPass); DEV_FN(CmdBeginRenderPass2);
     DEV_FN(CmdEndRenderPass); DEV_FN(CmdEndRenderPass2); DEV_FN(CmdBeginRendering); DEV_FN(CmdEndRendering);
     DEV_FN(CmdDraw); DEV_FN(CmdDrawIndexed); DEV_FN(CmdDrawIndirect); DEV_FN(CmdDrawIndexedIndirect);
-    DEV_FN(CmdDispatch); DEV_FN(CmdCopyImage); DEV_FN(CmdBlitImage); DEV_FN(CmdClearColorImage); DEV_FN(CmdResolveImage);
+    DEV_FN(CmdDispatch); DEV_FN(CmdDispatchIndirect); DEV_FN(CmdCopyImage); DEV_FN(CmdBlitImage); DEV_FN(CmdClearColorImage); DEV_FN(CmdResolveImage);
     DEV_FN(CmdExecuteCommands); DEV_FN(QueueSubmit2); DEV_FN(CmdPipelineBarrier2);
     DEV_FN(DestroyImage); DEV_FN(CmdCopyBufferToImage);
     DEV_FN(GetImageMemoryRequirements); DEV_FN(BindImageMemory);
     DEV_FN(BindBufferMemory2); DEV_FN(CmdCopyBuffer); DEV_FN(CmdBindIndexBuffer);
     DEV_FN(CreateGraphicsPipelines); DEV_FN(CreateComputePipelines); DEV_FN(CmdBindPipeline); DEV_FN(CmdBindVertexBuffers);
-    DEV_FN(CmdBindDescriptorSets); DEV_FN(CmdPushConstants); DEV_FN(UnmapMemory); DEV_FN(UpdateDescriptorSets); DEV_FN(UpdateDescriptorSetWithTemplate);
+    DEV_FN(CmdBindDescriptorSets); DEV_FN(CmdSetBlendConstants); DEV_FN(CmdPushConstants); DEV_FN(UnmapMemory); DEV_FN(UpdateDescriptorSets); DEV_FN(UpdateDescriptorSetWithTemplate);
     DEV_FN(CreateDescriptorUpdateTemplate); DEV_FN(CreateShaderModule); DEV_FN(CreateSampler);
     DEV_FN(CreateDescriptorSetLayout); DEV_FN(CreatePipelineLayout); DEV_FN(CmdSetViewport);
     DEV_FN(CreateDescriptorPool); DEV_FN(AllocateDescriptorSets); DEV_FN(FreeDescriptorSets); DEV_FN(ResetDescriptorPool); DEV_FN(DestroyDescriptorPool); DEV_FN(GetFenceStatus); DEV_FN(DestroyShaderModule);
@@ -4210,7 +4298,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL wowbg3_GetInstanceProcAddr(VkIns
     HOOK(CreateRenderPass2); HOOK(CreateRenderPass2KHR); HOOK(BeginCommandBuffer); HOOK(EndCommandBuffer);
     HOOK(CmdBeginRenderPass); HOOK(CmdBeginRenderPass2); HOOK(CmdEndRenderPass); HOOK(CmdEndRenderPass2);
     HOOK(CmdBeginRendering); HOOK(CmdBeginRenderingKHR); HOOK(CmdEndRendering); HOOK(CmdEndRenderingKHR);
-    HOOK(CmdDraw); HOOK(CmdDrawIndexed); HOOK(CmdDrawIndirect); HOOK(CmdDrawIndexedIndirect); HOOK(CmdDispatch);
+    HOOK(CmdDraw); HOOK(CmdDrawIndexed); HOOK(CmdDrawIndirect); HOOK(CmdDrawIndexedIndirect); HOOK(CmdDispatch); HOOK(CmdDispatchIndirect);
     HOOK(CmdCopyImage); HOOK(CmdBlitImage); HOOK(CmdResolveImage); HOOK(CmdExecuteCommands);
     HOOK(QueueSubmit); HOOK(QueueSubmit2); HOOK(QueueSubmit2KHR);
     HOOK(CmdPipelineBarrier); HOOK(CmdPipelineBarrier2); HOOK(CmdPipelineBarrier2KHR); HOOK(DestroyImage);
@@ -4240,7 +4328,7 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL wowbg3_GetDeviceProcAddr(VkDevic
     HOOK(CreateRenderPass2); HOOK(CreateRenderPass2KHR); HOOK(BeginCommandBuffer); HOOK(EndCommandBuffer);
     HOOK(CmdBeginRenderPass); HOOK(CmdBeginRenderPass2); HOOK(CmdEndRenderPass); HOOK(CmdEndRenderPass2);
     HOOK(CmdBeginRendering); HOOK(CmdBeginRenderingKHR); HOOK(CmdEndRendering); HOOK(CmdEndRenderingKHR);
-    HOOK(CmdDraw); HOOK(CmdDrawIndexed); HOOK(CmdDrawIndirect); HOOK(CmdDrawIndexedIndirect); HOOK(CmdDispatch);
+    HOOK(CmdDraw); HOOK(CmdDrawIndexed); HOOK(CmdDrawIndirect); HOOK(CmdDrawIndexedIndirect); HOOK(CmdDispatch); HOOK(CmdDispatchIndirect);
     HOOK(CmdCopyImage); HOOK(CmdBlitImage); HOOK(CmdResolveImage); HOOK(CmdExecuteCommands);
     HOOK(QueueSubmit); HOOK(QueueSubmit2); HOOK(QueueSubmit2KHR);
     HOOK(CmdPipelineBarrier); HOOK(CmdPipelineBarrier2); HOOK(CmdPipelineBarrier2KHR); HOOK(DestroyImage);

@@ -241,6 +241,56 @@ static void wowlight_note(uint32_t gl) {
     }
     pthread_mutex_unlock(&m);
 }
+// Patch 41: WR_PAR threads read a frame's payload together (the reader thread takes the first part).
+#define WR_PAR 4
+static struct { pthread_mutex_t m; pthread_cond_t go, done; int started, fd, left, ok; uint64_t gen; uint8_t* dst; size_t n; off_t at; } g_wrp =
+    {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, -1, 0, 1, 0, NULL, 0, 0};
+static void wrp_part(int i, int fd, uint8_t* dst, size_t n, off_t at, int* ok) {
+    size_t a = n / WR_PAR * (size_t)i, b = i == WR_PAR - 1 ? n : n / WR_PAR * (size_t)(i + 1);
+    a &= ~(size_t)4095; if (i != WR_PAR - 1) b &= ~(size_t)4095;
+    if (b > a && !wr_pread(fd, dst + a, b - a, at + (off_t)a)) *ok = 0;
+}
+static void* wrp_main(void* arg) {
+    const int i = (int)(intptr_t)arg;
+    uint64_t seen = 0;
+    pthread_mutex_lock(&g_wrp.m);
+    for (;;) {
+        while (g_wrp.gen == seen) pthread_cond_wait(&g_wrp.go, &g_wrp.m);
+        seen = g_wrp.gen;
+        int fd = g_wrp.fd; uint8_t* dst = g_wrp.dst; size_t n = g_wrp.n; off_t at = g_wrp.at;
+        pthread_mutex_unlock(&g_wrp.m);
+        int ok = 1;
+        wrp_part(i, fd, dst, n, at, &ok);
+        pthread_mutex_lock(&g_wrp.m);
+        if (!ok) g_wrp.ok = 0;
+        if (--g_wrp.left == 0) pthread_cond_signal(&g_wrp.done);
+    }
+    return NULL;
+}
+// The payload read in WR_PAR parts at once; one thread's read when the helpers are not running.
+static int wr_pread_par(int fd, void* out, size_t n, off_t at) {
+    if (!g_wrp.started) {
+        g_wrp.started = -1;
+        int made = 0;
+        for (int i = 1; i < WR_PAR; i++) { pthread_t t; if (pthread_create(&t, NULL, wrp_main, (void*)(intptr_t)i) == 0) { pthread_detach(t); made++; } }
+        if (made == WR_PAR - 1) g_wrp.started = 1;
+        logf_("reader: %s", g_wrp.started == 1 ? "frames read on 4 threads (patch 41)" : "helper threads failed; frames read on one thread");
+    }
+    if (g_wrp.started != 1) return wr_pread(fd, out, n, at);
+    pthread_mutex_lock(&g_wrp.m);
+    g_wrp.fd = fd; g_wrp.dst = out; g_wrp.n = n; g_wrp.at = at; g_wrp.ok = 1; g_wrp.left = WR_PAR - 1; g_wrp.gen++;
+    pthread_cond_broadcast(&g_wrp.go);
+    pthread_mutex_unlock(&g_wrp.m);
+    int ok = 1;
+    wrp_part(0, fd, out, n, at, &ok);
+    pthread_mutex_lock(&g_wrp.m);
+    while (g_wrp.left > 0) pthread_cond_wait(&g_wrp.done, &g_wrp.m);
+    ok = ok && g_wrp.ok;
+    pthread_mutex_unlock(&g_wrp.m);
+    return ok;
+}
+// Patch 42: set while BG3 waits for a WoW frame in lockstep (wowbg3_wd.inc.c): look for it every 100 us.
+static volatile int g_wr_hurry;
 static void* wr_main(void* arg) {
     (void)arg;
     while (!g_wr.stop) {
@@ -278,7 +328,7 @@ static void* wr_main(void* arg) {
         }
         if (slot < 0) {
             for (int j = 0; j < 2; j++) if (fd[j] >= 0) close(fd[j]);
-            usleep(k >= 0 ? 1000 : 500);
+            usleep(k >= 0 ? 1000 : (g_wr_hurry ? 100 : 500));
             continue;
         }
         WowSlot* w = &g_wr.s[slot];
@@ -290,39 +340,17 @@ static void* wr_main(void* arg) {
         w->bar = bar;
         uint64_t t0 = now_ns();
         int ok = gbuf_make(g_wr.d, &w->b, payload, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bar ? 2 : 1) &&
-                 wr_pread(fd[k], w->b.map, payload, 64);
+                 wr_pread_par(fd[k], w->b.map, payload, 64);
         uint8_t after[64];
         // Torn when benilla started rewriting this slot meanwhile (it writes seq2 = 0 first).
         int torn = ok && (!wr_pread(fd[k], after, 64, 0) || memcmp(after + 4, h[k] + 4, 4) || memcmp(after + 56, h[k] + 56, 4));
         uint64_t t1 = now_ns();
         for (int j = 0; j < 2; j++) if (fd[j] >= 0) close(fd[j]);
-        if (ok && !torn) {   // Flash recorder: WoW's picture jumping in brightness between two frames goes in the log, with that
-            // frame's colour rows on disk and BG3's next frames as a capture (at most 8 in a session).
-            static float flash_last = -1;
-            static int flash_n;
-            uint64_t sum = 0, count = 0;
-            for (uint32_t sy = wh / 40 + 1; sy < wh; sy += wh / 20 + 1)
-                for (uint32_t sx = ww / 80 + 1; sx < ww; sx += ww / 40 + 1) {
-                    uint32_t px;  // one read: the frame may be in video memory, slow to read
-                    memcpy(&px, (const uint8_t*)w->b.map + (size_t)sy * cbpr + (size_t)sx * 4, 4);
-                    sum += (px & 255) + ((px >> 8) & 255) + ((px >> 16) & 255);
-                    count += 3;
-                }
-            float mean = count ? (float)sum / count : 0;
-            if (flash_last >= 0 && !g_cc.camp && !g_cc.camp_hold && fabsf(mean - flash_last) > 30) {
-                logf_("compose: WoW frame %u jumps in brightness, %.0f to %.0f", s[k], flash_last, mean);
-                if (flash_n < 8) {
-                    char tag[32], path[256];
-                    flash_n++;
-                    snprintf(tag, sizeof tag, "wflash%d-%u", flash_n, s[k]);
-                    snprintf(path, sizeof path, "/%s.bgra-%ux%u-%u", tag, ww, wh, cbpr);
-                    FILE* f = fopen(outp(path), "wb");
-                    if (f) { fwrite(w->b.map, 1, (size_t)cbpr * wh, f); fclose(f); }
-                    f = fopen(outp("/request"), "w");
-                    if (f) { fprintf(f, "6 1 %s\n", tag); fclose(f); }
-                }
-            }
-            flash_last = mean;
+        if (g_cc.wdtime) {
+            static FILE* tf; static uint64_t n;
+            if (!tf) { tf = fopen(outp("/wrtime.csv"), "w"); if (tf) fprintf(tf, "read0_ns,ready_ns,seq,packet,cam,publish_ns,torn,ok\n"); }
+            if (tf) { fprintf(tf, "%llu,%llu,%u,%u,%u,%llu,%d,%d\n", (unsigned long long)t0, (unsigned long long)t1, s[k], packet, cam,
+                              (unsigned long long)(wtime * 1e9), torn, ok); if (++n % 60 == 0) fflush(tf); }
         }
         pthread_mutex_lock(&g_wr.m);
         // benilla restarted (its seq went back): frames of the old run are never newer. A torn frame counts
@@ -353,6 +381,35 @@ static void* wr_main(void* arg) {
             if (g_wr.cv_ok) pthread_cond_broadcast(&g_wr.cv);
         }
         pthread_mutex_unlock(&g_wr.m);
+        // Patch 42: after the hand-over (it reads video memory, 0.7 ms); only this thread refills the slot.
+        if (ok && !torn) {   // Flash recorder: WoW's picture jumping in brightness between two frames goes in the log, with that
+            // frame's colour rows on disk and BG3's next frames as a capture (at most 8 in a session).
+            static float flash_last = -1;
+            static int flash_n;
+            uint64_t sum = 0, count = 0;
+            for (uint32_t sy = wh / 40 + 1; sy < wh; sy += wh / 20 + 1)
+                for (uint32_t sx = ww / 80 + 1; sx < ww; sx += ww / 40 + 1) {
+                    uint32_t px;  // one read: the frame may be in video memory, slow to read
+                    memcpy(&px, (const uint8_t*)w->b.map + (size_t)sy * cbpr + (size_t)sx * 4, 4);
+                    sum += (px & 255) + ((px >> 8) & 255) + ((px >> 16) & 255);
+                    count += 3;
+                }
+            float mean = count ? (float)sum / count : 0;
+            if (flash_last >= 0 && !g_cc.camp && !g_cc.camp_hold && fabsf(mean - flash_last) > 30) {
+                logf_("compose: WoW frame %u jumps in brightness, %.0f to %.0f", s[k], flash_last, mean);
+                if (0 && flash_n < 8) {  // fx-route: the 6-frame capture would take the recorder
+                    char tag[32], path[256];
+                    flash_n++;
+                    snprintf(tag, sizeof tag, "wflash%d-%u", flash_n, s[k]);
+                    snprintf(path, sizeof path, "/%s.bgra-%ux%u-%u", tag, ww, wh, cbpr);
+                    FILE* f = fopen(outp(path), "wb");
+                    if (f) { fwrite(w->b.map, 1, (size_t)cbpr * wh, f); fclose(f); }
+                    f = fopen(outp("/request"), "w");
+                    if (f) { fprintf(f, "6 1 %s\n", tag); fclose(f); }
+                }
+            }
+            flash_last = mean;
+        }
         if (!ok) usleep(20000);
     }
     return NULL;
@@ -750,7 +807,7 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     uint32_t sfl = surf_for_compose(d, ground_framed_serial(), w.cam, w.glight, sv, (uint8_t*)g_gc.cam[k].map);
     if (sfl == 0xffffffffu) { g_gc.failed = 1; logf_("compose: no stand-in images for the surfaces; CPU path"); return -1; }
     if (dark) memset(g_gc.cam[k].map, 0, 176);  // no ground surfaces over the backdrop
-    VkDescriptorBufferInfo bi[6] = {{g_gc.out.buf, 0, VK_WHOLE_SIZE}, {pre ? pre->buf : g_gc.dep.buf, 0, VK_WHOLE_SIZE},
+    VkDescriptorBufferInfo bi[6] = {{g_gc.out.buf, 0, VK_WHOLE_SIZE}, {pre && !g_cc.fxbg ? pre->buf : g_gc.dep.buf, 0, VK_WHOLE_SIZE},
         {ui ? g_gc.ui.buf : g_gc.out.buf, 0, VK_WHOLE_SIZE}, {w.b.buf, 0, VK_WHOLE_SIZE}, {g_gc.cnt[k].buf, 0, VK_WHOLE_SIZE},
         {g_gc.cam[k].buf, 0, VK_WHOLE_SIZE}};
     VkDescriptorImageInfo ii[4];
@@ -773,6 +830,7 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     if (w.ww != W || w.wh != H) pc.flags |= 32u;
     if (w.code == 2 && !g_cc.wowraw) pc.flags |= 64u;  // WoW's bytes decoded once
     if (ui_only) pc.flags |= 128u;
+    if (g_cc.fxbg) pc.flags |= g_cc.fxbgpass ? 256u : 512u;  // fx-route prototype: BG3's own picture as it is; or what BG3's effects changed in it
 
     VkCommandBuffer cmd = g_gc.cmd[k];
     d->ResetCommandBuffer(cmd, 0);
@@ -790,10 +848,11 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy rc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}};
     d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_gc.out.buf, 1, &rc);
+    if (g_cc.fxbg) d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_gc.dep.buf, 1, &rc);  // binding 1 holds BG3's final picture
     // Layout changes take both aspects of a depth-stencil image (without separateDepthStencilLayouts).
     VkImageAspectFlags da = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (dfmt == VK_FORMAT_D32_SFLOAT_S8_UINT || dfmt == VK_FORMAT_D24_UNORM_S8_UINT || dfmt == VK_FORMAT_D16_UNORM_S8_UINT) da |= VK_IMAGE_ASPECT_STENCIL_BIT;
-    if (!pre) {
+    if (!pre && !g_cc.fxbg) {
         barrier_aspect(d, cmd, depth, da, dlayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy rd = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}};
         d->CmdCopyImageToBuffer(cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_gc.dep.buf, 1, &rd);

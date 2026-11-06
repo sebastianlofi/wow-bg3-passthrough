@@ -1,0 +1,7 @@
+// Research (wdeyelog): BG3's eye pass state (its 28-byte storage buffer, compute 7387a4a6b28ed0d9 set 1 binding 2) copied
+// to a host-visible buffer by our own command buffer, so its seven floats can be logged. BG3's buffer has storage usage only.
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer Eye { float e[7]; } eye;
+layout(std430, set = 0, binding = 1) buffer Out { float o[8]; } outp;
+void main() { for (int i = 0; i < 7; i++) outp.o[i] = eye.e[i]; outp.o[7] = 1.0; }

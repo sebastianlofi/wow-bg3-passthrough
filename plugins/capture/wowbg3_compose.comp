@@ -65,6 +65,7 @@ vec3 b10g11r11(uint v) { return vec3(uf(v & 0x7ffu, 6u), uf((v >> 11) & 0x7ffu, 
 vec3 surf_delta(uint x, uint y, float wdv, out uint st) {
     st = 0u;
     uint fl = cam.sflags.x;
+    if ((fl & 1u) == 0u) return vec3(0.0);
     ivec2 q = ivec2(int(x), int(y));
     if ((fl & 8u) == 0u) {
         if (!(wdv > 0.0)) return vec3(0.0);
@@ -134,6 +135,26 @@ vec3 wow_bgr(uint x, uint y) {
     return b;
 }
 
+// fx-route prototype: where this world point of WoW's frame M lies in BG3's frame N. -1: outside.
+ivec2 world_in_n(uint x, uint y, float wdv) {
+    float zm = wdv > 0.0 ? (pc.wnear / wdv + pc.wzoff) * 0.9144 : 4000.0;
+    vec2 ndc = (vec2(float(x), float(y)) + 0.5) / vec2(float(pc.W), float(pc.H)) * 2.0 - 1.0;
+    vec3 dir = cam.fwdM.xyz + cam.rightM.xyz * (ndc.x * cam.eyeM.w) - cam.upM.xyz * (ndc.y * cam.fwdM.w);
+    vec3 rel = wdv > 0.0 ? cam.eyeM.xyz + dir * zm : dir * zm;
+    vec4 c = cam.vpN * vec4(rel, 1.0);
+    if (!(c.w > 1e-6)) return ivec2(-1);
+    vec2 n = vec2(c.x, -c.y) / c.w;
+    vec2 qf = (n * 0.5 + 0.5) * vec2(float(pc.W), float(pc.H));
+    if (!(qf.x >= 0.0 && qf.y >= 0.0 && qf.x < float(pc.W) && qf.y < float(pc.H))) return ivec2(-1);
+    return ivec2(qf);
+}
+vec3 hud_bgr(uint i, out int a) {
+    uint uv = ui.u[i];
+    ivec4 u = ivec4(int(uv & 0xffu), int((uv >> 8) & 0xffu), int((uv >> 16) & 0xffu), int(uv >> 24));
+    a = (pc.flags & 1u) != 0u ? u.w : 0;
+    if ((pc.flags & 1u) == 0u) return vec3(0.0);
+    return vec3((pc.flags & 2u) != 0u ? u.zyx : u.xyz);
+}
 void main() {
     if (gl_LocalInvocationIndex == 0u) { s_n = 0u; s_sp = 0u; s_ok = 0u; s_bad = 0u; }
     barrier();
@@ -142,6 +163,41 @@ void main() {
     uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
     bool inside = x < pc.W && y < pc.H;
     bool wowpx = false;
+    if (inside) {
+        uint i = y * pc.W + x;
+        if ((pc.flags & 512u) != 0u) {
+            float wdv0 = uintBitsToFloat(wow.w[(pc.cbpr * pc.wh + y * pc.dbpr + x * 4u) >> 2]);
+            vec3 w0 = wow_bgr(x, y), base0 = w0;
+            uint st0 = 0u;
+            vec3 sd = surf_delta(x, y, wdv0, st0);
+            if (sd != vec3(0.0)) {
+                vec3 rgb = base0.zyx / 255.0;
+                vec3 l = clamp(vec3(s2l(rgb.r), s2l(rgb.g), s2l(rgb.b)) + sd, 0.0, 1.0);
+                base0 = floor(vec3(l2s(l.b), l2s(l.g), l2s(l.r)) * 255.0 + 0.5);
+            }
+            ivec2 qq = world_in_n(x, y, wdv0);
+            int ap = 0;
+            vec3 hp = hud_bgr(i, ap);
+            vec3 outc = base0;
+            if (qq.x >= 0) {
+                uint iq = uint(qq.y) * pc.W + uint(qq.x);
+                int aq = 0;
+                vec3 hq = hud_bgr(iq, aq);
+                uint fv = dep.d[iq];
+                vec3 fq = vec3(float(fv & 0xffu), float((fv >> 8) & 0xffu), float((fv >> 16) & 0xffu));
+                if (aq < 200) {
+                    vec3 sc = clamp((fq - hq) * 255.0 / float(255 - aq), vec3(0.0), vec3(255.0));
+                    float dif = max(max(abs(sc.x - w0.x), abs(sc.y - w0.y)), abs(sc.z - w0.z));
+                    float al = smoothstep(14.0, 34.0, dif);
+                    outc = mix(base0, sc, al);
+                }
+            }
+            vec3 res0 = min(hp + floor(outc + 0.5) * float(255 - ap) / 255.0, vec3(255.0));
+            o.px[i] = uint(res0.x) | (uint(res0.y) << 8) | (uint(res0.z) << 16) | (255u << 24);
+            inside = false;
+            wowpx = true;
+        }
+    }
     if (inside) {
         uint i = y * pc.W + x;
         float dv = bg3_depth(i);
@@ -159,7 +215,7 @@ void main() {
         // Its alpha, for the rule below; an ADD quad leaves alpha 0 but colour, so colour counts too.
         uint wraw = uionly ? wow.w[(wy * pc.cbpr + wx * 4u) >> 2] : 0u;
         int wa = int(wraw >> 24);
-        if (uionly ? wraw != 0u : !(bz < wz && bz < pc.far)) {
+        if ((pc.flags & 256u) == 0u && (uionly ? wraw != 0u : !(bz < wz && bz < pc.far))) {
             wowpx = true;
             vec3 base;
             if (scaled) {

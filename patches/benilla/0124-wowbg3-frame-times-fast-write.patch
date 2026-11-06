@@ -1,0 +1,270 @@
+WOW-BG3 benilla patch 0124: lockstep export timing and a faster frame write (on top of 0001-0123).
+
+- WOW_BG3_FRAME_TIMES=1: wowframe.times.csv beside the frame files, one line per exported frame: packet taken, ends of
+  First/PreUpdate/Update/PostUpdate (stamp schedules), main frame end, prepare, publish, mapped, written, follow_bg3
+  and apply_pose starts (CLOCK_MONOTONIC s). Off by default.
+- The writer copies colour and depth into a kept MAP_SHARED mapping of the slot file, two halves of each on four
+  threads (pwrite took the inode lock: four of them ran one after another). 2560x1440: 2.0 ms to 1.0 ms.
+
+diff --git a/crates/benilla-app/src/wowbg3_frames.rs b/crates/benilla-app/src/wowbg3_frames.rs
+index 0ce7374..89a2f7a 100644
+--- a/crates/benilla-app/src/wowbg3_frames.rs
++++ b/crates/benilla-app/src/wowbg3_frames.rs
+@@ -221,6 +221,8 @@ struct SinkState {
+     stats: Arc<Mutex<ExportStats>>,
+     /// 0123: the multisampled depth's resolve (pipeline and its storage buffer), made on first use.
+     msd: Option<MsDepth>,
++    /// Patch 0124: when this frame's `prepare` ran (CLOCK_MONOTONIC s).
++    t_prepare: f64,
+ }
+ 
+ /// One readback buffer pair. `state`: 0 free, 1 copied into this frame, 2 with the writer.
+@@ -240,6 +242,9 @@ struct Job {
+     header: [u8; HEADER],
+     tag: crate::wowbg3_pace::FrameTag,
+     submitted: Instant,
++    /// Patch 0124: `prepare` and `publish` of this frame (CLOCK_MONOTONIC s).
++    t_prepare: f64,
++    t_publish: f64,
+ }
+ 
+ #[derive(Default)]
+@@ -268,6 +273,7 @@ impl FrameSink {
+                 jobs: None,
+                 stats: Arc::new(Mutex::new(ExportStats::default())),
+                 msd: None,
++                t_prepare: 0.0,
+             })),
+         }
+     }
+@@ -335,6 +341,7 @@ fn prepare(
+ ) {
+     let Ok((target, depth)) = views.single() else { return };
+     let mut s = sink.inner.lock().unwrap();
++    s.t_prepare = crate::wowbg3_pace::mono_seconds();
+     s.color_copied = false;
+     s.depth_copied = false;
+     s.cur = None;
+@@ -622,19 +629,76 @@ fn publish(
+     let (code, _) = format_code(color.4).unwrap_or((0, 4));
+     let header = header(s.seq, color.2, color.3, code, color.1, depth.1, near, tag.depth_offset);
+     state.store(2, Ordering::Release);
+-    let job = Job { color: color.0, depth: depth.0, mapped, state: state.clone(), header, tag: *tag, submitted: Instant::now() };
++    let job = Job { color: color.0, depth: depth.0, mapped, state: state.clone(), header, tag: *tag, submitted: Instant::now(),
++                   t_prepare: s.t_prepare, t_publish: crate::wowbg3_pace::mono_seconds() };
+     if s.jobs.as_ref().is_some_and(|tx| tx.send(job).is_err()) {
+         s.jobs = None;
+         state.store(0, Ordering::Release);
+     }
+ }
+ 
++/// Patch 0124: a slot file mapped shared (address, length), kept by the writer thread for its slot.
++struct FileMap(usize, usize);
++
++impl Drop for FileMap {
++    fn drop(&mut self) {
++        // SAFETY: the address and length are this mapping's own (mmap below); nothing else unmaps it.
++        unsafe { libc::munmap(self.0 as *mut libc::c_void, self.1) };
++    }
++}
++
++/// Patch 0124: colour at `ca` and depth at `da` copied into the slot file's shared mapping, two halves of each on four
++/// threads at once (copies into the mapping take no file lock; four `pwrite`s of one file ran one after another).
++#[cfg(unix)]
++fn write_parallel(map: &mut Option<FileMap>, f: &std::fs::File, color: &[u8], ca: u64, depth: &[u8], da: u64) -> bool {
++    use std::os::unix::io::AsRawFd;
++    let end = (da as usize).max(ca as usize + color.len()).max(da as usize + depth.len());
++    if map.as_ref().is_none_or(|m| m.1 < end) {
++        *map = None;
++        if f.metadata().map_or(true, |m| (m.len() as usize) < end) && f.set_len(end as u64).is_err() {
++            return false;
++        }
++        // SAFETY: a shared, writable mapping of `end` bytes of this open file (now at least that long).
++        let p = unsafe { libc::mmap(std::ptr::null_mut(), end, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, f.as_raw_fd(), 0) };
++        if p == libc::MAP_FAILED {
++            return false;
++        }
++        *map = Some(FileMap(p as usize, end));
++    }
++    let base = map.as_ref().map_or(0, |m| m.0);
++    let half = |b: &[u8]| (b.len() / 2) & !4095;
++    let (ch, dh) = (half(color), half(depth));
++    let parts: [(&[u8], usize); 4] =
++        [(&color[..ch], ca as usize), (&color[ch..], ca as usize + ch), (&depth[..dh], da as usize), (&depth[dh..], da as usize + dh)];
++    let copy = move |(src, at): (&[u8], usize)| {
++        // SAFETY: `at + src.len()` is within the mapping (`end` above), and the four parts do not overlap.
++        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), (base + at) as *mut u8, src.len()) };
++    };
++    std::thread::scope(|s| {
++        let hs: Vec<_> = parts[1..].iter().map(|&p| s.spawn(move || copy(p))).collect();
++        copy(parts[0]);
++        hs.into_iter().all(|h| h.join().is_ok())
++    })
++}
++
+ /// The writer thread: waits for each frame's mapping (polling the device without blocking it)
+ /// and writes it into its slot file, framed by the sequence number, then frees the pair.
+ fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevice, stats: Arc<Mutex<ExportStats>>) {
+     let mut files: [Option<std::fs::File>; 2] = [None, None];
++    let mut maps: [Option<FileMap>; 2] = [None, None];
+     let mut warned = false;
+     let mut logged_at = Instant::now();
++    // Patch 0124: WOW_BG3_FRAME_TIMES=1 writes each exported frame's times beside the frame files.
++    let mut times = std::env::var("WOW_BG3_FRAME_TIMES").is_ok_and(|v| v == "1").then(|| {
++        let p = path.with_extension("times.csv");
++        let f = std::fs::File::create(&p).ok();
++        if let Some(mut f) = f.as_ref() {
++            use std::io::Write;
++            let _ = writeln!(f, "packet,t_packet,t_first,t_preupdate,t_update,t_postupdate,t_main_end,t_prepare,t_publish,t_mapped,t_written,bytes,t_follow,t_pose");
++        }
++        info!("wowbg3 frames: times to {:?}", p);
++        f
++    }).flatten();
+     while let Ok(job) = rx.recv() {
+         let t0 = Instant::now();
+         let mut lost = false;
+@@ -648,6 +712,8 @@ fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevic
+         }
+         let mut ok = !lost && job.mapped.iter().all(|m| m.load(Ordering::Acquire) == 1);
+         let map_us = t0.elapsed().as_micros() as u64;
++        let t_mapped = crate::wowbg3_pace::mono_seconds();
++        let mut bytes = 0usize;
+         let t1 = Instant::now();
+         let seq = u32::from_le_bytes(job.header[4..8].try_into().unwrap());
+         let slot = (seq % 2) as usize;
+@@ -677,6 +743,7 @@ fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevic
+             if let Some(f) = files[slot].as_ref() {
+                 let cbytes = job.color.slice(..).get_mapped_range();
+                 let dbytes = job.depth.slice(..).get_mapped_range();
++                bytes = cbytes.len() + dbytes.len();
+                 let mut torn = job.header;
+                 torn[56..60].copy_from_slice(&0u32.to_le_bytes());
+                 // seq2 = 0 while the rows change, the real seq once they are whole.
+@@ -684,8 +751,7 @@ fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevic
+                 let dbpr = u32::from_le_bytes(job.header[24..28].try_into().unwrap()) as usize;
+                 let width = u32::from_le_bytes(job.header[8..12].try_into().unwrap()) as usize;
+                 let written = f.write_all_at(&torn, 0).is_ok()
+-                    && f.write_all_at(&cbytes, HEADER as u64).is_ok()
+-                    && f.write_all_at(&dbytes, (HEADER + cbytes.len()) as u64).is_ok()
++                    && write_parallel(&mut maps[slot], f, &cbytes, HEADER as u64, &dbytes, (HEADER + cbytes.len()) as u64)
+                     && write_near_rect(f, HEADER + cbytes.len(), dbpr, dbytes.len(), width);
+                 tag_header(&mut whole, &job.tag, crate::wowbg3_pace::mono_seconds());
+                 ok = written && f.write_all_at(&whole, 0).is_ok();
+@@ -693,9 +759,17 @@ fn writer(rx: mpsc::Receiver<Job>, path: std::path::PathBuf, device: RenderDevic
+                 drop(dbytes);
+                 if !ok {
+                     files[slot] = None;
++                    maps[slot] = None;
+                 }
+             }
+         }
++        if let Some(f) = times.as_mut() {
++            use std::io::Write;
++            let s = job.tag.t_sched;
++            let _ = writeln!(f, "{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6}", job.tag.packet, job.tag.t_packet,
++                             s[0], s[1], s[2], s[3], job.tag.t_main_end,
++                             job.t_prepare, job.t_publish, t_mapped, crate::wowbg3_pace::mono_seconds(), bytes, job.tag.t_marks[0], job.tag.t_marks[1]);
++        }
+         if job.mapped[0].load(Ordering::Acquire) == 1 {
+             job.color.unmap();
+         }
+diff --git a/crates/benilla-app/src/wowbg3_lead.rs b/crates/benilla-app/src/wowbg3_lead.rs
+index 2eacf13..af7b0b4 100644
+--- a/crates/benilla-app/src/wowbg3_lead.rs
++++ b/crates/benilla-app/src/wowbg3_lead.rs
+@@ -915,6 +915,7 @@ fn follow_bg3(
+     mut cam: Query<(&mut Transform, &mut Projection), With<WorldCamera>>,
+     pace: Option<Res<crate::wowbg3_pace::Pace>>,
+ ) {
++    crate::wowbg3_pace::mark(0);
+     CAMERA_SEQ.store(0, Ordering::Relaxed);
+     // Patch 0026: set again below when this frame follows BG3's camera.
+     s.held = None;
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index 0ec394d..bfb13cc 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -115,8 +115,35 @@ pub(crate) struct FrameTag {
+     /// pass uses it (`clamp(ambient + diffuse × N·L)`, gamma 0..255 per channel, RGB), byte 3 = 1 when set.
+     /// The capture layer lights BG3's ground surfaces with it (WBF1 bytes 60..64).
+     pub(crate) ground_light: [u8; 4],
++    /// Patch 0124: when this frame's packet was taken (`wait_packet`) and when its main-world frame ended
++    /// (`tag_frame`), CLOCK_MONOTONIC s; 0 none.
++    pub(crate) t_packet: f64,
++    pub(crate) t_main_end: f64,
++    /// Patch 0124: the ends of First, PreUpdate, Update and PostUpdate in this frame (CLOCK_MONOTONIC s).
++    pub(crate) t_sched: [f64; 4],
++    /// Patch 0124: when `follow_bg3` and `apply_pose` started in this frame (CLOCK_MONOTONIC s).
++    pub(crate) t_marks: [f64; 2],
+ }
+ 
++/// Patch 0124: start marks of the packet's consumers (0 `follow_bg3`, 1 `apply_pose`), as f64 bits.
++static MARK_AT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++pub(crate) fn mark(k: usize) {
++    MARK_AT[k].store(mono_seconds().to_bits(), std::sync::atomic::Ordering::Relaxed);
++}
++
++/// Patch 0124: the main schedules' ends, as f64 bits, written by the stamp schedules.
++static SCHED_AT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
++
++#[derive(bevy::ecs::schedule::ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
++struct StampSchedule(usize);
++
++fn stamp_schedule<const K: usize>() {
++    SCHED_AT[K].store(mono_seconds().to_bits(), std::sync::atomic::Ordering::Relaxed);
++}
++
++/// Patch 0124: when the current packet was taken (CLOCK_MONOTONIC s, as f64 bits).
++static PACKET_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// CLOCK_MONOTONIC in seconds (the clock BG3's layer and plugin stamp with).
+ pub(crate) fn mono_seconds() -> f64 {
+     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+@@ -149,6 +176,16 @@ pub(crate) fn build(app: &mut App) {
+     .init_resource::<FrameTag>()
+     .add_systems(First, wait_packet)
+     .add_systems(Last, tag_frame);
++    // Patch 0124: a stamp after each main schedule (WOW_BG3_FRAME_TIMES's CSV).
++    app.add_schedule(Schedule::new(StampSchedule(0))).add_systems(StampSchedule(0), stamp_schedule::<0>);
++    app.add_schedule(Schedule::new(StampSchedule(1))).add_systems(StampSchedule(1), stamp_schedule::<1>);
++    app.add_schedule(Schedule::new(StampSchedule(2))).add_systems(StampSchedule(2), stamp_schedule::<2>);
++    app.add_schedule(Schedule::new(StampSchedule(3))).add_systems(StampSchedule(3), stamp_schedule::<3>);
++    let mut order = app.world_mut().resource_mut::<bevy::app::MainScheduleOrder>();
++    order.insert_after(First, StampSchedule(0));
++    order.insert_after(PreUpdate, StampSchedule(1));
++    order.insert_after(Update, StampSchedule(2));
++    order.insert_after(PostUpdate, StampSchedule(3));
+ }
+ 
+ /// (inode, mtime ns) of the file, cheap enough to check every [`POLL`].
+@@ -203,6 +240,7 @@ fn wait_packet(mut p: ResMut<Pace>, _main_thread: bevy::ecs::system::NonSendMark
+                 p.stats.latency_us += lat;
+                 p.stats.latency_max_us = p.stats.latency_max_us.max(lat);
+                 p.current = Some(pk);
++                PACKET_AT.store(mono_seconds().to_bits(), std::sync::atomic::Ordering::Relaxed);
+                 break;
+             }
+             // No packets lately: benilla's own clock.
+@@ -273,6 +311,10 @@ fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLigh
+         flags: u32::from(p.current.is_some()) | u32::from(crate::wowbg3_frames::interface_only()) << 1,
+         depth_offset: crate::wowbg3_lead::depth_offset(),
+         ground_light: lighting.map_or([0; 4], |l| ground_light(&l)),
++        t_packet: if p.current.is_some() { f64::from_bits(PACKET_AT.load(std::sync::atomic::Ordering::Relaxed)) } else { 0.0 },
++        t_main_end: mono_seconds(),
++        t_sched: std::array::from_fn(|k| f64::from_bits(SCHED_AT[k].load(std::sync::atomic::Ordering::Relaxed))),
++        t_marks: std::array::from_fn(|k| f64::from_bits(MARK_AT[k].load(std::sync::atomic::Ordering::Relaxed))),
+     };
+ }
+ 
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index 1618047..3a7f3aa 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -2115,6 +2115,7 @@ fn apply_pose(
+     world: benilla_world::world_point::WorldPoint,
+     mut palettes: Option<ResMut<benilla_world::rig_palette::RigPalettes>>,
+ ) {
++    crate::wowbg3_pace::mark(1);
+     *wow_frame += 1;
+     // Patch 0034: the `ab` mode's A/B request ([`AbBurst`]).
+     if d.skin == SkinMode::Ab && d.ab.is_none() && *wow_frame % 30 == 0 {

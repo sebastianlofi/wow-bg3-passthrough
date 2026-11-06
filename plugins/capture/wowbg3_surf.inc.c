@@ -128,6 +128,7 @@ static struct {
 // Surfaces drawn lately: the albedo pass and WoW's frame copy run only then (no cost without surfaces;
 // a surface's first frames after a pause composite once the next BG3 frame has the albedo pass).
 static int sf_active(void) {
+    if (g_cc.fxbg) return 1;
     uint64_t l = __atomic_load_n(&g_sf.last_draw, __ATOMIC_RELAXED);
     return l && __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED) + 1 - l < SF_IDLE;
 }
@@ -229,8 +230,17 @@ static int sf_cam(const uint8_t rec[96], const float eyeN[3], float eye[3], floa
     return 1;
 }
 // The camera record with this seq (g_pc ring, filled by the reader thread and the present).
+#define WDG_SEQ 0x40000000u
+#define WDG_N 32
+static struct { pthread_mutex_t m; uint32_t seq[WDG_N]; uint8_t rec[WDG_N][96]; uint32_t next, n; } g_wdg = {PTHREAD_MUTEX_INITIALIZER, {0}, {{0}}, 0, 0};
 static int sf_cam_rec(uint32_t seq, uint8_t out[96]) {
     int ok = 0;
+    if (seq & WDG_SEQ) {
+        pthread_mutex_lock(&g_wdg.m);
+        for (uint32_t i = 0; i < WDG_N && !ok; i++) if (g_wdg.seq[i] == seq) { memcpy(out, g_wdg.rec[i], 96); ok = 1; }
+        pthread_mutex_unlock(&g_wdg.m);
+        return ok;
+    }
     pthread_mutex_lock(&g_pc.m);
     for (uint32_t i = 0; i < g_pc.n && !ok; i++) {
         const PaceCam* c = &g_pc.r[(g_pc.head + PC_N - 1 - i) % PC_N];
@@ -343,7 +353,7 @@ static int sf_slot_images(DeviceData* d, SfSlot* s, uint32_t w, uint32_t h) {
         s->fb = VK_NULL_HANDLE; s->alb_view = VK_NULL_HANDLE; s->fb_img = 0;
     }
     const VkImageUsageFlags st = VK_IMAGE_USAGE_STORAGE_BIT;
-    if (!sf_img_make(d, &s->z, VK_FORMAT_R32_SFLOAT, w, h, st | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+    if (!sf_img_make(d, &s->z, VK_FORMAT_R32_SFLOAT, w, h, st | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
         !sf_img_make(d, &s->a0, VK_FORMAT_R8G8B8A8_UNORM, w, h, st | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         sf_img_free(d, &s->z); sf_img_free(d, &s->a0);
         logf_("surf: images %ux%u not made", w, h);
@@ -387,6 +397,7 @@ static VkImageView surf_inject(DeviceData* d, VkCommandBuffer cb, uint64_t seria
     int want = g_cc.surf && sf_init(d, alb_fmt, alb_lay);
     if (g_cc.surf && !want) g_sf.endwhy[6]++;
     if (want && !sf_active()) { want = 0; g_sf.idle++; }
+    if (g_cc.wdepth) want = 0;  // gate a: the placeholder stays neutral
     if (want) { want = sf_inverse(rec->vp, s->inv); if (!want) g_sf.endwhy[7]++; }
     if (want) g_sf.alb_img = alb_img;
     pthread_mutex_unlock(&g_sf.m);
@@ -564,7 +575,24 @@ static void surf_submit_cb(uint64_t cb, uint64_t pending_serial) {
 static void sf_scene_copy(VkCommandBuffer cb, uint64_t img, int32_t lay);
 // begin_pass, at swapchain size (g_trace_lock held): remember the pass's attachments. The hook runs
 // before BG3 records its own vkCmdBeginRenderPass, so a copy made here lands outside the pass.
+static void fb_feed(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayout lay);
+static __thread VkCommandBuffer t_fbg_cb;
+static __thread uint64_t t_fbg_img;
+static __thread int32_t t_fbg_lay;
+static void fb_fog(DeviceData* d, VkCommandBuffer cb);
+static void fb_clr(DeviceData* d, VkCommandBuffer cb);
+static __thread VkCommandBuffer t_pass_cb, t_fog_cb, t_cld_cb;  // wdfog: the full-size pass being recorded; the composite pass seen
+static __thread uint64_t t_pass_imgs[8]; static __thread int32_t t_pass_fins[8];
+static void fb_bare(DeviceData* d, VkCommandBuffer cb);
+static void fb_post(DeviceData* d, VkCommandBuffer cb);
+static __thread VkCommandBuffer t_post_cb;
+static void fb_bmask(DeviceData* d, VkCommandBuffer cb);
+static void fb_bcut(DeviceData* d, VkCommandBuffer cb);
+static __thread VkCommandBuffer t_bare_cb;
+static __thread uint32_t t_pass_n; static __thread uint64_t t_pass_img0, t_fog_img, t_cld_img; static __thread int32_t t_pass_fin0, t_fog_lay, t_cld_lay;
 static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* ini, const uint8_t* load, const int32_t* fin) {
+    t_pass_cb = cb; t_pass_n = n; t_pass_img0 = n ? imgs[0] : 0; t_pass_fin0 = n ? fin[0] : -1;
+    for (uint32_t k = 0; k < 8; k++) { t_pass_imgs[k] = k < n ? imgs[k] : 0; t_pass_fins[k] = k < n ? fin[k] : -1; }
     t_sf_cb = VK_NULL_HANDLE;
     if (!g_cc.surf || !g_sf.ready || g_screen) return;  // a BG3 screen (screen_check): BG3's own picture
     int depth = 0;
@@ -579,6 +607,19 @@ static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs
     // BG3's effects come later and are replayed by benilla instead. It goes into the same slot the
     // forward layer used, so the compositor, its flag and the "sfwd=" / "sfloor=" weights are
     // unchanged.
+    t_fbg_cb = VK_NULL_HANDLE;
+    if (depth && g_cc.fxbg) {
+        // BG3's forward target: cleared here (its sky), then its surfaces and effects blend over it, and the
+        // lighting composite (54fb164b) puts that over the lit scene. So WoW goes in right after the clear.
+        int colors = 0, at = -1;
+        for (uint32_t k = 0; k < n; k++) {
+            if (imgs[k] == g_role.depth || !imgs[k]) continue;
+            colors++;
+            ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh && load[k] == VK_ATTACHMENT_LOAD_OP_CLEAR) at = (int)k;
+        }
+        if (colors == 1 && at >= 0) { t_fbg_cb = cb; t_fbg_img = imgs[at]; t_fbg_lay = fin[at]; }
+    }
     if (depth && g_cc.surfscene && !g_cc.surfpost) {
         int colors = 0, at = -1;
         for (uint32_t k = 0; k < n; k++) {
@@ -630,6 +671,14 @@ static void sf_copy(DeviceData* d, VkCommandBuffer cb, VkImage src, VkImageLayou
 // BG3 ended a pass (its EndRenderPass already recorded): after the surface decals, A1; after the
 // surface forward layers, H. Copies record no binding, so BG3's state is untouched.
 static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
+    if (t_fbg_cb == cb) { t_fbg_cb = VK_NULL_HANDLE; fb_feed(d, cb, t_fbg_img, (VkImageLayout)t_fbg_lay); }
+    if (t_fog_cb == cb) { t_fog_cb = VK_NULL_HANDLE; fb_fog(d, cb); }
+    if (t_cld_cb == cb) { t_cld_cb = VK_NULL_HANDLE; fb_clr(d, cb); }
+    if (t_bare_cb == cb) { t_bare_cb = VK_NULL_HANDLE; fb_bare(d, cb); }
+    if (t_post_cb == cb) { t_post_cb = VK_NULL_HANDLE; fb_post(d, cb); }
+    if (t_blm_cb == cb) { t_blm_cb = VK_NULL_HANDLE; fb_bmask(d, cb); }
+    if (t_blc_cb == cb) { t_blc_cb = VK_NULL_HANDLE; fb_bcut(d, cb); }
+    if (t_pass_cb == cb) t_pass_cb = VK_NULL_HANDLE;  // a draw outside a full-size pass is in none of them
     if (t_sf_cb != cb) return;
     t_sf_cb = VK_NULL_HANDLE;
     if (g_cc.surfscene && !g_cc.surfpost) t_sf_fwd = 0;  // the lit-scene copy at the pass's start holds that slot
@@ -753,7 +802,7 @@ static uint32_t surf_for_compose(DeviceData* d, uint64_t framed_serial, uint32_t
         if (--g_sf.log_left == 0) { fclose(g_sf.lf); g_sf.lf = NULL; }
     }
     pthread_mutex_unlock(&g_sf.m);
-    if (!fl) return 0;
+    if (!fl && !g_cc.fxbg) return 0;
     uint8_t crec[96];
     float eye[3], fwd[3], right[3], up[3], tx, ty;
     if (!g_cc.surfpix && (!cam_m || !sf_cam_rec(cam_m, crec) || !sf_cam(crec, rec.eye, eye, fwd, right, up, &tx, &ty))) return 0;
@@ -772,6 +821,7 @@ static uint32_t surf_for_compose(DeviceData* d, uint64_t framed_serial, uint32_t
     uint32_t* u = (uint32_t*)(f + 40);
     // WoW's light on the ground (benilla 0052): BG3's decal colours lit by it.
     if (g_cc.slight && glight_m) { fl |= 32u; u[1] = glight_m; }
+    if (g_cc.fxbg) fl |= 64u;  // the camera block for the effects' lookup
     u[0] = fl;
     g_sf.composed++;
     if (!g_cc.surfpix) {  // the mapping check: WoW's camera (a few BG3 frames older) has BG3's own axes
