@@ -18,7 +18,7 @@ static void fb_stale_note(int bare, int slot) {
     if (n <= 10 || n % 300 == 0) logf_("fbstale: %s drew through the view of an image BG3 destroyed (slot %d), %llu such draws", bare ? "wdbare" : "feed", slot, (unsigned long long)n);
 }
 static VkImageView wd_mask_view(void);
-#define FB_PC 156
+#define FB_PC 160  // patch61: + evk
 // wdjit: BG3's TAA jitter (NDC, y down) of the frame recorded at a present, from wd_draw's G-buffer camera.
 static struct { uint64_t p; float j[2]; } g_jit[8];
 static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[2];
@@ -32,6 +32,119 @@ static struct {
     VkBuffer tbuf; VkDeviceMemory tmem; float* tmap; struct timespec tseen;
     uint64_t ebuf[2], eoff[2]; int etype[2]; VkBuffer esetbuf[2][2];
 } g_fbg;
+// patch60: BG3's eye state, where its adaptation writes it.
+#define WDX_METER 0x7387a4a6b28ed0d9ull
+#define WDX_ADAPT 0x1f20b342cda3d311ull
+#define WDX_WANT (g_cc.wdevref > 0.0f)  // patch61: the feed's wdevref
+static struct {
+    GBuf cur, held; int cur_ok, held_ok, made_fail; float held_e;
+    uint64_t out_res, out_off, in_res, in_off, n, skipped; uint32_t maxw;
+    FILE* csv; uint64_t csv_last;
+    struct { uint64_t key; uint32_t set, bind; } seen[64]; int nseen;
+} g_wdx;
+static __thread VkCommandBuffer t_wdx_cb; static __thread uint32_t t_wdx_mw, t_wdx_mh; static __thread uint64_t t_wdx_key;
+static void wdx_dispatch_pre(VkCommandBuffer cb) {
+    t_wdx_key = 0;
+    if (t_cbind_cb != cb || !t_cpipe) return;
+    CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL;
+    if (!p) return;
+    t_wdx_key = p->spv;
+    if (p->spv != WDX_METER) return;
+    uint64_t img = post_image(t_cset, 1, 1);  // the HDR target the meter reads
+    ImgInfo* im = img && g_img ? TABLE_FIND(g_img, IMG_CAP, img, 0) : NULL;
+    t_wdx_cb = cb; t_wdx_mw = im ? im->w : 0; t_wdx_mh = im ? im->hgt : 0;
+    if (im && im->w > g_wdx.maxw) g_wdx.maxw = im->w;
+    if (g_cc.wdexplog) {
+        static uint64_t nm; uint64_t o2 = 0;
+        const DescSlot* s2 = post_slot(t_cset, t_cdyn, t_cndyn, 1, 2, &o2);
+        if (nm++ < 4 || nm % 1800 == 0) logf_("wdexplog: meter %llu reads %ux%u, state %llx+%llu (type %d range %llu)", (unsigned long long)nm, t_wdx_mw, t_wdx_mh,
+                                              s2 ? (unsigned long long)s2->res : 0ull, (unsigned long long)o2, s2 ? s2->type : -1, s2 ? (unsigned long long)s2->range : 0ull);
+    }
+}
+static void wdx_barrier(DeviceData* d, VkCommandBuffer cb, VkPipelineStageFlags s0, VkAccessFlags a0, VkPipelineStageFlags s1, VkAccessFlags a1) {
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, a0, a1};
+    d->CmdPipelineBarrier(cb, s0, s1, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+static void wdx_dispatch_after(DeviceData* d, VkCommandBuffer cb) {
+    if (t_wdx_key != WDX_ADAPT || t_cbind_cb != cb || !d->CmdCopyBuffer) return;
+    if (!(g_cc.wdexplog || g_cc.wdexp > 0.0f || WDX_WANT)) return;
+    uint64_t oo = 0, oi = 0;
+    const DescSlot* so = post_slot(t_cset, t_cdyn, t_cndyn, 1, 1, &oo);
+    const DescSlot* si = post_slot(t_cset, t_cdyn, t_cndyn, 1, 2, &oi);
+    if (!so || !so->res) return;
+    // Only the main view's eye: its meter ran in this command buffer on the widest HDR target seen.
+    if (t_wdx_cb != cb || !t_wdx_mw || t_wdx_mw < g_wdx.maxw) { if (g_wdx.skipped++ < 4) logf_("wdexplog: an adaptation not on the main view skipped (meter %ux%u, widest %u)", t_wdx_mw, t_wdx_mh, g_wdx.maxw); return; }
+    if (!g_wdx.cur_ok && !g_wdx.made_fail) {
+        if (gbuf_make(d, &g_wdx.cur, 32, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) g_wdx.cur_ok = 1;
+        else { g_wdx.made_fail = 1; logf_("wdexplog: own state buffer not made"); return; }
+        memset(g_wdx.cur.map, 0, 32);
+    }
+    g_wdx.out_res = so->res; g_wdx.out_off = oo; g_wdx.in_res = si ? si->res : 0; g_wdx.in_off = oi; g_wdx.n++;
+    wdx_barrier(d, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (g_cc.wdexp > 0.0f) {  // the hold: all three values where BG3's adaptation wrote them
+        if (!g_wdx.held_ok) g_wdx.held_ok = gbuf_make(d, &g_wdx.held, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1);
+        if (g_wdx.held_ok) {
+            if (g_wdx.held_e != g_cc.wdexp) {  // a new value only when the word changes
+                float e = g_cc.wdexp, v[4] = {e, 1.0f / e, log2f(1.0f / (1.2f * e)), -8.0f};
+                memcpy(g_wdx.held.map, v, sizeof v); g_wdx.held_e = e;
+                logf_("wdexp: holding BG3's eye at EV %g (%g, %g) after its adaptation", v[2], v[0], v[1]);
+            }
+            VkBufferCopy r = {0, oo, 12};
+            d->CmdCopyBuffer(cb, g_wdx.held.buf, (VkBuffer)so->res, 1, &r);
+            wdx_barrier(d, cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        }
+    } else g_wdx.held_e = 0.0f;
+    VkBufferCopy rc = {oo, 0, 24};  // BG3's newest state into ours (read by the feed of the next frame, in queue order)
+    d->CmdCopyBuffer(cb, (VkBuffer)so->res, g_wdx.cur.buf, 1, &rc);
+    wdx_barrier(d, cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    if (g_cc.wdexplog) {
+        float u[4] = {0}; int ok = post_bytes(t_cset, t_cdyn, t_cndyn, 1, 3, u, 16);
+        const float* c = (const float*)g_wdx.cur.map;  // a frame or two old on the CPU: a log, not a control
+        if (g_wdx.n <= 4 || g_wdx.n % 300 == 0)
+            logf_("wdexplog: adaptation %llu out %llx+%llu (type %d) in %llx+%llu; window %g..%g compensation %g speed %g (%s); state %g %g EV %g %g",
+                  (unsigned long long)g_wdx.n, (unsigned long long)so->res, (unsigned long long)oo, so->type, (unsigned long long)g_wdx.in_res, (unsigned long long)oi,
+                  u[0], u[1], u[2], u[3], ok ? "read" : "not mapped", c[0], c[1], c[2], c[3]);
+        if (!g_wdx.csv) { g_wdx.csv = fopen(outp("/wdev.csv"), "a"); if (g_wdx.csv) fprintf(g_wdx.csv, "present,ev,ev_min,ev_max,comp,speed\n"); }
+        if (g_wdx.csv && g_req.presents != g_wdx.csv_last) { g_wdx.csv_last = g_req.presents; fprintf(g_wdx.csv, "%llu,%.4f,%g,%g,%g,%g\n", (unsigned long long)g_req.presents, c[2], u[0], u[1], u[2], u[3]); if (g_wdx.n % 60 == 0) fflush(g_wdx.csv); }
+    }
+}
+// Every pipeline that binds the eye state's buffer near its offset (who reads BG3's exposure on the GPU), once per key/set/binding.
+static void wdx_readers(VkCommandBuffer cb, int compute) {
+    if (!g_wdx.out_res || g_wdx.nseen >= 64) return;
+    const uint64_t* sets = compute ? t_cset : t_set;
+    if (compute ? (t_cbind_cb != cb || !t_cpipe) : (t_bind_cb != cb || !t_pipe)) return;
+    uint64_t key = 0, key2 = 0;
+    if (compute) { CPipeInfo* p = g_cpipe ? TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0) : NULL; key = p ? p->spv : 0; }
+    else {
+        RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
+        for (uint32_t s = 0; ri && ri->r && s < ri->r->nstages; s++) {
+            if (ri->r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) key = ri->r->st[s].key;
+            if (ri->r->st[s].stage == VK_SHADER_STAGE_VERTEX_BIT) key2 = ri->r->st[s].key;
+        }
+    }
+    for (uint32_t s = 0; s < 8; s++) {
+        if (!sets[s]) continue;
+        SetInfo* si = set_find(sets[s]);
+        for (uint32_t b = 0; si && b < DESC_SLOTS; b++) {
+            const DescSlot* sl = &si->slot[b];
+            if (!sl->res || (sl->res != g_wdx.out_res && sl->res != g_wdx.in_res)) continue;
+            uint64_t off = 0;
+            post_slot(sets, compute ? t_cdyn : t_dyn, compute ? t_cndyn : t_ndyn, s, b, &off);
+            uint64_t rng = sl->range == VK_WHOLE_SIZE ? ~0ull : sl->range;
+            int hit_out = sl->res == g_wdx.out_res && g_wdx.out_off >= off && g_wdx.out_off < off + rng;
+            int hit_in = sl->res == g_wdx.in_res && g_wdx.in_off >= off && g_wdx.in_off < off + rng;
+            int dup = 0;
+            for (int k = 0; k < g_wdx.nseen; k++) dup |= g_wdx.seen[k].key == key && g_wdx.seen[k].set == s && g_wdx.seen[k].bind == b;
+            if (dup || g_wdx.nseen >= 64) continue;
+            g_wdx.seen[g_wdx.nseen].key = key; g_wdx.seen[g_wdx.nseen].set = s; g_wdx.seen[g_wdx.nseen].bind = b; g_wdx.nseen++;
+            logf_("wdexplog: reader %s %llx%s%llx set %u binding %u type %d at %llx+%llu range %llu: %s (last out %llx+%llu, in %llx+%llu)", compute ? "cs" : "fs",
+                  (unsigned long long)key, compute ? "" : " vs ", (unsigned long long)key2, s, b, sl->type, (unsigned long long)sl->res, (unsigned long long)off,
+                  (unsigned long long)sl->range, hit_out ? "covers the last state written" : hit_in ? "covers the last state read" : "same buffer, elsewhere",
+                  (unsigned long long)g_wdx.out_res, (unsigned long long)g_wdx.out_off, (unsigned long long)g_wdx.in_res, (unsigned long long)g_wdx.in_off);
+        }
+    }
+}
 static int fb_make(DeviceData* d) {
     if (g_fbg.ready) return 1;
     if (g_fbg.failed) return 0;
@@ -907,11 +1020,13 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     fb_stale_note(0, slot);
     pthread_mutex_unlock(&g_fbt_m);
     if (!g_fbg.ebuf[0] || !g_fbg.ebuf[1]) { g_fbg.refused++; return; }
-    for (int e = 0; e < 2; e++) if (g_fbg.esetbuf[k][e] != (VkBuffer)g_fbg.ebuf[e]) {
-        VkDescriptorBufferInfo bi = {(VkBuffer)g_fbg.ebuf[e], 0, 16};
+    const int wdx_fix = mode == 0 && g_cc.wdevref > 0.0f && !g_cc.fxcal && g_wdx.cur_ok;  // patch61: binding 1 = BG3's newest eye state
+    const uint64_t eb[2] = {wdx_fix ? (uint64_t)g_wdx.cur.buf : g_fbg.ebuf[0], g_fbg.ebuf[1]};
+    for (int e = 0; e < 2; e++) if (g_fbg.esetbuf[k][e] != (VkBuffer)eb[e]) {
+        VkDescriptorBufferInfo bi = {(VkBuffer)eb[e], 0, 16};
         VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], (uint32_t)e + 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &bi, NULL};
         d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
-        g_fbg.esetbuf[k][e] = (VkBuffer)g_fbg.ebuf[e];
+        g_fbg.esetbuf[k][e] = (VkBuffer)eb[e];
     }
     {
         static VkImageView seen[2];
@@ -954,20 +1069,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             d->CmdCopyBuffer(cb, (VkBuffer)g_fbg.ebuf[1], rd.buf, 1, &r1);
         }
     }
-    if (g_cc.wdexp > 0.0f && d->CmdCopyBuffer) {
-        static GBuf held;
-        if (gbuf_make(d, &held, 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1)) {
-            float v[2] = {1.0f, g_cc.wdexp};
-            memcpy(held.map, v, sizeof v);
-            VkBufferCopy r0 = {0, g_fbg.eoff[0] + 4, 4}, r1 = {4, g_fbg.eoff[1], 4};
-            VkMemoryBarrier b0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
-            d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b0, 0, NULL, 0, NULL);
-            d->CmdCopyBuffer(cb, held.buf, (VkBuffer)g_fbg.ebuf[0], 1, &r0);
-            d->CmdCopyBuffer(cb, held.buf, (VkBuffer)g_fbg.ebuf[1], 1, &r1);
-            VkMemoryBarrier b1 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
-            d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b1, 0, NULL, 0, NULL);
-        }
-    }
+    // patch60: the wdexp hold moved to right after BG3's adaptation (wdx_dispatch_after), all three values.
     VkDescriptorSet fset = VK_NULL_HANDLE;
     if (fog) {
         const DescSlot *dp = &t_fogd.dep, *fx = &t_fogd.frox, *sm = &t_fogd.samp, *u30 = &t_fogd.u30, *u4 = &t_fogd.u4;
@@ -1007,7 +1109,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 9, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &b9, NULL}};
         d->UpdateDescriptorSets(d->device, 13, wr, 0, NULL);
     }
-    float pc[39];
+    float pc[40];
     memset(pc, 0, sizeof pc);
     memcpy(pc + 0, fN, 12); pc[3] = txN; memcpy(pc + 4, rN, 12); pc[7] = tyN; memcpy(pc + 8, uN, 12); pc[11] = 1.0f / (float)ii->w;
     memcpy(pc + 12, eK, 12); pc[15] = txK; memcpy(pc + 16, fK, 12); pc[19] = tyK; memcpy(pc + 20, rK, 12); pc[23] = 1.0f / (float)ii->hgt; memcpy(pc + 24, uK, 12);
@@ -1016,6 +1118,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     if (g_cc.wdfog && !fog) u[5] |= g_cc.wdfogst ? 64u : 4u;
     if (g_cc.wdfog && fog && g_cc.wdfogst) u[5] |= 64u;
     if (fog && g_cc.wdfogdbg) u[5] |= (uint32_t)g_cc.wdfogdbg << 4;  // 16: W off, 32: S out, 48/64/80: b2/b3/b1  // the feed only clears BG3's forward target at WoW's pixels
+    if (wdx_fix) { pc[39] = 1.2f * exp2f(g_cc.wdevref); u[5] |= 8u; }  // patch61
     pc[34] = w0.wnear; pc[35] = (w0.wzoff > -100.0f && w0.wzoff < 100.0f) ? w0.wzoff : 0.0f; pc[36] = g_cc.wgamma;
     if (g_cc.wdjit && !fog) {
         int b = -1;  // the newest G-buffer camera recorded: this frame's (its G-buffer pass comes before the forward pass)
@@ -1036,7 +1139,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, tost ? g_fog.rpst : g_fbg.rp, tost ? g_fog.fbst : slot_fb, {{0, 0}, {ii->w, ii->hgt}}, 0, NULL};
     d->CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    uint32_t eoffs[2] = {(uint32_t)g_fbg.eoff[0], (uint32_t)g_fbg.eoff[1]};
+    uint32_t eoffs[2] = {wdx_fix ? 0u : (uint32_t)g_fbg.eoff[0], (uint32_t)g_fbg.eoff[1]};
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? (tost ? g_fog.pipest : g_fog.pipe) : g_fbg.pipe);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? g_fog.layout : g_fbg.layout, 0, 1, fog ? &fset : &g_fbg.set[k], 2, eoffs);
     if (fog) { float k = (g_cc.fxcal || g_cc.wdfogdbg >= 2) ? 0.0f : 1.0f; float bc[4] = {k, k, k, 1.0f}; d->CmdSetBlendConstants(cb, bc); }

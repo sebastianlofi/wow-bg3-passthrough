@@ -13,6 +13,7 @@ layout(push_constant) uniform PC {
     float wnear, wzoff;
     float gamma;
     float jx, jy;  // wdjit (flag 128): BG3's TAA jitter of this frame, NDC y down
+    float evk;     // patch61 (flag 8): 1.2*2^EV_ref, WoW's ground has radiance table(w)/E_ref
 } pc;
 layout(location = 0) out vec4 o;
 layout(r32f, set = 0, binding = 4) uniform readonly image2D wmask;  // >0: the placeholder is what shows here
@@ -45,6 +46,9 @@ vec3 inv3(vec3 w) {
 }
 void main() {
     float ex = max(e0.a.y * e1.a.x, 1e-6);  // BG3's exposure: the x that shows as w is the table's over this
+    // patch61: e0 is BG3's newest eye state (the exposure this frame's lighting pre-exposes with): WoW's radiance
+    // table(w)/E_ref pre-exposed as BG3's lighting writes its own ground.
+    if ((pc.flags & 8u) != 0u && e0.a.x > 0.0) ex = 1.0 / (e0.a.x * pc.evk);
     vec2 ndc = vec2(gl_FragCoord.x * pc.uN.w, gl_FragCoord.y * pc.rK.w) * 2.0 - 1.0;  // y down
     if ((pc.flags & 128u) != 0u) ndc -= vec2(pc.jx, pc.jy);  // wdjit: the ray BG3's jittered projection gives this pixel
     bool zero = (pc.flags & 4u) != 0u;  // wdfog: the feed only clears; WoW comes in after the composite

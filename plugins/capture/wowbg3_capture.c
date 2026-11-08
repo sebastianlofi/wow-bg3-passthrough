@@ -1053,7 +1053,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, fbstale, wdtime, wdpostdbg; float wdexp, wdocc; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
@@ -1199,8 +1199,11 @@ static void compose_config(void) {
     g_cc.wdgcam = has_word(line, "wdgcam");
     g_cc.wdeyelog = has_word(line, "wdeyelog");
     g_cc.wdtime = has_word(line, "wdtime");
+    g_cc.wdexplog = has_word(line, "wdexplog");  // patch60
+    g_cc.wdexprd = has_word(line, "wdexprd");
     { const char* ws = strstr(line, "wdskip="); g_cc.wdskip = ws ? strtoull(ws + 7, NULL, 16) : 0; }
     { const char* we = strstr(line, "wdexp="); g_cc.wdexp = we ? (float)atof(we + 6) : 0.0f; }
+    { const char* wv = strstr(line, "wdevref="); g_cc.wdevref = wv ? strtof(wv + 8, NULL) : 0.0f; }  // patch61
     if (g_cc.wdepth) { g_cc.fxbg = 1; g_cc.fxbgpass = 1; g_cc.fxbgfwd = 1; }
     g_cc.surfpost = has_word(line, "surfpost");
     g_cc.fxwib = has_word(line, "fxwib");
@@ -2573,6 +2576,9 @@ static void fxp_dispatch(VkCommandBuffer cb);
 static int wd_skip_cs(VkCommandBuffer cb);
 static void wd_eye_log(VkCommandBuffer cb);
 static void wd_eye_after(DeviceData* d, VkCommandBuffer cb);
+static void wdx_dispatch_pre(VkCommandBuffer cb);
+static void wdx_dispatch_after(DeviceData* d, VkCommandBuffer cb);  // patch60
+static void wdx_readers(VkCommandBuffer cb, int compute);
 static void post_cas(DeviceData* d, VkCommandBuffer cb);
 static void fxc_copy(uint64_t src, uint64_t dst);
 static void fb_copy_hook(DeviceData* d, VkCommandBuffer cb, uint64_t s, uint64_t t, VkImageLayout sl);
@@ -3129,6 +3135,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(VkCommandBuffer cb, uint32_t v, 
     fxp_draw(cb);
     pv_draw(cb);
     fog_draw(cb);
+    if (g_cc.wdexprd) wdx_readers(cb, 0);
     COUNT_DRAW(cb, (uint64_t)v * i);
     d->CmdDraw(cb, v, i, fv, fi);
 }
@@ -3167,6 +3174,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(VkCommandBuffer cb, uint3
     if (!why && t_prop_cb == cb) why = 'Y';
     if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, why);
     COUNT_DRAW(cb, (uint64_t)n * i);
+    if (g_cc.wdexprd) wdx_readers(cb, 0);
     d->CmdDrawIndexed(cb, n, i, fi, vo, fin);
 }
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s) {
@@ -3193,7 +3201,10 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(VkCommandBuffer cb, uint32_t
     if (wd_skip_cs(cb)) return;
     if (g_cc.wdeyelog) wd_eye_log(cb);
     wd_light_log(cb);
+    wdx_dispatch_pre(cb);
+    if (g_cc.wdexprd) wdx_readers(cb, 1);
     d->CmdDispatch(cb, x, y, z);
+    wdx_dispatch_after(d, cb);
     if (g_cc.wdeyelog) wd_eye_after(d, cb);
     if (g_cc.wdpostcas) post_cas(d, cb);
 }
@@ -3202,6 +3213,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(VkCommandBuffer cb, 
     if (!d || !d->CmdDispatchIndirect) return;
     if (g_trace_armed) { CbLog* c = trace_cb(cb); if (c) { c->dispatches++; trace_dispatch_reads(c, cb, 0, 0, 0); pthread_mutex_unlock(&g_trace_lock); } }
     wd_light_ind(cb, o);
+    if (g_cc.wdexprd) wdx_readers(cb, 1);
     d->CmdDispatchIndirect(cb, b, o);
 }
 static void log_transfer(VkCommandBuffer cb, const char* what, uint64_t src, uint64_t dst) {
