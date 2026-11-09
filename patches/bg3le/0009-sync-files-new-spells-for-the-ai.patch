@@ -1,7 +1,37 @@
+diff --git a/src/game_state.cpp b/src/game_state.cpp
+--- a/src/game_state.cpp
++++ b/src/game_state.cpp
+@@ -37,6 +37,7 @@
+ extern "C" void bg3le_stats_module_loaded();
+ extern "C" void bg3le_templates_invalidate();
+ extern "C" void bg3le_stats_load_hooked();
++extern "C" void bg3le_meta_conditions_hook();
+ extern "C" void bg3le_stats_loading(bool loading);
+ extern "C" void bg3le_path_override_clear();
+ #include "targets.h"
+@@ -522,6 +523,8 @@
+     } else {
+         logf("gamestate: RPGStats::Load not found; StatsLoaded fires at story load");
+     }
++    // The spell loader's MetaConditions builder, so a spell made after the load gets its own (stat_sync.cpp).
++    bg3le_meta_conditions_hook();
+ 
+     // Its prologue loads a global rip-relatively, so the bytes differ in every
+     // build; the target's pattern wildcards that.
 diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
 --- a/src/vendor/stat_sync.cpp
 +++ b/src/vendor/stat_sync.cpp
-@@ -324,6 +324,7 @@
+@@ -23,6 +23,9 @@
+ #include "../targets.h"
+ #include "../mem.h"
+ #include "engine_containers.h"
++#include "../hook.h"
++
++#include <atomic>
+ 
+ namespace bg3le {
+ std::uintptr_t load_bias();
+@@ -324,6 +327,7 @@
  namespace {
  
  static_assert(offsetof(SpellPrototypeManager, SpellNames) - offsetof(SpellPrototypeManager, Spells) == 0x80);
@@ -9,7 +39,7 @@ diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
  static_assert(offsetof(StatusPrototypeManager, StatusNames) - offsetof(StatusPrototypeManager, Statuses) == 0x40);
  
  // Upstream's new-prototype branch of SyncStat: a default prototype, synced,
-@@ -335,6 +336,34 @@
+@@ -335,19 +339,108 @@
      std::memset((void*)p, 0, sizeof(P));
      new (p) P;
      return p;
@@ -41,10 +71,57 @@ diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
 +    const float steer = 1.0f;
 +    std::memcpy(raw + 0x330, &steer, sizeof(steer));
 +    return true;
++}
++
++// The spell loader's MetaConditions builder: run(manager, count, prototypes, job) builds each prototype's
++// MetaConditions (the conditions BG3's SpellMetaCondition resources add to the spells their filters match)
++// and moves them into it (bg3+0x3835bd0 on this build, a generic routine; the load calls it from
++// bg3+0x3e4b7ee with every prototype and a job whose vtable is image+0x7923be8, whose call entry is
++// bg3+0x5ecbc00). A spell made after the load never went through it. The load's call is seen through a hook
++// on the routine's call sites, which keeps the manager and the job's data; add_spell then runs the same
++// routine on the new prototype alone.
++using MetaRunFn = void (*)(void*, int, void* const*, void*, void*, void*);
++MetaRunFn g_meta_run = nullptr;
++std::atomic<void*> g_meta_manager{nullptr};
++std::atomic<void*> g_meta_job_data{nullptr};
++constexpr std::uintptr_t kMetaRun = 0x3835bd0;
++constexpr std::uintptr_t kMetaJobVtable = 0x7923be8;
++constexpr std::uintptr_t kMetaJobCall = 0x5ecbc00;
++const unsigned char kMetaRunBytes[] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
++                                       0x48, 0x81, 0xec, 0x28, 0x01, 0x00, 0x00};
++
++bool is_meta_job(void const* job) {
++    const std::uintptr_t bias = load_bias();
++    std::uintptr_t vt = 0, call = 0;
++    return job != nullptr && safe_read(job, &vt, sizeof(vt)) && vt == bias + kMetaJobVtable
++        && safe_read((void const*)(vt + 5 * sizeof(void*)), &call, sizeof(call)) && call == bias + kMetaJobCall;
++}
++
++void meta_run_hook(void* manager, int count, void* const* items, void* job, void* a5, void* a6) {
++    if (g_meta_manager.load() == nullptr && is_meta_job(job)) {
++        void* data = nullptr;
++        if (safe_read((char const*)job + sizeof(void*), &data, sizeof(data)) && data != nullptr) {
++            g_meta_job_data.store(data);
++            g_meta_manager.store(manager);
++            logf("stat sync: the spell loader's MetaConditions builder seen (%d prototypes)", count);
++        }
++    }
++    g_meta_run(manager, count, items, job, a5, a6);
  }
  
++// The new spell's MetaConditions, built by the loader's own routine. False if the load's call was not seen.
++bool build_meta_conditions(SpellPrototype* proto) {
++    void* manager = g_meta_manager.load();
++    void* data = g_meta_job_data.load();
++    if (g_meta_run == nullptr || manager == nullptr || data == nullptr) return false;
++    struct { std::uintptr_t Vtable; void* Data; } job{load_bias() + kMetaJobVtable, data};
++    void* items[1] = {proto};
++    g_meta_run(manager, 1, items, &job, nullptr, nullptr);
++    return true;
++}
++
  char const* add_spell(Object* object, char const* name) {
-@@ -342,9 +371,20 @@
+     auto* map = (char*)bg3le_prototype_map(0);
      if (map == nullptr) return "the spell prototype manager is not located";
      auto* proto = fresh_prototype<SpellPrototype>();
      if (proto == nullptr) return "out of memory";
@@ -65,3 +142,35 @@ diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
      if (!fs_map_insert<void*>(map, id, proto)) return "the spell map does not hash the way bg3le reads it";
      array_append<std::uint32_t>(map + 0x80, id);
      bg3le_prototype_added(0, name, proto);
++    if (!build_meta_conditions(proto)) {
++        logf("stat sync: %s has no MetaConditions: the loader's builder was not seen at this start", name);
++    }
+     return nullptr;
+ }
+ 
+@@ -478,6 +571,25 @@
+ // Rebuilds the prototype of the named stat. Returns nullptr on success, or
+ // when the stat has no prototype to rebuild (upstream does nothing there
+ // either); otherwise why it could not.
++// Called where bg3le hooks RPGStats::Load (game_state.cpp): the call sites of the spell loader's
++// MetaConditions builder, checked by its first bytes, go through meta_run_hook.
++extern "C" void bg3le_meta_conditions_hook() {
++    unsigned char have[sizeof(bg3le::kMetaRunBytes)] = {};
++    if (!bg3le::safe_read((void const*)(bg3le::load_bias() + bg3le::kMetaRun), have, sizeof(have))
++        || std::memcmp(have, bg3le::kMetaRunBytes, sizeof(have)) != 0) {
++        bg3le::logf("stat sync: the spell MetaConditions builder is not where this build has it; spells made in play get none");
++        return;
++    }
++    void* original = nullptr;
++    const std::size_t sites = bg3le::hook_call_sites(bg3le::kMetaRun, reinterpret_cast<void*>(&bg3le::meta_run_hook), &original);
++    if (sites == 0 || original == nullptr) {
++        bg3le::logf("stat sync: the spell MetaConditions builder's calls could not be hooked");
++        return;
++    }
++    bg3le::g_meta_run = reinterpret_cast<bg3le::MetaRunFn>(original);
++    bg3le::logf("stat sync: %zu call sites of the spell MetaConditions builder hooked", sites);
++}
++
+ extern "C" bool bg3le_stats_is_loading();
+ 
+ extern "C" char const* bg3le_stats_sync(char const* name) {
