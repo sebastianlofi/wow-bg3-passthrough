@@ -3059,6 +3059,27 @@ static int void_depth_only(const ImgInfo* i) {
     }
     return world;
 }
+// The pass on this thread is one of the world's shadow maps (void_depth_only), and its image.
+static __thread VkCommandBuffer t_shw_cb;
+static __thread uint64_t t_shw_img;
+static __thread VkViewport t_vs_vp;  // wowbg3_ground.inc.c's (the viewport BG3 set on this thread)
+static __thread VkCommandBuffer t_vs_cb;
+static __thread int t_vs_have;
+static volatile int g_shwlog;  // request "shwlog": the next draws of kept characters in shadow passes, with their view block
+static void shw_log(VkCommandBuffer cb) {
+    if (g_shwlog <= 0 || t_shw_cb != cb) return;
+    const float* f = (const float*)fxc_slot_cpu(0, 2, 224);
+    ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, t_shw_img, 0);
+    if (__atomic_sub_fetch(&g_shwlog, 1, __ATOMIC_RELAXED) < 0) return;
+    if (!f) { logf_("shwlog: image %ux%u, no view block at set 0 binding 2", i ? i->w : 0, i ? i->hgt : 0); return; }
+    logf_("shwlog: image %ux%u f%d viewport %g %g %gx%g depth %g..%g (have %d); V rows %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g; "
+          "P %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g; VP %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g; 48.. %g %g %g %g eye %g %g %g",
+          i ? i->w : 0, i ? i->hgt : 0, i ? (int)i->fmt : 0, t_vs_vp.x, t_vs_vp.y, t_vs_vp.width, t_vs_vp.height, t_vs_vp.minDepth, t_vs_vp.maxDepth, t_vs_cb == cb ? t_vs_have : -1,
+          f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15],
+          f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23], f[24], f[25], f[26], f[27], f[28], f[29], f[30], f[31],
+          f[32], f[33], f[34], f[35], f[36], f[37], f[38], f[39], f[40], f[41], f[42], f[43], f[44], f[45], f[46], f[47],
+          f[48], f[49], f[50], f[51], f[52], f[53], f[54]);
+}
 static void void_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs) {
     int colors = 0, scene = 0, depth = 0;
     ImgInfo* dimg = NULL;
@@ -3070,6 +3091,11 @@ static void void_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs) {
         if (is_depth_format(i->fmt)) { depth = 1; dimg = i; } else colors++;
     }
     if (scene || (depth && !colors && dimg && void_depth_only(dimg))) t_void_cb = cb;
+    t_shw_cb = VK_NULL_HANDLE;
+    if (!scene && depth && !colors && dimg && void_depth_only(dimg)) {
+        t_shw_cb = cb;
+        for (uint32_t k = 0; k < n; k++) if (imgs[k] && TABLE_FIND(g_img, IMG_CAP, imgs[k], 0) == dimg) t_shw_img = imgs[k];
+    }
     t_mesh_cb = scene && colors >= 5 ? cb : VK_NULL_HANDLE;  // BG3's G-buffer pass
 }
 // fxc_near_tav for a prop, decided now: a draw placed by its world-space vertices (fxc_place 3, the
@@ -3160,6 +3186,8 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
     if (g_screen && g_cc.screenlevel && !g_screen_dialog) return 0;
     if (t_void_cb != cb || !g_cc.void_ || !g_keep_active || t_ib_cb != cb || !t_ib) return 0;
     if (keep_has(t_ib)) {
+        shw_log(cb);
+        shade_view(cb);
         if (!hide_has(t_ib)) return 0;
         // A mesh both a kept character and a hidden one wear: the owner nearest the draw's own place.
         RecInfo* sri = t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;

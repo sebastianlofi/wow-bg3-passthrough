@@ -376,6 +376,7 @@ static __thread uint64_t t_ib;
 // forward pass), so this keeps world mode's own picture as it was.
 static __thread VkCommandBuffer t_tav_cb;
 static volatile int g_tavlog;  // presents left to log BG3's Tav draws (request "tavlog", research)
+static volatile int g_shwlog;  // wowbg3_fxcap.inc.c
 static void tav_log_draw(VkCommandBuffer cb);
 // BG3 screens with their own 3D picture: level-up, respec and the mirror
 // are character creation's screen, which draws a copy of the figure on BG3's scene depth with its own
@@ -414,8 +415,12 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
 static void ground_bind(VkCommandBuffer cb);
 static void ground_view_seen(void);
 static void ground_end(DeviceData* d, VkCommandBuffer cb);
+static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin, uint32_t w, uint32_t h);  // wowbg3_shade.inc.c
+static void shade_view(VkCommandBuffer cb);
+static void shade_end(DeviceData* d, VkCommandBuffer cb);
 static void ground_submit(uint32_t n, const VkCommandBuffer* cbs);
 static void ground_forget_image(DeviceData* d, VkImage img);
+static void shade_forget_image(DeviceData* d, VkImage img);
 static void ground_note_viewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v);
 static void ground_note_scissor(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkRect2D* r);
 static void ground_note_pipeline(const VkGraphicsPipelineCreateInfo* ci);
@@ -482,6 +487,7 @@ static void check_request(void) {
     if (!strcmp(tag, "fxdump")) { g_fx_dump_request = 1; logf_("fx: dump armed"); return; }
     if (!strcmp(tag, "bufs")) { g_bufs_request = 1; return; }
     if (!strcmp(tag, "tavlog")) { g_tavlog = 2; logf_("tavlog: armed"); return; }
+    if (!strcmp(tag, "shwlog")) { g_shwlog = 12; logf_("shwlog: armed"); return; }
     if (!strncmp(tag, "pace", 4)) { pace_request(atoi(tag + 4)); return; }
     if (!strncmp(tag, "surflog", 7)) { surf_log_request(atoi(tag + 7)); return; }
     if (!strncmp(tag, "fxwhy", 5)) { int f = atoi(tag + 5); g_fxw_frames = f > 0 && f <= 150 ? f : 1; logf_("fxwhy: armed for %d presents", g_fxw_frames); return; }
@@ -1053,7 +1059,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
@@ -1190,6 +1196,7 @@ static void compose_config(void) {
     g_cc.fbstale = has_word(line, "fbstale");
     g_cc.wdjit = has_word(line, "wdjit");
     g_cc.wdpost = has_word(line, "wdpost");
+    g_cc.noshade = has_word(line, "noshade");  // WoW's ground shade on BG3's figures off (wowbg3_shade.inc.c)
     g_cc.wdtable = has_word(line, "wdtable");  // research: WoW's pixels only through the feed's table, never their own colour after BG3's display transform
     g_cc.wdpostcas = has_word(line, "wdpostcas");
     g_cc.wdpostdbg = has_word(line, "wdpostdbg");
@@ -1920,6 +1927,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_DestroyImage(VkDevice device, VkImage im
     if (!d) return;
     gc_retire_image(image);  // the compositor's copies of it finish first
     ground_forget_image(d, image);
+    shade_forget_image(d, image);
     surf_forget_image(d, image);
     fb_forget_image(d, image);
     pthread_mutex_lock(&g_trace_lock);
@@ -2887,6 +2895,12 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         uint64_t imgs[8];
         for (uint32_t k = 0; k < n; k++) imgs[k] = view_image(il ? (uint64_t)il->pAttachments[k] : f->views[k]);
         void_pass(cb, n, imgs);
+        {  // the pass's layouts after it, for a draw of our own into a shadow map once it has ended (wowbg3_shade.inc.c)
+            RpInfo* ps = TABLE_FIND(g_rp, RP_CAP, (uint64_t)rp, 0);
+            int32_t sfin[8];
+            for (uint32_t k = 0; k < n; k++) sfin[k] = ps && k < ps->n ? ps->final[k] : -1;
+            shade_pass(cb, n, imgs, sfin, w, h);
+        }
         pthread_mutex_unlock(&g_trace_lock);
     }
     if (g_cc.on && g_cc.wdbloom && g_img) {  // patch28: any pass's first attachment (the bloom prefilter's is half size)
@@ -3001,6 +3015,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(VkCommandBuffer cb) {
     d->CmdEndRenderPass(cb);
     if (t_fx_cb == cb) fx_end(d, cb);
     ground_end(d, cb);
+    shade_end(d, cb);
     surf_pass_end(d, cb);
     pv_pass_end(d, cb);
 }
@@ -3014,6 +3029,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass2(VkCommandBuffer cb, co
     d->CmdEndRenderPass2(cb, info);
     if (t_fx_cb == cb) fx_end(d, cb);
     ground_end(d, cb);
+    shade_end(d, cb);
     surf_pass_end(d, cb);
     pv_pass_end(d, cb);
 }
@@ -3974,6 +3990,7 @@ static void pipe_watch(const VkGraphicsPipelineCreateInfo* ci) {
 }
 #include "wowbg3_pace.inc.c"
 #include "wowbg3_ground.inc.c"
+#include "wowbg3_shade.inc.c"
 #include "wowbg3_surf.inc.c"
 #include "wowbg3_preview.inc.c"
 __attribute__((visibility("hidden"))) int g_lk_sent_;
@@ -4034,6 +4051,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
         t = now_ns();
         fxc_present(q);
         ground_present();
+        shade_present();
         surf_present();
         pv_present(q);
         t_fxc = now_ns() - t;

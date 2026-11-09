@@ -1,0 +1,122 @@
+WOW-BG3 benilla patch 0126: WoW's ground shade of BG3's figures, for BG3's own lighting (on top of 0001-0125).
+
+- link/wowshade.txt: "WSH1 <count>", then a line a figure "<x y z, WoW yards> <0 lit .. 1 shadowed>": the light
+  ramp of the roots "wowbg3 Tav" and "wowbg3 companion N" (entity_shade.rs: the baked shadow of the ground under a
+  unit, the WMO and interior rules, the reference's ramp), written whole when a figure moved 0.3 yd or its level
+  0.02. BG3 draws those figures itself; the render plugin shadows each one in BG3's sun by this level.
+- GroundShade::shadowed(): the ramp between the lit outdoor level and the shadowed one, 0 to 1.
+- While BG3 draws the party (pose flag 8, patch 0122) the hidden roots are still moved to where the figures stand:
+  left where WoW last drew them (the world's origin on a start that never did), their shade was that place's.
+
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -303,10 +303,16 @@
+ }
+ 
+ /// End of a frame's update: what it was drawn from, for the export.
+-fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLighting>>, mut tag: ResMut<FrameTag>) {
++fn tag_frame(
++    p: Res<Pace>,
++    lighting: Option<Res<benilla_world::lighting::WowLighting>>,
++    figures: Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>,
++    mut tag: ResMut<FrameTag>,
++) {
+     if let Some(l) = lighting.as_ref() {
+         sky_export(l); // patch 0125
+     }
++    shade_export(&figures); // patch 0126
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+@@ -344,6 +350,42 @@
+     }
+ }
+ 
++/// Patch 0126: the ground shade of BG3's figures for BG3's own lighting. WoW shades a unit as a whole by the baked
++/// shadow of the ground under it (`entity_shade.rs`); BG3 draws the party's figures itself, so their roots here
++/// ("wowbg3 Tav", "wowbg3 companion N": hidden, still sampled and ramped like any unit) say what WoW would show:
++/// `$WOW_BG3_LINK_DIR/wowshade.txt`, "WSH1 <count>" then one line a figure, "<x y z, WoW yards> <0 lit .. 1
++/// shadowed>", written whole (rename) when a figure moved 0.3 yd or its level 0.02.
++fn shade_export(figures: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>) {
++    static LAST: std::sync::Mutex<Vec<[f32; 4]>> = std::sync::Mutex::new(Vec::new());
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let mut now: Vec<[f32; 4]> = figures
++        .iter()
++        .filter(|(name, _, _)| name.as_str().starts_with("wowbg3 "))
++        .map(|(_, gt, shade)| {
++            let p = benilla_assets::coords::bevy_to_wow(gt.translation());
++            [p[0], p[1], p[2], shade.shadowed()]
++        })
++        .collect();
++    now.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
++    let Ok(mut last) = LAST.lock() else { return };
++    let same = last.len() == now.len()
++        && last.iter().zip(now.iter()).all(|(a, b)| {
++            (a[0] - b[0]).abs() < 0.3 && (a[1] - b[1]).abs() < 0.3 && (a[2] - b[2]).abs() < 0.3 && (a[3] - b[3]).abs() < 0.02
++        });
++    if same {
++        return;
++    }
++    let mut text = format!("WSH1 {}\n", now.len());
++    for f in &now {
++        text.push_str(&format!("{:.2} {:.2} {:.2} {:.3}\n", f[0], f[1], f[2], f[3]));
++    }
++    let path = std::path::Path::new(&dir).join("wowshade.txt");
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
++        *last = now;
++    }
++}
++
+ /// Patch 0052: the terrain pass's light on level ground in full sun (`terrain.wgsl`: `clamp(ambient +
+ /// diffuse × max(N·L, 0))` per channel, gamma), as bytes, byte 3 = 1.
+ fn ground_light(l: &benilla_world::lighting::WowLighting) -> [u8; 4] {
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -2165,6 +2165,28 @@
+                 }
+             }
+         }
++        // Patch 0126: hidden, the roots still stand where the figures do, so each one's ground shade is its own
++        // place's (the render plugin shadows BG3's figure by it); left where they were, they sampled the ground of
++        // wherever WoW last drew them.
++        if let (Some(p), Some(file)) = (pose.as_ref(), d.file.as_ref()) {
++            let (centre, wow) = (file.centre, file.wow);
++            let place = |w: &[f32]| wow_to_bevy(bg3_to_wow(Vec3::new(w[4], w[5], w[6]), centre, wow));
++            if let Some(a) = p.recs.iter().find(|r| r.flags & 1 != 0) {
++                if let Ok((mut tf, _)) = roots.get_mut(root) {
++                    tf.translation = place(&a.world);
++                }
++            }
++            for f in d.figs.iter() {
++                let a = file
++                    .meshes
++                    .iter()
++                    .filter(|m| m.figure == f.figure)
++                    .find_map(|m| p.recs.iter().find(|r| r.key == m.key && r.flags & 1 != 0));
++                if let (Some(a), Ok((mut tf, _))) = (a, roots.get_mut(f.root)) {
++                    tf.translation = place(&a.world);
++                }
++            }
++        }
+         if !d.bg3_draws {
+             info!("wowbg3 tav: BG3 draws the party itself (pose flag 8): WoW's figures hidden");
+             d.bg3_draws = true;
+diff --git a/crates/benilla-world/src/entity_shade.rs b/crates/benilla-world/src/entity_shade.rs
+--- a/crates/benilla-world/src/entity_shade.rs
++++ b/crates/benilla-world/src/entity_shade.rs
+@@ -89,6 +89,12 @@
+ }
+ 
+ impl GroundShade {
++    /// WOW-BG3 patch 0126: how far this root's light has ramped to the shadowed level, 0 lit (or indoors) to 1 on
++    /// MCSH-shadowed ground, as its parts are drawn this frame.
++    pub fn shadowed(&self) -> f32 {
++        ((self.t - LIT_T) / (1.0 - LIT_T)).clamp(0.0, 1.0)
++    }
++
+     /// The committed intensity (`[node+0xa4]`), which the bake fold multiplies its diffuse word by.
+     pub(crate) fn intensity(&self) -> f32 {
+         2.5 - 2.0 * self.t
