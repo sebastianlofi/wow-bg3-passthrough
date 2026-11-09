@@ -1053,7 +1053,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
@@ -1190,6 +1190,7 @@ static void compose_config(void) {
     g_cc.fbstale = has_word(line, "fbstale");
     g_cc.wdjit = has_word(line, "wdjit");
     g_cc.wdpost = has_word(line, "wdpost");
+    g_cc.wdtable = has_word(line, "wdtable");  // research: WoW's pixels only through the feed's table, never their own colour after BG3's display transform
     g_cc.wdpostcas = has_word(line, "wdpostcas");
     g_cc.wdpostdbg = has_word(line, "wdpostdbg");
     { const char* oc = strstr(line, "wdocc="); g_cc.wdocc = oc ? strtof(oc + 6, NULL) : 1.0f; if (!(g_cc.wdocc >= 0.0f && g_cc.wdocc <= 1.0f)) g_cc.wdocc = 1.0f; }

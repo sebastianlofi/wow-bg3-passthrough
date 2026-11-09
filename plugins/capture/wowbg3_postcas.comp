@@ -1,13 +1,20 @@
-// WOW-BG3 capture layer (wdpostcas, wowbg3_fxbg.inc.c): after BG3's CAS sharpening, its input over its output where the
-// pixel is pure WoW ground (patch46: wdbloom's mask from the composite, as wdpost). Everything else keeps BG3's sharpening.
+// WOW-BG3 capture layer (wdpostcas, wowbg3_fxbg.inc.c): after BG3's CAS sharpening, where the pixel is pure WoW ground
+// (patch46: wdbloom's mask from the composite, as wdpost) and BG3 drew nothing over it after the feed (the mask says 2,
+// wowbg3_post.frag), WoW's own displayed colour of that pixel over CAS's output.
+// BG3's display transform takes a bright saturated colour towards white, so no value fed before it comes out as WoW's
+// quest mark yellow or a lit window; here, after it, the pixel is WoW's as WoW drew it. Without a colour from the feed
+// for the pixel: CAS's input (no sharpening). Everything else keeps BG3's picture.
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;
+layout(set = 0, binding = 1) uniform sampler2D wdsp;                    // WoW's own colour per pixel (the feed), a 1 where written
 layout(set = 0, binding = 5) uniform sampler2D cin;                     // CAS's input (the display transform's output)
 layout(rgb10_a2, set = 0, binding = 6) uniform writeonly image2D cout;  // CAS's output
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
-    if (!(imageLoad(nob, q).r > 0.5)) return;
-    imageStore(cout, q, texelFetch(cin, q, 0));
+    float n = imageLoad(nob, q).r;
+    if (!(n > 0.5)) return;
+    vec4 w = texelFetch(wdsp, q, 0);
+    imageStore(cout, q, n > 1.5 && w.a > 0.5 ? vec4(w.rgb, 1.0) : texelFetch(cin, q, 0));
 }

@@ -20,6 +20,7 @@ layout(r32f, set = 0, binding = 4) uniform readonly image2D wmask;  // >0: the p
 layout(std430, set = 0, binding = 3) readonly buffer Tab { float TAB[]; } tb;
 layout(rgba16f, set = 0, binding = 5) uniform readonly image2D stimg;
 layout(rgba32f, set = 0, binding = 6) uniform writeonly image2D wfed;  // patch28: what the feed wrote (wdbloom)  // wdfogst: BG3's S and T at the last composite
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D wdsp;  // WoW's own displayed colour at this pixel, no jitter (a 1): wdpostcas
 float s2l(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 vec3 wow_disp(uint x, uint y) {
     uint v = wow.w[(y * pc.cbpr + x * 4u) >> 2];
@@ -44,6 +45,26 @@ vec3 inv3(vec3 w) {
     vec3 c01 = mix(tab(i.x, i.y, i.z + 1), tab(i.x + 1, i.y, i.z + 1), f.x), c11 = mix(tab(i.x, i.y + 1, i.z + 1), tab(i.x + 1, i.y + 1, i.z + 1), f.x);
     return exp2(mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z));
 }
+// WoW's displayed colour where frame N's ray through `ndc` lands in WoW's frame K.
+vec3 wow_at(vec2 ndc) {
+    vec3 dir = pc.fN.xyz + pc.rN.xyz * (ndc.x * pc.fN.w) - pc.uN.xyz * (ndc.y * pc.rN.w);
+    uint qx = min(uint(gl_FragCoord.x * float(pc.ww) * pc.uN.w), pc.ww - 1u), qy = min(uint(gl_FragCoord.y * float(pc.wh) * pc.rK.w), pc.wh - 1u);
+    vec2 t = vec2(float(qx), float(qy));
+    for (int k = 0; k < 2; k++) {
+        float z = wow_z(qx, qy);
+        vec3 v = z < 1e20 ? dir * z - pc.eK.xyz : dir;
+        float zk = dot(v, pc.fK.xyz);
+        if (!(zk > 0.02)) break;
+        vec2 n = vec2(dot(v, pc.rK.xyz) / (zk * pc.eK.w), dot(v, pc.uK.xyz) / (zk * pc.fK.w));
+        t = vec2((n.x + 1.0) * 0.5 * float(pc.ww), (1.0 - n.y) * 0.5 * float(pc.wh)) - 0.5;
+        t = clamp(t, vec2(0.0), vec2(float(pc.ww) - 1.0, float(pc.wh) - 1.0));
+        qx = uint(t.x + 0.5); qy = uint(t.y + 0.5);
+    }
+    vec2 fl = floor(t), f = t - fl;
+    uint x0 = uint(fl.x), y0 = uint(fl.y), x1 = min(x0 + 1u, pc.ww - 1u), y1 = min(y0 + 1u, pc.wh - 1u);
+    vec3 w = mix(mix(wow_disp(x0, y0), wow_disp(x1, y0), f.x), mix(wow_disp(x0, y1), wow_disp(x1, y1), f.x), f.y);
+    return w;
+}
 void main() {
     float ex = max(e0.a.y * e1.a.x, 1e-6);  // BG3's exposure: the x that shows as w is the table's over this
     // patch61: e0 is BG3's newest eye state (the exposure this frame's lighting pre-exposes with): WoW's radiance
@@ -63,22 +84,10 @@ void main() {
     }
     if (!(imageLoad(wmask, ivec2(gl_FragCoord.xy)).r > 0.0)) discard;
     if (zero) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
-    vec3 dir = pc.fN.xyz + pc.rN.xyz * (ndc.x * pc.fN.w) - pc.uN.xyz * (ndc.y * pc.rN.w);
-    uint qx = min(uint(gl_FragCoord.x * float(pc.ww) * pc.uN.w), pc.ww - 1u), qy = min(uint(gl_FragCoord.y * float(pc.wh) * pc.rK.w), pc.wh - 1u);
-    vec2 t = vec2(float(qx), float(qy));
-    for (int k = 0; k < 2; k++) {
-        float z = wow_z(qx, qy);
-        vec3 v = z < 1e20 ? dir * z - pc.eK.xyz : dir;
-        float zk = dot(v, pc.fK.xyz);
-        if (!(zk > 0.02)) break;
-        vec2 n = vec2(dot(v, pc.rK.xyz) / (zk * pc.eK.w), dot(v, pc.uK.xyz) / (zk * pc.fK.w));
-        t = vec2((n.x + 1.0) * 0.5 * float(pc.ww), (1.0 - n.y) * 0.5 * float(pc.wh)) - 0.5;
-        t = clamp(t, vec2(0.0), vec2(float(pc.ww) - 1.0, float(pc.wh) - 1.0));
-        qx = uint(t.x + 0.5); qy = uint(t.y + 0.5);
-    }
-    vec2 fl = floor(t), f = t - fl;
-    uint x0 = uint(fl.x), y0 = uint(fl.y), x1 = min(x0 + 1u, pc.ww - 1u), y1 = min(y0 + 1u, pc.wh - 1u);
-    vec3 w = mix(mix(wow_disp(x0, y0), wow_disp(x1, y0), f.x), mix(wow_disp(x0, y1), wow_disp(x1, y1), f.x), f.y);
+    vec3 w = wow_at(ndc);
+    // BG3's display transform cannot show every colour WoW draws (a bright saturated one has no value that comes out
+    // as itself), so the pixel's own colour is kept beside what is fed, for after that transform.
+    imageStore(wdsp, ivec2(gl_FragCoord.xy), vec4((pc.flags & 128u) != 0u ? wow_at(ndc + vec2(pc.jx, pc.jy)) : w, 1.0));
     vec3 W = inv3(w) / ex;
     if ((pc.flags & 64u) != 0u) { vec4 st = imageLoad(stimg, ivec2(gl_FragCoord.xy)); W = max((W - st.rgb) / max(st.a, 1e-4), vec3(0.0)); }
     o = vec4(W, 1.0);
