@@ -9,7 +9,46 @@ diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
  static_assert(offsetof(StatusPrototypeManager, StatusNames) - offsetof(StatusPrototypeManager, Statuses) == 0x40);
  
  // Upstream's new-prototype branch of SyncStat: a default prototype, synced,
-@@ -345,6 +346,16 @@
+@@ -335,6 +336,34 @@
+     std::memset((void*)p, 0, sizeof(P));
+     new (p) P;
+     return p;
++}
++
++// What the engine's own constructor leaves in a new SpellPrototype where a zeroed bg3se one differs (the
++// constructor is inlined in the stats load's spell loop, bg3+0x6487d0a on this build, just before Init).
++// Init builds the rest from the stat -- its MetaConditions (the conditions the AI tests a spell by) and the
++// recharge range among them -- and relies on these: a zeroed prototype came out of Init with no
++// MetaConditions and no recharge, and BG3's AI never cast the spell (slot A, a boot copy and its twin made in
++// play from the same stats entry compared byte by byte).
++bool engine_defaults(SpellPrototype* proto) {
++    auto* raw = reinterpret_cast<unsigned char*>(proto);
++    auto put32 = [raw](std::size_t at, std::uint32_t v) { std::memcpy(raw + at, &v, sizeof(v)); };
++    put32(0x000, 0xffffffffu);  // StatsObjectIndex
++    put32(0x008, 0xffffffffu);  // SpellId
++    put32(0x048, 0xffffffffu);  // SpellContainerId
++    const std::uint16_t dice = 1;  // DiceValue 1, Cooldown 0
++    std::memcpy(raw + 0x054, &dice, sizeof(dice));
++    // A one-slot array with its buffer allocated, as the constructor makes it.
++    void* buffer = bg3se::GameAllocRaw(0x10);
++    if (buffer == nullptr) return false;
++    std::memset(buffer, 0, 0x10);
++    std::memcpy(raw + 0x2b0, &buffer, sizeof(buffer));
++    put32(0x2b8, 1);
++    put32(0x2bc, 0);
++    put32(0x2c0, 0xffffffffu);
++    for (std::size_t at : {std::size_t(0x310), std::size_t(0x314), std::size_t(0x318)}) put32(at, 0xffffffffu);
++    const float steer = 1.0f;
++    std::memcpy(raw + 0x330, &steer, sizeof(steer));
++    return true;
+ }
+ 
+ char const* add_spell(Object* object, char const* name) {
+@@ -342,9 +371,20 @@
+     if (map == nullptr) return "the spell prototype manager is not located";
+     auto* proto = fresh_prototype<SpellPrototype>();
+     if (proto == nullptr) return "out of memory";
++    if (!engine_defaults(proto)) return "out of memory";
      if (char const* err = sync_spell(object, proto)) return err;
      std::uint32_t id = 0;
      std::memcpy(&id, &object->Name, sizeof(id));

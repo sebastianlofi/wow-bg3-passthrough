@@ -8,7 +8,7 @@
   "llvm_commit": "392dfff97d29b59d77e5cac6d4b6ef2585fe7117",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "dae6bdfbeaaed6c98966f549b644138c76ba925520b0f81ae7b28fda9c612232",
+  "library_sha256": "e6ab3b219344acba887b63984939ab6523720e215e42fbbb0948b755ec096cd1",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -164,13 +164,13 @@
     },
     {
       "file": "patches/0009-sync-files-new-spells-for-the-ai.patch",
-      "sha256": "a842fddbefb1748a11a8e9872c79bd86c7c9d5fe0a34c86e968e93f858055740",
-      "purpose": "A spell made after the stats load (Create + Sync) is filed in SpellPrototypeManager's CombatAIOverrideSpells as the engine's load files every spell: missing there, the AI crashed on its holder's first turn",
+      "sha256": "09a12d6d2f2a2cd9cff501dfa5b707728c84c12ba49bea0d047b5d41f86ceb8a",
+      "purpose": "A spell made after the stats load (Create + Sync) is built as the engine's load builds one: the engine constructor's defaults before Init (else Init leaves out its MetaConditions and recharge, and BG3's AI never casts it), and filed in SpellPrototypeManager's CombatAIOverrideSpells (missing there, the AI crashed on its holder's first turn)",
       "targets": [
         {
           "path": "src/vendor/stat_sync.cpp",
           "before_sha256": "0b2b1bbde0c829dbc1bade12334d44909b2de4103be38062fdb6f2ee51490675",
-          "after_sha256": "b08cfc719703cff1e6bae93444c3b185ab8de5c86d0b8a4d52ce5c366af2a37d"
+          "after_sha256": "10ca9d7d96809dd12c1798f7e24bb794d193d5767775c721f04505ab859b75d3"
         }
       ]
     }
