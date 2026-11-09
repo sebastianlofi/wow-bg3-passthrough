@@ -82,6 +82,9 @@ function Probe.Start(context)
         if not okRs then Ext.Log.Print("WOW-BG3 render screen: " .. tostring(errRs)) end
         local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").StartClient() end)
         if not okMl then Ext.Log.Print("WOW-BG3 move loading: " .. tostring(errMl)) end
+        -- What the WoW side is doing, on BG3's loading screen while a load waits for it.
+        local okLn, errLn = pcall(function() Ext.Require("LoadingNote.lua").Start(report.RunId) end)
+        if not okLn then Ext.Log.Print("WOW-BG3 loading note: " .. tostring(errLn)) end
         Ext.Events.Tick:Subscribe(captureMenu)
         Ext.Require("MenuProbe.lua").Start(report.RunId)
         -- New game straight into world mode: research hook in any game state.

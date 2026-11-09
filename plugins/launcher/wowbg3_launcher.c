@@ -9,7 +9,9 @@
 //   3. Starts and stops the WoW side as child processes (launcher.conf: the portable server
 //      and the coordinator, which runs the offscreen benilla), with the data folder
 //      ~/.local/share/wow-bg3. They die with BG3 (PR_SET_PDEATHSIG from a supervisor thread that
-//      lives as long as the process) and get SIGTERM at a clean exit.
+//      lives as long as the process) and get SIGTERM at a clean exit. A child with "start = session"
+//      (the server) starts when BG3's client first leaves its main menu for a load (Load, Continue,
+//      New Game), so BG3's boot and the menu run with nothing of the WoW side working.
 //   4. Holds BG3's loading screen at every level load of a world-mode game until WoW's ground is
 //      placed under the hero. With bg3le patch 0004 the client is held in
 //      PrepareRunning: BG3's server goes Running and runs the level (the hero, the lifecycle's WoW
@@ -71,7 +73,7 @@
 
 #include "bg3le_plugin.h"
 
-#define LAUNCHER_VERSION "0.3.0"
+#define LAUNCHER_VERSION "0.4.0"
 #define MOD_UUID "a97c1258-37c3-434c-9309-c982f6cea252"
 #define MAX_CHILDREN 8
 #define MAX_ARGS 48
@@ -132,7 +134,7 @@ static const char* hold_target(void) {
 }
 
 // ---- children ----
-enum start_rule { START_ENABLED, START_REQUEST, START_ALWAYS, START_NEVER };
+enum start_rule { START_ENABLED, START_REQUEST, START_ALWAYS, START_NEVER, START_SESSION };
 typedef struct {
     char name[32];
     char exec[PATH_MAX * 2];
@@ -405,7 +407,7 @@ static void read_conf(void) {
         else if (!strcmp(key, "env") && c->envc < MAX_ENV && strchr(x, '=')) c->env[c->envc++] = strdup(x);
         else if (!strcmp(key, "start")) {
             c->start = !strcmp(x, "enabled") ? START_ENABLED : !strcmp(x, "always") ? START_ALWAYS
-                     : !strcmp(x, "never") ? START_NEVER : START_REQUEST;
+                     : !strcmp(x, "never") ? START_NEVER : !strcmp(x, "session") ? START_SESSION : START_REQUEST;
         } else if (!strcmp(key, "grace")) c->grace = atoi(x);
         else if (!strcmp(key, "restarts")) c->restarts = atoi(x);
         else if (!strcmp(key, "once")) c->once = atoi(x);
@@ -422,7 +424,7 @@ static void read_conf(void) {
             snprintf(marker, sizeof marker, "%s/run/%s.done", g_data, ch->name);
             ch->done = is_file(marker);
         }
-        static const char* rules[] = {"enabled", "request", "always", "never"};
+        static const char* rules[] = {"enabled", "request", "always", "never", "session"};
         LOG("child %s: %s (%d args), start %s", ch->name, ch->exec, ch->argc, rules[ch->start]);
     }
 }
@@ -652,6 +654,9 @@ static atomic_int g_quit;
 // BG3 itself skips exit() and with it the children's clean shutdown).
 static int s_stop_all = 0;
 static double g_start_wall = 0;
+// BG3's client has left its main menu for a load since this BG3 started (on_frame), or its game state cannot
+// be read (then "session" children start as "enabled" ones did). Set on the frame thread, read here.
+static atomic_int s_session_started;
 static int desired(child_t* c) {
     if (c->done || s_stop_all) return 0;
     if (c->want == 0) return 0;
@@ -659,6 +664,7 @@ static int desired(child_t* c) {
     switch (c->start) {
         case START_ALWAYS: return 1;
         case START_ENABLED: return s_mod_enabled;
+        case START_SESSION: return s_mod_enabled && atomic_load(&s_session_started);
         default: return 0;
     }
 }
@@ -1039,6 +1045,11 @@ static void on_frame(void* user, double dt) {
         last_holding = s_holding;
     }
     if (st && st != last) {
+        // Leaving the menu, or a session load reached without it (a launch straight into a save).
+        if (((last && !strcmp(last, "Menu")) || !strcmp(st, "LoadSession")) && !atomic_load(&s_session_started)) {
+            LOG("session: the client left the menu (%s); children with start = session start", st);
+            atomic_store(&s_session_started, 1);
+        }
         if (!strcmp(st, "UnloadSession") || !strcmp(st, "UnloadLevel") || !strcmp(st, "Menu")
             || !strcmp(st, "Disconnect")) {
             if (s_world != -1 || s_ready) LOG("session: %s; world and ready reset", st);
@@ -1145,6 +1156,10 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
         }
     } else {
         WARN("wowbg3-launcher: this bg3le has no state gates (WOW-BG3 patch 0003); the loading screen is not held");
+    }
+    if (!g_client_state) {
+        LOG("BG3's game state cannot be read: children with start = session start now");
+        atomic_store(&s_session_started, 1);
     }
     atexit(at_exit);
     write_status("start");

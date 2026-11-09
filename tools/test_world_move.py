@@ -508,7 +508,7 @@ class Cache(Base):
         point = {'id': 2, 'map': 0, 'x': -8840.25, 'y': 489.5, 'z': 109.125, 'name': 'Stormwind', W.ALLIANCE: 541, W.HORDE: 0}
         stored = []
         with mock.patch.object(W, 'nodes', lambda _: [point]), mock.patch.object(W, 'stand_z', lambda m, x, y, z, t: 104.5), \
-                mock.patch.object(B.wow_arena, 'ensure_mmtiles', lambda *_: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
+                mock.patch.object(B.wow_arena, 'ensure_mmtiles', lambda *_, **__: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
                 mock.patch.object(B, 'store_cut', stored.append):
             self.assertEqual(W.prewarm('dbc', (-1400.2, 120.0, -350.0), 2), 0)
         self.assertEqual(len(stored), 4)

@@ -5,6 +5,7 @@
 #   exec      the program (no shell; one arg per "arg" line)
 #   env       KEY=VALUE for this child only (repeatable)
 #   start     enabled: whenever WOW-BG3 is enabled in the mod manager (from the main menu on)
+#             session: when BG3 first leaves its main menu for a load (Load, Continue, New Game)
 #             request: only when the mod's Lua asks (Ext.Plugins.Set("wowbg3-launcher", NAME, 1))
 #             always | never
 #   grace     seconds between SIGTERM and SIGKILL when it is stopped
@@ -16,13 +17,14 @@
 
 [server]
 # The portable server (server/ in the WOW-BG3 repository): mangosd, realmd,
-# MariaDB, data generated from {wow} on the first start (a few minutes; the loading screen waits).
+# MariaDB, data generated from {wow} on the first start (about two minutes; the first load's loading
+# screen waits). Nothing runs at BG3's boot or in the menu: it starts with the first load.
 # "run": init on the first start, start, stay in the foreground, stop cleanly on SIGTERM.
 exec = {home}/server/wowbg3-server.sh
 arg = run
 arg = {wow}
 env = WOWBG3_SERVER_VAR={data}/server
-start = enabled
+start = session
 grace = 30
 restarts = 3
 

@@ -26,8 +26,19 @@
 #include "bg3le_plugin.h"
 
 typedef int (*state_gate_fn)(void*, const char*, const char*);
+// The host table as wowbg3_launcher.c reads it (its own fixed layout: bg3le's header has since grown
+// these fields into bg3le_host itself, so a struct that appends them to bg3le_host puts them too far).
 typedef struct {
-    bg3le_host base;
+    uint32_t abi;
+    uint32_t size;
+    const char* version;
+    void (*describe)(bg3le_plugin*, const char*, const char*);
+    void (*log)(bg3le_plugin*, const char*, ...);
+    void (*warn)(bg3le_plugin*, const char*, ...);
+    int (*add_event_handler)(bg3le_plugin*, bg3le_event_handler, void*);
+    void* (*sdl_function)(const char*);
+    int (*add_setting)(bg3le_plugin*, const char*, bg3le_setting_type, void*, double, double);
+    int (*add_frame_handler)(bg3le_plugin*, bg3le_frame_handler, void*);
     int (*add_state_gate)(bg3le_plugin*, state_gate_fn, void*);
     const char* (*game_state)(int);
     int (*state_gate_can_hold)(const char*, const char*);  // bg3le patch 0004 (TEST_HOLD4=1)
@@ -75,14 +86,14 @@ int main(int argc, char** argv) {
     if (!h) { printf("dlopen: %s\n", dlerror()); return 1; }
     int (*init)(const bg3le_host*, bg3le_plugin*) = (int (*)(const bg3le_host*, bg3le_plugin*))dlsym(h, "bg3le_plugin_init");
     static host_v2 host;
-    host.base.abi = BG3LE_PLUGIN_ABI;
-    host.base.size = getenv("TEST_OLD_BG3LE") ? sizeof(bg3le_host)
-                   : getenv("TEST_HOLD4") ? sizeof(host_v2) : offsetof(host_v2, state_gate_can_hold);
+    host.abi = BG3LE_PLUGIN_ABI;
+    host.size = getenv("TEST_OLD_BG3LE") ? offsetof(host_v2, add_state_gate)
+              : getenv("TEST_HOLD4") ? sizeof(host_v2) : offsetof(host_v2, state_gate_can_hold);
     host.state_gate_can_hold = can_hold;
-    host.base.version = "test"; host.base.describe = describe; host.base.log = hlog; host.base.warn = hwarn;
-    host.base.add_event_handler = add_event; host.base.sdl_function = sdl_fn; host.base.add_setting = add_setting;
-    host.base.add_frame_handler = add_frame; host.add_state_gate = add_gate; host.game_state = game_state;
-    int rc = init(&host.base, (bg3le_plugin*)&host);
+    host.version = "test"; host.describe = describe; host.log = hlog; host.warn = hwarn;
+    host.add_event_handler = add_event; host.sdl_function = sdl_fn; host.add_setting = add_setting;
+    host.add_frame_handler = add_frame; host.add_state_gate = add_gate; host.game_state = game_state;
+    int rc = init((const bg3le_host*)&host, (bg3le_plugin*)&host);
     printf("init -> %d\n", rc);
     char line[512];
     while (fgets(line, sizeof line, stdin)) {

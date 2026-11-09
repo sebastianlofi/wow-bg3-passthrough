@@ -92,10 +92,34 @@ def write_json(path, body):
     tmp.replace(path)
 
 
+NOTE = {'text': None}
+
+
 def status(phase, **extra):
     """run/coord.json: what the coordinator is doing (Busy holds BG3's loading screen past its timeout
-    while the server's first start builds its data, wowbg3-launcher)."""
+    while the server's first start builds its data, wowbg3-launcher). While that work is Busy, its line goes on
+    BG3's loading screen too (loading_note)."""
     write_json(RUN / 'coord.json', dict(extra, Format=1, Phase=phase, Pid=os.getpid(), Time=time.time()))
+    loading_note(phase, extra)
+
+
+def loading_note(phase, extra):
+    """wow-bg3/loading-note.json {RunId, Text}: the line LoadingNote.lua puts on BG3's loading screen while a
+    load waits for the WoW side; Text "" once nothing of ours is Busy. Written when it changes."""
+    text, detail = '', extra.get('Detail') or ''
+    if extra.get('Busy'):
+        if phase == 'server-init':
+            text = 'WoW server, first start: %s' % detail if detail else 'WoW server, first start'
+        elif phase.startswith('server-'):
+            text = 'Starting the WoW server'
+        elif detail:
+            text = 'WoW: %s' % detail
+    if text != NOTE['text']:
+        try:
+            write_json(IO / 'loading-note.json', {'RunId': os.environ.get('WOW_BG3_RUN_ID'), 'Text': text})
+            NOTE['text'] = text
+        except OSError as e:
+            log('loading note not written (%s)' % e)
 
 
 # ---- children ----
@@ -681,37 +705,18 @@ def abilities_make():
 
 
 BOOT_OVERRIDES = IO.parent / 'boot-path-overrides.txt'   # bg3le patch 0006 reads it as BG3 loads its stats
-BOOT_WAIT = IO.parent / 'boot-path-overrides.wait'        # bg3le patch 0008 waits on while it is fresh
-BOOT = {'held': False}
 
 
 def boot_overrides():
-    """This start's overrides file: it ends bg3le's wait, and BG3's loader reads the copies through it."""
+    """This start's overrides file: it ends bg3le's wait, and BG3's loader reads the copies through it.
+    BG3's boot never waits for the WoW side (bg3le patch 0008's wait file is not written any more): the server
+    starts at the first session load (launcher.conf start = session), so a table that is not there yet counts
+    from the next start."""
     on = S.get('mob_abilities') == '1'
     stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
     tmp = IO.parent / 'boot-path-overrides.tmp'
     tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_ready() else '')
     os.replace(tmp, BOOT_OVERRIDES)
-    BOOT['held'] = False
-
-
-def boot_hold():
-    """BG3's stats load waits (bg3le patch 0008) while BOOT_WAIT is younger than 10 s: written every 2 s until
-    boot_overrides(), or until the server's first start fails (then BG3 goes on without the copies)."""
-    BOOT['held'] = True
-
-    def refresh():
-        while BOOT['held']:
-            if server_state() == 'failed':
-                log('abilities: the server\'s first start failed; BG3 loads its stats without the mobs\' abilities')
-                boot_overrides()
-                break
-            try:
-                BOOT_WAIT.write_text('%d\n' % os.getpid())
-            except OSError as e:
-                log('abilities: %s not written (%s)' % (BOOT_WAIT, e))
-            time.sleep(2.0)
-    threading.Thread(target=refresh, daemon=True).start()
 
 
 def abilities_run(argv, env=None):
@@ -723,8 +728,8 @@ def abilities_run(argv, env=None):
 def abilities_first():
     """Before BG3 loads its stats (they are read once a start, and every copy must be there then): the table from
     this PC's seed when the rules or the database changed, needing no server. With no table at all (a new
-    install's first start), BG3's stats load is held (boot_hold) while the server imports its database, and
-    abilities_seeded() makes the seed and the table before it is let go. True when held."""
+    install's first start) BG3 goes on at once: its mobs use their basic attacks this start, and datagen makes
+    the seed and the table once the server runs, for the next start."""
     on = S.get('mob_abilities') == '1'
     if on and not abilities_current():
         t0 = time.time()
@@ -735,23 +740,9 @@ def abilities_first():
         elif abilities_ready():
             log('abilities: the rules changed, the seed is not of this database yet: last table kept, a new one after the server starts')
         elif game_data():
-            log('abilities: none yet: BG3 waits to load its stats until the server\'s database is in and they are made')
-            boot_hold()
-            return True
+            log('abilities: none yet: mobs use their basic attacks this start; the table is made once the server runs, for the next start')
         else:
             log('abilities: none, and no BG3 data folder to make them from')
-    boot_overrides()
-    return False
-
-
-def abilities_seeded():
-    """The held first start, once the server runs: the seed from its database, the table, then BG3's stats load."""
-    t0 = time.time()
-    rc = abilities_run(py('wow_abilities', 'localseed', ABILITIES_SEED, '--data', WOW / 'Data', '--key', seed_key(),
-                          '--db', 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos'), env=db_env())
-    if rc == 0:
-        rc = abilities_run(abilities_make())
-    log('abilities: seed and table of the new database, exit %d in %.1f s; BG3 loads its stats now' % (rc, time.time() - t0))
     boot_overrides()
 
 
@@ -796,34 +787,19 @@ def datagen():
     return rc
 
 
-# ---- movement tiles of the start zones, built ahead ----
+# ---- movement tiles, built where they are needed ----
 # The portable server's first start makes no movement maps; wow_arena.py builds the tiles a ground square
-# needs when it first needs them (6 to 10 s each, about a minute cold). The hero's start zones are built
-# here once, in the background, right after the server's first start, so a new game's first squares do not
-# wait for them under the loading screen. WoW start points (map, x, y) of every race's zone.
-STARTS = {'Northshire': (0, -8949.95, -132.49), 'Coldridge': (0, -6240.32, 331.03), 'Deathknell': (0, 1676.35, 1677.45),
-          'Shadowglen': (1, 10311.3, 832.46), 'ValleyOfTrials': (1, -618.52, -4251.67), 'Mulgore': (1, -2917.58, -257.98)}
+# needs when it first needs them (6 to 10 s each, about a minute cold) and keeps run/tiles.busy fresh
+# while it does. Nothing is built ahead: a held loading screen waits for them past hold_timeout (Busy).
+TILES_BUSY = RUN / 'tiles.busy'
 
 
-def pretiles():
-    """`wowbg3-coord.py --pretiles`: the 3 x 3 movement tiles round each start point (wowbg3-server.sh mmtiles,
-    three zones at a time, low priority), then run/pretiles.done."""
-    from concurrent.futures import ThreadPoolExecutor
-    script = Path(os.environ['WOW_BG3_SERVER']) / 'wowbg3-server.sh'
-
-    def zone(item):
-        name, (m, x, y) = item
-        tx, ty = int(32 - x / 533.33333), int(32 - y / 533.33333)
-        t0 = time.time()
-        # wowbg3-server.sh mmtile MAP X Y writes tile MAP Y X: its X is the grid's y index.
-        r = subprocess.run(['nice', '-n', '10', 'bash', str(script), 'mmtiles', str(m), str(ty), str(tx), '1'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log('start tiles %s (map %d, %d %d): exit %d in %.0f s' % (name, m, tx, ty, r.returncode, time.time() - t0))
-        return r.returncode
-    with ThreadPoolExecutor(3) as ex:
-        rcs = list(ex.map(zone, STARTS.items()))
-    (RUN / 'pretiles.done').write_text('%s\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
-    return 1 if any(rcs) else 0
+def tiles_busy():
+    """wow_arena.py is building movement tiles: run/tiles.busy written in the last 30 s (one tile takes 6 to 10 s)."""
+    try:
+        return time.time() - TILES_BUSY.stat().st_mtime < 30.0
+    except OSError:
+        return False
 
 
 # ---- the watcher, pointed at the release ----
@@ -882,24 +858,18 @@ def main():
     (IO / 'camp.json').write_text(json.dumps({'On': S.get('camp') == '1'}))
     (IO / 'wow-spells.json').write_text(json.dumps({'On': S.get('wow_spells') == '1'}))
     (IO / 'scaling.json').write_text(json.dumps({'On': S.get('scaling') == '1', 'Difficulty': S.get('difficulty')}))
-    held = abilities_first()
+    abilities_first()
     REL = Release()
     log('window %dx%d, settings %s' % (REL.size + (S,)))
+    log('server: starts when a session loads (launcher.conf start = session)')
     if not wait_server(stop):
-        if BOOT['held']:
-            boot_overrides()
         status('stopped')
         return
-    if held and BOOT['held']:
-        status('abilities')
-        abilities_seeded()
     status('accounts')
     account_env()
     REL.tav_prepare()
     if datagen_needed():
         PROCS.start('datagen', [sys.executable, '-u', Path(__file__).resolve(), '--datagen'])
-    if not (RUN / 'pretiles.done').exists():
-        PROCS.start('pretiles', [sys.executable, '-u', Path(__file__).resolve(), '--pretiles'])
     try:
         creature_stats()
     except Exception as e:
@@ -908,12 +878,11 @@ def main():
     status('watching')
 
     def busy_writer():
-        # While the start zones' movement tiles are still being built (the first start), a held loading screen
-        # waits for world mode past hold_timeout (coord.json Busy, refreshed every 2 s: wowbg3-launcher wants it
-        # under 10 s old; a thread, as a bring-up blocks the main loop for many seconds). Measured:
-        # the first New Game of a fresh install needed about 110 s for its first squares' tiles.
+        # While movement tiles are being built (a square's first visit), a held loading screen waits for world
+        # mode past hold_timeout (coord.json Busy, refreshed every 2 s: wowbg3-launcher wants it under 10 s old;
+        # a thread, as a bring-up blocks the main loop for many seconds).
         while not stop['now']:
-            status('watching', Busy=PROCS.alive('pretiles'))
+            status('watching', Busy=tiles_busy(), **({'Detail': 'building movement maps'} if tiles_busy() else {}))
             time.sleep(2.0)
     threading.Thread(target=busy_writer, daemon=True).start()
     log('lifecycle: watching BG3 (run %s)' % os.environ.get('WOW_BG3_RUN_ID'))
@@ -946,6 +915,4 @@ def main():
 if __name__ == '__main__':
     if sys.argv[1:] == ['--datagen']:
         sys.exit(datagen())
-    if sys.argv[1:] == ['--pretiles']:
-        sys.exit(pretiles())
     main()

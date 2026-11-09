@@ -219,7 +219,7 @@ def prewarm(dbc_dir, centre=None, floor=4):
     for n in points:
         if os.getppid() != parent:
             return 0
-        wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH)
+        wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH, busy=False)
     if centre is None:
         return 0
     import world_bridge as B
@@ -241,7 +241,7 @@ def prewarm(dbc_dir, centre=None, floor=4):
                         except Exception:  # noqa: BLE001
                             origins[n['id']] = (n['x'], n['y'], n['z'])
                     wx, wy = origins[n['id']][0] - (B.CELL * ij[1] + B.CELL / 2) / B.YD, origins[n['id']][1] + (B.CELL * ij[0] + B.CELL / 2) / B.YD
-                    wow_arena.ensure_mmtiles(mmaps, maps, n['map'], wx, wy, B.CELL / 2 / B.YD + 3)
+                    wow_arena.ensure_mmtiles(mmaps, maps, n['map'], wx, wy, B.CELL / 2 / B.YD + 3, busy=False)
                     B.store_cut(B.cut_args(terrain, n['map'], centre, origins[n['id']], ij))
                 except Exception:  # noqa: BLE001  a point off the height maps costs its move a cut, no more
                     continue

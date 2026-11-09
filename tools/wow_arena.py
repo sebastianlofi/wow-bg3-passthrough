@@ -60,7 +60,7 @@ picture under WoW's camera match WoW's; see the collision-hooks notes). --mirror
 at zero yaw, (-y, z, -x), which the patch 0003 proofs used. Size up to 120 m (wowbg3 plugin limits).
 Output is derived from Blizzard data: keep it out of git.
 """
-import argparse, json, math, os, struct, subprocess
+import argparse, json, math, os, struct, subprocess, time
 from pathlib import Path
 
 YD = 0.9144
@@ -373,14 +373,15 @@ class Surfaces:
                 out.append((z, self.tilt[k]))
         return out
 
-def ensure_mmtiles(mmaps, maps, map_id, wx, wy, reach):
+def ensure_mmtiles(mmaps, maps, map_id, wx, wy, reach, busy=True):
     """The movement tiles the square needs. The release's portable server
     makes maps and vmaps at its first start but no movement maps (data/mmaps stays empty), and a tile
     is walkable here only on a movement map polygon: without them every tile was blocked, BG3 found no
     valid position in world mode's ground and refused every CreateAt (no stand-ins, no fights). With a
     portable server (WOW_BG3_SERVER) each missing tile the square reaches is built once with its
     `wowbg3-server.sh mmtile` (MoveMapGenerator --tile, 6 to 10 s each, in parallel) and kept in the
-    server's data; the running server loads it too. The Docker test server has every tile."""
+    server's data; the running server loads it too. The Docker test server has every tile. `busy` False for
+    work ahead of need (wow_waypoints.py prewarm), which must not stretch a held loading screen."""
     server = os.environ.get('WOW_BG3_SERVER')
     script = Path(server) / 'wowbg3-server.sh' if server else None
     if script is None or not script.is_file():
@@ -396,6 +397,17 @@ def ensure_mmtiles(mmaps, maps, map_id, wx, wy, reach):
         # wowbg3-server.sh mmtile MAP X Y writes MAP Y X: its X is our ty, its Y our tx.
         jobs.append((name, subprocess.Popen(['bash', str(script), 'mmtile', str(map_id), str(ty), str(tx)],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
+    # <data>/run/tiles.busy stays fresh while they build: wowbg3-coord.py reports Busy, so a held loading
+    # screen waits for them past its timeout (nothing is built ahead of the square that needs it).
+    data = os.environ.get('WOWBG3_DATA')
+    mark = Path(data) / 'run' / 'tiles.busy' if busy and data and jobs else None
+    while mark is not None and any(p.poll() is None for _, p in jobs):
+        try:
+            mark.parent.mkdir(parents=True, exist_ok=True)
+            mark.touch()
+        except OSError:
+            pass
+        time.sleep(2.0)
     for name, p in jobs:
         p.wait()
         if not (Path(mmaps) / f'{name}.mmtile').exists():

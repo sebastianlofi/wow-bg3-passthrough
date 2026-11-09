@@ -263,6 +263,26 @@ pids="$(grep 'get server_pid' "$t/out8" | awk '{print $4}' | tr '\n' ' ')"
 [[ "$pids" =~ ^[1-9][0-9]*\ 0\ $ ]] && grep -q "clean exit server" "$data/logs/server.log" && pass "run/stop: children stopped cleanly and not restarted" || bad "run/stop: $pids"
 mv "$data/run/stop" "$t/stop.done"
 
+# 9 (0.4.0): a "start = session" child waits through BG3's menu and starts when the client leaves it.
+mv "$data/logs" "$t/oldlogs/run8" 2>/dev/null
+cp "$t/WOW-BG3/launcher.conf" "$t/launcher.conf.orig"
+sed -i '0,/start = enabled/s//start = session/' "$t/WOW-BG3/launcher.conf"
+"$host" "$plugin" > "$t/out9" 2>&1 <<S
+state Menu
+frame
+sleep 2
+get server_pid
+state StartLoading
+frame
+sleep 2
+get server_pid
+exit
+S
+pids="$(grep 'get server_pid' "$t/out9" | awk '{print $4}' | tr '\n' ' ')"
+[[ "$pids" =~ ^0\ [1-9][0-9]*\ $ ]] && grep -q "start session" "$t/out9" && grep -q "left the menu (StartLoading)" "$t/out9" \
+    && pass "start = session: not started in the menu, started when the client left it" || bad "start = session: $pids"
+cp "$t/launcher.conf.orig" "$t/WOW-BG3/launcher.conf"
+
 # 3: a bg3le without patch 0003: loads, says so, never holds
 TEST_OLD_BG3LE=1 "$host" "$plugin" > "$t/out3" 2>&1 <<S
 gate LoadLevel StopLoading
