@@ -791,6 +791,59 @@ def datagen():
 TILES_BUSY = RUN / 'tiles.busy'
 
 
+# ---- the WoW side coming in for a loaded session ----
+# A held loading screen (wowbg3-launcher, hold at PrepareRunning) lets BG3 in once world mode's Start has
+# placed the hero on WoW's ground; past hold_timeout only while coord.json says Busy. Between the server
+# running and that Start the coordinator still works (accounts, benilla's login, world mode, the first square's
+# movement tiles), so a session whose WoW side is not in yet is Busy too: else a first start gave up the hold
+# a minute and a half before WoW's ground was there and BG3 showed an empty void (Wolf, 2026-11-09).
+BRING = {'session': None, 'placed': None, 'since': 0.0}
+STEPS = {None: 'logging in', 'benilla': 'entering the world', 'world': 'placing the world', 'up': 'placing the ground'}
+
+
+def _io_json(name):
+    try:
+        p = IO / name
+        return json.loads(p.read_text()), p.stat().st_mtime
+    except (OSError, ValueError):
+        return None, 0.0
+
+
+def bringing_in():
+    """The step the WoW side is at for the session BG3 has loaded (hero.json, this run), or None when it is in
+    (world-status.json Active and OK, written since the session was first seen), failed, or no session is loaded."""
+    run = os.environ.get('WOW_BG3_RUN_ID')
+    hero, _ = _io_json('hero.json')
+    session = hero.get('Session') if isinstance(hero, dict) and hero.get('RunId') == run else None
+    if not session:
+        return None
+    flag, _ = _io_json('worldflag.json')
+    if isinstance(flag, dict) and flag.get('On') is False:   # a vanilla BG3 game: no WoW side comes in
+        return None
+    if session != BRING['session']:
+        BRING.update(session=session, placed=None, since=time.time())
+    if BRING['placed'] == session:
+        return None
+    ws, wm = _io_json('world-status.json')
+    if isinstance(ws, dict) and ws.get('RunId') == run and ws.get('Active') and ws.get('OK') and wm >= BRING['since'] - 1.0:
+        BRING['placed'] = session
+        return None
+    lc, _ = _io_json('lifecycle-state.json')
+    phase = lc.get('Phase') if isinstance(lc, dict) and lc.get('Session') == session else None
+    if phase in ('failed', 'down'):
+        return None
+    return STEPS.get(phase, 'logging in')
+
+
+def busy_now():
+    """(Busy, Detail) for coord.json once the server runs: movement tiles being built, or a session's WoW side
+    still coming in."""
+    if tiles_busy():
+        return True, 'building movement maps'
+    step = bringing_in()
+    return (True, step) if step else (False, None)
+
+
 def tiles_busy():
     """wow_arena.py is building movement tiles: run/tiles.busy written in the last 30 s (one tile takes 6 to 10 s)."""
     try:
@@ -862,7 +915,7 @@ def main():
     if not wait_server(stop):
         status('stopped')
         return
-    status('accounts')
+    status('accounts', Busy=True, Detail='setting up accounts')
     account_env()
     REL.tav_prepare()
     if datagen_needed():
@@ -872,14 +925,19 @@ def main():
     except Exception as e:
         log('creature numbers not made (%r): fights without WoW damage scaling' % e)
     life = lifecycle.Life(argparse.Namespace(launcher='release', tag='release', char=''))
-    status('watching')
+    def watching():
+        busy, detail = busy_now()
+        status('watching', Busy=busy, **({'Detail': detail} if detail else {}))
+
+    watching()
 
     def busy_writer():
-        # While movement tiles are being built (a square's first visit), a held loading screen waits for world
-        # mode past hold_timeout (coord.json Busy, refreshed every 2 s: wowbg3-launcher wants it under 10 s old;
-        # a thread, as a bring-up blocks the main loop for many seconds).
+        # While the WoW side comes in for a loaded session or movement tiles are being built (a square's first
+        # visit), a held loading screen waits for world mode past hold_timeout (coord.json Busy, refreshed every
+        # 2 s: wowbg3-launcher wants it under 10 s old; a thread, as a bring-up blocks the main loop for many
+        # seconds).
         while not stop['now']:
-            status('watching', Busy=tiles_busy(), **({'Detail': 'building movement maps'} if tiles_busy() else {}))
+            watching()
             time.sleep(2.0)
     threading.Thread(target=busy_writer, daemon=True).start()
     log('lifecycle: watching BG3 (run %s)' % os.environ.get('WOW_BG3_RUN_ID'))

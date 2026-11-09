@@ -415,9 +415,9 @@ static void rpc_calibrate(void) {
     const RpInfo* r0 = &smp[multi];
     // Mesa's own layouts first (vk_render_pass_attachment: format, flags, aspects, samples, view_mask, load,
     // store, stencil load, stencil store, initial, final, stencil initial, stencil final, external format;
-    // before Mesa 23 without flags), then the field search below.
-    static const int known[2][6] = {{56, 0, 20, 24, 36, 40}, {52, 0, 16, 20, 32, 36}};
-    for (int kk = 0; kk < 2 && !g_rpc.ok; kk++)
+    // Mesa 25.0 without flags or external format, 48 bytes), then the field search below.
+    static const int known[3][6] = {{56, 0, 20, 24, 36, 40}, {48, 0, 16, 20, 32, 36}, {52, 0, 16, 20, 32, 36}};
+    for (int kk = 0; kk < 3 && !g_rpc.ok; kk++)
         for (int o_cnt = 8; o_cnt < 256 && !g_rpc.ok; o_cnt += 4)
             for (int o_ptr = 8; o_ptr < 256 && !g_rpc.ok; o_ptr += 8) {
                 const int* L = known[kk];
@@ -501,21 +501,34 @@ static void rpc_recover(VkRenderPass rp) {
 }
 // Buffers made before the plugin. BG3 makes its constant rings at startup, so the
 // layer never saw them bound or their memory mapped, and the ground injection found no camera in BG3's
-// per-view block ("ground: ... without BG3's camera ... unmapped"). RADV keeps what is needed (Mesa 26.2:
-// radv_buffer = vk_buffer {vk_object_base, create_flags, size +72, usage, device_address +88, ...}, then
-// its winsys bo +104; the bo {va +0, size, ..., cpu_map}): a mapped buffer's bytes are at
-// bo->cpu_map + (device_address - bo->va). The offsets are checked, and the bo's cpu_map found, on buffers
-// the layer saw bound to mapped memory; until every sample fits, nothing is read (g_buf_recover stays unset).
-static struct { int ok, tries; int o_size, o_da, o_bo, o_va, o_map; uint64_t recovered, unmapped; } g_brc;
+// per-view block ("ground: ... without BG3's camera ... unmapped"). RADV keeps what is needed, laid out by
+// Mesa version (vk_buffer {vk_object_base, create_flags, size +72, usage +80, ...}):
+//   Mesa 26.x: vk_buffer gains device_address +88; radv_buffer {vk, winsys bo +104, range}: a mapped
+//              buffer's bytes are at bo->cpu_map + (device_address - bo->va).
+//   Mesa 25.0: radv_buffer {vk, winsys bo +88, offset +96, bo_va +104 (= bo->va), range}: bytes at
+//              bo->cpu_map + offset (Wolf's Steam container, Ubuntu 25.04: the 26.x read found no camera).
+// The bo {va +0, size +8, ..., cpu_map}. Which layout, and the bo's cpu_map, are checked on buffers the plugin
+// makes itself; until every sample fits, nothing is read (g_buf_recover stays unset).
+enum { BRC_ADDRESS, BRC_OFFSET };
+static struct { int ok, tries, kind; int o_size, o_da, o_bo, o_va, o_map, o_off, o_bova; uint64_t recovered, unmapped; } g_brc;
 static int brc_read(uint64_t h, int o_map, const uint8_t** p, uint64_t* size) {
-    uint64_t sz = 0, da = 0, bo = 0, va = 0, map = 0;
-    if (!rd((void*)(uintptr_t)(h + g_brc.o_size), &sz, 8) || !rd((void*)(uintptr_t)(h + g_brc.o_da), &da, 8) ||
-        !rd((void*)(uintptr_t)(h + g_brc.o_bo), &bo, 8))
-        return 0;
+    uint64_t sz = 0, bo = 0, va = 0, map = 0, at = 0;
+    if (!rd((void*)(uintptr_t)(h + g_brc.o_size), &sz, 8) || !rd((void*)(uintptr_t)(h + g_brc.o_bo), &bo, 8)) return 0;
     if (bo < 0x10000 || !rd((void*)(uintptr_t)(bo + g_brc.o_va), &va, 8) || !rd((void*)(uintptr_t)(bo + o_map), &map, 8)) return 0;
-    if (!sz || sz > (1ull << 32) || da < va || da - va > (1ull << 34)) return 0;
+    if (!sz || sz > (1ull << 32)) return 0;
+    if (g_brc.kind == BRC_ADDRESS) {
+        uint64_t da = 0;
+        if (!rd((void*)(uintptr_t)(h + g_brc.o_da), &da, 8) || da < va || da - va > (1ull << 34)) return 0;
+        at = da - va;
+    } else {
+        uint64_t bova = 0, bsz = 0;
+        if (!rd((void*)(uintptr_t)(h + g_brc.o_off), &at, 8) || !rd((void*)(uintptr_t)(h + g_brc.o_bova), &bova, 8) ||
+            !rd((void*)(uintptr_t)(bo + 8), &bsz, 8))
+            return 0;
+        if (bova != va || at > bsz || sz > bsz - at) return 0;
+    }
     *size = sz;
-    *p = map ? (const uint8_t*)(uintptr_t)(map + (da - va)) : NULL;
+    *p = map ? (const uint8_t*)(uintptr_t)(map + at) : NULL;
     return 1;
 }
 static const uint8_t* brc_recover(uint64_t buffer, uint64_t* size) {
@@ -532,25 +545,38 @@ static void brc_calibrate(void) {
     // makes two small host-visible buffers of its own (gbuf_make: the driver's functions, BG3's device)
     // and finds where RADV keeps what it needs on those.
     static GBuf own[2];
+    static const struct { const char* mesa; int kind, o_bo, o_da, o_off, o_bova; } L[2] = {
+        {"26.x", BRC_ADDRESS, 104, 88, 0, 0},
+        {"25.0", BRC_OFFSET, 88, 0, 96, 104},
+    };
     DeviceData* d = &g_devices[0];
     if (!d->device) return;
     g_brc.tries++;
     for (int k = 0; k < 2; k++)
         if (!own[k].buf && !gbuf_make(d, &own[k], 4096u << k, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return;
     if (!own[0].map || !own[1].map) return;
-    g_brc.o_size = 72; g_brc.o_da = 88; g_brc.o_bo = 104; g_brc.o_va = 0;
-    for (int o_map = 40; o_map <= 200 && !g_brc.ok; o_map += 8) {
-        int all = 1;
-        for (int k = 0; k < 2 && all; k++) {
-            const uint8_t* p = NULL;
-            uint64_t sz = 0;
-            all = brc_read((uint64_t)(uintptr_t)own[k].buf, o_map, &p, &sz) && p == (const uint8_t*)own[k].map && sz >= (4096u << k);
+    int which = -1;
+    for (int l = 0; l < 2 && !g_brc.ok; l++) {
+        g_brc.kind = L[l].kind; g_brc.o_size = 72; g_brc.o_bo = L[l].o_bo; g_brc.o_da = L[l].o_da;
+        g_brc.o_off = L[l].o_off; g_brc.o_bova = L[l].o_bova; g_brc.o_va = 0;
+        for (int o_map = 40; o_map <= 200 && !g_brc.ok; o_map += 8) {
+            int all = 1;
+            for (int k = 0; k < 2 && all; k++) {
+                const uint8_t* p = NULL;
+                uint64_t sz = 0;
+                all = brc_read((uint64_t)(uintptr_t)own[k].buf, o_map, &p, &sz) && p == (const uint8_t*)own[k].map && sz >= (4096u << k);
+            }
+            if (all) { g_brc.o_map = o_map; g_brc.ok = 1; which = l; }
         }
-        if (all) { g_brc.o_map = o_map; g_brc.ok = 1; }
     }
     if (g_brc.ok) {
-        rlog("buffers made before the plugin: the driver's object read (size +72, address +88, bo +104; bo va +0, cpu map +%d),"
-             " checked on two buffers of the plugin's own", g_brc.o_map);
+        if (L[which].kind == BRC_ADDRESS)
+            rlog("buffers made before the plugin: the driver's object read, Mesa %s layout (size +72, address +%d, bo +%d;"
+                 " bo va +0, cpu map +%d), checked on two buffers of the plugin's own", L[which].mesa, g_brc.o_da, g_brc.o_bo, g_brc.o_map);
+        else
+            rlog("buffers made before the plugin: the driver's object read, Mesa %s layout (size +72, bo +%d, offset +%d,"
+                 " bo va +%d; bo va +0, cpu map +%d), checked on two buffers of the plugin's own", L[which].mesa, g_brc.o_bo,
+                 g_brc.o_off, g_brc.o_bova, g_brc.o_map);
         g_buf_recover = brc_recover;
     } else if (g_brc.tries <= 3) {
         uint64_t q[16] = {0};
