@@ -83,13 +83,19 @@ local function uuidOf(s) return type(s) == "string" and s:match("(%x+%-%x+%-%x+%
 M.UuidOf = uuidOf
 
 -- ---- the item table ----
-local items, iconSet = nil, nil
+local items, iconSet, itemsLooked = nil, nil, nil
+-- A new install's first session makes items.json while the game runs: until it is there the table is empty and is
+-- looked for again at the next call (kept empty, a first session had no item of WoW's until the next load).
 function M.Items()
     if items then return items end
-    items = {}
+    local now = Ext.Utils.MonotonicTime()
+    if itemsLooked and now - itemsLooked < 2000 then return {} end
+    itemsLooked = now
     local raw = Ext.IO.LoadFile(IO .. "items.json")
     local ok, t = pcall(Ext.Json.Parse, raw or "")
-    if ok and type(t) == "table" and type(t.Items) == "table" then
+    if not (ok and type(t) == "table" and type(t.Items) == "table") then return {} end
+    items = {}
+    do
         for _, r in ipairs(t.Items) do items[r.e] = r end
         M.CopperPerGold = t.CopperPerGold or 1
         -- The effects switch (wow_items.py --effects): absent from the table when off.

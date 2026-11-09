@@ -216,7 +216,9 @@ function M.InstallMerchantCursor()
     return M.MerchantInstalled
 end
 
-function M.InstallQuestCursors()
+-- `again`: a later look for the files (a new install's first session makes them while the game runs; the early
+-- plugin reads each file when BG3 first sets its cursor): says nothing while they are still missing.
+function M.InstallQuestCursors(again)
     local st = {}
     local ok, err = pcall(function()
         for _, f in ipairs(QUEST_FILES) do
@@ -232,6 +234,7 @@ function M.InstallQuestCursors()
         st.Plugin = plugin.Version
     end)
     M.QuestInstalled = ok
+    if again and not ok then return false end
     st.Installed, st.Error = ok, (not ok) and tostring(err) or nil
     M.QuestStatus = st
     Ext.IO.SaveFile("wow-bg3/cursor-status.json", Ext.Json.Stringify(st))
@@ -340,6 +343,7 @@ function M.Start(runId)
     local ticks, overridden, written = 0, false, nil
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
+        if not M.QuestInstalled and ticks % 300 == 0 then pcall(M.InstallQuestCursors, true) end
         if not M.MerchantInstalled and ticks % 300 == 1 then pcall(M.InstallMerchantCursor) end
         if not (World.IsActive and World.IsActive()) then
             if overridden then pcall(function() local c = Ext.UI.GetCursorControl(); c.CursorOverrides = {} end); overridden = false end
