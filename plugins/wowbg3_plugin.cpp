@@ -2666,10 +2666,6 @@ struct CamPose {
     glm::vec3 Translate{};
     float Rotate[4]{};
     bg3se::Transform Xform{};
-    // The rigid orbit: the rotation BG3 renders this pose's eye with (the one served a frame earlier, see clear_pose),
-    // camera-to-world (s, u, f); lead_frame sends it to benilla with the eye.
-    bool Rendered = false;
-    glm::mat3 RenderedRot{};
 };
 
 struct CameraSwap {
@@ -2720,13 +2716,45 @@ CamPose const* live_pose(void const* self) {
 
 CamPose const* clear_pose(void const* self, bool* tested = nullptr);  // leading: BG3's own pose, eye out of WoW's ground
 
+// link/camtrace.on: every camera getter call BG3 makes (link/camcalls.csv): when, which thread, which getter
+// (T translate, X transform, R rotate), the frame count it fell in and what it was given.
+std::atomic<bool> g_camtrace{false};
+std::uint64_t cam_trace_frame();
+void cam_call_trace(char which, void const* self, glm::vec3 const* eye, float const* quat) {
+    static std::mutex lock;
+    static FILE* tf = nullptr;
+    std::lock_guard<std::mutex> held(lock);
+    if (tf == nullptr) {
+        tf = std::fopen((io_dir() + "link/camcalls.csv").c_str(), "w");
+        if (tf == nullptr) return;
+        std::fprintf(tf, "t,tid,getter,game,frame,eye_x,eye_y,eye_z,q0,q1,q2,q3,own_x,own_y,own_z,own_q0,own_q1,own_q2,own_q3\n");
+    }
+    glm::vec3 own(0.0f);
+    float ownq[4] = {};
+    if (self == g_cam.Controller) {  // BG3's own pose at this very call
+        if (bg3se::Transform const* x = known_cam(self).Transform(self)) {
+            own = x->Translate;
+            std::memcpy(ownq, &x->RotationQuat, sizeof(ownq));
+        }
+    }
+    const glm::vec3 e = eye != nullptr ? *eye : glm::vec3(0.0f);
+    const float zero[4] = {};
+    const float* q = quat != nullptr ? quat : zero;
+    std::fprintf(tf, "%.6f,%ld,%c,%d,%llu,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f,%.6f\n", mono_seconds(),
+                 (long)::syscall(SYS_gettid), which, self == g_cam.Controller ? 1 : 0, (unsigned long long)cam_trace_frame(), e.x, e.y, e.z,
+                 q[0], q[1], q[2], q[3], own.x, own.y, own.z, ownq[0], ownq[1], ownq[2], ownq[3]);
+}
+
 glm::vec3 const* cam_translate_hook(void const* self) {
     g_cam.Calls[0].fetch_add(1, std::memory_order_relaxed);
     if (auto const* p = live_pose(self)) {
         g_cam.Served[0].fetch_add(1, std::memory_order_relaxed);
         return &p->Translate;
     }
-    if (auto const* p = clear_pose(self)) return &p->Translate;
+    if (auto const* p = clear_pose(self)) {
+        if (g_camtrace.load(std::memory_order_relaxed)) cam_call_trace('T', self, &p->Translate, nullptr);
+        return &p->Translate;
+    }
     return known_cam(self).Translate(self);
 }
 float const* cam_rotate_hook(void const* self) {
@@ -2735,6 +2763,7 @@ float const* cam_rotate_hook(void const* self) {
         g_cam.Served[1].fetch_add(1, std::memory_order_relaxed);
         return p->Rotate;
     }
+    if (g_camtrace.load(std::memory_order_relaxed)) cam_call_trace('R', self, nullptr, known_cam(self).Rotate(self));
     return known_cam(self).Rotate(self);
 }
 bg3se::Transform const* cam_transform_hook(void const* self) {
@@ -2743,7 +2772,10 @@ bg3se::Transform const* cam_transform_hook(void const* self) {
         g_cam.Served[2].fetch_add(1, std::memory_order_relaxed);
         return &p->Xform;
     }
-    if (auto const* p = clear_pose(self)) return &p->Xform;
+    if (auto const* p = clear_pose(self)) {
+        if (g_camtrace.load(std::memory_order_relaxed)) cam_call_trace('X', self, &p->Xform.Translate, p->Rotate);
+        return &p->Xform;
+    }
     return known_cam(self).Transform(self);
 }
 float cam_fov_hook(void* self) {
@@ -3133,7 +3165,8 @@ struct CamClear {
         bool Moved = false;
         bool Tested = false;      // WoW's ground was there to test it against
         bool Easing = false;      // held in by the ease out: computed again next frame
-        bool Rigid = false;       // the rigid orbit's pose: the one pose of its frame (see clear_pose)
+        bool Rigid = false;       // the rigid orbit's pose: one per state of BG3's own camera (see clear_pose)
+        float RotKey[4]{};        // that controller's own rotation it was computed for (rigid)
         std::uint64_t Frame = 0;  // g_clear.Frame when computed
         CamPose Pose;
     };
@@ -3141,9 +3174,6 @@ struct CamClear {
     Entry Ring[2][kPoseRing];
     std::atomic<int> Current[2]{-1, -1};
     // The rigid orbit's last rotation per controller and its frame (under Lock): what BG3 renders the next frame with.
-    glm::mat3 RigidRot[2]{};
-    std::uint64_t RigidFrame[2]{0, 0};
-    bool RigidHave[2]{false, false};
     int Next[2]{0, 0};
     std::mutex Lock;
     std::atomic<std::uint64_t> Computed{0}, Moved{0};
@@ -3564,8 +3594,9 @@ void read_wish(double now) {
 
 // Sets `eye` and `rot` (BG3's camera-to-world: s, u, f) from the wish. False: BG3's own camera stays (no word from
 // the client, tactical view, off WoW's ground: camp, a load).
-bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& tav, double now, glm::vec3 const* aim, glm::vec3& eye,
-                glm::mat3& rot) {
+bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& tav, double now, glm::vec3& eye, glm::mat3& rot,
+                bool& settling) {
+    settling = false;
     read_wish(now);
     ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
     glm::vec3 look(g_wish.Look.x, g_wish.Height + kRigidLiftM, g_wish.Look.z);
@@ -3588,10 +3619,13 @@ bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& t
     const double dt = std::clamp(now - g_pin_at, 0.0, 0.1);
     g_pin_at = now;
     g_pin_y += (look.y - g_pin_y) * (1.0f - std::exp(-(float)dt / kRigidEaseS));
-    // BG3's Direction points from the eye to the look point or back: its side is the one its own forward is on.
-    glm::vec2 dir = glm::normalize(across);
+    // The bearing is BG3's own, of the very camera state this pose is for (clear_pose): the wish is the client Lua's
+    // record of a tick and can be a state behind or ahead of the one being asked about. BG3 never swings its bearing
+    // round what stands in the way, only its height and distance, so those two stay the wish's.
     const glm::vec2 fwd0(rot0[2].x, rot0[2].z);
+    glm::vec2 dir = glm::normalize(across);  // BG3's Direction points from the eye to the look point or back
     if (glm::dot(dir, fwd0) < 0.0f) dir = -dir;
+    if (glm::length(fwd0) > 1e-3f) dir = glm::normalize(fwd0);
     const float pitch = glm::radians(std::abs(g_wish.Pitch));
     const glm::vec3 f = glm::normalize(glm::vec3(dir.x * std::cos(pitch), -std::sin(pitch), dir.y * std::cos(pitch)));
     glm::vec3 side = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), f));
@@ -3599,14 +3633,16 @@ bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& t
     glm::vec3 up = glm::normalize(glm::cross(f, side));
     if (glm::dot(up, rot0[1]) < 0.0f) up = -up;
     rot = glm::mat3(side, up, f);
-    // `aim`: the view direction BG3 renders this eye with, when that is not this wish's (clear_pose).
-    eye = glm::vec3(look.x, g_pin_y, look.z) - (aim != nullptr ? *aim : f) * g_wish.Distance;
+    eye = glm::vec3(look.x, g_pin_y, look.z) - f * g_wish.Distance;
+    settling = std::abs(look.y - g_pin_y) > 1e-3f;  // the height still eases: computed again next frame
     if (++g_wish.Served % 600 == 1) {
         logf("camera: rigid, distance %.2f pitch %.1f (BG3's forward y %.2f) look %.1f %.1f height %.2f (tav %.2f); BG3's own eye %.1f over the height, ours %.1f",
              g_wish.Distance, g_wish.Pitch, rot0[2].y, g_wish.Look.x, g_wish.Look.z, g_wish.Height, tav.y, eye0.y - look.y, eye.y - look.y);
     }
     return true;
 }
+
+std::uint64_t cam_trace_frame() { return g_clear.Frame.load(std::memory_order_acquire); }
 
 CamPose const* clear_pose(void const* self, bool* tested) {
     if (tested != nullptr) *tested = false;
@@ -3621,17 +3657,24 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     const glm::vec3 eye0 = x->Translate;
     auto& ring = g_clear.Ring[slot];
     const std::uint64_t frame = g_clear.Frame.load(std::memory_order_acquire);
-    // The rigid orbit: one pose per frame (lead_frame's count), the first one asked for, whoever asks. BG3's render
-    // (its main thread) asks first, about 20 ms after lead_frame, and always reads the newest campose.bin of a whole
-    // tick; BG3's GameThread and lead_frame ask 10 to 13 ms later, close to the client Lua tick that writes the file,
-    // and computed it again whenever Tav's generation or BG3's own eye had changed. Measured in release mode slot B,
-    // zoomed in, walking at 30 fps: the poses BG3 rendered advanced one campose record per frame, those lead_frame
-    // sent benilla 0, 1, 2, 0, 1, 2 (a period of three), so one rendered frame in three had no camera record, its
-    // packet took the newest (a frame ahead of her pose) and she shook against the camera by a frame's step.
-    // Held for the frame, what BG3 renders and the record lead_frame writes are the same pose.
+    // The rigid orbit: one pose per state of BG3's own camera, as BG3's own getters give one. BG3's GameThread moves
+    // its camera once a tick and at once copies the transform for the next frame's render; its main thread and
+    // the culling workers ask again at the start of that frame, before the next move (link/camcalls.csv: the own
+    // pose changes about 6 ms into a frame, first seen by GameThread's transform call). Stock, all of them read the
+    // same state, so a frame's rotation, eye, shadow fit and light culling agree. Served one pose per frame of ours
+    // instead (two builds: the first asker's for everyone; then the eye turned back by a frame), the copy GameThread
+    // took and the eye the render asked for came from different poses: turning, the picture stepped back and forth,
+    // and BG3 lit and shadowed its characters for another camera than it drew them with, so their shading changed
+    // whenever the camera started or stopped. Keyed on BG3's own eye and rotation, every asker of one state gets one
+    // pose, whenever it asks.
+    float rotKey[4];
+    std::memcpy(rotKey, &x->RotationQuat, sizeof(rotKey));
     auto cached = [&](int i) {
         if (i < 0 || ring[i].Controller != self) return false;
-        if (ring[i].Rigid) return ring[i].Frame == frame;
+        if (ring[i].Rigid) {
+            return ring[i].Key == eye0 && std::memcmp(ring[i].RotKey, rotKey, sizeof(rotKey)) == 0
+                && (!ring[i].Easing || ring[i].Frame == frame);
+        }
         return ring[i].Gen == gen && ring[i].Key == eye0 && (!ring[i].Easing || ring[i].Frame == frame);
     };
     auto found = [&](int i) -> CamPose const* {
@@ -3686,24 +3729,40 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     glm::vec3 eye = chest + (eye0 - chest) * served;
     // Only the game camera: a cast's action camera (slot 1) is BG3's picture.
     glm::mat3 rigidRot = rot;
-    // BG3 renders a frame with the camera rotation its tick took from the transform getter a frame earlier, and the
-    // eye it asks for live: rendered, our eye of this frame met the rotation we served the frame before (measured
-    // with link/camtrace.csv: every rendered forward = the previous frame's served one). Turning, the eye
-    // then stood a frame further round the orbit than its view direction, and on a frame with a larger step (three
-    // mouse moves in it instead of two) the picture stepped back and then forth. So this frame's eye is placed
-    // along the direction BG3 will render it with: the rotation served last frame. This frame's rotation is still
-    // served, for BG3's tick to take for the next frame; walking (direction unchanged) is as before.
-    const bool prevRigid = slot == 0 && g_clear.RigidHave[0] && g_clear.RigidFrame[0] + 1 == frame;
-    const glm::mat3 renderedRot = prevRigid ? g_clear.RigidRot[0] : glm::mat3(1.0f);
-    const glm::vec3 renderedF = glm::normalize(renderedRot[2]);
-    const bool rigid = slot == 0 && g_indoor == IndoorMode::Free
-        && rigid_pose(eye0, rot, tav, now, prevRigid ? &renderedF : nullptr, eye, rigidRot);
-    if (slot == 0 && (g_clear.RigidFrame[0] != frame || !rigid)) {
-        g_clear.RigidHave[0] = rigid;
-        g_clear.RigidRot[0] = rigidRot;
-        g_clear.RigidFrame[0] = frame;
+    bool settling = false;
+    const bool rigid = slot == 0 && g_indoor == IndoorMode::Free && rigid_pose(eye0, rot, tav, now, eye, rigidRot, settling);
+    if (rigid) easing = settling;
+    if (rigid && slot == 0) {
+        // A turn that steps forward, back, forward in three frames: seen in a player's session (the rendered camera
+        // yawed 23, -2, 6 degrees), never reproduced. Logged with BG3's own rotation beside the one served, so the
+        // next sighting says whether BG3's camera itself went back (its input) or only what we made of it.
+        static float yawS[3], yawO[3];
+        static std::uint32_t seqs[3];
+        static double at[3];
+        static std::uint64_t seen = 0;
+        static int have = 0;
+        if (now - at[2] > 0.25) have = 0;
+        for (int k = 0; k < 2; ++k) { yawS[k] = yawS[k + 1]; yawO[k] = yawO[k + 1]; seqs[k] = seqs[k + 1]; at[k] = at[k + 1]; }
+        yawS[2] = glm::degrees(std::atan2(rigidRot[2].z, rigidRot[2].x));
+        yawO[2] = glm::degrees(std::atan2(fwd.z, fwd.x));
+        seqs[2] = g_wish.Seq;
+        at[2] = now;
+        if (++have >= 4) {
+            auto step = [](float a, float b) { return std::remainder(b - a, 360.0f); };
+            static float prevS = 0, prevO = 0;  // the step before these two
+            const float s1 = step(yawS[0], yawS[1]), s2 = step(yawS[1], yawS[2]);
+            if (std::abs(prevS) > 2.0f && std::abs(s2) > 2.0f && prevS * s2 > 0 && s1 * prevS < 0 && std::abs(s1) > 1.0f) {
+                if (++seen <= 40 || seen % 200 == 0) {
+                    logf("camera: turn stepped back for one frame (%llu so far): served yaw steps %.2f %.2f %.2f, BG3's own %.2f %.2f %.2f, "
+                         "wish seq steps %u %u, frame ms %.1f %.1f",
+                         (unsigned long long)seen, prevS, s1, s2, prevO, step(yawO[0], yawO[1]), step(yawO[1], yawO[2]),
+                         seqs[1] - seqs[0], seqs[2] - seqs[1], (at[1] - at[0]) * 1e3, (at[2] - at[1]) * 1e3);
+                }
+            }
+            prevS = s1;
+            prevO = step(yawO[0], yawO[1]);
+        }
     }
-    if (rigid) easing = true;  // computed again next frame
     const bool moved = (wasTested && served < 0.999f) || rigid;
     if (slot == 0) {  // the see-through's ends, for the cursor
         for (int k = 0; k < 3; ++k) {
@@ -3719,6 +3778,7 @@ CamPose const* clear_pose(void const* self, bool* tested) {
     e.Tested = wasTested;
     e.Easing = easing;
     e.Rigid = rigid;
+    std::memcpy(e.RotKey, rotKey, sizeof(rotKey));
     e.Frame = frame;
     if (tested != nullptr) *tested = wasTested;
     {  // link/camtrace.on: per frame, BG3's own eye and forward against the pose served (link/camtrace.csv)
@@ -3728,6 +3788,7 @@ CamPose const* clear_pose(void const* self, bool* tested) {
         if (now - look_at > 2.0) {
             look_at = now;
             on = ::access((io_dir() + "link/camtrace.on").c_str(), F_OK) == 0;
+            g_camtrace.store(on, std::memory_order_relaxed);
             if (on && tf == nullptr) {
                 tf = std::fopen((io_dir() + "link/camtrace.csv").c_str(), "w");
                 if (tf != nullptr) std::fprintf(tf, "frame,slot,t,rigid,eye0_x,eye0_y,eye0_z,fwd0_x,fwd0_y,fwd0_z,eye_x,eye_y,eye_z,fwd_x,fwd_y,fwd_z,wish_seq,tid\n");
@@ -3747,8 +3808,6 @@ CamPose const* clear_pose(void const* self, bool* tested) {
         e.Pose.Xform.Translate = eye;
         e.Pose.Translate = eye;
         std::memcpy(e.Pose.Rotate, &x->RotationQuat, sizeof(e.Pose.Rotate));
-        e.Pose.Rendered = rigid && prevRigid;
-        e.Pose.RenderedRot = renderedRot;
         if (rigid) {  // back into BG3's order (the reading above, the other way)
             const glm::quat rq = glm::quat_cast(order >= 2 ? glm::transpose(rigidRot) : rigidRot);
             float out[4];
@@ -3806,7 +3865,6 @@ void lead_frame() {
     glm::quat q = (order & 1) == 0 ? glm::quat(raw[3], raw[0], raw[1], raw[2]) : glm::quat(raw[0], raw[1], raw[2], raw[3]);
     glm::mat3 m = glm::mat3_cast(q);
     if (order >= 2) m = glm::transpose(m);
-    if (served != nullptr && served->Rendered) m = served->RenderedRot;  // the rotation BG3 renders this eye with
     // Columns of the camera-to-world rotation are BG3's s, u, f (see view_from).
     const glm::dvec3 eye = wow_point(glm::dvec3(x->Translate));
     const glm::dvec3 f = wow_vec(glm::dvec3(m[2])), u = wow_vec(glm::dvec3(m[1]));
