@@ -13,10 +13,15 @@ This is the first public version. What we know is missing or rough:
 
 - The first New Game after installing waits about three minutes behind the loading screen while
   the server data and the first movement maps are built from your WoW files.
-- WoW item icons show from the second BG3 start (BG3 reads its icon atlases only at start; the items
-  themselves work at once).
+- WoW item icons, the item table and the quest cursors are made in the background of that first session, a
+  minute or two in; until then a WoW item shows its BG3 base's icon. No restart is needed.
 
 ## Picture
+
+- WoW's world is shown in WoW's own colours. BG3's spell glow no longer spills onto WoW ground that the effect
+  itself does not cover.
+- BG3's characters are shaded as WoW shades its own: as a whole, when the ground they stand on is in a tree's or a
+  building's baked shadow. A shadow's edge does not cross a body.
 
 - Enemy vision cones show on WoW's ground while you sneak (BG3's own overlay, composited), but their
   edges are ragged: BG3 tests each 0.5 m tile's height, and where WoW's ground is more than about half
@@ -31,6 +36,9 @@ This is the first public version. What we know is missing or rough:
   also missing from the capture, so she looks wrong without armour.
 
 ## Game
+
+- Dungeons and instances are not levels of their own in 0.1.0: they are played inside the same hidden BG3 level as
+  the outdoor world.
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
