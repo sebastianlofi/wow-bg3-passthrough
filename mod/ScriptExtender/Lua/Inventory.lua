@@ -158,13 +158,21 @@ function M.EffectBoosts(wornItems)
 end
 
 -- Icons the atlas holds (wow_icons.py): only those names are given to items, others keep the base's.
+-- The atlas is made in the background of a new install's first session and BG3 takes it while it runs
+-- (InventoryClient.lua). Until the client says it is in, no item is given one of its names: a name BG3 cannot find
+-- shows no picture at all, the base's icon does. M.IconsIn() turns true once, and every item is dressed again then.
+function M.IconsIn()
+    if iconSet then return false end
+    local ok, st = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/inventory-client.json") or "")
+    if not (ok and type(st) == "table" and st.Atlas == "loaded") then return false end
+    local okI, t = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/gui/wow-icons.json") or "")
+    if not (okI and type(t) == "table" and type(t.Icons) == "table") then return false end
+    iconSet = {}
+    for _, n in ipairs(t.Icons) do iconSet[n] = true end
+    return true
+end
 function M.IconName(row)
-    if not iconSet then
-        iconSet = {}
-        local raw = Ext.IO.LoadFile("wow-bg3/gui/wow-icons.json")
-        local ok, t = pcall(Ext.Json.Parse, raw or "")
-        if ok and type(t) == "table" then for _, n in ipairs(t.Icons or {}) do iconSet[n] = true end end
-    end
+    if not iconSet then return nil end
     if not row or type(row.i) ~= "string" or row.i == "" then return nil end
     local key = "WowBg3_" .. row.i:lower():gsub("[^a-z0-9_]", "_")
     return iconSet[key] and key or nil
@@ -1744,6 +1752,10 @@ function M.Start(id)
         pcall(settleRest) -- after the looks: a trade that closed has written its last into its own day
         if reqSeq == 0 then M.Request({Op = "list"}) end -- hello: the bridge answers this state from now on
         if not M.Redressed then M.Redressed = M.Redress() end
+        if tick % 60 == 0 and M.IconsIn() then
+            local okR, n = pcall(M.Redress)
+            Ext.Log.Print("WOW-BG3 inventory: WoW's icons are in BG3's atlas map: " .. tostring(okR and n or 0) .. " items dressed again")
+        end
         for u, f in pairs(M.Fresh) do
             if tick - f.Tick >= 10 then M.Fresh[u] = nil; pcall(M.DressFresh, u, f.Row) end
         end

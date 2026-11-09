@@ -5,9 +5,12 @@
 -- <ambient r g b>", Light.dbc as WoW samples it for the time of day (sRGB 0..1). WoW's lighting sun keeps a
 -- fixed bearing and only rises and falls a little; night is in its colours (benilla lighting/daynight.rs).
 -- BG3's side is its own lighting path: the fight spot's lighting zone (6d2f0a51, in our pak) lists stock
--- Rivington and our copy of it, LTN_WOWBG3_WoWSun. A lighting's values reach the renderer when the zone applies
--- it (a write to the active one did nothing until the camera left the zone and came back; measured), so each
--- change is written into the inactive one and TriggerSetLighting switches the zone to it.
+-- Rivington and two copies of it, LTN_WOWBG3_WoWSun and LTN_WOWBG3_WoWSun_B. A lighting's values reach the renderer
+-- when the zone applies it (a write to the active one did nothing until the camera left the zone and came back;
+-- measured), so each change is written into the inactive copy and TriggerSetLighting switches the zone to it.
+-- Never back to stock Rivington: under it the far ground stood in haze and characters took a purple cast that
+-- the copies do not show, so the picture changed with every switch (seen in play: hazy for the minutes one was
+-- active, clear for the next).
 -- Mapping (measured, the renderer's sun vector): to-sun = (cos(Yaw-180)*cosE, sinE, sin(Yaw-180)*cosE) with
 -- elevation E = 180 - Pitch; BG3 axes from WoW's: x = WoW y, y = WoW z, z = -WoW x. The physical sun (this
 -- lighting lights by its scattering: SunIntensity 0) takes WoW's diffuse colour and its strength by WoW's
@@ -18,7 +21,7 @@ local Hero = Ext.Require("Hero.lua")
 local Session = Ext.Require("Session.lua")
 
 M.ZONE = "6d2f0a51-77c4-4b0e-9a5e-1f3c2b8d4e01"
-M.LIGHTINGS = {"ebb84b6f-727a-2c83-203f-12835effd5d5", "a7d3c1e9-5f2b-4c8e-9d16-3b0e7f4a2c58"}
+M.LIGHTINGS = {"a7d3c1e9-5f2b-4c8e-9d16-3b0e7f4a2c58", "c4f81b27-3a6d-4e09-8b52-7d1e9a0c6f34"}
 M.SUN_INTENSITY = 100000  -- stock Rivington's SkyLight.ScatteringSunIntensity
 M.REF_LUMA = 0.65         -- WoW's noon diffuse in Durotar, linear luminance (measured 0.651): BG3's sun is stock then
 M.EVERY_MS = 5000         -- at most one switch this often
@@ -46,7 +49,7 @@ function M.Target(line)
     return {Yaw = yaw, Pitch = 180 - elev, Colour = colour, Intensity = M.SUN_INTENSITY * luma / M.REF_LUMA, Luma = luma}
 end
 
-local active = 1        -- the zone starts on its first listed lighting, stock Rivington
+local active = 2        -- the zone starts on stock Rivington; the first change goes to the first copy
 local lastLine, lastAt = nil, nil
 local function status(t)
     pcall(Ext.IO.SaveFile, "wow-bg3/wowsky-status.json", Ext.Json.Stringify(t))

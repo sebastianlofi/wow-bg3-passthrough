@@ -743,16 +743,26 @@ def abilities_first():
     boot_overrides()
 
 
+def icons_current():
+    """The icon atlas of our own (Icons_WowBg3). An atlas of an earlier build, a larger copy of BG3's Icons_Items_6
+    that only a restart could show, is made again."""
+    try:
+        return json.loads((IO / 'gui/wow-icons.json').read_text()).get('Atlas') == 'Icons_WowBg3'
+    except (OSError, ValueError):
+        return False
+
+
 def datagen_needed():
-    return not (items_current() and abilities_current() and (IO / 'gui/wow-icons.json').is_file()
+    return not (items_current() and abilities_current() and icons_current()
                 and (IO / 'cursors/quest-turnin.cur').is_file() and (LINK / 'see-noise.r8').is_file() and (LINK / 'spells.json').is_file())
 
 
 def datagen():
     """`wowbg3-coord.py --datagen`: what the inventory and the quest cursors need, made once from the player's
     WoW files, BG3's paks and the server's database (link/tools wow_items.py, wow_icons.py, wowcursor.py; about
-    a minute), and BG3's see-through noise for benilla (seenoise.py, from BG3's paks). BG3 reads the icon atlas
-    when it starts, so the icons show from the next start on; benilla picks the noise up while it runs."""
+    a minute), and BG3's see-through noise for benilla (seenoise.py, from BG3's paks). The mod's client Lua hands
+    the icon atlas to BG3's own atlas load when it is there (InventoryClient.lua), and benilla picks the noise up
+    while it runs: nothing here waits for a restart."""
     rc = 0
     steps = []
     if not items_current():
@@ -765,9 +775,8 @@ def datagen():
         steps.append(('abilities', abilities_make()))
     if not (LINK / 'spells.json').is_file():
         steps.append(('spells', py('wow_spells', '--data', WOW / 'Data', '--out', LINK / 'spells.json')))
-    if not (IO / 'gui/wow-icons.json').is_file() and game_data():
-        steps.append(('icons', py('wow_icons', 'build', '--data', WOW / 'Data', '--bg3', game_data(), '--out', IO / 'gui',
-                                  '--items', LINK / 'items.json')))
+    if not icons_current():
+        steps.append(('icons', py('wow_icons', 'build', '--data', WOW / 'Data', '--out', IO / 'gui', '--items', LINK / 'items.json')))
     if not (IO / 'cursors/quest-turnin.cur').is_file():
         steps.append(('cursors', py('wowcursor', '--data', WOW / 'Data', '--out', IO / 'cursors')))
     if not (LINK / 'see-noise.r8').is_file() and game_data():

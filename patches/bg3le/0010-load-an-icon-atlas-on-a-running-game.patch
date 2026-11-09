@@ -1,0 +1,95 @@
+diff --git a/src/lua_host.cpp b/src/lua_host.cpp
+--- a/src/lua_host.cpp
++++ b/src/lua_host.cpp
+@@ -7403,6 +7403,7 @@
+ extern "C" void* bg3le_texture_atlas_map();
+ extern "C" void* bg3le_icon_atlas(char const* icon);
+ extern "C" void* bg3le_icon_uvs(char const* icon);
++extern "C" int bg3le_load_icon_atlas(char const* path);
+ 
+ // Ext._Internal.TextureAtlasMap() / IconAtlas(icon) / IconUVs(icon) -> address
+ int push_address_or_nothing(lua_State* L, void* at) {
+@@ -7416,6 +7417,13 @@
+ int l_icon_atlas(lua_State* L) {
+     return push_address_or_nothing(L, bg3le_icon_atlas(luaL_checkstring(L, 1)));
+ }
++// Ext._Internal.LoadIconAtlas(path) -> true | false | nil (no map)
++int l_load_icon_atlas(lua_State* L) {
++    const int r = bg3le_load_icon_atlas(luaL_checkstring(L, 1));
++    if (r < 0) return 0;
++    lua_pushboolean(L, r);
++    return 1;
++}
+ int l_icon_uvs(lua_State* L) {
+     return push_address_or_nothing(L, bg3le_icon_uvs(luaL_checkstring(L, 1)));
+ }
+@@ -7961,6 +7969,8 @@
+     lua_setfield(g_lua, -2, "IconAtlas");
+     lua_pushcfunction(g_lua, l_icon_uvs);
+     lua_setfield(g_lua, -2, "IconUVs");
++    lua_pushcfunction(g_lua, l_load_icon_atlas);
++    lua_setfield(g_lua, -2, "LoadIconAtlas");
+     lua_pushcfunction(g_lua, l_boost_prototype);
+     lua_setfield(g_lua, -2, "BoostPrototype");
+     lua_pushcfunction(g_lua, l_resource_bank_get);
+@@ -16066,6 +16076,13 @@
+   return at and Ext._Internal.ReadObject(at, "TextureAtlas", "", {}) or nil
+ end
+ 
++-- Not upstream: BG3's own load of one icon atlas file (the absolute data path, as the keys of AtlasMap), on a
++-- running game. true when its icons are in the map now, false when BG3 refused the file, nil without a map.
++function Ext.StaticData.LoadIconAtlas(path)
++  if type(path) ~= "string" then return nil end
++  return Ext._Internal.LoadIconAtlas(path)
++end
++
+ function Ext.StaticData.GetIconUVs(icon)
+   if type(icon) ~= "string" then return nil end
+   local at = Ext._Internal.IconUVs(icon)
+diff --git a/src/targets.cpp b/src/targets.cpp
+--- a/src/targets.cpp
++++ b/src/targets.cpp
+@@ -102,6 +102,10 @@
+              resolve_rip(Sig{"ParserContext", 0x284b29b, "48 8b 0d ?? ?? ?? ?? 41 89 c6 48 8d 7c 24 68 48 89 ee"}, 3, 7))
+ BG3LE_TARGET(TextureAtlasMap,
+              resolve_rip(Sig{"TextureAtlasMap", 0x37d690f, "48 8b 3d ?? ?? ?? ?? 4c 89 74 24 20 44 89 f8 4c 89 6c 24 30"}, 3, 7))
++// ls::TextureAtlasMap::Load(STDString const& path): the load of one icon atlas file, as the boot runs it for every
++// GUI/*.lsx of every mod (true: loaded now or already there).
++BG3LE_TARGET(TextureAtlasMapLoad,
++             resolve_code(Sig{"TextureAtlasMapLoad", 0x3b8c480, "41 57 41 56 41 54 53 50 49 89 fe 49 89 f7 8b 7f 0c 49 8b 76 10 4c 89 fa e8 ?? ?? ?? ?? b3 01 84 c0 75"}))
+ BG3LE_TARGET(TemplatesManager,
+              resolve_rip(Sig{"TemplatesManager", 0x2387b76, "48 8b 15 ?? ?? ?? ?? 48 8b 0d ?? ?? ?? ?? 4c 8b 05 ?? ?? ?? ?? 0f b6 7e 04 e8 ?? ?? ?? ?? 48 85 c0 74 16"}, 3, 7))
+ BG3LE_TARGET(ResourcesGlobal,
+diff --git a/src/targets.h b/src/targets.h
+--- a/src/targets.h
++++ b/src/targets.h
+@@ -83,6 +83,7 @@
+ std::uintptr_t SurfaceActionFactory();
+ std::uintptr_t ParserContext();
+ std::uintptr_t TextureAtlasMap();
++std::uintptr_t TextureAtlasMapLoad();
+ std::uintptr_t TemplatesManager();
+ std::uintptr_t ResourcesGlobal();
+ // The instruction that loads it; the engine indexes its banks just after.
+diff --git a/src/vendor/extender_globals.cpp b/src/vendor/extender_globals.cpp
+--- a/src/vendor/extender_globals.cpp
++++ b/src/vendor/extender_globals.cpp
+@@ -199,6 +199,18 @@
+ 
+ extern "C" void* bg3le_texture_atlas_map() { return atlas_map(); }
+ 
++// Ext.StaticData.LoadIconAtlas: BG3 reads its icon atlases once, at boot. This runs BG3's own load of one atlas
++// file on a running game, for an atlas whose files did not exist then (1 loaded or already there, 0 BG3 refused
++// the file, -1 no map or the function was not found).
++extern "C" int bg3le_load_icon_atlas(char const* path) {
++    auto* map = atlas_map();
++    const std::uintptr_t at = bg3le::target::TextureAtlasMapLoad();
++    if (map == nullptr || path == nullptr || at == 0) return -1;
++    const bg3se::STDString lsPath(path);
++    using Load = bool (*)(bg3se::TextureAtlasMap*, bg3se::STDString const*);
++    return reinterpret_cast<Load>(bg3le::load_bias() + at)(map, &lsPath) ? 1 : 0;
++}
++
+ extern "C" void* bg3le_icon_atlas(char const* icon) {
+     auto* map = atlas_map();
+     if (map == nullptr || icon == nullptr) return nullptr;

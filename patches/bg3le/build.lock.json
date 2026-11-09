@@ -178,6 +178,33 @@
           "after_sha256": "30c368454338ba8ee8ecec111222ea647a9fdb5e6733bb13ba3bce0ef28e94f8"
         }
       ]
+    },
+    {
+      "file": "patches/0010-load-an-icon-atlas-on-a-running-game.patch",
+      "sha256": "96d4177f9aeca2c4ae4bb7b9be77bb5dca84cf579d47bd5035a7ec39c3b98232",
+      "purpose": "Ext.StaticData.LoadIconAtlas: the engine's own load of one icon atlas file (TextureAtlasMap::Load), callable on a running game, for an atlas whose files are made after boot",
+      "targets": [
+        {
+          "path": "src/lua_host.cpp",
+          "before_sha256": "28acd5044a6af0a5ef561f34b2a846b67975a73cbf0c14b86c3d2d1ad9b01cde",
+          "after_sha256": "89f22aae6bbb42ea34a5cbc2221c3a81bdff5239d69f8e0e332cf9d20a4a7d29"
+        },
+        {
+          "path": "src/targets.cpp",
+          "before_sha256": "635472a2deba6c2a1372364f4cd4d2cb3f2e1a82e9562d958f83b8d4a34190fd",
+          "after_sha256": "46a6beba2ca1b314dcae948f474070a9d081f610514ac0c27ce198587f199562"
+        },
+        {
+          "path": "src/targets.h",
+          "before_sha256": "f0d3aa36839b0012f8b47042247f82f7b24d77a5f650e9cbd0c84d31fbc3911a",
+          "after_sha256": "81c7f803f21b04b03b1ea4e8a40faa8cb4448b9f3e68fec1d56a74b702f26a1b"
+        },
+        {
+          "path": "src/vendor/extender_globals.cpp",
+          "before_sha256": "53c281ac3779e49a59822015302df4b2d4160c5b55c200614c127415b1928a64",
+          "after_sha256": "2b239078bdd9e1ef86b3131cab14a93249ca8cfad2f0462eb5bde8ea590624a6"
+        }
+      ]
     }
   ],
   "previous_library_sha256": "38523fef5d50200eebbdb9ff1588191b1e747d3a436534ee3db1144f2b1a6149",
