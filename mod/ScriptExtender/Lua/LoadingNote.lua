@@ -32,25 +32,29 @@ local function findLine()
     return found
 end
 
+-- The client's states with BG3's loading screen up (a load, and the launcher's hold in PrepareRunning).
+M.LOADING = {StartLoading = true, LoadModule = true, LoadSession = true, LoadLevel = true, SwapLevel = true,
+             PrepareRunning = true}
+
 function M.Start(runId)
-    local ticks, shown, line = 0, "", nil
+    local ticks, shown = 0, ""
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
         if ticks % 15 ~= 0 then return end
-        local note = readJson("wow-bg3/loading-note.json")
+        local okState, state = pcall(Ext.Utils.GetGameState)
+        local loading = okState and M.LOADING[tostring(state)]
+        local note = loading and readJson("wow-bg3/loading-note.json")
         local want = note and note.RunId == runId and type(note.Text) == "string" and note.Text or ""
         if want == shown then return end
-        -- A node from an earlier loading screen is gone with it: look again.
-        if not (line and pcall(function() return line.Name end)) then line = findLine() end
-        if not line then
-            if want == "" then shown = "" end
-            return
-        end
-        if pcall(function() line:SetProperty("Text", want) end) then
+        -- Found again from the root every time and never kept: a UI node is a bare pointer (bg3le's Ext.UI holds
+        -- no reference), and the loading screen's nodes are freed with it, so a kept one read later is a crash
+        -- that pcall cannot catch.
+        local line = findLine()
+        if line and pcall(function() line:SetProperty("Text", want) end) then
             Ext.Log.Print("WOW-BG3 loading note: " .. (want ~= "" and want or "(cleared)"))
             shown = want
-        else
-            line = nil
+        elseif want == "" or not loading then
+            shown = want   -- no loading screen: nothing shows a line, nothing to clear
         end
     end)
 end
