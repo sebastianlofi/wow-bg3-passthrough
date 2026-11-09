@@ -154,6 +154,9 @@ function Probe.Start(context)
         -- WoW's light as BG3's gameplay light round the party: cones, sight, stealth.
         local okWl, errWl = pcall(function() Ext.Require("WorldLight.lua").Start(report.RunId) end)
         if not okWl then Ext.Log.Print("WOW-BG3 worldlight: " .. tostring(errWl)) end
+        -- WoW's scene light as BG3's own light at the fight spot: sun direction, colour and strength.
+        local okSky, errSky = pcall(function() Ext.Require("WowSky.lua").Start(report.RunId) end)
+        if not okSky then Ext.Log.Print("WOW-BG3 wowsky: " .. tostring(errSky)) end
     end
     save("bootstrap")
     Ext.Events.GameStateChanged:Subscribe(function() save("state-change") end)

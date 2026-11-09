@@ -1,0 +1,50 @@
+WOW-BG3 benilla patch 0125: WoW's scene light to BG3's own lighting (on top of 0001-0124).
+
+- link/wowsky.txt: "WSK1 <to-sun x y z, WoW axes> <diffuse r g b> <ambient r g b>" (Light.dbc as sampled for the time
+  of day, sRGB 0..1), written whole when a value moved by 0.002 or more. The mod (WorldLight.lua) sets the sun, its
+  colour and the sky light of its own lighting at the fight spot from it.
+
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index 959f456..b0cbe92 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -259,6 +259,9 @@ pub(crate) fn packet_camera(p: &Pace) -> Option<[u8; 96]> {
+ 
+ /// End of a frame's update: what it was drawn from, for the export.
+ fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLighting>>, mut tag: ResMut<FrameTag>) {
++    if let Some(l) = lighting.as_ref() {
++        sky_export(l); // patch 0125
++    }
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+@@ -269,6 +272,29 @@ fn tag_frame(p: Res<Pace>, lighting: Option<Res<benilla_world::lighting::WowLigh
+     };
+ }
+ 
++/// Patch 0125: WoW's scene light for BG3's own lighting (the mod's WorldLight.lua sets BG3's sun and sky from it):
++/// `$WOW_BG3_LINK_DIR/wowsky.txt`, one line "WSK1 <to-sun x y z, WoW axes> <diffuse r g b> <ambient r g b>" (the
++/// `Light.dbc` colours as sampled for the time of day, sRGB 0..1), written whole (rename) when a value moved.
++fn sky_export(l: &benilla_world::lighting::WowLighting) {
++    static LAST: std::sync::Mutex<Option<[f32; 9]>> = std::sync::Mutex::new(None);
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let to_sun = benilla_assets::coords::bevy_to_wow(-l.sun_dir.normalize_or_zero());
++    let v = [to_sun[0], to_sun[1], to_sun[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.ambient[0], l.ambient[1], l.ambient[2]];
++    let Ok(mut last) = LAST.lock() else { return };
++    if last.is_some_and(|p| p.iter().zip(v.iter()).all(|(a, b)| (a - b).abs() < 0.002)) {
++        return;
++    }
++    let text = format!(
++        "WSK1 {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}\n",
++        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]
++    );
++    let path = std::path::Path::new(&dir).join("wowsky.txt");
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
++        *last = Some(v);
++    }
++}
++
+ /// Patch 0052: the terrain pass's light on level ground in full sun (`terrain.wgsl`: `clamp(ambient +
+ /// diffuse × max(N·L, 0))` per channel, gamma), as bytes, byte 3 = 1.
+ fn ground_light(l: &benilla_world::lighting::WowLighting) -> [u8; 4] {
