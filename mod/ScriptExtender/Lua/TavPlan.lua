@@ -364,7 +364,7 @@ function M.Clear()
 end
 
 -- BG3's map off (world mode, compose word "void"): the capture layer keeps drawing only the index
--- buffers listed in wow-bg3/link/keep.txt ("KEEP 1", then one hex VkBuffer handle a line; "KEEP 0":
+-- buffers listed in wow-bg3/link/keep.txt ("KEEP 1", then "<hex VkBuffer handle> <owner x y z>" a line; "KEEP 0":
 -- the map is back). Listed: every level of detail of every character (anything with Health) within
 -- radius metres of centre, their attachments included, so Tav, her party and a fight's stand-ins stay.
 -- Whose each listed buffer is, said once per buffer in bg3le.log ("WOW-BG3 hide:"): part 0 the body, others
@@ -440,12 +440,19 @@ function M.PublishKeep(centre, radius, party)
             local dx, dy, dz = p[1] - centre[1], p[2] - centre[2], p[3] - centre[3]
             local d2, r = dx * dx + dy * dy + dz * dz, kept and radius or math.max(radius, M.HideRadius)
             if d2 < r * r then
+                -- Each line also says where its owner stands: BG3 shares a mesh's index buffer between the
+                -- characters wearing it (Gale's human body and a human guard stand-in's are one buffer), so a
+                -- buffer on both lists is told apart by where the draw is (the layer's void).
+                local at = string.format(" %.2f %.2f %.2f", p[1], p[2], p[3])
                 if kept then
+                    local from = #ids + 1
                     pcall(indexBuffers, e, ids)
+                    for i = from, #ids do ids[i] = ids[i] .. at end
                 else
                     local from = #hide + 1
                     pcall(indexBuffers, e, hide, hideParts)
                     pcall(sayHidden, e, from, #hide, hide, hideParts)
+                    for i = from, #hide do hide[i] = hide[i] .. at end
                 end
             end
         end

@@ -2558,6 +2558,40 @@ static uint32_t g_keep_n;
 static int g_keep_active;  // world mode is running ("KEEP 1"); "KEEP 0" or no file: the map stays
 static struct timespec g_keep_seen;
 
+// Where each listed buffer's owner stands ("ib x y z" lines, TavPlan.PublishKeep): BG3 shares a mesh's
+// index buffer between every character wearing it -- Gale's human male body and a human guard stand-in's
+// are one buffer -- so a buffer on both lists says nothing about whose draw it is, and keep_has alone kept
+// the stand-in's bare skin over WoW's NPC. For such a buffer the draw's own place decides: the nearest owner
+// of that buffer, kept or hidden (shared_owner).
+#define OWN_CAP 8192u
+typedef struct { uint64_t ib; float x, z; } Owner;
+static Owner g_keep_own[OWN_CAP], g_hide_own[OWN_CAP];
+static uint64_t g_shared_kept, g_shared_hidden;  // draws of a mesh on both lists, by whose they were
+static uint32_t g_keep_own_n, g_hide_own_n;
+static uint32_t owners_read(FILE* f, char* line, size_t cap, uint64_t* next, uint32_t* n, Owner* own) {
+    uint32_t m = 0;
+    while (fgets(line, (int)cap, f) && *n < KEEP_CAP / 2) {
+        char* end = NULL;
+        uint64_t ib = strtoull(line, &end, 16);
+        if (!ib) continue;
+        float x = 0, y = 0, z = 0;
+        if (m < OWN_CAP && end && sscanf(end, "%f %f %f", &x, &y, &z) == 3) own[m++] = (Owner){ib, x, z};
+        uint32_t i = hslot(ib, KEEP_CAP);
+        while (next[i] && next[i] != ib) i = (i + 1) & (KEEP_CAP - 1);
+        if (!next[i]) { next[i] = ib; (*n)++; }
+    }
+    return m;
+}
+static float owner_d2(const Owner* own, uint32_t n, uint64_t ib, float x, float z) {
+    float best = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (own[i].ib != ib) continue;
+        float dx = own[i].x - x, dz = own[i].z - z, d = dx * dx + dz * dz;
+        if (best < 0 || d < best) best = d;
+    }
+    return best;
+}
+
 static int keep_has(uint64_t ib) {
     if (!g_keep_n || !ib) return 0;
     for (uint32_t i = hslot(ib, KEEP_CAP), n = 0; n < KEEP_CAP; n++, i = (i + 1) & (KEEP_CAP - 1)) {
@@ -2583,20 +2617,17 @@ static void keep_read(void) {
     static uint64_t next[KEEP_CAP];
     memset(next, 0, sizeof next);
     uint32_t n = 0;
-    char line[64];
+    char line[96];
     if (!fgets(line, sizeof line, f) || strncmp(line, "KEEP ", 5)) { fclose(f); return; }
     int active = line[5] == '1';
-    while (fgets(line, sizeof line, f) && n < KEEP_CAP / 2) {
-        uint64_t ib = strtoull(line, NULL, 16);
-        if (!ib) continue;
-        uint32_t i = hslot(ib, KEEP_CAP);
-        while (next[i] && next[i] != ib) i = (i + 1) & (KEEP_CAP - 1);
-        if (!next[i]) { next[i] = ib; n++; }
-    }
+    static Owner own[OWN_CAP];
+    uint32_t m = owners_read(f, line, sizeof line, next, &n, own);
     fclose(f);
     pthread_mutex_lock(&g_fxl_lock);
     memcpy(g_keep, next, sizeof g_keep);
     g_keep_n = n;
+    memcpy(g_keep_own, own, m * sizeof *own);
+    g_keep_own_n = m;
     if (active != g_keep_active) logf_("void: BG3's map %s (%u character index buffers kept)", active ? "off" : "back", n);
     g_keep_active = active;
     pthread_mutex_unlock(&g_fxl_lock);
@@ -2636,19 +2667,16 @@ static void hide_read(void) {
     static uint64_t next[KEEP_CAP];
     memset(next, 0, sizeof next);
     uint32_t n = 0;
-    char line[64];
+    char line[96];
     if (!fgets(line, sizeof line, f) || strncmp(line, "HIDE ", 5)) { fclose(f); return; }
-    while (fgets(line, sizeof line, f) && n < KEEP_CAP / 2) {
-        uint64_t ib = strtoull(line, NULL, 16);
-        if (!ib) continue;
-        uint32_t i = hslot(ib, KEEP_CAP);
-        while (next[i] && next[i] != ib) i = (i + 1) & (KEEP_CAP - 1);
-        if (!next[i]) { next[i] = ib; n++; }
-    }
+    static Owner own[OWN_CAP];
+    uint32_t m = owners_read(f, line, sizeof line, next, &n, own);
     fclose(f);
     pthread_mutex_lock(&g_fxl_lock);
     memcpy(g_hide, next, sizeof g_hide);
     g_hide_n = n;
+    memcpy(g_hide_own, own, m * sizeof *own);
+    g_hide_own_n = m;
     pthread_mutex_unlock(&g_fxl_lock);
     __atomic_store_n(&g_hide_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
 }
@@ -2987,6 +3015,9 @@ static void ibage_present(void) {
     if (now && now % 300 == 0 && g_cc.fxglow)
         logf_("fxglow: %llu draws of a figure's glow kept, %llu past the probe limit", (unsigned long long)__atomic_exchange_n(&g_glow_kept, 0, __ATOMIC_RELAXED),
               (unsigned long long)__atomic_exchange_n(&g_glow_full, 0, __ATOMIC_RELAXED));
+    if (now && now % 300 == 0 && g_keep_active)
+        logf_("void: shared meshes: %llu draws a kept character's, %llu a hidden one's", (unsigned long long)__atomic_exchange_n(&g_shared_kept, 0, __ATOMIC_RELAXED),
+              (unsigned long long)__atomic_exchange_n(&g_shared_hidden, 0, __ATOMIC_RELAXED));
     if (now && now % 300 == 0 && g_cc.fxprops)
         logf_("fxprops: %llu draws kept as a spell's props, %llu skinned draws waiting for a hide list, busiest present %llu new "
               "skinned slices, %llu slices past the probe limit",
@@ -3128,7 +3159,24 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
     // the voiding on, which is what 0.1.0 did.
     if (g_screen && g_cc.screenlevel && !g_screen_dialog) return 0;
     if (t_void_cb != cb || !g_cc.void_ || !g_keep_active || t_ib_cb != cb || !t_ib) return 0;
-    if (keep_has(t_ib)) return 0;
+    if (keep_has(t_ib)) {
+        if (!hide_has(t_ib)) return 0;
+        // A mesh both a kept character and a hidden one wear: the owner nearest the draw's own place.
+        RecInfo* sri = t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
+        float sat[3];
+        int shown = 1;
+        if (sri && sri->r && (sri->r->have & 1)) {
+            int how = fxc_place(sri->r, fi, sat, NULL);
+            if (how == 1 || how == 2) {
+                float dk = owner_d2(g_keep_own, g_keep_own_n, t_ib, sat[0], sat[2]);
+                float dh = owner_d2(g_hide_own, g_hide_own_n, t_ib, sat[0], sat[2]);
+                shown = !(dh >= 0 && (dk < 0 || dh < dk));
+            }
+        }
+        __atomic_add_fetch(shown ? &g_shared_kept : &g_shared_hidden, 1, __ATOMIC_RELAXED);
+        if (shown) return 0;
+        return 1;
+    }
     if (g_cc.fxkeep && t_dec_cb != cb) {  // not BG3's deferred decal pass: surf_draw keeps its surfaces, and a kept decal paints BG3's albedo
         // fx-route prototype: only the level goes, known by where it is (a kilometre from everyone in
         // the void), and the stand-ins' bodies, which WoW's models replace. Everything else stays.
