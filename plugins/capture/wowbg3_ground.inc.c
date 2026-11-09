@@ -93,6 +93,8 @@ static struct {
     uint64_t presents;
     uint32_t extra_dynamic;          // dynamic states (bit = VkDynamicState < 32) BG3's pipelines have besides viewport and scissor
     uint64_t binds, nobind, badview; // descriptor binds seen in G-buffer passes, without a mapped view block, rejected blocks
+    uint64_t sub_same, sub_changed, sub_unread;  // camera read at recording against the same block read at BG3's submit
+    double sub_deg;                  // summed view-direction change of the changed ones, degrees
 } g_gr = {.m = PTHREAD_MUTEX_INITIALIZER, .cur = -1, .pending_pre = -1, .framed_pre = -1};
 
 // wowbg3_surf.inc.c (included after this file)
@@ -112,6 +114,7 @@ static __thread int32_t t_gr_lay[4];
 static __thread uint32_t t_gr_w, t_gr_h;
 static __thread int t_gr_cam;
 static __thread GrRec t_gr_rec;
+static __thread uint64_t t_gr_src_res, t_gr_src_off;  // where t_gr_rec was read: BG3's view block (buffer, offset)
 // Viewport and scissor BG3 set last on this thread's command buffer (restored after the injection).
 static __thread VkCommandBuffer t_vs_cb;
 static __thread VkViewport t_vs_vp;
@@ -156,7 +159,19 @@ static int ground_view_parse(const float* f, GrRec* out) {
 static int ground_view_record(GrRec* out) {
     const float* f = (const float*)fxc_slot_cpu(0, 2, 224);
     if (!f) { g_gr.nobind++; return 0; }
-    return ground_view_parse(f, out);
+    if (!ground_view_parse(f, out)) return 0;
+    // The block's buffer and offset as bound (fxc_slot_cpu's lookup), to read it again at BG3's submit.
+    SetInfo* si = set_find(t_set[0]);
+    DescSlot* sl = si ? &si->slot[2] : NULL;
+    t_gr_src_res = sl ? sl->res : 0;
+    t_gr_src_off = sl ? sl->off : 0;
+    if (sl && (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)) {
+        uint32_t at = 0;
+        for (uint32_t b = 0; b < 2; b++)
+            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
+        if (at < t_ndyn[0] && at < 8) t_gr_src_off += t_dyn[0][at];
+    }
+    return 1;
 }
 
 // With nothing of BG3's in view (Tav out of frame, a stand-in not drawn yet) its G-buffer pass makes no
@@ -207,15 +222,44 @@ static int ground_view_elsewhere(GrRec* out) {
         int k = -1;
         for (int i = 0; i < GR_VIEWS; i++) if (v[i].res && (k < 0 || v[i].clock > v[k].clock)) k = i;
         if (k < 0) return 0;
-        uint64_t left = 0;
-        const float* f = (const float*)buf_cpu(v[k].res, v[k].off, &left);
+        uint64_t left = 0, kres = v[k].res, koff = v[k].off;
+        const float* f = (const float*)buf_cpu(kres, koff, &left);
         v[k].res = 0;
         if (!f || left < 224 || !ground_view_parse(f, out)) continue;
         uint32_t seq = 0;
         float err = -1, err2 = -1;
-        if (pace_match(out->eye, &seq, &err, &err2) && err < 0.05f) return 1;
+        if (pace_match(out->eye, &seq, &err, &err2) && err < 0.05f) { t_gr_src_res = kres; t_gr_src_off = koff; return 1; }
     }
     return 0;
+}
+
+// The camera as read while BG3 records the frame, against the same view block read again when BG3 submits that
+// command buffer (by then BG3 has written the frame's constants: Vulkan wants host writes done before the submit).
+// Different means BG3 fills the block after recording, and the injection drew with an older frame's camera.
+#define GR_SUB 64
+static struct { uint64_t cb, res, off; float vp[16], fwd[3]; } g_gr_sub[GR_SUB];
+static uint32_t g_gr_sub_next;
+static void ground_sub_note(VkCommandBuffer cb) {  // g_gr.m held
+    uint32_t k = g_gr_sub_next++ % GR_SUB;
+    g_gr_sub[k].cb = (uint64_t)(uintptr_t)cb; g_gr_sub[k].res = t_gr_src_res; g_gr_sub[k].off = t_gr_src_off;
+    memcpy(g_gr_sub[k].vp, t_gr_rec.vp, 64); memcpy(g_gr_sub[k].fwd, t_gr_rec.fwd, 12);
+}
+static void ground_cam_check(VkCommandBuffer cb) {
+    pthread_mutex_lock(&g_gr.m);
+    for (uint32_t i = 0; i < GR_SUB; i++) {
+        if (g_gr_sub[i].cb != (uint64_t)(uintptr_t)cb) continue;
+        __typeof__(g_gr_sub[0]) e = g_gr_sub[i];
+        g_gr_sub[i].cb = 0;
+        uint64_t left = 0;
+        const float* f = e.res ? (const float*)buf_cpu(e.res, e.off, &left) : NULL;
+        GrRec r;
+        if (!f || left < 224 || !ground_view_parse(f, &r)) { g_gr.sub_unread++; continue; }
+        if (!memcmp(r.vp, e.vp, 64)) { g_gr.sub_same++; continue; }
+        g_gr.sub_changed++;
+        double dot = e.fwd[0] * r.fwd[0] + e.fwd[1] * r.fwd[1] + e.fwd[2] * r.fwd[2];
+        g_gr.sub_deg += acos(dot > 1.0 ? 1.0 : dot < -1.0 ? -1.0 : dot) * 57.29577951308232;
+    }
+    pthread_mutex_unlock(&g_gr.m);
 }
 
 // begin_pass found a pass at swapchain size (g_trace_lock held): BG3's G-buffer pass is the scene
@@ -253,7 +297,9 @@ static void ground_bind(VkCommandBuffer cb) {
     if (t_gr_cb != cb) return;
     g_gr.binds++;
     GrRec r;
+    uint64_t res0 = t_gr_src_res, off0 = t_gr_src_off;
     if (ground_view_record(&r)) { t_gr_rec = r; t_gr_cam = 1; }
+    else { t_gr_src_res = res0; t_gr_src_off = off0; }
 }
 
 static int ground_init(DeviceData* d, const VkFormat fmt[4], const int32_t lay[4]) {
@@ -448,6 +494,15 @@ static void ground_inject(DeviceData* d, VkCommandBuffer cb) {
     if (!fb) { pthread_mutex_unlock(&g_gr.m); __atomic_add_fetch(&g_gr.nofb, 1, __ATOMIC_RELAXED); return; }
     const uint32_t ri = g_gr.rec_next++ % GR_REC;
     memcpy((uint8_t*)g_gr.rec.map + (size_t)ri * sizeof(GrRec), &t_gr_rec, sizeof(GrRec));
+    ground_sub_note(cb);
+    if (g_cc.wdtime) {  // the camera each injection drew with: eye and view direction of BG3's view block, per BG3 frame
+        static FILE* cf; static uint64_t cn;
+        if (!cf) { cf = fopen(outp("/grcam.csv"), "w"); if (cf) fprintf(cf, "serial,present,t_ns,eye_x,eye_y,eye_z,fwd_x,fwd_y,fwd_z\n"); }
+        if (cf) { fprintf(cf, "%llu,%llu,%llu,%.5f,%.5f,%.5f,%.6f,%.6f,%.6f\n", (unsigned long long)serial,
+                          (unsigned long long)__atomic_load_n(&g_req.presents, __ATOMIC_RELAXED), (unsigned long long)now_ns(),
+                          t_gr_rec.eye[0], t_gr_rec.eye[1], t_gr_rec.eye[2], t_gr_rec.fwd[0], t_gr_rec.fwd[1], t_gr_rec.fwd[2]);
+                  if (++cn % 60 == 0) fflush(cf); }
+    }
     // The depth as BG3 drew it, for the compositor (only when it composites on the GPU).
     int pre = -1;
     const int db = depth_bytes(fmt[0]);
@@ -537,6 +592,7 @@ static void ground_end(DeviceData* d, VkCommandBuffer cb) {
 // pairing them with an older frame's A0 and Z whitened all of WoW's ground for as long as it lasted.
 static void ground_submit(uint32_t n, const VkCommandBuffer* cbs) {
     if (!g_cc.ground) return;
+    for (uint32_t i = 0; i < n; i++) ground_cam_check(cbs[i]);
     pthread_mutex_lock(&g_gr.m);
     for (uint32_t i = 0; i < n; i++) {
         uint64_t h = (uint64_t)(uintptr_t)cbs[i];
@@ -680,15 +736,19 @@ static void ground_present(void) {
         const uint32_t extra = g_gr.extra_dynamic & ~0x1fcu;  // beyond those the injection keeps dynamic (2..8)
         logf_("ground: %llu G-buffer passes, %llu drawn (%u of %u WoW triangles; %llu loads), %llu without BG3's camera, %llu with one bound elsewhere (%llu binds, %llu unmapped,"
               " %llu rejected), %llu without triangles, %llu without a framebuffer; GPU %.3f ms each (max %.3f, %llu timed); compositor took BG3's"
-              " own depth %llu times, missed %llu; %llu frames presented without an injection; BG3 dynamic states %#x%s",
+              " own depth %llu times, missed %llu; %llu frames presented without an injection; BG3 dynamic states %#x%s;"
+              " camera at submit: %llu as recorded, %llu changed (view turned %.3f deg on average), %llu not read",
               (unsigned long long)g_gr.passes, (unsigned long long)g_gr.drawn, g_gr.tris_kept, g_gr.tris, (unsigned long long)g_gr.loads,
               (unsigned long long)g_gr.nocam, (unsigned long long)g_gr.cam_elsewhere, (unsigned long long)g_gr.binds, (unsigned long long)g_gr.nobind, (unsigned long long)g_gr.badview,
               (unsigned long long)g_gr.nogeo, (unsigned long long)g_gr.nofb,
               g_gr.gpu_n ? g_gr.gpu_ns / 1e6 / g_gr.gpu_n : 0.0, g_gr.gpu_max / 1e6, (unsigned long long)g_gr.gpu_n,
               (unsigned long long)g_gr.pre_used, (unsigned long long)g_gr.pre_missed, (unsigned long long)g_gr.frames_bare, g_gr.extra_dynamic,
-              extra ? " (NOTE: some the injection's pipeline sets statically)" : "");
+              extra ? " (NOTE: some the injection's pipeline sets statically)" : "",
+              (unsigned long long)g_gr.sub_same, (unsigned long long)g_gr.sub_changed, g_gr.sub_changed ? g_gr.sub_deg / g_gr.sub_changed : 0.0,
+              (unsigned long long)g_gr.sub_unread);
         g_gr.passes = g_gr.drawn = g_gr.nocam = g_gr.nogeo = g_gr.nofb = g_gr.gpu_ns = g_gr.gpu_n = g_gr.gpu_max = g_gr.pre_used = g_gr.pre_missed = g_gr.frames_bare = g_gr.cam_elsewhere = 0;
         g_gr.loads = g_gr.binds = g_gr.nobind = g_gr.badview = 0;
+        g_gr.sub_same = g_gr.sub_changed = g_gr.sub_unread = 0; g_gr.sub_deg = 0;
         pthread_mutex_unlock(&g_gr.m);
     }
 }

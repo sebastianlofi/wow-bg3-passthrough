@@ -796,7 +796,7 @@ TILES_BUSY = RUN / 'tiles.busy'
 # placed the hero on WoW's ground; past hold_timeout only while coord.json says Busy. Between the server
 # running and that Start the coordinator still works (accounts, benilla's login, world mode, the first square's
 # movement tiles), so a session whose WoW side is not in yet is Busy too: else a first start gave up the hold
-# a minute and a half before WoW's ground was there and BG3 showed an empty void (Wolf, 2026-11-09).
+# a minute and a half before WoW's ground was there and BG3 showed an empty void.
 BRING = {'session': None, 'placed': None, 'since': 0.0}
 STEPS = {None: 'logging in', 'benilla': 'entering the world', 'world': 'placing the world', 'up': 'placing the ground'}
 

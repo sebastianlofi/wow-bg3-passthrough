@@ -177,13 +177,73 @@ function M.StartServer()
     end)
 end
 
+-- The fade's wheel. BG3's widget shows its wheel (BusyElement "Spinner", bottom right) when the player's
+-- ScreenFadeHasSpin is true, which its own teleport cover sets while the place streams in; a ScreenFadeTo never
+-- does, so a move's black screen (a flight point's, say) had no wheel. The flag is read-only from
+-- Lua; the Spinner's Visibility can be set. It is set Visible while a move's flag is up, and from the first move on
+-- (a set value outlives the move: bg3le has no ClearValue) it follows ScreenFadeHasSpin again, so BG3's own fades
+-- show or hide the wheel as before. The node is found from the root each time and never kept (UI nodes are bare
+-- pointers; see LoadingNote.lua).
+local function fadeWidget()
+    local function find(node, depth)
+        if not node or depth > 6 then return nil end
+        local okt, t = pcall(function() return node.Type end)
+        if okt and t == "ls.UIWidget" then
+            local okn, name = pcall(function() return node.Name end)
+            return (okn and name == "ScreenFade") and node or nil
+        end
+        local okc, cnt = pcall(function() return node.VisualChildrenCount end)
+        for i = 1, math.min(okc and cnt or 0, 128) do
+            local r = find(node:VisualChild(i), depth + 1)
+            if r then return r end
+        end
+    end
+    local ok, root = pcall(Ext.UI.GetRoot)
+    return ok and find(root, 0) or nil
+end
+
+local function spinnerOf(widget)
+    local function find(node, depth)
+        if not node or depth > 24 then return nil end
+        local okn, name = pcall(function() return node.Name end)
+        if okn and name == "Spinner" then return node end
+        local okc, cnt = pcall(function() return node.VisualChildrenCount end)
+        for i = 1, math.min(okc and cnt or 0, 64) do
+            local r = find(node:VisualChild(i), depth + 1)
+            if r then return r end
+        end
+    end
+    return find(widget, 0)
+end
+
 -- What the in-game check needs: BG3's own values for the fade while a move is on, each time they change
 -- (visibility, opacity, wheel), with the time since the move began.
 function M.StartClient()
     local ticks, seen, at, last = 0, Ext.IO.LoadFile(FLAG) or "", nil, nil
+    local wheel = nil   -- the Spinner's Visibility as last set (nil: never set, BG3's binding rules)
     Ext.Events.Tick:Subscribe(function()
         ticks = ticks + 1
-        if ticks % 30 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
+        if ticks % 15 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
+        local moving = (Ext.IO.LoadFile(FLAG) or "") ~= ""
+        if moving or wheel ~= nil then
+            local w = fadeWidget()
+            if w then
+                local want = moving
+                if not moving then
+                    local okd, spin = pcall(function() return w.DataContext.CurrentPlayer.UIData.ScreenFadeHasSpin end)
+                    want = okd and spin == true
+                end
+                local v = want and "Visible" or "Collapsed"
+                if v ~= wheel then
+                    local s = spinnerOf(w)
+                    if s and pcall(function() s:SetProperty("Visibility", v) end) then
+                        wheel = v
+                        Ext.Log.Print("WOW-BG3 move fade: wheel " .. v .. (moving and " (a move)" or " (BG3's own)"))
+                    end
+                end
+            end
+        end
+        if ticks % 30 ~= 0 then return end
         local flag = Ext.IO.LoadFile(FLAG) or ""
         if flag ~= seen then
             if (flag ~= "") ~= (seen ~= "") then at, last = flag ~= "" and Ext.Utils.MonotonicTime() or nil, nil end

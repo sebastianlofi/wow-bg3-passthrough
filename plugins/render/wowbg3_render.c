@@ -506,7 +506,7 @@ static void rpc_recover(VkRenderPass rp) {
 //   Mesa 26.x: vk_buffer gains device_address +88; radv_buffer {vk, winsys bo +104, range}: a mapped
 //              buffer's bytes are at bo->cpu_map + (device_address - bo->va).
 //   Mesa 25.0: radv_buffer {vk, winsys bo +88, offset +96, bo_va +104 (= bo->va), range}: bytes at
-//              bo->cpu_map + offset (Wolf's Steam container, Ubuntu 25.04: the 26.x read found no camera).
+//              bo->cpu_map + offset (Ubuntu 25.04's driver, as Steam's runtime uses it: the 26.x read found no camera).
 // The bo {va +0, size +8, ..., cpu_map}. Which layout, and the bo's cpu_map, are checked on buffers the plugin
 // makes itself; until every sample fits, nothing is read (g_buf_recover stays unset).
 enum { BRC_ADDRESS, BRC_OFFSET };
