@@ -5,7 +5,7 @@
 # order (apply-patches.py), runs bg3le's own source checks and its sniper build (Docker, the SDK image
 # in sdk-image.lock). Output: $WOWBG3_SNIPER/bg3le/libbg3le.so; its sha256 should be build.lock.json's
 # library_sha256. Every object is compiled through repro-cc.sh, so no folder of the building machine
-# ends up in the library or in the libc++ the plugins link. Needs: clang 22.1.8, bsdtar, lua, Docker.
+# ends up in the library or in the libc++ the plugins link. Needs: clang 23.1.5, bsdtar, lua, Docker.
 set -euo pipefail
 source "$(dirname "$0")/../../release/build-env.sh"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
@@ -23,10 +23,10 @@ bash tools/check-prelude.sh
 python3 "$here/check-view-contract.py"
 llvm_source="$BG3LE_SNIPER_BUILD/llvm-project"
 if [[ ! -d "$llvm_source/.git" ]]; then
-    git clone --depth 1 --branch llvmorg-22.1.8 --filter=blob:none --sparse https://github.com/llvm/llvm-project.git "$llvm_source"
+    git clone --depth 1 --branch llvmorg-23.1.5 --filter=blob:none --sparse https://github.com/llvm/llvm-project.git "$llvm_source"
 fi
-[[ "$(git -C "$llvm_source" rev-parse HEAD)" == ca7933e47d3a3451d81e72ac174dcb5aa28b59d1 ]]
-[[ "$(git -C "$llvm_source" describe --tags)" == llvmorg-22.1.8 ]]
+[[ "$(git -C "$llvm_source" rev-parse HEAD)" == 392dfff97d29b59d77e5cac6d4b6ef2585fe7117 ]]
+[[ "$(git -C "$llvm_source" describe --tags)" == llvmorg-23.1.5 ]]
 need_clang
 if [[ -f "$BG3LE_SNIPER_BUILD/sysroot/.image" ]]; then
     [[ "$(cat "$BG3LE_SNIPER_BUILD/sysroot/.image")" == "$(docker image inspect --format '{{.Id}}' "$BG3LE_SNIPER_IMAGE")" ]]

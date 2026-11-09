@@ -7,7 +7,7 @@ in, so the release runs on any distribution Steam supports.
 ## What you need
 
 - Linux x86_64 with about 60 GB free for sources, toolchains and build trees.
-- clang 22.1.8 (the build scripts check the version), `bsdtar`, `lua`, `zstd`, `rsync`, `git`, `curl`.
+- clang 23.1.5 (the build scripts check the version), `bsdtar`, `lua`, `zstd`, `rsync`, `git`, `curl`.
 - Docker: the sniper SDK image (`patches/bg3le/sdk-image.lock`) provides the sysroot and builds the
   server.
 - rustup with toolchain 1.98.1 (`CARGO_HOME` and `RUSTUP_HOME` default to the build folder).

@@ -708,14 +708,11 @@ BOOT_OVERRIDES = IO.parent / 'boot-path-overrides.txt'   # bg3le patch 0006 read
 
 
 def boot_overrides():
-    """This start's overrides file: it ends bg3le's wait, and BG3's loader reads the copies through it.
-    BG3's boot never waits for the WoW side (bg3le patch 0008's wait file is not written any more): the server
-    starts at the first session load (launcher.conf start = session), so a table that is not there yet counts
-    from the next start."""
-    on = S.get('mob_abilities') == '1'
-    stats = LINK / ('abilities-stats-scaled.txt' if S.get('scaling') == '1' else 'abilities-stats.txt')
+    """This start's overrides file, empty: it ends bg3le's wait for it (patch 0006). BG3's stats load no longer
+    reads the mobs' copies: Abilities.lua makes a stand-in's copies when it is granted (bg3le patch 0009), so
+    nothing of them is made at BG3's boot and a new install's first session has them too."""
     tmp = IO.parent / 'boot-path-overrides.tmp'
-    tmp.write_text('%s\t%s\n' % (ABILITIES_CARRIER, stats) if on and abilities_ready() else '')
+    tmp.write_text('')
     os.replace(tmp, BOOT_OVERRIDES)
 
 
@@ -740,7 +737,7 @@ def abilities_first():
         elif abilities_ready():
             log('abilities: the rules changed, the seed is not of this database yet: last table kept, a new one after the server starts')
         elif game_data():
-            log('abilities: none yet: mobs use their basic attacks this start; the table is made once the server runs, for the next start')
+            log('abilities: none yet: the table is made once the server runs; stand-ins get their copies then')
         else:
             log('abilities: none, and no BG3 data folder to make them from')
     boot_overrides()

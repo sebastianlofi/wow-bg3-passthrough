@@ -1,0 +1,28 @@
+diff --git a/src/vendor/stat_sync.cpp b/src/vendor/stat_sync.cpp
+--- a/src/vendor/stat_sync.cpp
++++ b/src/vendor/stat_sync.cpp
+@@ -324,6 +324,7 @@
+ namespace {
+ 
+ static_assert(offsetof(SpellPrototypeManager, SpellNames) - offsetof(SpellPrototypeManager, Spells) == 0x80);
++static_assert(offsetof(SpellPrototypeManager, CombatAIOverrideSpells) - offsetof(SpellPrototypeManager, Spells) == 0x40);
+ static_assert(offsetof(StatusPrototypeManager, StatusNames) - offsetof(StatusPrototypeManager, Statuses) == 0x40);
+ 
+ // Upstream's new-prototype branch of SyncStat: a default prototype, synced,
+@@ -345,6 +346,16 @@
+     if (char const* err = sync_spell(object, proto)) return err;
+     std::uint32_t id = 0;
+     std::memcpy(&id, &object->Name, sizeof(id));
++    // The engine's stats load files every spell in CombatAIOverrideSpells too (the map after Spells): the
++    // prototype the AI weighs in its place, the spell its CombatAIOverrideSpell names, else the spell itself
++    // (6389 of 6651 stock spells map to themselves, 262 to another). The AI looks up every spell a
++    // character has there and reads the result unchecked, so a spell made after the load and missing there
++    // crashed the server on its holder's first turn (signal 11 at 0x8). Upstream's SyncStat has the same gap.
++    void* ai = proto;
++    if (char const* over = attr_label(object, "CombatAIOverrideSpell"); over != nullptr && *over != '\0') {
++        if (void* other = bg3le_prototype_find(0, over)) ai = other;
++    }
++    if (!fs_map_insert<void*>(map + 0x40, id, ai)) return "the spell AI override map does not hash the way bg3le reads it";
+     if (!fs_map_insert<void*>(map, id, proto)) return "the spell map does not hash the way bg3le reads it";
+     array_append<std::uint32_t>(map + 0x80, id);
+     bg3le_prototype_added(0, name, proto);

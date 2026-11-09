@@ -27,7 +27,7 @@ BENILLA_COMMIT=d3ac9f75bf946bf9896a01deceb1b6dd539ace64
 VMANGOS_URL=https://github.com/vmangos/core.git
 VMANGOS_COMMIT=53d24d5c748bef5e0cde7b1155bcb3d979af614c
 RUST_TOOLCHAIN=1.98.1
-CLANG_VERSION=22.1.8
+CLANG_VERSION=23.1.5
 SNIPER_SDK="$(cat "$WOWBG3_REPO/patches/bg3le/sdk-image.lock")"
 
 # clone_pinned URL COMMIT DIR: a checkout of COMMIT in DIR (made when DIR does not exist yet).

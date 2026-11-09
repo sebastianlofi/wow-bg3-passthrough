@@ -1,14 +1,14 @@
 {
   "extender_commit": "5c729b72296defd4a09556ee723b12b76a0d445d",
-  "compiler": "clang-22.1.8-4.fc44.x86_64",
+  "compiler": "clang-23.1.5-2.fc45.x86_64",
   "sdk": "registry.gitlab.steamos.cloud/steamrt/sniper/sdk@sha256:1c33c507bc75d012e77df5727f93b0d5b8c3f7c8d4142ba5f7a16882cc92e014",
   "vulkan_tag_note": "Upstream fetch script omits .0; official matching tag is vulkan-sdk-1.4.357.0.",
   "runtime_source_patched": true,
   "source_test_adaptation": "tools/check-view-contract.py corrects stale expectations and missing fixture stubs only.",
-  "llvm_commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
+  "llvm_commit": "392dfff97d29b59d77e5cac6d4b6ef2585fe7117",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "38523fef5d50200eebbdb9ff1588191b1e747d3a436534ee3db1144f2b1a6149",
+  "library_sha256": "dae6bdfbeaaed6c98966f549b644138c76ba925520b0f81ae7b28fda9c612232",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -161,9 +161,21 @@
           "after_sha256": "c2a53013f7f14854915f10d6b0c191fb0f1d583e89e600e0cbe29861703dd580"
         }
       ]
+    },
+    {
+      "file": "patches/0009-sync-files-new-spells-for-the-ai.patch",
+      "sha256": "a842fddbefb1748a11a8e9872c79bd86c7c9d5fe0a34c86e968e93f858055740",
+      "purpose": "A spell made after the stats load (Create + Sync) is filed in SpellPrototypeManager's CombatAIOverrideSpells as the engine's load files every spell: missing there, the AI crashed on its holder's first turn",
+      "targets": [
+        {
+          "path": "src/vendor/stat_sync.cpp",
+          "before_sha256": "0b2b1bbde0c829dbc1bade12334d44909b2de4103be38062fdb6f2ee51490675",
+          "after_sha256": "b08cfc719703cff1e6bae93444c3b185ab8de5c86d0b8a4d52ce5c366af2a37d"
+        }
+      ]
     }
   ],
-  "previous_library_sha256": "e9a56f06729e628c587600c72ae3612f6e7c5a9e23b792e8cf1fbaef66f9d54c",
+  "previous_library_sha256": "38523fef5d50200eebbdb9ff1588191b1e747d3a436534ee3db1144f2b1a6149",
   "retired_patches": [
     {
       "file": "patches/0003-wow-arena-hooks.patch",

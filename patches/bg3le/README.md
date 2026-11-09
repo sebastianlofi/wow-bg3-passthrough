@@ -13,6 +13,7 @@ Baldur's Gate 3, at commit `5c729b72296defd4a09556ee723b12b76a0d445d`.
 | 0006-boot-path-overrides | path overrides from a file, set before BG3 loads its stats: no mod's Lua runs that early (the mob abilities' spell copies) |
 | 0007-loca-written-strings-stay-put | strings written through Ext.Loca stay where the index's views point: a vector growing left short handles' views dangling, and a later load crashed in `bg3le_loca_set` |
 | 0008-first-start-stats-wait | on a new install's first start, BG3's stats load waits (at most 20 minutes) while the coordinator refreshes `boot-path-overrides.wait`: it is making the mobs' abilities that load reads, from the server's new database |
+| 0009-sync-files-new-spells-for-the-ai | a spell made after the stats load (Create + Sync) also goes into `SpellPrototypeManager`'s `CombatAIOverrideSpells`, as the engine's load files every spell (its `CombatAIOverrideSpell` or itself): missing there, BG3's AI read a null and crashed on the holder's first turn |
 
 `build.lock.json` pins every patch by sha256 with the file hashes before and after it, the compiler,
 the SDK image and the sha256 of the resulting `libbg3le.so`. `externals.lock.json` pins bg3le's
