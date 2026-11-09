@@ -735,7 +735,7 @@ class World:
             party = json.loads((IO / 'party.json').read_text())
             if party.get('RunId') == self.run:
                 # The members, then their summons (Party.lua M.Summons: a familiar the player walks on its own
-                # needs ground of its own as much as a companion does; the maintainer 2026-11-02, his spider).
+                # needs ground of its own as much as a companion does; a player's spider).
                 summons = party.get('Summons')
                 rows = [(m, False) for m in party.get('Members', [])]
                 rows += [(m, True) for m in (summons if isinstance(summons, list) else [])]

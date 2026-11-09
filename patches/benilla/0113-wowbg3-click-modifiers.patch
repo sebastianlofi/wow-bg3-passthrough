@@ -1,5 +1,5 @@
 WOW-BG3 benilla patch 0113: a replayed BG3 click carries the modifier keys held on it.
-A Shift-click in WoW's quest log never watched the quest (playtest 2026-11-02): WoW's handlers read
+A Shift-click in WoW's quest log never watched the quest (playtest): WoW's handlers read
 IsShiftKeyDown from benilla's own keyboard, which hears BG3's keys only while WoW's chat box is
 typing (patch 0008), so every click forwarded from BG3 was a plain one. bg3input.bin may be BGI3
 (40 bytes: BGI2's fields, the newest click's modifiers at 32 as bits 1 Shift, 2 Ctrl, 4 Alt, the seq
