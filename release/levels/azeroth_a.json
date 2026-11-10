@@ -1,0 +1,62 @@
+{
+ "Name": "WOWBG3_Azeroth_A",
+ "Bounds": [
+  -16000,
+  -100,
+  -16000,
+  16000,
+  500,
+  16000
+ ],
+ "Start": [
+  -1000,
+  0,
+  -1000
+ ],
+ "LightingZone": "6d2f0a51-77c4-4b0e-9a5e-1f3c2b8d4e01",
+ "AtmosphereZone": "0b9e4c27-3a61-4f8d-b2c5-7d1e9a6f3c02",
+ "LightingList": [
+  "c4f81b27-3a6d-4e09-8b52-7d1e9a0c6f34",
+  "a7d3c1e9-5f2b-4c8e-9d16-3b0e7f4a2c58"
+ ],
+ "AtmosphereList": [
+  "5e2c8a71-4b3d-4f19-9c6e-2a7d1f80b4c5"
+ ],
+ "Scenery": [
+  {
+   "Template": "1645d06c-0a6f-4656-9fc7-0dc8e174e655",
+   "Name": "WOWBG3_RayProxy_000",
+   "Pos": [
+    0.0,
+    -40.0,
+    0.0
+   ]
+  }
+ ],
+ "Subgrids": [
+  {
+   "X": -1032,
+   "Y": 0,
+   "Z": -1032,
+   "Kind": "walk"
+  },
+  {
+   "X": -16000,
+   "Y": -20,
+   "Z": -16000,
+   "Kind": "blank"
+  },
+  {
+   "X": 15936,
+   "Y": -20,
+   "Z": 15936,
+   "Kind": "blank"
+  }
+ ],
+ "BlankGrid": {
+  "X0": -320,
+  "Z0": -320,
+  "N": 10,
+  "Y": -20
+ }
+}
