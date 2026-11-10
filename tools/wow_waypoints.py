@@ -204,11 +204,12 @@ def square_order(floor):
     return core, rest
 
 
-def prewarm(dbc_dir, centre=None, floor=4):
+def prewarm(dbc_dir, centre=None, floor=4, fixed=False):
     """Builds the movement tiles round every flight point ahead of the first trip there: a city's tile takes
     the generator 45 s, which a move would otherwise wait for. Tiles are kept, so a later run only looks. With
     `centre` also the cuts of the squares a move there lands on, every point's 2 x 2 before any point's rest: a cut takes
     up to 3 s, and a move would wait for 4 to 12 of them (world_bridge.py cut_cmd reads them; on this machine only).
+    `fixed`: a level of our own, where a move's centre is the point's own BG3 place (world_bridge.py fixed_pair).
     Ends with the process that started it."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import wow_arena
@@ -240,9 +241,10 @@ def prewarm(dbc_dir, centre=None, floor=4):
                             origins[n['id']] = (n['x'], n['y'], float(stand_z(n['map'], n['x'], n['y'], n['z'], terrain)))
                         except Exception:  # noqa: BLE001
                             origins[n['id']] = (n['x'], n['y'], n['z'])
-                    wx, wy = origins[n['id']][0] - (B.CELL * ij[1] + B.CELL / 2) / B.YD, origins[n['id']][1] + (B.CELL * ij[0] + B.CELL / 2) / B.YD
+                    c, o = B.fixed_pair(origins[n['id']]) if fixed else (centre, origins[n['id']])
+                    wx, wy = o[0] - (B.CELL * ij[1] + B.CELL / 2) / B.YD, o[1] + (B.CELL * ij[0] + B.CELL / 2) / B.YD
                     wow_arena.ensure_mmtiles(mmaps, maps, n['map'], wx, wy, B.CELL / 2 / B.YD + 3, busy=False)
-                    B.store_cut(B.cut_args(terrain, n['map'], centre, origins[n['id']], ij))
+                    B.store_cut(B.cut_args(terrain, n['map'], c, o, ij))
                 except Exception:  # noqa: BLE001  a point off the height maps costs its move a cut, no more
                     continue
     return 0
@@ -251,8 +253,8 @@ def prewarm(dbc_dir, centre=None, floor=4):
 def main(argv):
     if len(argv) == 2 and argv[0] == 'prewarm':
         return prewarm(argv[1])
-    if len(argv) == 6 and argv[0] == 'prewarm':
-        return prewarm(argv[1], (float(argv[2]), float(argv[3]), float(argv[4])), int(argv[5]))
+    if len(argv) in (6, 7) and argv[0] == 'prewarm':
+        return prewarm(argv[1], (float(argv[2]), float(argv[3]), float(argv[4])), int(argv[5]), len(argv) == 7 and argv[6] == 'fixed')
     if len(argv) != 2 or argv[0] not in ('table', 'stand'):
         print(__doc__)
         return 2

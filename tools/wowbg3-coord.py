@@ -538,11 +538,9 @@ class Release:
             e.setdefault('WOW_BG3_WORLD_Z', '-1000')
             e.setdefault('WOW_BG3_POOL', '84')
             e.setdefault('WOW_BG3_LAYER', '-1.981,9.74')
-        elif host and host.startswith('WOWBG3_'):  # a level of our own (the level generator's layout): the pool is its
-            e.setdefault('WOW_BG3_WORLD_X', '0')    # 10 x 10 blank squares round the origin, 120 m under the world
-            e.setdefault('WOW_BG3_WORLD_Y', '100')
-            e.setdefault('WOW_BG3_WORLD_Z', '0')
-            e.setdefault('WOW_BG3_POOL', '100')
+        elif host and host.startswith('WOWBG3_'):  # a level of our own (tools/wowbg3_level.py): every WoW point has
+            e.setdefault('WOW_BG3_FIXED', '1')      # one BG3 place (world_bridge.py fixed_pair); the pool is the level's
+            e.setdefault('WOW_BG3_POOL', '100')     # 100 blank squares, parked outside WoW's map at y -20
             e.setdefault('WOW_BG3_LAYER', '-20')
         e.setdefault('WOW_BG3_WORLD_X', '-1400')
         e.setdefault('WOW_BG3_WORLD_Y', '120')

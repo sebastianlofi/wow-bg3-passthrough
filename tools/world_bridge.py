@@ -349,6 +349,20 @@ def camera_wow():
     return eye if all(math.isfinite(v) for v in eye) else None
 
 
+# A level of our own (--fixed): one mapping for a whole continent, for good. WoW's (0, 0, 0) is BG3's (0, FIXED_Y0, 0),
+# so every WoW point has one BG3 place in every session and in every save: BG3 = (y, z, -x) * 0.9144 + (0, FIXED_Y0, 0).
+# WoW's maps reach 17066 yd from their middle (15.6 km: inside the level's 16 km) and its ground lies between about
+# -500 and 3000 yd, so sea level sits 1 km over the level's floor. A session still names a centre and the WoW point
+# it stands for (the hero is put there, the squares' lattice starts there): any pair that this mapping joins.
+FIXED_Y0 = 1000.0
+
+
+def fixed_pair(wow):
+    """The (centre, origin) pair of the fixed mapping nearest the WoW point: the centre on the tile grid."""
+    c = lattice_centre((wow[1] * YD, wow[2] * YD + FIXED_Y0, -wow[0] * YD))
+    return c, (-c[2] / YD, c[0] / YD, wow[2])
+
+
 def lattice_centre(c):
     """The lattice is in tiles: the centre goes on the 0.5 m grid."""
     return (round(c[0] * 2) / 2, c[1], round(c[2] * 2) / 2)
@@ -478,6 +492,7 @@ class World:
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
         self.centre = lattice_centre(a.centre)
         self.origin = None   # WoW point mapped onto self.centre for the whole session
+        self.fixed = bool(getattr(a, 'fixed', False))  # the continent's own mapping (fixed_pair): the centre follows the origin
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
         self.pinned = {}        # pool index -> until when it is not moved (something stood on it)
@@ -494,6 +509,11 @@ class World:
         self.landed = None      # when the last re-origin landed, until benilla's player has followed (settle)
 
     # ---- mapping ----
+    def anchor(self):
+        """After self.origin was set: in a level of our own the centre is that WoW point's own place."""
+        if self.fixed and self.origin:
+            self.centre, self.origin = fixed_pair(self.origin)
+
     def to_bg3(self, w):
         W, C = self.origin, self.centre
         return (C[0] + (w[1] - W[1]) * YD, C[1] + (w[2] - W[2]) * YD, C[2] - (w[0] - W[0]) * YD)
@@ -930,11 +950,13 @@ class World:
         y = self.storey_floors(self.centre[0], self.centre[2])
         if y is None and login:
             self.origin = (at[0], at[1], self.terrain.height(at[0], at[1]))
+            self.anchor()
             print('start: no raised floor under WoW\'s player, the terrain', flush=True)
             self.cells.clear()
             cut_all()
         elif y is not None and abs(y - self.centre[1]) > wow_arena.STOREY_CLEAR * YD:
             self.origin = (at[0], at[1], at[2] + (y - self.centre[1]) / YD)
+            self.anchor()
             print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.origin[2]), flush=True)
             self.cells.clear()
             cut_all()
@@ -960,6 +982,7 @@ class World:
             if STOREYS and abs(wz - self.origin[2]) > wow_arena.STOREY_CLEAR:
                 at, login = (wx, wy, wz), True
                 self.origin = tuple(at)
+        self.anchor()
         w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
         w.node = (0, 0)
         want, _ = self.window(w, self.centre[0], self.centre[2])
@@ -987,6 +1010,10 @@ class World:
         """This session at the WoW point `at` (see the notes at the top). None, or why not: then the caller goes on
         with Stop and Start, which take everything home whatever this left (the mod may have stopped publishing).
         `covered`: called once the cuts are made, before the mod's part (move: waits for the cover to be black)."""
+        if self.fixed:
+            # The mod's Reorigin keeps BG3's centre and gives it another WoW point; here every WoW point keeps its own
+            # BG3 place, so the hero is the one who moves: Stop and Start at the new place.
+            return 'a level of our own: the map stays, the hero moves'
         self.origin = tuple(at)
         self.cells.clear()
         self.ready.clear()
@@ -1451,6 +1478,8 @@ def main():
     env = lambda k, d: float(os.environ.get(k, d))  # noqa: E731
     p.add_argument('--centre', type=float, nargs=3,
                    default=(env('WOW_BG3_WORLD_X', '-1400'), env('WOW_BG3_WORLD_Y', '120'), env('WOW_BG3_WORLD_Z', '-350')))
+    p.add_argument('--fixed', action='store_true', default=os.environ.get('WOW_BG3_FIXED') == '1',
+                   help='a level of our own: the continent\'s fixed mapping (fixed_pair), --centre is not used')
     p.add_argument('--pool', type=int, default=int(env('WOW_BG3_POOL', '6')), help='pool subgrids to use (4 to 128)')
     # A bigger host level: the out-of-bounds layer's height, the hero's floor side in
     # squares (4, since the friendly NPCs' stand-ins reach 40 yd: a 4 x 4 block, at least 88 m of ground
@@ -1473,7 +1502,7 @@ def main():
     if os.environ.get('WOW_BG3_SERVER') and os.environ.get('WOWBG3_SERVER_VAR'):
         try:
             subprocess.Popen(['nice', '-n', '19', sys.executable, str(Path(__file__).resolve().parent / 'wow_waypoints.py'), 'prewarm',
-                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')] + [str(v) for v in a.centre] + [str(a.floor)],
+                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')] + [str(v) for v in a.centre] + [str(a.floor)] + (['fixed'] if a.fixed else []),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             print('movement tiles ahead:', e, flush=True)

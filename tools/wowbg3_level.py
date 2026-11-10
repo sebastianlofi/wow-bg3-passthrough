@@ -22,7 +22,8 @@ What it writes: an empty level the size of a WoW continent, whose ground world m
 
 Also in SPEC.json: "LightingList" / "AtmosphereList" (resource ids listed on the two zones, the first one the
 level's own), "LightingZone" / "AtmosphereZone" (fixed ids for the zone triggers, so the mod's Lua can name them),
-"BlankGrid" {"X0", "Z0", "N", "Y"} (N x N blank squares from that corner: the pool world mode moves under the party).
+"BlankGrid" {"X0", "Z0", "N" or "NX" and "NZ", "Y"} (blank squares in rows from that corner: the pool world mode
+moves under the party).
 
 SPEC.json: {"Name": "WOWBG3_Skel_A", "Bounds": [minx, miny, minz, maxx, maxy, maxz],
             "Start": [x, y, z],
@@ -205,8 +206,9 @@ def main():
     if spec.get("AtmosphereList"): spec["Atmosphere"] = spec["AtmosphereList"][0]
     if spec.get("BlankGrid"):  # {"X0","Z0","N","Y"}: N x N blank 128-tile squares from that corner, the treadmill's pool
         g = spec["BlankGrid"]
+        nx, nz = g.get("NX", g.get("N")), g.get("NZ", g.get("N"))
         spec["Subgrids"] = spec.get("Subgrids", []) + [{"X": g["X0"] + 64 * i, "Y": g["Y"], "Z": g["Z0"] + 64 * j, "Kind": "blank"}
-                                                        for j in range(g["N"]) for i in range(g["N"])]
+                                                        for j in range(nz) for i in range(nx)]
     for d in ("Ai", "Triggers", "Layers"):
         os.makedirs(os.path.join(out, d), exist_ok=True)
     layer = uid(spec["Name"], "layer", "Triggers")
