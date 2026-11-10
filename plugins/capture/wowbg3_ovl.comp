@@ -1,0 +1,23 @@
+// WOW-BG3 capture layer (wdpost, wowbg3_fxbg.inc.c): after one of BG3's overlay passes (between its TAA and its display
+// transform, there only while something is aimed or highlighted: an ability's area on the ground, an outline), what the
+// pass changed at a pure WoW pixel. The pass reads the scene and writes it again with its overlay: where the two differ,
+// the overlay's share of the written pixel a channel (1 - before / after) joins what BG3's effects pass drew there
+// (wowbg3_post.frag) in the same image, shares multiplied as the passes follow each other. wdpostcas adds that share
+// of BG3's displayed pixel to WoW's own colour.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;   // 2: pure WoW ground (wowbg3_post.frag)
+layout(set = 0, binding = 1) uniform sampler2D before;             // the scene the pass read
+layout(set = 0, binding = 2) uniform sampler2D after;              // and what it wrote
+layout(rgba16f, set = 0, binding = 3) uniform image2D late;
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
+    if (q.x >= sz.x || q.y >= sz.y) return;
+    if (!(imageLoad(nob, q).r > 1.5)) return;
+    vec3 b = texelFetch(before, q, 0).rgb, a = texelFetch(after, q, 0).rgb;
+    if (!any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6)))) return;
+    vec3 l2 = clamp((a - b) / max(a, vec3(1e-6)), vec3(-8.0), vec3(1.0));
+    vec4 l = imageLoad(late, q);
+    vec3 l1 = l.a > 0.5 ? l.rgb : vec3(0.0);
+    imageStore(late, q, vec4(clamp(1.0 - (1.0 - l1) * (1.0 - l2), vec3(-8.0), vec3(1.0)), 1.0));
+}

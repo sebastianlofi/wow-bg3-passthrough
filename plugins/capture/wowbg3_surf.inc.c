@@ -588,6 +588,9 @@ static void fb_post(DeviceData* d, VkCommandBuffer cb);
 static __thread VkCommandBuffer t_post_cb;
 static void fb_bmask(DeviceData* d, VkCommandBuffer cb);
 static void fb_bcut(DeviceData* d, VkCommandBuffer cb);
+static void late_pass_end(DeviceData* d, VkCommandBuffer cb);
+static void fb_ovl(DeviceData* d, VkCommandBuffer cb);
+static __thread VkCommandBuffer t_ovl_cb;
 static __thread VkCommandBuffer t_bare_cb;
 static __thread uint32_t t_pass_n; static __thread uint64_t t_pass_img0, t_fog_img, t_cld_img; static __thread int32_t t_pass_fin0, t_fog_lay, t_cld_lay;
 static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* ini, const uint8_t* load, const int32_t* fin) {
@@ -678,6 +681,8 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     if (t_post_cb == cb) { t_post_cb = VK_NULL_HANDLE; fb_post(d, cb); }
     if (t_blm_cb == cb) { t_blm_cb = VK_NULL_HANDLE; fb_bmask(d, cb); }
     if (t_blc_cb == cb) { t_blc_cb = VK_NULL_HANDLE; fb_bcut(d, cb); }
+    late_pass_end(d, cb);
+    if (t_ovl_cb == cb) { t_ovl_cb = VK_NULL_HANDLE; fb_ovl(d, cb); }
     if (t_pass_cb == cb) t_pass_cb = VK_NULL_HANDLE;  // a draw outside a full-size pass is in none of them
     if (t_sf_cb != cb) return;
     t_sf_cb = VK_NULL_HANDLE;

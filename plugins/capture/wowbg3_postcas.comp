@@ -8,13 +8,23 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;
 layout(set = 0, binding = 1) uniform sampler2D wdsp;                    // WoW's own colour per pixel (the feed), a 1 where written
+layout(set = 0, binding = 3) uniform sampler2D late;                    // BG3's late addition over a pure pixel: its share of BG3's pixel a channel, a 1 (wowbg3_post.frag)
 layout(set = 0, binding = 5) uniform sampler2D cin;                     // CAS's input (the display transform's output)
 layout(rgb10_a2, set = 0, binding = 6) uniform image2D cout;  // CAS's output (read for BG3's own pixels under WoW's fog)
+layout(push_constant) uniform PC { uint dbg; } pc;  // word wdpcdbg: the mask's classes as colours
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
     float n = imageLoad(nob, q).r;
     vec4 w = texelFetch(wdsp, q, 0);
+    if (pc.dbg != 0u) {  // pure and untouched: WoW's colour; pure at the composite only: blue; under an addition: red its share, green its gain
+        vec4 l = texelFetch(late, q, 0);
+        if (n > 1.5 && l.a > 0.5) imageStore(cout, q, vec4(1.0, 0.0, 1.0, 1.0));
+        else if (n > 1.5) imageStore(cout, q, vec4(w.rgb, 1.0));
+        else if (n > 0.5) imageStore(cout, q, vec4(0.0, 0.0, 1.0, 1.0));
+        else if (n < 0.0) { float v = -n - 1.0; imageStore(cout, q, vec4(0.15 + 0.85 * floor(v) / 255.0, fract(v), 0.0, 1.0)); }
+        return;
+    }
     // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255 + g)): WoW's own colour, lightened by g,
     // for WoW's share, BG3's picture for BG3's share t. Nearly all BG3's: its sharpened output stays.
     if (n < 0.0) {
@@ -28,5 +38,10 @@ void main() {
         if (w.a >= 2.0 && w.a < 2.999) imageStore(cout, q, vec4(mix(w.rgb, imageLoad(cout, q).rgb, w.a - 2.0), 1.0));
         return;
     }
-    imageStore(cout, q, n > 1.5 && w.a > 0.5 ? vec4(w.rgb, 1.0) : texelFetch(cin, q, 0));
+    vec4 c = texelFetch(cin, q, 0);
+    if (!(n > 1.5 && w.a > 0.5)) { imageStore(cout, q, c); return; }
+    // WoW's own colour, and over it what BG3 drew there after its composite: that share of BG3's displayed pixel
+    // (a glow adds, smoke takes away).
+    vec4 l = texelFetch(late, q, 0);
+    imageStore(cout, q, vec4(l.a > 0.5 ? clamp(w.rgb + c.rgb * l.rgb, vec3(0.0), vec3(1.0)) : w.rgb, 1.0));
 }
