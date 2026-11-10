@@ -171,6 +171,13 @@ local function startOwn(runId)
             if ticks % 30 == 0 then noNights() end
             local lv = level()
             if asked and lv == asked.To then asked = nil end
+            -- The story unlocks camp (the Long Rest button, sending companions to camp) when it has a camp, which
+            -- it learns in the camp's level: before the first trip Long Rest was greyed out. Its own fact for
+            -- "camp is unlocked" (the story's debug word "campon" sets the same).
+            if lv == Hero.REGION and #(q(function() return Osi.DB_Camp_Unlocked:Get(1) end) or {1}) == 0 then
+                Osi.DB_Camp_Unlocked(1)
+                Ext.Utils.Print("WOW-BG3 camp: camp unlocked for the story (DB_Camp_Unlocked)")
+            end
             if lv ~= M.LEVEL then
                 if visit then Ext.Utils.Print("WOW-BG3 camp: back from camp") end
                 visit = nil
@@ -178,6 +185,16 @@ local function startOwn(runId)
             end
             local hero = Hero.Uuid()
             if not hero then return end
+            if not visit then
+                -- Long Rest pressed in our level began the story's End the Day (DB_GoingToCamp, a request to the
+                -- engine to gather the party at camp) and the level change cut it short before the engine's
+                -- answer: the story then took every later Long Rest for one still under way and did nothing.
+                -- Its own rule for an answer that says no (RequestGatherAtCampFail) drops the same fact.
+                if #(q(function() return Osi.DB_GoingToCamp:Get(1) end) or {}) > 0 then
+                    pcall(function() Osi.DB_GoingToCamp:Delete(1) end)
+                    Ext.Utils.Print("WOW-BG3 camp: the End the Day begun before the level change is over (DB_GoingToCamp)")
+                end
+            end
             visit = visit or {Since = ticks, Tries = 0, Next = ticks, In = false, Out = 0, Let = false}
             local inCamp = inCampDb(hero)
             if inCamp and not visit.In then
