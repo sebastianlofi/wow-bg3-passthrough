@@ -104,6 +104,8 @@ function Probe.Start(context)
         Ext.Require("WowCursor.lua").Start(report.RunId)
         Ext.Require("RightAttack.lua").Start(report.RunId)
         -- Mirrored mobs' client copies where WoW draws them, every frame.
+        local okLt, errLt = pcall(function() Ext.Require("Lights.lua").Start(report.RunId) end)
+        if not okLt then Ext.Log.Print("WOW-BG3 lights unavailable: " .. tostring(errLt)) end
         local okCl, errCl = pcall(function() Ext.Require("CharLight.lua").Start(report.RunId) end)
         if not okCl then Ext.Log.Print("WOW-BG3 charlight unavailable: " .. tostring(errCl)) end
         local okMc, errMc = pcall(function() Ext.Require("MirrorsClient.lua").Start(report.RunId) end)

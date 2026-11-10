@@ -1064,7 +1064,7 @@ typedef struct {
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
     int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
-    float wdamb; int wdwfog;
+    float wdamb; int wdwfog, wdwlit;
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
@@ -1210,6 +1210,7 @@ static void compose_config(void) {
     g_cc.fbstale = has_word(line, "fbstale");
     g_cc.wdjit = has_word(line, "wdjit");
     g_cc.wdpost = has_word(line, "wdpost");
+    g_cc.wdwlit = has_word(line, "wdwlit");  // WoW's point lights on BG3's own pixels
     g_cc.wdwfog = has_word(line, "wdwfog");  // WoW's fog on BG3's own pixels (wowbg3_fxbg.inc.c)
     g_cc.noshade = has_word(line, "noshade");  // WoW's ground shade on BG3's figures off (wowbg3_shade.inc.c)
     g_cc.wdtable = has_word(line, "wdtable");  // research: WoW's pixels only through the feed's table, never their own colour after BG3's display transform

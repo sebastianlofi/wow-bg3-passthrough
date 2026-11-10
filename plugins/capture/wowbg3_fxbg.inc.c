@@ -23,6 +23,8 @@ static VkImageView wd_mask_view(void);
 static struct { uint64_t p; float j[2]; } g_jit[8];
 static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[2];
 #define FB_TAB (17 * 17 * 17 * 3)
+#define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
+#define FB_TAIL (4 + FB_LIT * 8)
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
@@ -39,10 +41,10 @@ static struct {
 // colour (link/wowsky.txt, patch 0125: the last three numbers, as WoW samples Light.dbc for the time of day), and the
 // feed adds what WoW's ambient term is, the material's colour times the ambient, to BG3's lit scene at each of BG3's
 // pixels, through the same table that brings WoW's ground into BG3's light (wowbg3_fxbg2.frag).
-static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
+static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; int nlit; float lit[FB_LIT][7]; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
 static void amb_present(void) {
     const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
-    if (!g_cc.on || (!(g_cc.wdamb > 0.0f) && !g_cc.wdwfog) || pr % 30 != 7) return;
+    if (!g_cc.on || (!(g_cc.wdamb > 0.0f) && !g_cc.wdwfog) || pr % (g_cc.wdwlit ? 6 : 30) != 1) return;
     char path[1100];
     snprintf(path, sizeof path, "%s/wowsky.txt", link_dir());
     float v[14]; int ok = 0, okf = 0;
@@ -52,13 +54,31 @@ static void amb_present(void) {
         okf = ok && fscanf(f, "%f %f %f %f %f", v + 9, v + 10, v + 11, v + 12, v + 13) == 5;  // benilla patch 0129: fog r g b, start, end
         fclose(f);
     }
+    // WoW's point lights near the hero (benilla patch 0130: link/wowlights.txt).
+    float lit[FB_LIT][7]; int nlit = 0;
+    if (g_cc.wdwlit) {
+        snprintf(path, sizeof path, "%s/wowlights.txt", link_dir());
+        FILE* lf = fopen(path, "r");
+        if (lf) {
+            int count = 0;
+            if (fscanf(lf, "WLT1 %d", &count) == 1)
+                for (int k = 0; k < count && nlit < FB_LIT; k++) {
+                    float* v7 = lit[nlit];
+                    if (fscanf(lf, "%f %f %f %f %f %f %f", v7, v7 + 1, v7 + 2, v7 + 3, v7 + 4, v7 + 5, v7 + 6) != 7) break;
+                    nlit++;
+                }
+            fclose(lf);
+        }
+    }
     pthread_mutex_lock(&g_amb.m);
+    g_amb.nlit = nlit; memcpy(g_amb.lit, lit, sizeof lit);
     if (ok) { for (int i = 0; i < 3; i++) g_amb.rgb[i] = v[6 + i] < 0 ? 0 : v[6 + i] > 1 ? 1 : v[6 + i]; g_amb.have = 1; }
     if (okf) { memcpy(g_amb.fog, v + 9, sizeof g_amb.fog); g_amb.have_fog = 1; }
     const uint64_t n = ++g_amb.reads;
     pthread_mutex_unlock(&g_amb.m);
-    if (n % 600 == 1) logf_("wdamb: WoW's ambient %.3f %.3f %.3f (%s), share %.2f; fog %.3f %.3f %.3f from %.1f to %.1f yd (%s)", g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2], ok ? "read" : "kept: no wowsky.txt", g_cc.wdamb,
+    if (n % (g_cc.wdwlit ? 3000 : 600) == 1) logf_("wdamb: WoW's ambient %.3f %.3f %.3f (%s), share %.2f; fog %.3f %.3f %.3f from %.1f to %.1f yd (%s)", g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2], ok ? "read" : "kept: no wowsky.txt", g_cc.wdamb,
                          g_amb.fog[0], g_amb.fog[1], g_amb.fog[2], g_amb.fog[3], g_amb.fog[4], !g_cc.wdwfog ? "off" : okf ? "read" : "none in wowsky.txt");
+    if (g_cc.wdwlit && n % 3000 == 1) logf_("wdwlit: %d of WoW's point lights near the hero", nlit);
 }
 // WoW's fog on BG3's own pixels (compose word "wdwfog"). WoW fogs everything it draws by its eye depth, a straight
 // blend towards the fog colour between a start and an end distance, in the colours it displays. BG3's characters and
@@ -76,6 +96,33 @@ static void wfog_get(float* f) {
         memcpy(f + 3, &c, 4);
     }
     pthread_mutex_unlock(&g_amb.m);
+}
+// WoW's point lights on BG3's own pixels (compose word "wdwlit"): a torch on a wall, a camp fire, a lamp post light
+// WoW's units and left BG3's characters dark beside them. The feed has each of BG3's pixels' place and facing (BG3's
+// G-buffer eye depth, and the facing that depth's neighbours give), and adds for it what WoW adds for a unit: its three nearest lights, each its colour
+// over 0.7 d + 0.03 d^2 (d in yards) times the facing, into the same sum as the ambient.
+// out: count, the ambient share, then a light each: its place in the camera's view (metres: right, up, forward),
+// its range (yards), its colour.
+static void wlit_put(float* out, int on, const float* eye, const float* fwd, const float* right, const float* up) {
+    out[0] = 0.0f; out[1] = g_cc.wdamb;
+    { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; BG3's eye depth %s, ambient %s", g_amb.nlit, g_blv_z ? "found" : "not bound by its lighting pass", on || !g_blv_z ? "on" : "off"); }
+    if (!on || !g_cc.wdwlit || !g_tav.seq) return;
+    pthread_mutex_lock(&g_amb.m);
+    const int n = g_amb.nlit;
+    const double yd = 0.9144;
+    for (int i = 0; i < n; i++) {
+        const float* l = g_amb.lit[i];
+        const double w[3] = {g_tav.centre[0] + (l[1] - g_tav.wow[1]) * yd - eye[0], g_tav.centre[1] + (l[2] - g_tav.wow[2]) * yd - eye[1],
+                             g_tav.centre[2] - (l[0] - g_tav.wow[0]) * yd - eye[2]};
+        float* o8 = out + 4 + i * 8;
+        o8[0] = (float)(w[0] * right[0] + w[1] * right[1] + w[2] * right[2]);
+        o8[1] = (float)(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+        o8[2] = (float)(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
+        o8[3] = l[3]; o8[4] = l[4]; o8[5] = l[5]; o8[6] = l[6]; o8[7] = 0.0f;
+    }
+    pthread_mutex_unlock(&g_amb.m);
+    { static uint64_t said2; if (g_cc.wdlog && n && said2++ % 600 == 0) logf_("wdwlit: nearest light in view at %.2f %.2f %.2f m (right, up, forward), colour %.2f %.2f %.2f", out[4], out[5], out[6], out[8], out[9], out[10]); }
+    out[0] = (float)n;
 }
 // rgb: WoW's ambient times the dial; 0 when there is none to add.
 static int amb_get(float* rgb) {
@@ -250,7 +297,7 @@ static int fb_make(DeviceData* d) {
     VkDescriptorSetLayout l[2] = {g_fbg.dsl, g_fbg.dsl};
     VkDescriptorSetAllocateInfo sai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_fbg.pool, 2, l};
     if (d->AllocateDescriptorSets(d->device, &sai, g_fbg.set) != VK_SUCCESS) return 0;
-    VkBufferCreateInfo tci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, FB_TAB * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+    VkBufferCreateInfo tci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (FB_TAB + FB_TAIL) * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (d->CreateBuffer(d->device, &tci, NULL, &g_fbg.tbuf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
     d->GetBufferMemoryRequirements(d->device, g_fbg.tbuf, &req);
@@ -1204,7 +1251,8 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     float pc[48];
     memset(pc, 0, sizeof pc);
     if (!fog && g_blv_alb && amb_get(pc + 40)) pc[43] = 1.0f;  // WoW's ambient, times the dial (amb_present)
-    if (!fog && g_blv_z) wfog_get(pc + 44);  // WoW's fog: start and end (yards of eye depth), 1 when there is one, and its colour packed
+    if (!fog && g_blv_z) wfog_get(pc + 44);
+    if (!fog && g_fbg.tmap) wlit_put(g_fbg.tmap + FB_TAB, g_blv_z && pc[43] > 0.5f, eN, fN, rN, uN);  // WoW's fog: start and end (yards of eye depth), 1 when there is one, and its colour packed
     memcpy(pc + 0, fN, 12); pc[3] = txN; memcpy(pc + 4, rN, 12); pc[7] = tyN; memcpy(pc + 8, uN, 12); pc[11] = 1.0f / (float)ii->w;
     memcpy(pc + 12, eK, 12); pc[15] = txK; memcpy(pc + 16, fK, 12); pc[19] = tyK; memcpy(pc + 20, rK, 12); pc[23] = 1.0f / (float)ii->hgt; memcpy(pc + 24, uK, 12);
     uint32_t* u = (uint32_t*)(pc + 28);

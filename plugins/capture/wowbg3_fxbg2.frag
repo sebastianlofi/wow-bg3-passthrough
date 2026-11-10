@@ -69,6 +69,8 @@ vec3 wow_at(vec2 ndc) {
     vec3 w = mix(mix(wow_disp(x0, y0), wow_disp(x1, y0), f.x), mix(wow_disp(x0, y1), wow_disp(x1, y1), f.x), f.y);
     return w;
 }
+// A pixel's place in frame N's view from its eye depth: right, up, forward (metres).
+vec3 vpos(vec2 ndc, float z) { return vec3(ndc.x * pc.fN.w * z, -ndc.y * pc.rN.w * z, z); }
 void main() {
     float ex = max(e0.a.y * e1.a.x, 1e-6);  // BG3's exposure: the x that shows as w is the table's over this
     // patch61: e0 is BG3's newest eye state (the exposure this frame's lighting pre-exposes with): WoW's radiance
@@ -106,7 +108,46 @@ void main() {
         vec3 al = texelFetch(galb, q, 0).rgb;
         if (max(al.r, max(al.g, al.b)) < 0.5 / 255.0) return;
         vec3 tex = pow(clamp(al, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
-        o = vec4(max(inv3(tex * pc.amb.rgb) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
+        // WoW's light sum for a unit: the ambient, and its three nearest point lights within their range (after the
+        // table in its buffer: count, share, then place in this view, range, colour a light).
+        vec3 lit = pc.amb.rgb;
+        const int LT = 17 * 17 * 17 * 3;
+        int nl = int(tb.TAB[LT]);
+        if (nl > 0) {
+            // The pixel's place in this view (right, up, forward: metres) and its facing, from the eye depths beside
+            // it: on each axis the neighbour nearer in depth, so the step at a figure's edge gives no wild facing.
+            float z = texelFetch(gz, q, 0).r;
+            vec3 P = vpos(ndc, z);
+            vec2 px = vec2(pc.uN.w, pc.rK.w) * 2.0;
+            float zl = texelFetch(gz, q + ivec2(-1, 0), 0).r, zr = texelFetch(gz, q + ivec2(1, 0), 0).r;
+            float zu = texelFetch(gz, q + ivec2(0, -1), 0).r, zd = texelFetch(gz, q + ivec2(0, 1), 0).r;
+            vec3 dx = abs(zr - z) < abs(zl - z) ? vpos(ndc + vec2(px.x, 0.0), zr) - P : P - vpos(ndc - vec2(px.x, 0.0), zl);
+            vec3 dy = abs(zd - z) < abs(zu - z) ? vpos(ndc + vec2(0.0, px.y), zd) - P : P - vpos(ndc - vec2(0.0, px.y), zu);
+            vec3 N = cross(dx, dy);
+            float nn = dot(N, N);
+            N = nn > 1e-20 ? N / sqrt(nn) : vec3(0.0, 0.0, -1.0);
+            if (dot(N, P) > 0.0) N = -N;
+            float sd[3] = float[3](1e30, 1e30, 1e30); int sel[3] = int[3](0, 0, 0);
+            for (int i = 0; i < nl && i < 8; i++) {
+                int b = LT + 4 + i * 8;
+                vec3 dv = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
+                float d2 = dot(dv, dv), rg = tb.TAB[b + 3];
+                if (d2 > rg * rg) continue;
+                if (d2 < sd[0]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = sd[0]; sel[1] = sel[0]; sd[0] = d2; sel[0] = b; }
+                else if (d2 < sd[1]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = d2; sel[1] = b; }
+                else if (d2 < sd[2]) { sd[2] = d2; sel[2] = b; }
+            }
+            vec3 sum = vec3(0.0);
+            for (int s = 0; s < 3; s++) {
+                if (sd[s] > 9.9e29) break;
+                int b = sel[s];
+                vec3 tl = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
+                float d = length(tl);
+                sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * (max(dot(N, tl / max(d, 1e-4)), 0.0) / (0.7 * d + 0.03 * d * d));
+            }
+            lit += sum * tb.TAB[LT + 1];
+        }
+        o = vec4(max(inv3(tex * min(lit, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
         return;
     }
     if (zero) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }

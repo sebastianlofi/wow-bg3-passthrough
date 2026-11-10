@@ -1,0 +1,127 @@
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index 89813c7..c2bf46f 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -175,7 +175,8 @@ pub(crate) fn build(app: &mut App) {
+     })
+     .init_resource::<FrameTag>()
+     .add_systems(First, wait_packet)
+-    .add_systems(Last, tag_frame);
++    .add_systems(Last, (tag_frame, lights_export))
++    .add_systems(First, bg3_lights_import.after(wait_packet));
+     // Patch 0124: a stamp after each main schedule (WOW_BG3_FRAME_TIMES's CSV).
+     app.add_schedule(Schedule::new(StampSchedule(0))).add_systems(StampSchedule(0), stamp_schedule::<0>);
+     app.add_schedule(Schedule::new(StampSchedule(1))).add_systems(StampSchedule(1), stamp_schedule::<1>);
+@@ -443,3 +444,112 @@ mod tests {
+         assert!(decode_trailer(old).is_none(), "a pose file without a trailer");
+     }
+ }
++
++/// Patch 0130: a point light that stands for one of BG3's (a spell's light, a torch BG3 carries), spawned from
++/// `bg3lights.txt`: WoW lights its world with it as with its own.
++#[derive(Component)]
++struct Bg3Light;
++
++/// Patch 0130: WoW's point lights near the hero's figure, for BG3's own pixels (the render plugin lights them as WoW
++/// lights a unit): `$WOW_BG3_LINK_DIR/wowlights.txt`, "WLT1 <count>" then a line a light, "<x y z, WoW yards>
++/// <range yd> <r g b>" (the colour as the shaders add it: authored colour x intensity), the 8 nearest within 60 yd,
++/// written whole (rename) when one moved 0.1 yd or changed. Never one of BG3's own lights back to it.
++fn lights_export(
++    figures: Query<(&Name, &GlobalTransform), With<benilla_world::entity_shade::GroundShade>>,
++    lights: Query<(&benilla_world::lighting::WorldPointLight, &GlobalTransform), Without<Bg3Light>>,
++) {
++    static LAST: std::sync::Mutex<Vec<[f32; 7]>> = std::sync::Mutex::new(Vec::new());
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let Some(at) = figures.iter().find(|(name, _)| name.as_str() == "wowbg3 Tav").map(|(_, gt)| gt.translation()) else { return };
++    let mut near: Vec<(f32, [f32; 7])> = lights
++        .iter()
++        .filter_map(|(l, gt)| {
++            let p = gt.translation();
++            let d2 = p.distance_squared(at);
++            (d2 < 60.0 * 60.0).then(|| {
++                let w = benilla_assets::coords::bevy_to_wow(p);
++                let s = l.intensity / (4.0 * std::f32::consts::PI);
++                (d2, [w[0], w[1], w[2], l.range, (l.color[0] * s).max(0.0), (l.color[1] * s).max(0.0), (l.color[2] * s).max(0.0)])
++            })
++        })
++        .collect();
++    near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
++    near.truncate(8);
++    let now: Vec<[f32; 7]> = near.into_iter().map(|(_, v)| v).collect();
++    let Ok(mut last) = LAST.lock() else { return };
++    let same = last.len() == now.len()
++        && last.iter().zip(now.iter()).all(|(a, b)| a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| (x - y).abs() < if i < 4 { 0.1 } else { 0.01 }));
++    if same {
++        return;
++    }
++    let mut text = format!("WLT1 {}\n", now.len());
++    for v in &now {
++        text.push_str(&format!("{:.2} {:.2} {:.2} {:.1} {:.4} {:.4} {:.4}\n", v[0], v[1], v[2], v[3], v[4], v[5], v[6]));
++    }
++    let path = std::path::Path::new(&dir).join("wowlights.txt");
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
++        *last = now;
++    }
++}
++
++/// Patch 0130: BG3's lights in WoW's world. The mod writes `$WOW_BG3_LINK_DIR/bg3lights.txt` when BG3's lights near
++/// the party change: "BLT1 <count>" then a line a light, "<x y z, WoW yards> <range yd> <r g b>" (the colour as the
++/// shaders add it). Each becomes a [`WorldPointLight`], so terrain, buildings and units take it among their three
++/// nearest as they take WoW's own; a file gone or older than two seconds with lights in it means the mod is not
++/// writing any more, and they go.
++fn bg3_lights_import(
++    mut commands: Commands,
++    old: Query<Entity, With<Bg3Light>>,
++    mut seen: Local<Option<std::time::SystemTime>>,
++    mut count: Local<usize>,
++) {
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let path = std::path::Path::new(&dir).join("bg3lights.txt");
++    let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
++    let stale = stamp.is_none_or(|s| s.elapsed().is_ok_and(|e| e.as_secs_f32() > 2.0));
++    if stale {
++        if *count > 0 {
++            for e in &old {
++                commands.entity(e).despawn();
++            }
++            *count = 0;
++            *seen = None;
++        }
++        return;
++    }
++    if stamp == *seen {
++        return;
++    }
++    *seen = stamp;
++    let Ok(text) = std::fs::read_to_string(&path) else { return };
++    let mut lines = text.lines();
++    if !lines.next().is_some_and(|h| h.starts_with("BLT1 ")) {
++        return;
++    }
++    for e in &old {
++        commands.entity(e).despawn();
++    }
++    *count = 0;
++    for line in lines.take(16) {
++        let v: Vec<f32> = line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
++        if v.len() != 7 || v.iter().any(|x| !x.is_finite()) {
++            continue;
++        }
++        let top = v[4].max(v[5]).max(v[6]);
++        if top <= 0.0 {
++            continue;
++        }
++        commands.spawn((
++            Name::new("wowbg3 light"),
++            benilla_world::lighting::WorldPointLight {
++                color: [v[4] / top, v[5] / top, v[6] / top],
++                intensity: top * 4.0 * std::f32::consts::PI,
++                range: v[3].clamp(1.0, 60.0),
++            },
++            Transform::from_translation(benilla_assets::coords::wow_to_bevy([v[0], v[1], v[2]])),
++            Bg3Light,
++        ));
++        *count += 1;
++    }
++}
