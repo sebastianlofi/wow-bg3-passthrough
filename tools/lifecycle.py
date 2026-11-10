@@ -203,6 +203,7 @@ class Life:
         self.benilla_seen = 0.0    # when benilla was last looked for
         self.benilla_back = 0      # times it was started again this session
         self.keep_chars = False    # the next bring_up is such a start: no restore, the WoW characters are current
+        self.was_up = None         # the session whose WoW side was last up: back in it (a level change, camp) is no load
         self.crash_kept = False    # its report is made
         # `/wowbg3 time` is for one sitting: a new start of the game shows the time of this device.
         try:
@@ -434,6 +435,12 @@ class Life:
         if self.keep_chars:
             self.keep_chars = False
             log('benilla again: WoW characters as they are')
+        elif session == self.was_up:
+            # The same session up again with no load between (a load makes a new session): BG3 changed level and
+            # came back, as for camp in a level of our own (Camp.lua). The WoW characters are where the party
+            # left them; the loaded save's snapshot would undo everything since that save (the party came back
+            # from camp on the last save's spot).
+            log('the same session again (a level change, no load): WoW characters as they are')
         elif sid and (wowsave.SNAP / ('%s.sql' % sid)).is_file():
             secs = wowsave.sections(sid)
             # A new database (a reinstall kept the saves): the server's start put them back (wowsave.py rehome,
@@ -530,6 +537,7 @@ class Life:
         self.phase(session, 'world', Char=hero_char)
         self.up['world'] = self.lc('world', timeout=300)
         self.session = session
+        self.was_up = session
         # The WoW side is up for this session now: its own later unload (the main menu: UnloadLevel with the
         # same session token, no new one) must take it down again (testing: after an F8 the
         # loading screen had already named this session, so the return to the main menu kept WoW running).
@@ -718,7 +726,9 @@ class Life:
             if lc_.get('Loading'):
                 return None
         req = read('wowsave-request.json')
-        if req and self.session and req.get('RunId') == run and req.get('Session') == self.session:
+        # A save while the WoW side is down inside its own session (at camp in a level of our own) is snapshotted too,
+        # its characters offline as they stand: a load of it then puts them back like any other save's.
+        if req and req.get('RunId') == run and req.get('Session') in (self.session, self.was_up) and req.get('Session'):
             self.snapshot(req)
         self.index_save()
         if self.session == session:
