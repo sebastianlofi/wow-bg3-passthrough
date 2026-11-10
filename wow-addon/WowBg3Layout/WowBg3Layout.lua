@@ -437,6 +437,42 @@ end
 -- and every two seconds after.
 local f = CreateFrame("Frame", "WowBg3LayoutFrame")
 local tick = 0
+-- The party is BG3's: its members stand in WoW's group only so the server counts them, and WoW's own lines
+-- about that group ("Shadowheart joins the party.", "... leaves the party.", the group disbanding) say nothing the
+-- player did; they also came at every load, when the WoW side puts the group back (a playtest report). Those lines are
+-- left out of the chat frames, matched by WoW's own texts for them (the client's language, whatever it is).
+local partyLines, partyHooked = nil, {}
+local function partyLine(text)
+    if not partyLines then
+        partyLines = {}
+        for _, key in ipairs({"ERR_JOINED_GROUP_S", "ERR_LEFT_GROUP_S", "ERR_LEFT_GROUP_YOU", "ERR_GROUP_DISBANDED",
+                              "ERR_UNINVITE_YOU", "ERR_NEW_LEADER_S", "ERR_NEW_LEADER_YOU"}) do
+            local t = getglobal(key)
+            if type(t) == "string" and t ~= "" then
+                t = string.gsub(t, "([%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+                table.insert(partyLines, "^" .. string.gsub(t, "%%s", ".+") .. "$")
+            end
+        end
+    end
+    for _, p in ipairs(partyLines) do
+        if string.find(text, p) then return true end
+    end
+    return false
+end
+local function quietParty()
+    for i = 1, 7 do
+        local frame = getglobal("ChatFrame" .. i)
+        if frame and not partyHooked[frame] then
+            partyHooked[frame] = true
+            local add = frame.AddMessage
+            frame.AddMessage = function(self, text, r, g, b, a, id)
+                if type(text) == "string" and partyLine(text) then return end
+                return add(self, text, r, g, b, a, id)
+            end
+        end
+    end
+end
+
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("UPDATE_CHAT_WINDOWS")
 f:RegisterEvent("PLAYER_DEAD")
@@ -451,6 +487,7 @@ f:SetScript("OnEvent", function()
         if SetCVar then SetCVar("showTutorials", "0") end
         if ClearTutorials then ClearTutorials() end
     end
+    quietParty()
     if not chatHidden then showMainChat() end
     apply()
     hideDeathPopups()
