@@ -1,0 +1,20 @@
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+index d104a97..2a41aea 100644
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -2189,6 +2189,15 @@ fn apply_pose(
+                 }
+             }
+         }
++        // Patch 0128: the roots of the plan before go here too. They went only where WoW draws the figures, so with
++        // BG3 drawing them every new plan (a companion joining, a change of clothes) left its old roots behind, and
++        // each stayed a figure with a ground shade of its own at the place it last had.
++        if let Some(old) = d.old_root.take() {
++            commands.entity(old).despawn();
++        }
++        for old in std::mem::take(&mut d.old_figs) {
++            commands.entity(old).despawn();
++        }
+         if !d.bg3_draws {
+             info!("wowbg3 tav: BG3 draws the party itself (pose flag 8): WoW's figures hidden");
+             d.bg3_draws = true;

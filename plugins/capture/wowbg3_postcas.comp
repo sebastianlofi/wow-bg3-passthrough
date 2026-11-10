@@ -9,7 +9,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;
 layout(set = 0, binding = 1) uniform sampler2D wdsp;                    // WoW's own colour per pixel (the feed), a 1 where written
 layout(set = 0, binding = 5) uniform sampler2D cin;                     // CAS's input (the display transform's output)
-layout(rgb10_a2, set = 0, binding = 6) uniform writeonly image2D cout;  // CAS's output
+layout(rgb10_a2, set = 0, binding = 6) uniform image2D cout;  // CAS's output (read for BG3's own pixels under WoW's fog)
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
@@ -22,6 +22,11 @@ void main() {
         if (w.a > 0.5 && t < 0.98) imageStore(cout, q, vec4(mix(min(w.rgb * (1.0 + g), vec3(1.0)), texelFetch(cin, q, 0).rgb, t), 1.0));
         return;
     }
-    if (!(n > 0.5)) return;
+    if (!(n > 0.5)) {
+        // BG3's own pixel with WoW's fog for it (the feed: the fog's colour, alpha 2 + WoW's factor): blended as WoW
+        // blends, in displayed colours.
+        if (w.a >= 2.0 && w.a < 2.999) imageStore(cout, q, vec4(mix(w.rgb, imageLoad(cout, q).rgb, w.a - 2.0), 1.0));
+        return;
+    }
     imageStore(cout, q, n > 1.5 && w.a > 0.5 ? vec4(w.rgb, 1.0) : texelFetch(cin, q, 0));
 }

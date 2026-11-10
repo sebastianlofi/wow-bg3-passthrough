@@ -70,7 +70,7 @@ lifecycle.log = log  # the watcher's lines in the same log
 def settings():
     """WOW-BG3/settings.conf: `key = value` lines, # comments."""
     s = {'debug_commands': '1', 'host': 'WOWBG3_Azeroth_A', 'wow_sound': '1', 'view_distance': '',
-         'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '1', 'difficulty': 'balanced', 'wow_spells': '0'}
+         'compose': 'auto void fxkeep wowbar ground surf fxprops fxsolid fxglow wdepth wdfeed wdlock wdgcam wdbare bg3tav wdbloom wdpost wdpostcas wdevref=11.7 wdamb=0.83 wdwfog', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '1', 'difficulty': 'balanced', 'wow_spells': '0'}
     try:
         for line in (HOME / 'settings.conf').read_text().splitlines():
             line = line.split('#', 1)[0].strip()

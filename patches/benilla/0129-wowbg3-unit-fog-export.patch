@@ -1,0 +1,83 @@
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index 7df349e..89813c7 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -310,7 +310,9 @@ fn tag_frame(
+     mut tag: ResMut<FrameTag>,
+ ) {
+     if let Some(l) = lighting.as_ref() {
+-        sky_export(l); // patch 0125
++        // Patch 0129: with the fog WoW would draw the hero's figure with.
++        let indoor = figures.iter().any(|(name, _, shade)| name.as_str() == "wowbg3 Tav" && shade.is_indoor());
++        sky_export(l, indoor); // patch 0125
+     }
+     shade_export(&figures); // patch 0126
+     *tag = FrameTag {
+@@ -330,18 +332,25 @@ fn tag_frame(
+ /// Patch 0125: WoW's scene light for BG3's own lighting (the mod's WorldLight.lua sets BG3's sun and sky from it):
+ /// `$WOW_BG3_LINK_DIR/wowsky.txt`, one line "WSK1 <to-sun x y z, WoW axes> <diffuse r g b> <ambient r g b>" (the
+ /// `Light.dbc` colours as sampled for the time of day, sRGB 0..1), written whole (rename) when a value moved.
+-fn sky_export(l: &benilla_world::lighting::WowLighting) {
+-    static LAST: std::sync::Mutex<Option<[f32; 9]>> = std::sync::Mutex::new(None);
++/// Patch 0129: five more numbers, "<fog r g b> <fog start> <fog end>" (the colour as WoW blends it, sRGB 0..1; the
++/// distances in yards of eye depth): the fog of the place the hero's figure stands in, a room's when it is indoors.
++/// The render plugin fogs BG3's own pixels with it as WoW fogs a unit.
++fn sky_export(l: &benilla_world::lighting::WowLighting, indoor: bool) {
++    static LAST: std::sync::Mutex<Option<[f32; 14]>> = std::sync::Mutex::new(None);
+     let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
+     let to_sun = benilla_assets::coords::bevy_to_wow(-l.sun_dir.normalize_or_zero());
+-    let v = [to_sun[0], to_sun[1], to_sun[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.ambient[0], l.ambient[1], l.ambient[2]];
++    let (fog, fog_start, fog_end) = l.unit_fog(indoor);
++    let v = [
++        to_sun[0], to_sun[1], to_sun[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.ambient[0], l.ambient[1], l.ambient[2],
++        fog[0], fog[1], fog[2], fog_start, fog_end,
++    ];
+     let Ok(mut last) = LAST.lock() else { return };
+-    if last.is_some_and(|p| p.iter().zip(v.iter()).all(|(a, b)| (a - b).abs() < 0.002)) {
++    if last.is_some_and(|p| p.iter().zip(v.iter()).enumerate().all(|(i, (a, b))| (a - b).abs() < if i < 12 { 0.002 } else { 0.5 })) {
+         return;
+     }
+     let text = format!(
+-        "WSK1 {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4}\n",
+-        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]
++        "WSK1 {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.1} {:.1}\n",
++        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
+     );
+     let path = std::path::Path::new(&dir).join("wowsky.txt");
+     let tmp = path.with_extension("tmp");
+diff --git a/crates/benilla-world/src/entity_shade.rs b/crates/benilla-world/src/entity_shade.rs
+index 1abb3da..1ea3b13 100644
+--- a/crates/benilla-world/src/entity_shade.rs
++++ b/crates/benilla-world/src/entity_shade.rs
+@@ -95,6 +95,11 @@ impl GroundShade {
+         ((self.t - LIT_T) / (1.0 - LIT_T)).clamp(0.0, 1.0)
+     }
+ 
++    /// WOW-BG3 patch 0129: the interior classifier's verdict for this root (a unit in a room takes the room's fog).
++    pub fn is_indoor(&self) -> bool {
++        self.indoor
++    }
++
+     /// The committed intensity (`[node+0xa4]`), which the bake fold multiplies its diffuse word by.
+     pub(crate) fn intensity(&self) -> f32 {
+         2.5 - 2.0 * self.t
+diff --git a/crates/benilla-world/src/lighting/mod.rs b/crates/benilla-world/src/lighting/mod.rs
+index 5cf772f..aa6145a 100644
+--- a/crates/benilla-world/src/lighting/mod.rs
++++ b/crates/benilla-world/src/lighting/mod.rs
+@@ -102,6 +102,15 @@ pub struct WowLighting {
+ }
+ 
+ impl WowLighting {
++    /// WOW-BG3 patch 0129: the fog a unit is drawn with, `(colour, start, end)` in the units of the eye depth the
++    /// shaders compare (yards): the scene's, or indoors the room's (the interior triple).
++    pub fn unit_fog(&self, indoor: bool) -> ([f32; 3], f32, f32) {
++        if indoor {
++            (self.wmo_fog_color, self.wmo_fog_start, self.wmo_fog_end)
++        } else {
++            (self.fog_color, self.fog_start, self.fog_end)
++        }
++    }
+     /// Per-kind water swatch endpoints `(shallow_rgb, deep_rgb, shallow_alpha, deep_alpha)`, the
+     /// IntBand rows raw: the × 0.711 dim belongs to the sky fill `0x68c250`, not to water. The ADT
+     /// swatch is the reference's 64-row byte ramp between them (`0x68a830`, in `liquid.wgsl`);

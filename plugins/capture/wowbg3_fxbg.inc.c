@@ -18,7 +18,7 @@ static void fb_stale_note(int bare, int slot) {
     if (n <= 10 || n % 300 == 0) logf_("fbstale: %s drew through the view of an image BG3 destroyed (slot %d), %llu such draws", bare ? "wdbare" : "feed", slot, (unsigned long long)n);
 }
 static VkImageView wd_mask_view(void);
-#define FB_PC 160  // patch61: + evk
+#define FB_PC 192  // patch61: + evk; + amb (WoW's ambient on BG3's own pixels); + fog (WoW's fog on them)
 // wdjit: BG3's TAA jitter (NDC, y down) of the frame recorded at a present, from wd_draw's G-buffer camera.
 static struct { uint64_t p; float j[2]; } g_jit[8];
 static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[2];
@@ -31,7 +31,61 @@ static struct {
     uint64_t fed_present, fed_img; uint64_t feeds, refused, nowow; uint64_t fedp[3], fedi[3], fogs;
     VkBuffer tbuf; VkDeviceMemory tmem; float* tmap; struct timespec tseen;
     uint64_t ebuf[2], eoff[2]; int etype[2]; VkBuffer esetbuf[2][2];
+    VkSampler asmp;
 } g_fbg;
+// WoW's ambient on BG3's own pixels (compose word "wdamb=K", K the share of WoW's ambient, 0 or absent: off).
+// BG3 lights its characters with its sun and little else: the level of our own has no light probe, so a side turned
+// from the sun is near black, where WoW lights every unit with the zone's ambient colour first. benilla writes that
+// colour (link/wowsky.txt, patch 0125: the last three numbers, as WoW samples Light.dbc for the time of day), and the
+// feed adds what WoW's ambient term is, the material's colour times the ambient, to BG3's lit scene at each of BG3's
+// pixels, through the same table that brings WoW's ground into BG3's light (wowbg3_fxbg2.frag).
+static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
+static void amb_present(void) {
+    const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    if (!g_cc.on || (!(g_cc.wdamb > 0.0f) && !g_cc.wdwfog) || pr % 30 != 7) return;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/wowsky.txt", link_dir());
+    float v[14]; int ok = 0, okf = 0;
+    FILE* f = fopen(path, "r");
+    if (f) {
+        ok = fscanf(f, "WSK1 %f %f %f %f %f %f %f %f %f", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8) == 9;
+        okf = ok && fscanf(f, "%f %f %f %f %f", v + 9, v + 10, v + 11, v + 12, v + 13) == 5;  // benilla patch 0129: fog r g b, start, end
+        fclose(f);
+    }
+    pthread_mutex_lock(&g_amb.m);
+    if (ok) { for (int i = 0; i < 3; i++) g_amb.rgb[i] = v[6 + i] < 0 ? 0 : v[6 + i] > 1 ? 1 : v[6 + i]; g_amb.have = 1; }
+    if (okf) { memcpy(g_amb.fog, v + 9, sizeof g_amb.fog); g_amb.have_fog = 1; }
+    const uint64_t n = ++g_amb.reads;
+    pthread_mutex_unlock(&g_amb.m);
+    if (n % 600 == 1) logf_("wdamb: WoW's ambient %.3f %.3f %.3f (%s), share %.2f; fog %.3f %.3f %.3f from %.1f to %.1f yd (%s)", g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2], ok ? "read" : "kept: no wowsky.txt", g_cc.wdamb,
+                         g_amb.fog[0], g_amb.fog[1], g_amb.fog[2], g_amb.fog[3], g_amb.fog[4], !g_cc.wdwfog ? "off" : okf ? "read" : "none in wowsky.txt");
+}
+// WoW's fog on BG3's own pixels (compose word "wdwfog"). WoW fogs everything it draws by its eye depth, a straight
+// blend towards the fog colour between a start and an end distance, in the colours it displays. BG3's characters and
+// what it draws on the ground got none of it. The feed finds each of BG3's pixels' depth in BG3's G-buffer (its
+// eye-depth image, metres), works out WoW's factor for it and leaves colour and factor beside WoW's own colours (wdsp,
+// alpha 2 + factor); wdpostcas, after BG3's display transform, blends as WoW does.
+// f[0..3]: start, end, 1 (there is fog), the colour packed 10 bits a channel.
+static void wfog_get(float* f) {
+    if (!g_cc.wdwfog) return;
+    pthread_mutex_lock(&g_amb.m);
+    if (g_amb.have_fog && g_amb.fog[4] > g_amb.fog[3]) {
+        f[0] = g_amb.fog[3]; f[1] = g_amb.fog[4]; f[2] = 1.0f;
+        uint32_t c = 0;
+        for (int i = 0; i < 3; i++) { float v = g_amb.fog[i] < 0 ? 0 : g_amb.fog[i] > 1 ? 1 : g_amb.fog[i]; c |= (uint32_t)(v * 1023.0f + 0.5f) << (10 * i); }
+        memcpy(f + 3, &c, 4);
+    }
+    pthread_mutex_unlock(&g_amb.m);
+}
+// rgb: WoW's ambient times the dial; 0 when there is none to add.
+static int amb_get(float* rgb) {
+    if (!(g_cc.wdamb > 0.0f)) return 0;
+    pthread_mutex_lock(&g_amb.m);
+    const int have = g_amb.have;
+    for (int i = 0; i < 3; i++) rgb[i] = g_amb.rgb[i] * g_cc.wdamb;
+    pthread_mutex_unlock(&g_amb.m);
+    return have;
+}
 // patch60: BG3's eye state, where its adaptation writes it.
 #define WDX_METER 0x7387a4a6b28ed0d9ull
 #define WDX_ADAPT 0x1f20b342cda3d311ull
@@ -155,13 +209,16 @@ static int fb_make(DeviceData* d) {
     VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &cr, NULL, NULL, 0, NULL};
     VkRenderPassCreateInfo rci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &at, 1, &sp, 0, NULL};
     if (d->CreateRenderPass(d->device, &rci, NULL, &g_fbg.rp) != VK_SUCCESS) return 0;
-    VkDescriptorSetLayoutBinding b[8] = {{5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+    VkDescriptorSetLayoutBinding b[10] = {{8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 8, b};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 10, b};
     if (d->CreateDescriptorSetLayout(d->device, &dci, NULL, &g_fbg.dsl) != VK_SUCCESS) return 0;
+    VkSamplerCreateInfo smi = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0, VK_FALSE, 1, VK_FALSE, VK_COMPARE_OP_NEVER, 0, 0, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE};
+    if (d->CreateSampler(d->device, &smi, NULL, &g_fbg.asmp) != VK_SUCCESS) return 0;
     VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, FB_PC};
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_fbg.dsl, 1, &pr};
     if (d->CreatePipelineLayout(d->device, &lci, NULL, &g_fbg.layout) != VK_SUCCESS) return 0;
@@ -178,17 +235,17 @@ static int fb_make(DeviceData* d) {
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE, VK_POLYGON_MODE_FILL,
         VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, VK_FALSE, VK_FALSE};
-    // Added to BG3's lit scene: in the void that is black but for what BG3 itself lit there (a fire's light, a
-    // prop, a lit surface). Word "fxbgmax": the brighter of the two instead.
-    VkPipelineColorBlendAttachmentState cb = {g_cc.fxbgmax ? VK_TRUE : VK_FALSE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, g_cc.fxbgmax ? VK_BLEND_OP_MAX : VK_BLEND_OP_ADD,
+    // WoW's pixel replaces what BG3 lit there (alpha 1), and on BG3's own pixels WoW's ambient is added to BG3's
+    // light (alpha 0): source + destination x (1 - source alpha). Word "fxbgmax": the brighter of the two instead.
+    VkPipelineColorBlendAttachmentState cb = {VK_TRUE, VK_BLEND_FACTOR_ONE, g_cc.fxbgmax ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, g_cc.fxbgmax ? VK_BLEND_OP_MAX : VK_BLEND_OP_ADD,
         VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT};
     VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY, 1, &cb, {0, 0, 0, 0}};
     VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_fbg.layout, g_fbg.rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_fbg.pipe) != VK_SUCCESS) return 0;
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
-    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2, 3, ps};
+    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2, 4, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_fbg.pool) != VK_SUCCESS) return 0;
     VkDescriptorSetLayout l[2] = {g_fbg.dsl, g_fbg.dsl};
     VkDescriptorSetAllocateInfo sai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_fbg.pool, 2, l};
@@ -326,7 +383,7 @@ static int fog_st_pass(DeviceData* d) {
 }
 
 // wdbare: the lighting buffer's image and layout, and BG3's own views of its G-buffer albedo and surface (recording thread).
-static __thread struct { uint64_t img; int32_t lay; uint64_t alb, surf; int32_t lalb, lsurf; } t_bare;
+static __thread struct { uint64_t img; int32_t lay; uint64_t alb, surf, z; int32_t lalb, lsurf, lz; } t_bare;
 static struct {
     int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe; VkSampler smp;
     VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring;
@@ -362,13 +419,14 @@ static void fb_forget_image(DeviceData* d, VkImage img) {
 }
 static void bare_draw(VkCommandBuffer cb) {
     // BG3's sets at its draw: the views of its albedo and surface images.
-    t_bare.alb = t_bare.surf = 0;
+    t_bare.alb = t_bare.surf = t_bare.z = 0;
     for (uint32_t s = 0; s < 4; s++) {
         SetInfo* si = t_set[s] ? set_find(t_set[s]) : NULL;
         for (uint32_t b = 0; si && b < DESC_SLOTS; b++) {
             if (si->slot[b].type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || !si->slot[b].res) continue;
             uint64_t im = view_image(si->slot[b].res);
             if (im && im == g_gb_alb) { t_bare.alb = si->slot[b].res; t_bare.lalb = si->slot[b].layout; }
+            if (im && im == g_gb_z) { t_bare.z = si->slot[b].res; t_bare.lz = si->slot[b].layout; }
             if (im && im == g_gb_surf) { t_bare.surf = si->slot[b].res; t_bare.lsurf = si->slot[b].layout; }
         }
     }
@@ -380,6 +438,8 @@ static void bare_draw(VkCommandBuffer cb) {
     static int said;
     if (!t_bare.img || !t_bare.alb || !t_bare.surf) { if (!said++) logf_("wdbare: pass found without its parts: target %llx albedo %llx surface %llx (G-buffer %llx %llx)", (unsigned long long)t_bare.img, (unsigned long long)t_bare.alb, (unsigned long long)t_bare.surf, (unsigned long long)g_gb_alb, (unsigned long long)g_gb_surf); return; }
     g_blv_alb = t_bare.alb; g_blv_lalb = t_bare.lalb; g_blv_surf = t_bare.surf; g_blv_lsurf = t_bare.lsurf;  // patch28
+    g_blv_z = t_bare.z; g_blv_lz = t_bare.lz;
+    { static int saidz; if (g_cc.wdwfog && !t_bare.z && !saidz++) logf_("wdwfog: BG3's lighting pass binds no eye-depth image (G-buffer %llx): no fog on BG3's pixels", (unsigned long long)g_gb_z); }
     t_bare_cb = cb;
 }
 static int bare_make(DeviceData* d) {
@@ -1052,6 +1112,24 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             d->UpdateDescriptorSets(d->device, 1, &wr6, 0, NULL);
             seen6[k] = g_blm.wfed.view;
         }
+        // Binding 8: BG3's G-buffer albedo (its own view, as its lighting pass bound it), for WoW's ambient on BG3's
+        // pixels; until that pass has been seen, an image of our own, and no ambient.
+        static VkImageView seen8[2];
+        const VkImageView av = g_blv_alb ? (VkImageView)g_blv_alb : g_blm.wdsp.view;
+        if (seen8[k] != av) {
+            VkDescriptorImageInfo i8 = {g_fbg.asmp, av, g_blv_alb ? (VkImageLayout)g_blv_lalb : VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet wr8 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i8, NULL, NULL};
+            d->UpdateDescriptorSets(d->device, 1, &wr8, 0, NULL);
+            seen8[k] = av;
+        }
+        static VkImageView seen9[2];  // binding 9: BG3's G-buffer eye depth, for WoW's fog on BG3's pixels
+        const VkImageView zv = g_blv_z ? (VkImageView)g_blv_z : g_blm.wdsp.view;
+        if (seen9[k] != zv) {
+            VkDescriptorImageInfo i9 = {g_fbg.asmp, zv, g_blv_z ? (VkImageLayout)g_blv_lz : VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet wr9 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i9, NULL, NULL};
+            d->UpdateDescriptorSets(d->device, 1, &wr9, 0, NULL);
+            seen9[k] = zv;
+        }
         static VkImageView seen7[2];
         if (seen7[k] != g_blm.wdsp.view) {
             VkDescriptorImageInfo i7 = {VK_NULL_HANDLE, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -1123,8 +1201,10 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 9, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, NULL, &b9, NULL}};
         d->UpdateDescriptorSets(d->device, 13, wr, 0, NULL);
     }
-    float pc[40];
+    float pc[48];
     memset(pc, 0, sizeof pc);
+    if (!fog && g_blv_alb && amb_get(pc + 40)) pc[43] = 1.0f;  // WoW's ambient, times the dial (amb_present)
+    if (!fog && g_blv_z) wfog_get(pc + 44);  // WoW's fog: start and end (yards of eye depth), 1 when there is one, and its colour packed
     memcpy(pc + 0, fN, 12); pc[3] = txN; memcpy(pc + 4, rN, 12); pc[7] = tyN; memcpy(pc + 8, uN, 12); pc[11] = 1.0f / (float)ii->w;
     memcpy(pc + 12, eK, 12); pc[15] = txK; memcpy(pc + 16, fK, 12); pc[19] = tyK; memcpy(pc + 20, rK, 12); pc[23] = 1.0f / (float)ii->hgt; memcpy(pc + 24, uK, 12);
     uint32_t* u = (uint32_t*)(pc + 28);

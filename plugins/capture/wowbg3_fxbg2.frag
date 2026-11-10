@@ -14,12 +14,16 @@ layout(push_constant) uniform PC {
     float gamma;
     float jx, jy;  // wdjit (flag 128): BG3's TAA jitter of this frame, NDC y down
     float evk;     // patch61 (flag 8): 1.2*2^EV_ref, WoW's ground has radiance table(w)/E_ref
+    vec4 amb;      // WoW's ambient colour times its share (as WoW displays it, 0..1); a 1: add it on BG3's own pixels
+    float fog0, fog1, fogon; uint fogc;  // WoW's fog: start and end (yards of eye depth), 1 when on, the colour 10 bits a channel
 } pc;
 layout(location = 0) out vec4 o;
 layout(r32f, set = 0, binding = 4) uniform readonly image2D wmask;  // >0: the placeholder is what shows here
 layout(std430, set = 0, binding = 3) readonly buffer Tab { float TAB[]; } tb;
 layout(rgba16f, set = 0, binding = 5) uniform readonly image2D stimg;
 layout(rgba32f, set = 0, binding = 6) uniform writeonly image2D wfed;  // patch28: what the feed wrote (wdbloom)  // wdfogst: BG3's S and T at the last composite
+layout(set = 0, binding = 9) uniform sampler2D gz;    // BG3's G-buffer eye depth, metres (WoW's fog on BG3's pixels)
+layout(set = 0, binding = 8) uniform sampler2D galb;  // BG3's G-buffer albedo (WoW's ambient on BG3's pixels)
 layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D wdsp;  // WoW's own displayed colour at this pixel, no jitter (a 1): wdpostcas
 float s2l(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 vec3 wow_disp(uint x, uint y) {
@@ -82,7 +86,29 @@ void main() {
         imageStore(wfed, ivec2(gl_FragCoord.xy), o);
         return;
     }
-    if (!(imageLoad(wmask, ivec2(gl_FragCoord.xy)).r > 0.0)) discard;
+    if (!(imageLoad(wmask, ivec2(gl_FragCoord.xy)).r > 0.0)) {
+        // BG3's own pixel: WoW's ambient term for it, added to what BG3 lit (alpha 0: the blend keeps BG3's light).
+        // WoW shows a unit's texture times (ambient + sun); the ambient part alone would show as texture x ambient,
+        // and the table gives the light that shows as that colour. Black adds nothing (the table's own floor is
+        // taken off), and so does the placeholder, whose albedo is black.
+        // WoW's fog for the pixel, for wdpostcas: its factor by the pixel's eye depth (1: none), beside the fog's colour.
+        // Every one of BG3's pixels is written, so none keeps what an earlier frame left there.
+        ivec2 q = ivec2(gl_FragCoord.xy);
+        vec4 fg = vec4(0.0);
+        if (pc.fogon > 0.5 && !zero) {
+            float zy = texelFetch(gz, q, 0).r / 0.9144;
+            float f = clamp((pc.fog1 - zy) / max(pc.fog1 - pc.fog0, 0.001), 0.0, 1.0);
+            if (zy < 1e6) fg = vec4(float(pc.fogc & 1023u), float((pc.fogc >> 10) & 1023u), float((pc.fogc >> 20) & 1023u), 0.0) / 1023.0 + vec4(0.0, 0.0, 0.0, 2.0 + f);
+        }
+        imageStore(wdsp, q, fg);
+        o = vec4(0.0);
+        if (!(pc.amb.a > 0.5) || zero) return;
+        vec3 al = texelFetch(galb, q, 0).rgb;
+        if (max(al.r, max(al.g, al.b)) < 0.5 / 255.0) return;
+        vec3 tex = pow(clamp(al, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+        o = vec4(max(inv3(tex * pc.amb.rgb) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
+        return;
+    }
     if (zero) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
     vec3 w = wow_at(ndc);
     // BG3's display transform cannot show every colour WoW draws (a bright saturated one has no value that comes out

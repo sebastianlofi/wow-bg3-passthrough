@@ -13,8 +13,15 @@
 -- active, clear for the next).
 -- Mapping (measured, the renderer's sun vector): to-sun = (cos(Yaw-180)*cosE, sinE, sin(Yaw-180)*cosE) with
 -- elevation E = 180 - Pitch; BG3 axes from WoW's: x = WoW y, y = WoW z, z = -WoW x. The physical sun (this
--- lighting lights by its scattering: SunIntensity 0) takes WoW's diffuse colour and its strength by WoW's
--- diffuse luminance against REF_LUMA (WoW's daytime), both in linear light.
+-- lighting lights by its scattering: SunIntensity 0) takes its colour and strength from WoW's two colours.
+-- WoW shows a unit as its texture times (ambient + sun), and the render plugin adds WoW's ambient term to BG3's
+-- pixels itself (compose word wdamb: BG3 has no ambient light of its own in our level). What is left for BG3's sun is
+-- the step from the ambient to the fully lit colour, lin(min(ambient + diffuse, 1)) - lin(ambient) a channel, at
+-- MATCH_K a unit of its luminance: with it and the full ambient, BG3's drawing of the hero came out within a tenth of
+-- WoW's own drawing of him on the sunlit and on the shadowed side (measured at Northshire, noon). BG3's own look
+-- before that was the diffuse colour alone at stock daylight's strength (REF_LUMA: WoW's noon in Durotar), eight
+-- times as strong and far more orange. SHARE says where between the two the game stands, 0 BG3's own and 1 WoW's
+-- (the maintainer picked between two thirds and all the way); the plugin's ambient share is the same number.
 -- Status: wow-bg3/wowsky-status.json.
 local M = {}
 local Hero = Ext.Require("Hero.lua")
@@ -24,6 +31,8 @@ M.ZONE = "6d2f0a51-77c4-4b0e-9a5e-1f3c2b8d4e01"
 M.LIGHTINGS = {"a7d3c1e9-5f2b-4c8e-9d16-3b0e7f4a2c58", "c4f81b27-3a6d-4e09-8b52-7d1e9a0c6f34"}
 M.SUN_INTENSITY = 100000  -- stock Rivington's SkyLight.ScatteringSunIntensity
 M.REF_LUMA = 0.65         -- WoW's noon diffuse in Durotar, linear luminance (measured 0.651): BG3's sun is stock then
+M.MATCH_K = 10900         -- sun strength a unit of luminance of WoW's sun step (8000 at Northshire's noon, luminance 0.734)
+M.SHARE = 0.83            -- 0 BG3's own light, 1 matched to WoW's; wowbg3-coord.py's wdamb is the same share
 M.EVERY_MS = 5000         -- at most one switch this often
 
 local function lin(c) return math.max(0, c) ^ 2.2 end
@@ -41,11 +50,20 @@ function M.Target(line)
     x, y, z = x / n, y / n, z / n
     local elev = math.deg(math.asin(math.max(-1, math.min(1, y))))
     local yaw = (180 + math.deg(math.atan(z, x))) % 360
-    local r, g, b = lin(v[5]), lin(v[6]), lin(v[7])
-    local top = math.max(r, g, b)
-    local luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
-    local colour = top > 1e-6 and {r / top, g / top, b / top} or {1, 1, 1}
-    return {Yaw = yaw, Pitch = 180 - elev, Colour = colour, Intensity = M.SUN_INTENSITY * luma / M.REF_LUMA, Luma = luma}
+    local function lum(c) return 0.2126 * c[1] + 0.7152 * c[2] + 0.0722 * c[3] end
+    local function chroma(c)
+        local top = math.max(c[1], c[2], c[3])
+        return top > 1e-6 and {c[1] / top, c[2] / top, c[3] / top} or {1, 1, 1}
+    end
+    -- BG3's own: the diffuse colour at stock strength. WoW's: the step from the ambient to the lit colour.
+    local own, step = {lin(v[5]), lin(v[6]), lin(v[7])}, {}
+    for i = 1, 3 do step[i] = math.max(0, lin(math.min(1, v[7 + i] + v[4 + i])) - lin(v[7 + i])) end
+    local i0, i1 = M.SUN_INTENSITY * lum(own) / M.REF_LUMA, M.MATCH_K * lum(step)
+    local c0, c1, s = chroma(own), chroma(step), M.SHARE
+    local colour = chroma({c0[1] + (c1[1] - c0[1]) * s, c0[2] + (c1[2] - c0[2]) * s, c0[3] + (c1[3] - c0[3]) * s})
+    -- Strengths blend by ratio (they are an eighth apart); a night with no sun step at all ends at none.
+    local intensity = (i0 > 1e-3 and i1 > 1e-3) and i0 ^ (1 - s) * i1 ^ s or i0 * (1 - s) + i1 * s
+    return {Yaw = yaw, Pitch = 180 - elev, Colour = colour, Intensity = intensity, Luma = lum(own)}
 end
 
 local active = 2        -- the zone starts on stock Rivington; the first change goes to the first copy

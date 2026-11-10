@@ -109,7 +109,7 @@ static void wd_mark(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkBuffer
 // The G-buffer pass being recorded on this thread: its command buffer, images, size; the frame's camera.
 static __thread VkCommandBuffer t_gr_cb;
 static __thread uint64_t t_gr_img[4];
-static uint64_t g_gb_alb, g_gb_surf;  // BG3's G-buffer albedo and surface images (wdbare)
+static uint64_t g_gb_alb, g_gb_surf, g_gb_z;  // BG3's G-buffer albedo, surface and eye-depth (metres) images (wdbare; the feed's fog)
 static __thread int32_t t_gr_lay[4];
 static __thread uint32_t t_gr_w, t_gr_h;
 static __thread int t_gr_cam;
@@ -287,7 +287,7 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
     if (!i0 || !i1 || !i2 || i0->fmt != VK_FORMAT_R16G16_SFLOAT || i0->samples > 1) return;
     t_gr_cb = cb;
     t_gr_img[0] = g_role.depth; t_gr_img[1] = col[0]; t_gr_img[2] = col[1]; t_gr_img[3] = col[2];
-    g_gb_alb = col[1]; g_gb_surf = col[2];
+    g_gb_alb = col[1]; g_gb_surf = col[2]; g_gb_z = col[3];
     t_gr_lay[0] = dfin; t_gr_lay[1] = cfin[0]; t_gr_lay[2] = cfin[1]; t_gr_lay[3] = cfin[2];
     t_gr_w = w; t_gr_h = h;
     t_gr_cam = t_bind_cb == cb ? ground_view_record(&t_gr_rec) : 0;

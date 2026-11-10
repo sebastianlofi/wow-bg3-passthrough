@@ -360,7 +360,7 @@ static volatile int g_tav_hide;
 static __thread VkCommandBuffer t_any_cb, t_blc_cb, t_blm_cb;
 static __thread uint64_t t_any_img0, t_blc_img, t_blm_img, t_blm_b1;
 static __thread int32_t t_any_fin0, t_blc_lay, t_blm_lay, t_blm_b1lay;
-static uint64_t g_blv_alb, g_blv_surf; static int32_t g_blv_lalb, g_blv_lsurf;  // BG3's G-buffer albedo and surface views (bare_draw, this frame)
+static uint64_t g_blv_alb, g_blv_surf, g_blv_z; static int32_t g_blv_lalb, g_blv_lsurf, g_blv_lz;  // BG3's G-buffer albedo and surface views (bare_draw, this frame)
 static volatile int g_fxl_frames;  // effects research log (see fxl_pass)
 static volatile int g_fxw_frames;  // draw decisions research log (request "fxwhy<N>", see fxw_draw)
 static volatile int g_sight_lines;  // BG3's sight overlay research log (request "sight<N>", see sight_note)
@@ -1064,6 +1064,7 @@ typedef struct {
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
     int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    float wdamb; int wdwfog;
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
     int surfpost;   // ... taken AFTER BG3's effects pass instead of before it (word "surfpost", research)
@@ -1209,6 +1210,7 @@ static void compose_config(void) {
     g_cc.fbstale = has_word(line, "fbstale");
     g_cc.wdjit = has_word(line, "wdjit");
     g_cc.wdpost = has_word(line, "wdpost");
+    g_cc.wdwfog = has_word(line, "wdwfog");  // WoW's fog on BG3's own pixels (wowbg3_fxbg.inc.c)
     g_cc.noshade = has_word(line, "noshade");  // WoW's ground shade on BG3's figures off (wowbg3_shade.inc.c)
     g_cc.wdtable = has_word(line, "wdtable");  // research: WoW's pixels only through the feed's table, never their own colour after BG3's display transform
     g_cc.wdpostcas = has_word(line, "wdpostcas");
@@ -1225,6 +1227,7 @@ static void compose_config(void) {
     { const char* ws = strstr(line, "wdskip="); g_cc.wdskip = ws ? strtoull(ws + 7, NULL, 16) : 0; }
     { const char* we = strstr(line, "wdexp="); g_cc.wdexp = we ? (float)atof(we + 6) : 0.0f; }
     { const char* wv = strstr(line, "wdevref="); g_cc.wdevref = wv ? strtof(wv + 8, NULL) : 0.0f; }  // patch61
+    { const char* wa = strstr(line, "wdamb="); g_cc.wdamb = wa ? strtof(wa + 6, NULL) : 0.0f; if (!(g_cc.wdamb >= 0.0f && g_cc.wdamb <= 4.0f)) g_cc.wdamb = 0.0f; }  // WoW's ambient on BG3's pixels
     if (g_cc.wdepth) { g_cc.fxbg = 1; g_cc.fxbgpass = 1; g_cc.fxbgfwd = 1; }
     g_cc.surfpost = has_word(line, "surfpost");
     g_cc.fxwib = has_word(line, "fxwib");
@@ -4069,6 +4072,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
         fxc_present(q);
         ground_present();
         shade_present();
+        amb_present();
         surf_present();
         pv_present(q);
         t_fxc = now_ns() - t;
