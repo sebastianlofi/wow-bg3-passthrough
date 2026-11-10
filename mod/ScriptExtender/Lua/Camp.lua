@@ -158,11 +158,7 @@ local function startOwn(runId)
     pcall(Ext.Osiris.RegisterListener, "EndTheDayRequested", 1, "before", function(who)
         local ok, err = pcall(function()
             if level() ~= Hero.REGION or #(q(function() return Osi.DB_Players:Get(who) end) or {}) == 0 then return end
-            if q(Osi.QRY_WaypointTeleport_PlayerBlocked, who) then
-                -- No rest here (a fight, an arrest, a WoW instance: InstanceRest.lua): the story's own words for it.
-                pcall(Osi.ShowError, who, "CampFastTravel")
-                return
-            end
+            if q(Osi.QRY_WaypointTeleport_PlayerBlocked, who) then return end
             send(M.LEVEL, "Long Rest")
         end)
         if not ok then Ext.Utils.Print("WOW-BG3 camp: " .. tostring(err)) end
