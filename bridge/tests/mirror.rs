@@ -4,7 +4,9 @@ use wow_bg3_link::{
     bridge::{Combatant, CreatureStats, Fight},
     coords::{Basis, Point},
     handoff::{Handoff, ServerHandoff},
-    mirror::{KILL_RETRY_MS, Mapping, Mirror, SETTLE_MS, bg3_forward, parse_mobs, parse_status},
+    mirror::{
+        KILL_RETRY_MS, Mapping, Mirror, MirrorState, SETTLE_MS, bg3_forward, parse_mobs, parse_status,
+    },
 };
 
 const MOBS: &str = "seq 7\n\
@@ -901,4 +903,36 @@ fn feed_lines_come_from_the_feed_file() {
     assert_eq!(seq, 12);
     assert!(m.feeds["Astarion"].is_empty(), "crgone from the feed file");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in killed while a spell throws it: WoW's corpse goes where the body came to rest, once.
+#[test]
+fn a_corpse_goes_where_the_body_came_to_rest() {
+    let mut m = Mirror::new("s");
+    m.mapping = Mapping::from_world(
+        &json!({"Active": true, "WowOrigin": [0.0, 0.0, 0.0], "Centre": [0.0, 1000.0, 0.0]}),
+    );
+    let g = "f130000000012b01".to_string();
+    let body = |p: [f64; 3]| MirrorState {
+        dead: true,
+        pos: Some(p),
+        ..Default::default()
+    };
+    m.status.mobs.insert(g.clone(), body([10.0, 1050.0, -20.0]));
+    assert!(m.corpses_due(0).is_empty(), "WoW has no corpse before the server confirmed the kill");
+    m.kill_event("WOWBG3 hp pull-1 F130000000012B01 killed 0 42");
+    assert!(m.corpses_due(1000).is_empty(), "first seen");
+    m.status.mobs.insert(g.clone(), body([14.0, 1050.0, -20.0]));
+    assert!(m.corpses_due(1300).is_empty(), "still in the air");
+    assert!(m.corpses_due(1600).is_empty(), "not lying long enough");
+    let due = m.corpses_due(1900);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].0, g);
+    let at = due[0].1;
+    assert!((at.0 - 20.0 / 0.9144).abs() < 1e-6 && (at.1 - 14.0 / 0.9144).abs() < 1e-6);
+    assert!((at.2 - 50.0 / 0.9144).abs() < 1e-6);
+    assert!(m.corpses_due(5000).is_empty(), "lying there: not sent again");
+    m.status.mobs.insert(g.clone(), body([14.0, 1050.0, -26.0]));
+    assert!(m.corpses_due(5300).is_empty());
+    assert_eq!(m.corpses_due(6000).len(), 1, "moved on (a second push): sent again");
 }

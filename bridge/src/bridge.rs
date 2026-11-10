@@ -1521,6 +1521,7 @@ fn drive(
                 }
             }
             party_step(o, mirror, server)?;
+            corpses_step(mirror, server)?;
             if f.state == "active" {
                 let have = f.guids();
                 let now_ms = mirror.now();
@@ -1784,6 +1785,17 @@ pub fn kills_outside_fights(
     Ok(())
 }
 
+/// WoW's corpses go where BG3's bodies came to rest ([`Mirror::corpses_due`], server patch 0029).
+pub fn corpses_step(mirror: &mut Mirror, server: &mut dyn ServerHandoff) -> Result<(), Error> {
+    let now = mirror.now();
+    for (mob, at) in mirror.corpses_due(now) {
+        let h = Handoff::Corpse { mob, x: at.0, y: at.1, z: at.2 };
+        println!("handoff: {}", h.describe());
+        server.send(&h)?;
+    }
+    Ok(())
+}
+
 /// The last line number of an `N LINE` file (0 when none): where a new reader starts.
 fn last_line(path: &Path) -> u64 {
     event_lines(path, 0).iter().map(|e| e.0).max().unwrap_or(0)
@@ -1924,6 +1936,7 @@ pub fn run(o: &Options) -> Result<(), Error> {
                     server.send(&h)?;
                 }
                 kills_outside_fights(&mut mirror, &mut server)?;
+                corpses_step(&mut mirror, &mut server)?;
                 party_step(o, &mut mirror, &mut server)?;
                 // BG3 combat with a mirrored mob (Tav attacked it, or its stand-in saw her), or a
                 // mob Tav attacked that BG3 left out of combat (a miss on a neutral one).

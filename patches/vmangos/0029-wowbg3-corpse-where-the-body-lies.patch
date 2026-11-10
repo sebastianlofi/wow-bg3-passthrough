@@ -1,0 +1,61 @@
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index cf80f29..88d6e2c 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -1081,6 +1081,47 @@ namespace
+         out.Add(head + "ok");
+     }
+ 
++    // corpse <guid> <x> <y> <z>: a dead mob's body lies where BG3's body came to rest (0029).
++    // A stand-in that dies while a spell pushes, pulls or throws it lands somewhere else than
++    // where it died, and `pos` (0004) knows only the place of death. Only a body the owner's
++    // side killed (tapped by the owner), on the owner's map, to a place within PLACE_RANGE of
++    // the owner. Applying the same line again changes nothing.
++    void Corpse(Player* p, std::string const& guidText, std::string const& xText,
++        std::string const& yText, std::string const& zText, Out& out)
++    {
++        ObjectGuid g;
++        if (!ParseGuid(guidText, g))
++            return out.Add("WOWBG3 corpse " + guidText + " refused badguid");
++        std::string const head = "WOWBG3 corpse " + Hex(g) + " ";
++        std::string const* texts[3] = { &xText, &yText, &zText };
++        float xyz[3] = { 0.0f, 0.0f, 0.0f };
++        for (int i = 0; i < 3; ++i)
++        {
++            char* end = nullptr;
++            xyz[i] = strtof(texts[i]->c_str(), &end);
++            if (texts[i]->empty() || !end || *end || !std::isfinite(xyz[i]))
++                return out.Add(head + "refused badpos");
++        }
++        float const x = xyz[0], y = xyz[1], z = xyz[2];
++        if (!MaNGOS::IsValidMapCoord(x, y, z))
++            return out.Add(head + "refused badpos");
++        if (char const* why = CheckPlayer(p))
++            return out.Add(head + "refused " + why);
++        Creature* c = FindMob(p->GetMapId(), p->GetInstanceId(), g, p);
++        if (!c)
++            return out.Add(head + "gone");
++        if (c->IsAlive())
++            return out.Add(head + "refused alive");
++        if (!c->HasLootRecipient() || !c->IsTappedBy(p))
++            return out.Add(head + "refused notyours");
++        if (p->GetDistance(x, y, z, SizeFactor::None) > PLACE_RANGE)
++            return out.Add(head + "refused far");
++        if (c->GetDistance(x, y, z, SizeFactor::None) < 0.5f)
++            return out.Add(head + "ok same");
++        c->NearTeleportTo(x, y, z, c->GetOrientation());
++        out.Add(head + "ok");
++    }
++
+     // hero <enc|-> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
+     // follows Tav's as a fraction (rounded, at least 1 while Tav lives), both
+     // ways. 0 is a normal WoW death: the
+@@ -1715,6 +1756,8 @@ namespace
+             Keep(p, a[2], out);
+         else if (verb == "pos" && a.size() == 7 && ValidId(a[2]))
+             Place(p, a[2], a[3], a[4], a[5], a[6], out);
++        else if (verb == "corpse" && a.size() == 6)
++            Corpse(p, a[2], a[3], a[4], a[5], out);
+         else if (verb == "faction" && a.size() == 3 && (a[2] == "horde" || a[2] == "alliance" || a[2] == "own"))
+             Faction(p, a[2], out);
+         else if (verb == "hold" && a.size() >= 5 && a[3] == "guids")

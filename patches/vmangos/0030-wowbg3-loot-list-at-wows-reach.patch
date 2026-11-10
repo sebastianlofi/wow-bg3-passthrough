@@ -1,0 +1,16 @@
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index d2c0415..6b4d0ef 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -875,7 +875,10 @@ namespace
+         };
+         if (sub == "list")
+         {
+-            if (!m->IsWithinDistInMap(c, INTERACTION_DISTANCE))
++            // 0030: WoW's own loot reach (InLootReach, as its loot handlers measure it), not a distance of
++            // ours: between the two a listing passed here and WoW's handler refused it, with its red
++            // "too far away to loot that corpse" on the player's screen for each try.
++            if (!InLootReach(m, c))
+                 return out.Add(head + "refused far");
+             if (!open())
+                 return out.Add(head + "refused notyours");

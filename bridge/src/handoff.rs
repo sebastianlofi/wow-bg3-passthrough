@@ -56,6 +56,10 @@ pub enum Handoff {
         y: f64,
         z: f64,
     },
+    /// Where a dead mob's body came to rest in BG3, in WoW yards (server patch 0029): a stand-in
+    /// that dies while a spell pushes, pulls or throws it lands somewhere else than where it
+    /// died, and WoW's corpse goes there. No encounter: the body may land after the fight's end.
+    Corpse { mob: String, x: f64, y: f64, z: f64 },
     /// Tav's hit points as BG3 has them (the WoW character's HP follows
     /// Tav's as a fraction; Tav dying kills it). Shape `hero ENC TAVHP TAVMAX`, agreed with the server patch.
     Hero {
@@ -103,6 +107,7 @@ impl Handoff {
                 y,
                 z,
             } => format!(".wowbg3 pos {encounter} {mob} {x:.2} {y:.2} {z:.2}"),
+            Self::Corpse { mob, x, y, z } => format!(".wowbg3 corpse {mob} {x:.2} {y:.2} {z:.2}"),
             Self::Hero {
                 encounter,
                 hp,

@@ -709,7 +709,23 @@ pub struct Mirror {
     /// Mobs the server confirmed dead: guid -> left `mobs.txt` since (benilla lists the living
     /// only). Back on the list after that, WoW has respawned it ([`Mirror::respawned`]).
     wow_killed: HashMap<String, bool>,
+    /// The bodies of dead stand-ins the server confirmed dead, by mob guid ([`Mirror::corpses_due`]).
+    bodies: HashMap<String, Body>,
 }
+
+/// A dead stand-in's body as BG3 has it.
+#[derive(Clone, Debug, Default)]
+struct Body {
+    /// Its BG3 position as last read, and since when it has lain there.
+    pos: [f64; 3],
+    since: u64,
+    /// Where WoW's corpse was last sent, in BG3: sent again only when the body has moved on.
+    sent: Option<[f64; 3]>,
+}
+
+/// A body counts as lying still once two reads this far apart find it at the same place
+/// (`mirror-status.json` comes about three times a second; a thrown body is in the air for longer).
+const BODY_REST_MS: u64 = 600;
 
 /// Set by SIGTERM or SIGINT once [`catch_stop`] ran: the bridge's loops end at the next
 /// [`Mirror::stop_if_asked`].
@@ -1053,6 +1069,38 @@ impl Mirror {
         }
     }
     /// A server line about kills. `hp ENC GUID killed|gone|dead ...` is WoW's word that the mob is
+    /// The dead mobs whose WoW corpse does not lie where BG3's body has come to rest (a stand-in
+    /// killed while a spell moved it), with the body's place in WoW yards: one line each for the
+    /// server (patch 0029), again only when the body moves on. Only mobs the server confirmed
+    /// dead: before that WoW has no corpse to move.
+    pub fn corpses_due(&mut self, now: u64) -> Vec<(String, Point)> {
+        let Some(map) = self.mapping.clone() else {
+            return Vec::new();
+        };
+        let dead: HashMap<String, [f64; 3]> = self
+            .status
+            .mobs
+            .iter()
+            .filter(|(g, s)| s.dead && self.wow_killed.contains_key(*g))
+            .filter_map(|(g, s)| Some((g.clone(), s.pos?)))
+            .collect();
+        self.bodies.retain(|g, _| dead.contains_key(g));
+        let far = |a: [f64; 3], b: [f64; 3], d: f64| {
+            (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2) > d * d
+        };
+        let mut due = Vec::new();
+        for (g, p) in dead {
+            let b = self.bodies.entry(g.clone()).or_insert(Body { pos: p, since: now, sent: None });
+            if far(p, b.pos, 0.05) {
+                b.pos = p;
+                b.since = now;
+            } else if now.saturating_sub(b.since) >= BODY_REST_MS && b.sent.is_none_or(|s| far(p, s, 0.45)) {
+                b.sent = Some(p);
+                due.push((g, map.to_wow(p)));
+            }
+        }
+        due
+    }
     /// dead, in a fight or out of one. `begin ENC refused dead -` is the player dead;
     /// `begin ENC refused dead GUID` the mob, which needs no kill any more.
     pub fn kill_event(&mut self, line: &str) {

@@ -26,3 +26,5 @@ ec669f98d950220bbfb1bba0a49f194e021ae5c75e192068e02f634d97ebfcbb  0024-wowbg3-bo
 bc4437720bb5667a84c15346ba95628ec57caebfba25167c49095f3e512d2c61  0026-wowbg3-hold-by-guid.patch
 0be8188367293e1c73776b4d004b26057f3e942958380cf5fe1591dd982182d2  0027-wowbg3-pack-at-fight-start.patch
 4d45d1ede3c737fd1c683ba8e4511efd749e9270eb201783d99857f510f585c5  0028-wowbg3-empty-loot-closes.patch
+eb5349600a572b5fb2e2f25d1a1f75bc44b9fb57bf4772259531ec784e4fc4f8  0029-wowbg3-corpse-where-the-body-lies.patch
+860cc5ba69e72d3471ceb24eff96e34908b2b99ad04edd6c074bba56185c04fc  0030-wowbg3-loot-list-at-wows-reach.patch
