@@ -23,6 +23,30 @@ void main() {
         bool bare = all(lessThan(a.rgb, vec3(0.5 / 255.0))) && s.x > 254.5 / 255.0 && s.y < 0.5 / 255.0 && s.z < 0.5 / 255.0 && (mat & 0xf7u) == 0u;
         pure = same && bare && imageLoad(wmask, q).r > 0.0;
     }
-    imageStore(nob, q, vec4(pure ? 1.0 : 0.0));
+    // WoW's ground with something of BG3's on it: not pure, but still WoW's pixel under BG3's addition. Before, such a
+    // pixel was BG3's composite alone, and an ability whose range decal covers the screen put BG3's relit picture of
+    // WoW's ground back everywhere (a playtest report: "the fog comes back when I aim").
+    // The mask holds, negative, what wdpostcas needs: -(1 + t * 255 + g), t (0..1 in 255 steps) BG3's share of the
+    // pixel and g (0..0.99) a gain on WoW's own colour.
+    //   * Something drawn over the ground (an effect, a preview: the G-buffer still bare, the forward buffer changed):
+    //     t is the share of the pixel's light that BG3 added.
+    //   * A decal lit over the placeholder (an ability's range, a surface): BG3 lights the decal's own colour there,
+    //     and over its own ground that lightens the ground by the decal's share of the albedo. The placeholder's albedo
+    //     is black, so BG3's result is the decal's colour alone under BG3's exposure: a grey lift that covers WoW's
+    //     night ground like fog. WoW's colour gets the lightening the decal means instead (g: the decal's albedo over
+    //     a ground albedo of 0.18), and a decal strong enough to hide the ground (t from its albedo) is BG3's pixel.
+    float m = pure ? 1.0 : 0.0;
+    if (!pure && pc.cal == 0u && w.a > 0.5 && imageLoad(wmask, q).r > 0.0) {
+        vec3 d = abs(f - w.rgb) / max(max(f, w.rgb), vec3(1e-5));
+        float t = clamp((max(d.r, max(d.g, d.b)) - 0.04) / 0.96, 0.0, 1.0), g = 0.0;
+        vec4 a = texelFetch(alb, q, 0);
+        float al = max(a.r, max(a.g, a.b));
+        if (al >= 0.5 / 255.0) {
+            t = smoothstep(0.06, 0.30, al);
+            g = min(dot(a.rgb, vec3(0.2126, 0.7152, 0.0722)) / 0.18, 0.99);
+        }
+        m = -(1.0 + floor(t * 255.0 + 0.5) + g);
+    }
+    imageStore(nob, q, vec4(m));
     o = vec4(0.0);
 }

@@ -14,7 +14,14 @@ void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
     float n = imageLoad(nob, q).r;
-    if (!(n > 0.5)) return;
     vec4 w = texelFetch(wdsp, q, 0);
+    // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255 + g)): WoW's own colour, lightened by g,
+    // for WoW's share, BG3's picture for BG3's share t. Nearly all BG3's: its sharpened output stays.
+    if (n < 0.0) {
+        float v = -n - 1.0, t = floor(v) / 255.0, g = fract(v);
+        if (w.a > 0.5 && t < 0.98) imageStore(cout, q, vec4(mix(min(w.rgb * (1.0 + g), vec3(1.0)), texelFetch(cin, q, 0).rgb, t), 1.0));
+        return;
+    }
+    if (!(n > 0.5)) return;
     imageStore(cout, q, n > 1.5 && w.a > 0.5 ? vec4(w.rgb, 1.0) : texelFetch(cin, q, 0));
 }

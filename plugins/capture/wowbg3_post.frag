@@ -15,9 +15,13 @@ layout(push_constant) uniform PC { uint dbg; } pc;
 void main() {
     ivec2 q = ivec2(gl_FragCoord.xy);
     if (!(imageLoad(nob, q).r > 0.5)) discard;
-    vec3 c = texelFetch(cur, q, 0).rgb, f = texelFetch(fed, q, 0).rgb, t = texelFetch(fwd, q, 0).rgb;
-    // the target holds 10 and 11 bit floats: equal within their step
-    bool same = all(lessThanEqual(abs(t - f), 0.04 * max(t, f) + vec3(2e-4)));
-    imageStore(nob, q, vec4(same && (pc.dbg & 2u) == 0u ? 2.0 : 1.0));
+    vec3 c = texelFetch(cur, q, 0).rgb;
+    // Pure at the composite (wowbg3_blmask.frag: the forward buffer the composite read was what the feed wrote, the
+    // G-buffer bare) is untouched: BG3's effects are in that buffer by then. This pass used to look at the forward
+    // image again here, at the TAA, and call the pixel touched when it differed from the feed; but BG3 uses that image
+    // for other things after the composite in some states (turn-based mode, an armed ability with a wide range), so
+    // every pixel failed at once and BG3's own relit picture of WoW's ground came back over the whole view (a playtest
+    // report: "the fog comes back when I aim, and in turn-based mode").
+    imageStore(nob, q, vec4((pc.dbg & 2u) == 0u ? 2.0 : 1.0));
     o = (pc.dbg & 1u) != 0u ? vec4(0.0, 8.0, 0.0, 1.0) : vec4(c, 1.0);
 }
