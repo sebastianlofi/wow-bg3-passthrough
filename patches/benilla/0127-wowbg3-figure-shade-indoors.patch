@@ -1,0 +1,100 @@
+WOW-BG3 benilla patch 0127: the figures BG3 draws are asked where they stand, indoors too (on top of 0126)
+
+- entity_shade.rs: `ShadeOnlyRoot`, a shade root with no lit part of its own. benilla's interior classifier asks
+  only anchors with lit parts whether they stand in a room or on a WMO's floor; the hidden roots of BG3's figures
+  ("wowbg3 Tav", "wowbg3 companion N") have none, so their light chased the terrain's baked shadow under any
+  building. `classify_shade_only_roots` asks the same question the same way (a unit's down-ray attach,
+  `indoor_verdict_at`) when the root has moved or a building streamed in, and sets the root's indoor and on-WMO bits
+  before `update_ground_shade` picks its target: day/night indoors, lit on a WMO floor, the MCSH sample elsewhere.
+- wowbg3_tav.rs: both kinds of figure root carry it.
+
+diff --git a/crates/benilla-app/src/wowbg3_tav.rs b/crates/benilla-app/src/wowbg3_tav.rs
+--- a/crates/benilla-app/src/wowbg3_tav.rs
++++ b/crates/benilla-app/src/wowbg3_tav.rs
+@@ -1314,6 +1314,7 @@
+             Transform::default(),
+             Visibility::Hidden,
+             benilla_world::entity_shade::GroundShade::default(),
++            benilla_world::entity_shade::ShadeOnlyRoot::default(), // patch 0127
+         ))
+         .id();
+     // Patch 0033 (the party): a root of its own for each companion's figure; the previous plan's
+@@ -1337,6 +1338,7 @@
+                     Transform::default(),
+                     Visibility::Hidden,
+                     benilla_world::entity_shade::GroundShade::default(),
++                    benilla_world::entity_shade::ShadeOnlyRoot::default(), // patch 0127
+                     // Patch 0050: the party bot of this companion stands where this root does.
+                     crate::wowbg3_party::CompanionFigure(figure),
+                 ))
+diff --git a/crates/benilla-world/src/entity_shade.rs b/crates/benilla-world/src/entity_shade.rs
+--- a/crates/benilla-world/src/entity_shade.rs
++++ b/crates/benilla-world/src/entity_shade.rs
+@@ -216,6 +216,7 @@
+         app.init_resource::<ShadeDirtyRoots>().add_systems(
+             Update,
+             (
++                classify_shade_only_roots, // WOW-BG3 patch 0127
+                 detect_shade_reclaims,
+                 update_ground_shade,
+                 census_shade_marks,
+@@ -226,6 +227,59 @@
+     }
+ }
+ 
++/// WOW-BG3 patch 0127: a shade root with no lit part of its own (BG3 draws the figure that stands there). The
++/// interior classifier asks only anchors with lit parts where they stand, so such a root was never told that it is
++/// indoors or on a WMO's floor, and its light chased the baked shadow of the terrain under the building: inside a
++/// crypt the figure's shade flipped between lit and shadowed every yard or two (a playtest report). The same
++/// question, asked the same way (a unit's down-ray attach), when the root has moved or a building streamed in.
++#[derive(Component, Default)]
++pub struct ShadeOnlyRoot {
++    asked: bool,
++    last: Vec3,
++    generation: u32,
++}
++
++fn classify_shade_only_roots(
++    residency: Res<crate::interior::WmoResidency>,
++    wmos: Res<Assets<benilla_assets::WmoModel>>,
++    instances: Query<(Entity, &crate::wmo_portal::WmoPortalInstance)>,
++    streamer: Option<Res<TerrainStreamer>>,
++    adt_tiles: Res<Assets<AdtTile>>,
++    mut roots: Query<(&GlobalTransform, &mut GroundShade, &mut ShadeOnlyRoot)>,
++) {
++    let Some(streamer) = streamer else {
++        return;
++    };
++    for (gt, mut shade, mut root) in &mut roots {
++        let pos = gt.translation();
++        if root.asked && root.generation == residency.generation() && pos.distance_squared(root.last) < 1e-4 {
++            continue;
++        }
++        let (verdict, _) = crate::wmo_portal::indoor_verdict_at(
++            &wmos,
++            instances.iter(),
++            &streamer,
++            &adt_tiles,
++            pos,
++            crate::wmo_portal::LightAttach::DownRay,
++        );
++        let on_wmo = matches!(verdict, crate::wmo_portal::IndoorVerdict::OutdoorsOnWmo);
++        let indoor = matches!(
++            verdict,
++            crate::wmo_portal::IndoorVerdict::DayNight | crate::wmo_portal::IndoorVerdict::Baked { .. }
++        );
++        if shade.on_wmo != on_wmo {
++            shade.on_wmo = on_wmo;
++        }
++        if shade.indoor != indoor {
++            shade.indoor = indoor;
++        }
++        root.asked = true;
++        root.last = pos;
++        root.generation = residency.generation();
++    }
++}
++
+ /// Sample and ramp each shaded root, then push its byte to its parts' tags.
+ #[allow(clippy::type_complexity)]
+ pub(crate) fn update_ground_shade(
