@@ -529,22 +529,9 @@ class Release:
                 break
             time.sleep(2)
         e = os.environ.copy()
-        try:
-            host = json.loads((IO / 'host.json').read_text()).get('Region')
-        except (OSError, ValueError):
-            host = None
-        if host == 'BGO_Main_A':  # world-extras.sh wx_host_defaults
-            e.setdefault('WOW_BG3_WORLD_X', '-2600')
-            e.setdefault('WOW_BG3_WORLD_Z', '-1000')
-            e.setdefault('WOW_BG3_POOL', '84')
-            e.setdefault('WOW_BG3_LAYER', '-1.981,9.74')
-        elif host and host.startswith('WOWBG3_'):  # a level of our own (tools/wowbg3_level.py): every WoW point has
-            e.setdefault('WOW_BG3_FIXED', '1')      # one BG3 place (world_bridge.py fixed_pair); the pool is the level's
-            e.setdefault('WOW_BG3_POOL', '100')     # 100 blank squares, parked outside WoW's map at y -20
-            e.setdefault('WOW_BG3_LAYER', '-20')
-        e.setdefault('WOW_BG3_WORLD_X', '-1400')
-        e.setdefault('WOW_BG3_WORLD_Y', '120')
-        e.setdefault('WOW_BG3_WORLD_Z', '-350')
+        # The level of our own (tools/wowbg3_level.py): its pool is 100 blank squares, parked outside WoW's map at y -20.
+        e.setdefault('WOW_BG3_POOL', '100')
+        e.setdefault('WOW_BG3_LAYER', '-20')
         e['WOWBG3_CAPTURE_DIR'] = str(CAPTURE)  # Camp: the compose file aside during a trip
         PROCS.start('world', py('world_bridge', '--maps', P['maps']), e)
         self.tav_pending = tav_ok()  # Tav's textures for benilla (tick() starts the baker once its index exists)

@@ -60,12 +60,8 @@ HYST = 8.0       # metres past a square's middle before the window moves
 # stands there in BG3 and benilla puts WoW's player on her, as on any big gap ("placed on BG3's
 # character"). A WoW-side teleport alone never sticks: benilla's movement sync puts WoW's player back
 # on the hero within a second (tried with .tele). Answer: world-move-result.json.
-# On the session's own continent the session stays (World.reorigin, WorldMode.lua Reorigin): the lattice and
-# the pool subgrids stay where they are, only the WoW point the centre stands for changes. The squares placed
-# then still hold the old place (stale): a wanted one is retiled where it lies, one nobody wants goes first when
-# a square needs a subgrid, and a stale storey over wanted ground gets tiles all blocked, or BG3 would keep finding the
-# old place's upper floor there; the plugin registers such a storey in no patch (cells_for). Only a refusal, or another
-# continent, takes Stop and Start.
+# A move on the session's own continent is Stop and Start too: every WoW point keeps its own BG3 place in the
+# level, so the hero is the one who moves.
 CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cut_cache)
 # Kalimdor too: Map in the request picks the continent. Another continent than the
 # session's: Stop, a server teleport of the WoW character to the game_tele place Via names on that
@@ -352,24 +348,23 @@ def camera_wow():
 # A level of our own (--fixed): one mapping for a whole continent, for good. WoW's (0, 0, 0) is BG3's (0, FIXED_Y0, 0),
 # so every WoW point has one BG3 place in every session and in every save: BG3 = (y, z, -x) * 0.9144 + (0, FIXED_Y0, 0).
 # WoW's maps reach 17066 yd from their middle (15.6 km: inside the level's 16 km) and its ground lies between about
-# -500 and 3000 yd, so sea level sits 1 km over the level's floor. A session still names a centre and the WoW point
-# it stands for (the hero is put there, the squares' lattice starts there): any pair that this mapping joins.
+# -500 and 3000 yd, so sea level sits 1 km over the level's floor. The mapping's pair is the same in every session
+# (FIXED_CENTRE, FIXED_ORIGIN), so the squares' lattice is one for all of them and a square cut once fits every later
+# session; where a session's hero lands is its own point (World.at, World.spot()).
 FIXED_Y0 = 1000.0
+FIXED_CENTRE = (0.0, FIXED_Y0, 0.0)
+FIXED_ORIGIN = (0.0, 0.0, 0.0)
 
 
-def fixed_pair(wow):
-    """The (centre, origin) pair of the fixed mapping nearest the WoW point: the centre on the tile grid."""
-    c = lattice_centre((wow[1] * YD, wow[2] * YD + FIXED_Y0, -wow[0] * YD))
-    return c, (-c[2] / YD, c[0] / YD, wow[2])
+def node_of(centre, bx, bz):
+    """The lattice node nearest a BG3 point."""
+    return (int(math.floor((bx - centre[0]) / CELL + 0.5)), int(math.floor((bz - centre[2]) / CELL + 0.5)))
 
 
-def lattice_centre(c):
-    """The lattice is in tiles: the centre goes on the 0.5 m grid."""
-    return (round(c[0] * 2) / 2, c[1], round(c[2] * 2) / 2)
-
-
-def cut_args(terrain, map_id, centre, origin, ij):
-    """wow_arena.py's arguments (after the output folder) for square ij of a session: the same ones, the same cut."""
+def cut_args(terrain, map_id, centre, origin, ij, at=None):
+    """wow_arena.py's arguments (after the output folder) for square ij: the same ones, the same cut. `at`: the WoW
+    point the session's hero landed on. Over the ground it changes nothing, so every such session cuts a square the
+    same way; a session that landed under the terrain (Undercity, Ironforge) cuts that place's own floors (--under)."""
     W, C = origin, centre
     cx, cz = C[0] + CELL * ij[0] + CELL / 2, C[2] + CELL * ij[1] + CELL / 2
     wx, wy = W[0] - (cz - C[2]) / YD, W[1] + (cx - C[0]) / YD
@@ -377,8 +372,8 @@ def cut_args(terrain, map_id, centre, origin, ij):
     args = ['--wow', str(wx), str(wy), '--bg3', str(cx), str(by), str(cz), '--size', str(CELL), '--islands', 'border',
             '--map', str(map_id), '--storeys', '1' if STOREYS else '0',
             '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
-    if STOREYS and W[2] < terrain.height(W[0], W[1]) - wow_arena.UNDER_CLEAR:
-        args += ['--under', str(W[0]), str(W[1]), str(W[2])]
+    if STOREYS and at and at[2] < terrain.height(at[0], at[1]) - wow_arena.UNDER_CLEAR:
+        args += ['--under', str(at[0]), str(at[1]), str(at[2])]
     return args
 
 
@@ -490,9 +485,8 @@ class World:
         self.map = map_id if map_id is not None else (player_map() or 0)
         assert self.map in CONTINENTS, 'world mode has ground for Eastern Kingdoms and Kalimdor only (map %s)' % self.map
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
-        self.centre = lattice_centre(a.centre)
-        self.origin = None   # WoW point mapped onto self.centre for the whole session
-        self.fixed = bool(getattr(a, 'fixed', False))  # the continent's own mapping (fixed_pair): the centre follows the origin
+        self.centre, self.origin = FIXED_CENTRE, FIXED_ORIGIN   # the level's mapping: the same in every session
+        self.at = None       # WoW point the session's hero lands on
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
         self.pinned = {}        # pool index -> until when it is not moved (something stood on it)
@@ -503,16 +497,16 @@ class World:
         self.ground_pool = a.pool                                   # squares of ground at most
         self.pool = a.pool + (STOREY_SPARE if STOREYS else 0)    # pool subgrids, storeys included
         self.started = 0.0
-        self.stale = set()      # pool indices whose square still holds the place before the last re-origin
-        self.blocked = set()    # the stale storeys already given tiles all blocked (still stale: no new ground yet)
-        self.to_block = set()   # those moves() has just asked cells_for to block
-        self.landed = None      # when the last re-origin landed, until benilla's player has followed (settle)
+        self.cuts = [0, 0]   # squares this session cut itself, and squares it read from the cuts made ahead or earlier
 
     # ---- mapping ----
-    def anchor(self):
-        """After self.origin was set: in a level of our own the centre is that WoW point's own place."""
-        if self.fixed and self.origin:
-            self.centre, self.origin = fixed_pair(self.origin)
+    def land(self, at):
+        """The WoW point this session's hero lands on."""
+        self.at = tuple(at)
+
+    def spot(self):
+        """Where the hero lands, in BG3."""
+        return self.to_bg3(self.at)
 
     def to_bg3(self, w):
         W, C = self.origin, self.centre
@@ -560,7 +554,7 @@ class World:
     # ---- squares ----
     def cut_cmd(self, ij):
         """The wow_arena.py command for square ij, and its output folder; no command for one made ahead."""
-        args = cut_args(self.terrain, self.map, self.centre, self.origin, ij)
+        args = cut_args(self.terrain, self.map, self.centre, self.origin, ij, self.at)
         ahead = cached_cut(args)
         if ahead:
             return None, ahead
@@ -592,6 +586,7 @@ class World:
             self.cells[ij] = self.cells.pop(ij)  # newest last
             return self.cells[ij]
         cmd, out = self.cut_cmd(ij)
+        self.cuts[0 if cmd else 1] += 1
         if ij in self.ready:
             self.ready.discard(ij)
         elif cmd:
@@ -792,8 +787,7 @@ class World:
         tiers = [[], [], []]
         for w, p, _ in members:
             if w.node is None:
-                w.node = (int(math.floor((p[0] - self.centre[0]) / CELL + 0.5)),
-                          int(math.floor((p[2] - self.centre[2]) / CELL + 0.5)))
+                w.node = node_of(self.centre, p[0], p[2])
             core, rest = self.window(w, p[0], p[2])
             tiers[0].append(self.under(p[0], p[2]))
             tiers[1].extend(core)
@@ -825,9 +819,7 @@ class World:
 
     def moves(self, want):
         """[(pool index, square)]: squares in `want` not placed yet, filled from pool subgrids not
-        in `want` (stale ones first, then never placed ones, then the farthest from every member); the stale
-        squares in `want` where they lie, nothing has to leave them for that (the plugin's pool_same_spot); and last
-        the stale storeys over a wanted square that no cut wants, which only go blocked (self.to_block)."""
+        in `want` (never placed ones first, then the farthest from every member)."""
         at = {ij: k for k, ij in self.placed.items()}
         missing = [ij for ij in want if ij not in at]
         # A pool subgrid one side moved and the other did not (a refused Place) holds its square on
@@ -844,45 +836,28 @@ class World:
                     break
         held = set().union(*self.split.values()) if self.split else set()
         missing = [ij for ij in missing if ij not in held]
-        spots = [p for _, p, _ in self.members] or [(self.centre[0], 0, self.centre[2])]
+        spots = [p for _, p, _ in self.members] or [self.spot()]
         def far(k):
             if k not in self.placed:
                 return 1e12
             minx, minz = self.cell_min(self.placed[k])
             return min(math.hypot(minx + CELL / 2 - p[0], minz + CELL / 2 - p[2]) for p in spots)
         free = sorted((k for k in range(self.pool) if k not in self.split and self.placed.get(k) not in want
-                       and self.pinned.get(k, 0) < now), key=lambda k: (k in self.stale, far(k)), reverse=True)
-        # In `want` order, new and stale alike: the square under every member comes first.
-        free, out = iter(free), []
+                       and self.pinned.get(k, 0) < now), key=far, reverse=True)
+        # In `want` order: the square under every member comes first.
+        free = iter(free)
         for ij in want:
-            if ij in at:
-                if at[ij] in self.stale:
-                    out.append((at[ij], ij))
-            elif ij in missing:
+            if ij in missing:
                 k = next(free, None)
                 if k is not None:
-                    out.append((k, ij))
-        pairs += out
-        used = {k for k, _ in pairs}
-        self.to_block = {k for k in self.stale - self.blocked - used
-                         if len(self.placed.get(k, ())) == 3 and self.placed[k][:2] in want}
-        return pairs + sorted((k, self.placed[k]) for k in self.to_block)
+                    pairs.append((k, ij))
+        return pairs
 
     def cells_for(self, pairs):
         """Writes each square's tiles for the plugin (section-<k>-<serial>.bin) -> Cells for the mod."""
         out = []
-        self.precut([ij[:2] for k, ij in pairs if k not in self.to_block])
+        self.precut([ij[:2] for k, ij in pairs])
         for k, ij in pairs:
-            if k in self.to_block:
-                # No walkable tile: the plugin's Place takes a storey without a floor out of every patch, so BG3
-                # finds nothing of it at any height (wowbg3_plugin.cpp pool_place). Registered with blocked tiles at
-                # the centre's height it was the hero's own floor after a move's teleport, and BG3's server ran no
-                # tick for 7 to 13.5 s after such re-origins (0.1.3013.59).
-                self.serial = self.serial % SERIALS + 1
-                atomic_write(IO / ('section-%d-%d.bin' % (k, self.serial)),
-                             (b'\0' + struct.pack('<f', self.centre[1])) * (TILES * TILES))
-                out.append([k, *self.cell_min(ij), self.centre[1], self.serial])
-                continue
             cell = self.cut(ij[:2])
             if len(ij) == 3:
                 cell = cell['storeys'][ij[2] - 1]
@@ -929,8 +904,6 @@ class World:
         self.placed = {k: server[k] for k in server if k < self.pool and server[k] is not None and server[k] == client.get(k)}
         self.split = {k: {server.get(k), client.get(k)} - {None} for k in range(self.pool)
                       if server.get(k) != client.get(k) and ({server.get(k), client.get(k)} - {None})}
-        self.stale &= set(self.placed)
-        self.blocked &= self.stale
         print('resync:', self.placed, 'split:', self.split, flush=True)
 
     # ---- session ----
@@ -947,25 +920,26 @@ class World:
         if not at or abs(at[2] - self.terrain.height(at[0], at[1])) <= wow_arena.STOREY_CLEAR:
             return []
         # A cut holds one storey a tile: where it kept another floor of this column, that one.
-        y = self.storey_floors(self.centre[0], self.centre[2])
+        S = self.spot()
+        y = self.storey_floors(S[0], S[2])
         if y is None and login:
-            self.origin = (at[0], at[1], self.terrain.height(at[0], at[1]))
-            self.anchor()
+            self.land((at[0], at[1], self.terrain.height(at[0], at[1])))
             print('start: no raised floor under WoW\'s player, the terrain', flush=True)
             self.cells.clear()
             cut_all()
-        elif y is not None and abs(y - self.centre[1]) > wow_arena.STOREY_CLEAR * YD:
-            self.origin = (at[0], at[1], at[2] + (y - self.centre[1]) / YD)
-            self.anchor()
-            print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.origin[2]), flush=True)
+        elif y is not None and abs(y - S[1]) > wow_arena.STOREY_CLEAR * YD:
+            self.land((at[0], at[1], at[2] + (y - S[1]) / YD))
+            print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.at[2]), flush=True)
             self.cells.clear()
             cut_all()
         # A Start holds 12 squares: the level under the hero first, the others stream in after it.
+        S = self.spot()
+
         def gap(u):
             st = self.cells[u[:2]]['storeys'][u[2] - 1]
-            c0, r0 = int((self.centre[0] - st['min'][0]) // 0.5), int((self.centre[2] - st['min'][1]) // 0.5)
+            c0, r0 = int((S[0] - st['min'][0]) // 0.5), int((S[2] - st['min'][1]) // 0.5)
             if 0 <= c0 < TILES and 0 <= r0 < TILES and st['floors'][(r0 * TILES + c0) * 5] & 1:
-                return abs(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0] - self.centre[1])
+                return abs(struct.unpack_from('<f', st['floors'], (r0 * TILES + c0) * 5 + 1)[0] - S[1])
             return math.inf
         return sorted([ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in want
                        if k < len(self.cells[ij].get('storeys') or ())], key=gap)
@@ -974,24 +948,25 @@ class World:
         """World mode at WoW's player, or at the WoW point `at` (x, y, z): its origin for the session."""
         login = False
         if at:
-            self.origin = tuple(at)
+            self.land(at)
         else:
             wx, wy, wz = player_wow()
-            self.origin = (wx, wy, self.terrain.height(wx, wy))
+            self.land((wx, wy, self.terrain.height(wx, wy)))
             # WoW's player on a raised floor (a city street) starts on it, not on the terrain under it.
-            if STOREYS and abs(wz - self.origin[2]) > wow_arena.STOREY_CLEAR:
+            if STOREYS and abs(wz - self.at[2]) > wow_arena.STOREY_CLEAR:
                 at, login = (wx, wy, wz), True
-                self.origin = tuple(at)
-        self.anchor()
+                self.land(at)
         w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
-        w.node = (0, 0)
-        want, _ = self.window(w, self.centre[0], self.centre[2])
+        S = self.spot()
+        w.node = node_of(self.centre, S[0], S[2])
+        want, _ = self.window(w, S[0], S[2])
         ups = self.landing(at, login, want)
         pairs = list(zip(range(4), want)) + list(zip(range(4, min(self.pool, 12)), ups))
         cells = self.cells_for(pairs)
         self.write_triangles(want)
         self.rays = sorted(want)
-        seq = self.command('Start', Centre=list(self.centre), WowOrigin=list(self.origin), Cells=cells, PoolSize=self.pool,
+        seq = self.command('Start', Centre=list(self.centre), WowOrigin=list(self.origin), Spot=list(self.spot()),
+                           Cells=cells, PoolSize=self.pool,
                            Layer=self.a.layers[0], Layers=self.a.layers)
         ok, err = self.wait_done(seq, 90)
         assert ok, 'Start failed: %s' % err
@@ -1003,65 +978,14 @@ class World:
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         print('pool of', self.pool, 'squares; placed', self.placed, flush=True)
+        print('start: %d squares cut now, %d read from cuts kept' % tuple(self.cuts), flush=True)
         self.started = time.time()
         self.publish(True)
 
-    def reorigin(self, at, covered=None):
-        """This session at the WoW point `at` (see the notes at the top). None, or why not: then the caller goes on
-        with Stop and Start, which take everything home whatever this left (the mod may have stopped publishing).
-        `covered`: called once the cuts are made, before the mod's part (move: waits for the cover to be black)."""
-        if self.fixed:
-            # The mod's Reorigin keeps BG3's centre and gives it another WoW point; here every WoW point keeps its own
-            # BG3 place, so the hero is the one who moves: Stop and Start at the new place.
-            return 'a level of our own: the map stays, the hero moves'
-        self.origin = tuple(at)
-        self.cells.clear()
-        self.ready.clear()
-        self.walkers.clear()
-        self.pinned.clear()
-        self.stale = set(self.placed)
-        self.blocked = set()
-        w = self.walker((hero(self.run) or {}).get('Uuid') or 'hero', 'hero')
-        w.node = (0, 0)
-        want, _ = self.window(w, self.centre[0], self.centre[2])
-        ups = self.landing(at, False, want)
-        squares = want + ups[:max(0, min(self.pool, 12) - len(want))]
-        why = None
-        for _ in range(3):
-            pairs = self.moves(squares)
-            short = set(want) - {ij for _, ij in pairs}
-            if short:
-                return why or 'no pool subgrid for %s' % sorted(short)
-            cells = self.cells_for(pairs)
-            self.write_triangles(want)
-            if covered:
-                covered()
-                covered = None
-            seq = self.command('Reorigin', WowOrigin=list(self.origin), Cells=cells)
-            ok, why = self.wait_done(seq, 45)
-            if ok:
-                for k, ij in pairs:
-                    self.took(k, ij)
-                self.rays = sorted(want)
-                self.started = self.landed = time.time()
-                return None
-            # As in follow: a subgrid on its way to another square that something stands on waits, another one goes.
-            m = re.search(r'stands on pool ([0-9 ]+)', str(why))
-            if not m:
-                return why
-            for k in m.group(1).split():
-                self.pinned[int(k)] = time.time() + 15.0
-        return why
-
     def took(self, k, ij):
-        """Pool subgrid k has square ij now, on both sides; one only blocked has no new ground yet."""
-        if k in self.to_block:
-            self.blocked.add(k)
-            return
+        """Pool subgrid k has square ij now, on both sides."""
         self.placed[k] = ij
         self.split.pop(k, None)
-        self.stale.discard(k)
-        self.blocked.discard(k)
 
     def arrived(self):
         """benilla's player stands at this session's place: the server has placed it (camera.bin flag) within
@@ -1071,32 +995,15 @@ class World:
         except (AssertionError, OSError, struct.error):
             return None
         t = tav(self.started + 1.0)
-        where = [self.origin] + ([t[0]] if t else [])  # she may have walked on since
+        where = [self.at] + ([t[0]] if t else [])  # she may have walked on since
         if min(math.hypot(x - p[0], y - p[1]) for p in where) > LANDED_YD:
             return False, (x, y, where)
         return True, (x, y, where)
 
-    def settle(self):
-        """After a re-origin world.json stays Active false until benilla's player has followed the hero (about 2 s):
-        with it Active the mirrors would map the mobs round the old place through the new mapping. A player that never
-        follows says so and leaves world.json off: mobs mapped wrong would only hide that."""
-        if self.landed is None:
-            return
-        got = self.arrived()
-        if got is None:
-            return
-        ok, (x, y, where) = got
-        if not ok:
-            if time.time() - self.landed > 30:
-                self.landed = time.time()
-                print('move: benilla\'s player is still at WoW %.1f %.1f, not at %s' % (x, y, where), flush=True)
-            return
-        self.landed = None
-        self.publish(True)
-
     def publish(self, active):
         """link/world.json: the session mapping, for the fight bridge (wow-bg3-link bridge)."""
         body = {'Active': active, 'WowOrigin': list(self.origin or (0, 0, 0)), 'Centre': list(self.centre), 'Map': self.map,
+                'Spot': list(self.spot()) if self.at else list(self.centre),
                 'Time': time.time()}
         atomic_write(LINK / 'world.json', json.dumps(body).encode())
 
@@ -1122,7 +1029,7 @@ class World:
     def floor_at(self, bx, bz):
         """(walkable, floor y) of the placed square's tile under BG3 (x, z), or None."""
         ij = (int(math.floor((bx - self.centre[0]) / CELL)), int(math.floor((bz - self.centre[2]) / CELL)))
-        if ij not in {s for k, s in self.placed.items() if k not in self.stale} or ij not in self.cells:
+        if ij not in set(self.placed.values()) or ij not in self.cells:
             return None
         cell = self.cells[ij]
         c = min(TILES - 1, max(0, int((bx - cell['min'][0]) / 0.5)))
@@ -1177,9 +1084,8 @@ class World:
                                                           'Members': rows}).encode())
 
     def move(self, m):
-        """World mode at the requested WoW point. On this continent the session goes on there (reorigin). Another
-        continent, or a refused re-origin: Stop (hero, party and squares home), then a new
-        session with that point as the origin, on the request's continent (Map; another continent: a
+        """World mode at the requested WoW point: Stop (hero, party and squares home), then a new
+        session whose hero lands there, on the request's continent (Map; another continent: a
         server teleport first, see CONTINENTS). A failed Start is tried again; if the new place never
         starts, world mode starts again where WoW's player stands. Returns the World to go on with (self if
         refused or re-origined)."""
@@ -1232,15 +1138,6 @@ class World:
             # Once the cover is black (the cuts of a re-origin take that time first): the old mapping is off.
             cover_wait(black)
             self.publish(False)
-        if not cross:
-            try:
-                why = self.reorigin((x, y, z), covered)
-            except Exception as e:  # noqa: BLE001  Stop and Start cut again from nothing
-                why = e
-            if why is None:
-                answer(True, {'Origin': list(self.origin), 'Map': target})
-                return self
-            print('move: no re-origin (%s), Stop and Start' % why, flush=True)
         covered()
         seq = self.command('Stop')
         ok, err = self.wait_done(seq, 60)
@@ -1263,7 +1160,7 @@ class World:
             w = World(self.a, map_id=target)
             try:
                 w.start((x, y, z))
-                answer(True, {'Origin': list(w.origin), 'Map': target})
+                answer(True, {'Origin': list(w.at), 'Map': target})
                 return w
             except Exception as e:
                 last = e
@@ -1308,7 +1205,6 @@ class World:
         return self.arrive(target)
 
     def follow(self):
-        self.settle()
         # Tav's record counts once WorldMode has teleported her (it publishes only after Start).
         t = tav(self.started + 1.0)
         if not t:
@@ -1333,8 +1229,7 @@ class World:
         def near(ij):
             minx, minz = self.cell_min(ij)
             return any(math.hypot(minx + CELL / 2 - p[0], minz + CELL / 2 - p[2]) <= KEEP_RAYS for p in where)
-        # A stale square's WoW triangles would be another place's than its tiles: it gets them as it is retiled.
-        squares = [ij for k, ij in self.placed.items() if k not in moving and k not in self.stale and (ij in want or near(ij))]
+        squares = [ij for k, ij in self.placed.items() if k not in moving and (ij in want or near(ij))]
         squares += [ij for _, ij in pairs]
         # Squares one side still holds (a split pool subgrid) keep their WoW triangles too.
         squares += [ij for k, spots in self.split.items() if k not in moving for ij in spots
@@ -1468,24 +1363,13 @@ class FarSight:
 
 def main():
     p = argparse.ArgumentParser()
-    # Tav's place in BG3 (in the void, well away from the tutorial scene, the whole
-    # session): 1.1 km west of the level's AI grid (x -296..331, z -478..70), where no BG3 tile
-    # or shape shares a column with the treadmill's squares (over the out-of-bounds layer, its
-    # chasm tiles under the squares killed Tav on her first walk). Height: BG3's cursor
-    # picked characters only while Tav stood below about 150 m over that layer (works at 151.7, not
-    # at 161.7; physics still hits her higher up and the level's bounds are +-10 km).
-    # WOW_BG3_WORLD_X, _Y and _Z override it.
+    # The pool: the level's blank squares (tools/wowbg3_level.py) and the height they are parked at. The floor: the
+    # hero's side in squares (4, since the friendly NPCs' stand-ins reach 40 yd: a 4 x 4 block, at least 88 m of ground
+    # on every side), the same under every other party member.
     env = lambda k, d: float(os.environ.get(k, d))  # noqa: E731
-    p.add_argument('--centre', type=float, nargs=3,
-                   default=(env('WOW_BG3_WORLD_X', '-1400'), env('WOW_BG3_WORLD_Y', '120'), env('WOW_BG3_WORLD_Z', '-350')))
-    p.add_argument('--fixed', action='store_true', default=os.environ.get('WOW_BG3_FIXED') == '1',
-                   help='a level of our own: the continent\'s fixed mapping (fixed_pair), --centre is not used')
-    p.add_argument('--pool', type=int, default=int(env('WOW_BG3_POOL', '6')), help='pool subgrids to use (4 to 128)')
-    # A bigger host level: the out-of-bounds layer's height, the hero's floor side in
-    # squares (4, since the friendly NPCs' stand-ins reach 40 yd: a 4 x 4 block, at least 88 m of ground
-    # on every side; 2: the old 2 x 2 plus two ahead) and the same under every other party member.
-    # One height or several, comma separated (plugin 0.2.9: the pool from every listed layer).
-    p.add_argument('--layer', default=os.environ.get('WOW_BG3_LAYER', '-15.262'))
+    p.add_argument('--pool', type=int, default=int(env('WOW_BG3_POOL', '100')), help='pool subgrids to use (4 to 128)')
+    p.add_argument('--layer', default=os.environ.get('WOW_BG3_LAYER', '-20'),
+                   help='the height the level parks its blank squares at')
     p.add_argument('--floor', type=int, default=int(env('WOW_BG3_FLOOR', '4')))
     p.add_argument('--party-floor', action='store_true', default=os.environ.get('WOW_BG3_PARTY_FLOOR') == '1')
     p.add_argument('--maps', default=os.environ.get('WOW_BG3_MAPS') or (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/storage/mangosd/extracted-data/maps')
@@ -1502,7 +1386,7 @@ def main():
     if os.environ.get('WOW_BG3_SERVER') and os.environ.get('WOWBG3_SERVER_VAR'):
         try:
             subprocess.Popen(['nice', '-n', '19', sys.executable, str(Path(__file__).resolve().parent / 'wow_waypoints.py'), 'prewarm',
-                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')] + [str(v) for v in a.centre] + [str(a.floor)] + (['fixed'] if a.fixed else []),
+                              str(Path(os.environ['WOWBG3_SERVER_VAR']) / 'data/5875/dbc')]  + [str(a.floor)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             print('movement tiles ahead:', e, flush=True)

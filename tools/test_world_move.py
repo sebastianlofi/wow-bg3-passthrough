@@ -32,11 +32,11 @@ class Flat:
 class Fake(B.World):
     """A World with no cuts and no mod: `answers` says how each mod command ends, `sent` keeps them."""
     def __init__(self, tmp):
-        self.a = SimpleNamespace(pool=6, floor=2, layers=[-15.0], centre=(-1400.0, 120.0, -350.0), maps='maps')
+        self.a = SimpleNamespace(pool=6, floor=2, layers=[-15.0], maps='maps')
         with mock.patch.object(B, 'run_id', lambda: 'r1'), mock.patch.object(B, 'player_map', lambda: 0), \
                 mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()):
             super().__init__(self.a)
-        self.origin = (0.0, 0.0, 100.0)
+        self.land((0.0, 0.0, 100.0))
         self.answers, self.sent = [], []
         self.storeys = {}  # square -> how many storeys its cut has
 
@@ -89,133 +89,11 @@ class Base(unittest.TestCase):
 
 
 class Moves(Base):
-    def test_without_stale_squares_as_before(self):
+    def test_a_new_square_takes_a_free_subgrid(self):
         w = self.w
         w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0)}
-        w.members = [(None, (-1400.0, 120.0, -350.0), False)]
+        w.members = [(None, B.FIXED_CENTRE, False)]
         self.assertEqual(w.moves([(0, 0), (1, 0)]), [(4, (1, 0))])
-        self.assertEqual(w.to_block, set())
-
-    def test_stale_wanted_square_stays_on_its_subgrid(self):
-        w = self.w
-        w.placed = {0: (0, 0), 1: (5, 5)}
-        w.stale = {0, 1}
-        self.assertEqual(w.moves([(0, 0)]), [(0, (0, 0))])
-
-    def test_a_stale_subgrid_goes_first_for_a_new_square(self):
-        w = self.w
-        w.placed = {0: (5, 5), 1: (6, 6)}
-        w.stale = {1}
-        self.assertEqual(w.moves([(0, 0)])[0], (1, (0, 0)))
-
-    def test_a_pinned_stale_square_is_still_retiled(self):
-        w = self.w
-        w.placed = {0: (0, 0)}
-        w.stale = {0}
-        w.pinned = {0: time.time() + 15}
-        self.assertEqual(w.moves([(0, 0)]), [(0, (0, 0))])
-
-    def test_stale_storey_over_wanted_ground_goes_blocked_once(self):
-        w = self.w
-        w.pool = w.ground_pool = 2   # no other subgrid wants it: it stays and goes blocked
-        w.placed = {0: (0, 0), 1: (0, 0, 1)}
-        w.stale = {0, 1}
-        pairs = w.moves([(0, 0)])
-        self.assertEqual(pairs, [(0, (0, 0)), (1, (0, 0, 1))])
-        self.assertEqual(w.to_block, {1})
-        cells = w.cells_for(pairs)
-        raw = (self.tmp / ('section-1-%d.bin' % cells[1][4])).read_bytes()
-        self.assertEqual(len(raw), 5 * B.TILES * B.TILES)
-        self.assertEqual(raw[::5], bytes(B.TILES * B.TILES))
-        self.assertEqual(cells[1][1:3], list(w.cell_min((0, 0, 1))))
-        # Off the lattice and without one walkable tile: the plugin's Place registers it in no patch.
-        lo = w.cell_min((0, 0, 1))
-        self.assertTrue(round(lo[0] * 2) % B.TILES != 0 or round(lo[1] * 2) % B.TILES != 0)
-        self.assertEqual({struct.unpack_from('<f', raw, i * 5 + 1)[0] for i in range(B.TILES * B.TILES)}, {cells[1][3]})
-        for k, ij in pairs:
-            w.took(k, ij)
-        self.assertEqual((w.stale, w.blocked), ({1}, {1}))
-        self.assertEqual(w.moves([(0, 0)]), [])
-
-    def test_a_blocked_storey_gets_ground_when_a_cut_wants_it(self):
-        w = self.w
-        w.placed = {1: (0, 0, 1)}
-        w.stale, w.blocked = {1}, {1}
-        pairs = w.moves([(0, 0, 1)])
-        self.assertEqual(pairs, [(1, (0, 0, 1))])
-        w.took(1, (0, 0, 1))
-        self.assertEqual((w.stale, w.blocked), (set(), set()))
-
-    def test_a_stale_square_has_no_floor_for_the_guard(self):
-        w = self.w
-        w.placed = {0: (0, 0)}
-        w.cut((0, 0))
-        w.cells[(0, 0)]['tiles'] = bytes(5 * B.TILES * B.TILES)
-        self.assertIsNotNone(w.floor_at(-1390.0, -340.0))
-        w.stale = {0}
-        self.assertIsNone(w.floor_at(-1390.0, -340.0))
-
-    def test_resync_forgets_stale_subgrids_no_longer_placed(self):
-        w = self.w
-        w.placed, w.stale, w.blocked = {0: (0, 0), 1: (1, 1)}, {0, 1}, {1}
-        at = {0: (0, 0)}
-        side = {**{k: None for k in range(8)}, **at}
-        with mock.patch.object(w, 'pool_files', lambda: (side, side)):
-            w.resync()
-        self.assertEqual((w.stale, w.blocked), ({0}, set()))
-
-
-class Reorigin(Base):
-    def placed_round_centre(self):
-        self.w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0), 4: (7, 7), 5: (8, 8)}
-        self.w.members = [(None, (-1400.0 + 7.5 * 64, 120.0, -350.0 + 7.5 * 64), False)]
-
-    def test_lands_where_the_squares_are(self):
-        self.placed_round_centre()
-        self.assertIsNone(self.w.reorigin(TARGET))
-        action, f = self.w.sent[0]
-        self.assertEqual(action, 'Reorigin')
-        self.assertEqual(f['WowOrigin'], list(TARGET))
-        self.assertEqual(sorted(c[0] for c in f['Cells']), [0, 1, 2, 3])
-        self.assertEqual(self.w.stale, {4, 5})
-        self.assertEqual(self.w.rays, sorted(self.w.triangles))
-        self.assertEqual(self.w.origin, TARGET)
-
-    def test_centre_squares_elsewhere_take_stale_subgrids(self):
-        self.w.placed = {k: (10 + k, 10) for k in range(6)}
-        self.w.members = [(None, (-1400.0 + 64 * 10, 120.0, -350.0 + 64 * 10), False)]
-        self.assertIsNone(self.w.reorigin(TARGET))
-        self.assertEqual(len(self.w.sent[0][1]['Cells']), 4)
-        self.assertEqual(len(self.w.stale), 2)
-
-    def test_busy_subgrid_waits_and_another_goes(self):
-        self.w.placed = {k: (10 + k, 10) for k in range(6)}
-        self.w.members = [(None, (-1400.0 + 64 * 10, 120.0, -350.0 + 64 * 10), False)]
-        far = max(range(6))  # farthest from the party: asked first
-        self.w.answers = [(False, 'Place refused: something stands on pool %d' % far)]
-        self.assertIsNone(self.w.reorigin(TARGET))
-        self.assertEqual(self.w.sent[0][0], self.w.sent[1][0])
-        self.assertIn(far, [c[0] for c in self.w.sent[0][1]['Cells']])
-        self.assertNotIn(far, [c[0] for c in self.w.sent[1][1]['Cells']])
-
-    def test_active_only_once_benilla_has_followed(self):
-        self.placed_round_centre()
-        self.w.publish(False)
-        self.assertIsNone(self.w.reorigin(TARGET))
-        self.camera(5000.0, 5000.0)
-        self.w.settle()
-        self.assertFalse(self.active())
-        self.camera(TARGET[0] + 3, TARGET[1] - 2)
-        self.w.settle()
-        self.assertTrue(self.active())
-        self.assertIsNone(self.w.landed)
-
-    def test_no_camera_stream_yet_is_no_error(self):
-        self.placed_round_centre()
-        self.w.publish(False)
-        self.assertIsNone(self.w.reorigin(TARGET))
-        self.w.settle()
-        self.assertFalse(self.active())
 
 
 class SeenMoves(Base):
@@ -256,7 +134,7 @@ class Cover(Base):
         p = mock.patch.object(B, 'move_cover', lambda on: self.lifted.append(on))
         p.start()
         self.addCleanup(p.stop)
-        self.w.origin = TARGET
+        self.w.land(TARGET)
 
     def test_held_until_benilla_is_there(self):
         now = time.time()
@@ -292,24 +170,6 @@ class CoverTime(Base):
         B.move_cover(False)
         self.assertFalse(flag.exists())
 
-    def test_the_cuts_come_before_the_wait_and_the_mapping_goes_off_after_it(self):
-        w = self.w
-        w.placed = {0: (-1, -1), 1: (0, -1), 2: (-1, 0), 3: (0, 0)}
-        w.publish(True)
-        order = []
-        cut = w.cut
-        w.cut = lambda ij: (order.append('cut'), cut(ij))[1]
-        def covered():
-            order.append('covered')
-            self.assertTrue(self.active())   # the old mapping holds until the cover is black
-            w.publish(False)
-        self.assertIsNone(w.reorigin(TARGET, covered))
-        self.assertEqual(order[-1], 'covered')
-        self.assertIn('cut', order)
-        self.assertEqual([a for a, _ in w.sent], ['Reorigin'])
-        self.assertFalse(self.active())
-
-
 class Move(Base):
     def request(self, **fields):
         return dict({'Seq': 3, 'Wow': list(TARGET), 'Map': 0}, **fields)
@@ -320,10 +180,10 @@ class Move(Base):
         started = []
         class New:
             def __init__(self, a, map_id=None):
-                self.origin = None
+                self.at = None
 
             def start(self, at):
-                self.origin = at
+                self.at = at
                 started.append(at)
         with mock.patch.object(B, 'tav_flags', lambda *_: 0), mock.patch.object(B, 'camp_state', lambda *_: False), \
                 mock.patch.object(B, 'move_cover', lambda *_: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
@@ -331,23 +191,15 @@ class Move(Base):
             result = w.move(m)
         return result, started, json.loads(B.MOVE_RESULT.read_text())
 
-    def test_same_continent_keeps_the_session(self):
+    def test_same_continent_is_stop_and_start_too(self):
         result, started, answer = self.run_move(self.request())
-        self.assertIs(result, self.w)
-        self.assertEqual(started, [])
-        self.assertEqual(self.w.sent[0][0], 'Reorigin')
+        self.assertIsNot(result, self.w)
+        self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
+        self.assertEqual(started, [TARGET])
         self.assertEqual(answer['Value'], {'Origin': list(TARGET), 'Map': 0})
         self.assertFalse(self.active())
 
-    def test_a_refusal_goes_the_whole_way(self):
-        self.w.answers = [(False, 'Cell too far from the disposable character'), (True, None)]
-        result, started, answer = self.run_move(self.request())
-        self.assertIsNot(result, self.w)
-        self.assertEqual([a for a, _ in self.w.sent], ['Reorigin', 'Stop'])
-        self.assertEqual(started, [TARGET])
-        self.assertTrue(answer['OK'])
-
-    def test_another_continent_never_re_origins(self):
+    def test_another_continent(self):
         with mock.patch.object(self.w, 'arrive', lambda t: None):
             result, started, answer = self.run_move(self.request(Map=1, Arrived=True))
         self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
@@ -417,7 +269,7 @@ class ArenaWait(unittest.TestCase):
 @unittest.skipIf(lupa is None, 'needs the lupa module')
 class StatusReport(unittest.TestCase):
     """WorldMode.lua's world-status.json: a job of the mod's own (extend) ending after a command's job keeps the
-    command's Seq there, so the bridge's wait_done still sees it (0.1.3013.61: a move's Reorigin report lost)."""
+    command's Seq there, so the bridge's wait_done still sees it (0.1.3013.61: a move's report lost)."""
     def setUp(self):
         self.L = L = lupa.LuaRuntime(unpack_returned_tuples=True)
         L.execute(r'''
@@ -434,11 +286,11 @@ class StatusReport(unittest.TestCase):
         s = self.L.globals().saved
         return {k: s[k] for k in ('Last', 'Seq', 'OK', 'Error')}, s['Chore']
 
-    def test_an_extend_after_a_reorigin_keeps_its_seq(self):
-        self.L.execute('jobDone({name = "Reorigin", seq = 7}, true)')
+    def test_an_extend_after_a_command_keeps_its_seq(self):
+        self.L.execute('jobDone({name = "Stop", seq = 7}, true)')
         self.L.execute('jobDone({name = "extend"}, false, "Extend: no result")')
         report, chore = self.status()
-        self.assertEqual(report, {'Last': 'Reorigin', 'Seq': 7, 'OK': True, 'Error': None})
+        self.assertEqual(report, {'Last': 'Stop', 'Seq': 7, 'OK': True, 'Error': None})
         self.assertEqual((chore['Name'], chore['OK'], chore['Error']), ('extend', False, 'Extend: no result'))
         self.L.execute('writeStatus()')  # the 600-tick status too
         self.assertEqual(self.status()[0]['Seq'], 7)
@@ -471,11 +323,11 @@ class Cache(Base):
             p.start()
             self.addCleanup(p.stop)
 
-    def args(self, ij=(0, 0), origin=TARGET):
-        return B.cut_args(Flat(), 0, self.w.centre, origin, ij)
+    def args(self, ij=(0, 0), at=TARGET):
+        return B.cut_args(Flat(), 0, B.FIXED_CENTRE, B.FIXED_ORIGIN, ij, at)
 
     def test_the_bridge_reads_what_prewarm_cut(self):
-        self.w.origin = TARGET
+        self.w.land(TARGET)
         cmd, out = B.World.cut_cmd(self.w, (0, 0))
         self.assertTrue(cmd)
         self.assertEqual(out, B.CELLS / '0_0')
@@ -484,10 +336,16 @@ class Cache(Base):
         self.assertIsNone(cmd)
         self.assertTrue((out / 'arena.json').exists())
 
-    def test_another_square_or_point_is_another_cut(self):
+    def test_another_square_is_another_cut(self):
         B.store_cut(self.args())
         self.assertIsNone(B.cached_cut(self.args((1, 0))))
-        self.assertIsNone(B.cached_cut(self.args(origin=(TARGET[0], TARGET[1] + 1, TARGET[2]))))
+
+    def test_sessions_over_the_ground_share_a_cut_and_one_under_it_has_its_own(self):
+        B.store_cut(self.args())
+        self.assertIsNotNone(B.cached_cut(self.args(at=(TARGET[0] + 40, TARGET[1], 100.0))))
+        under = self.args(at=(TARGET[0], TARGET[1], 100.0 - B.wow_arena.UNDER_CLEAR - 5))
+        self.assertIn('--under', under)
+        self.assertIsNone(B.cached_cut(under))
 
     def test_a_failed_cut_leaves_nothing(self):
         self.assertFalse(B.store_cut(self.args() + ['--fail']))
@@ -510,13 +368,17 @@ class Cache(Base):
         with mock.patch.object(W, 'nodes', lambda _: [point]), mock.patch.object(W, 'stand_z', lambda m, x, y, z, t: 104.5), \
                 mock.patch.object(B.wow_arena, 'ensure_mmtiles', lambda *_, **__: None), mock.patch.object(B.wow_arena, 'Terrain', lambda *_: Flat()), \
                 mock.patch.object(B, 'store_cut', stored.append):
-            self.assertEqual(W.prewarm('dbc', (-1400.2, 120.0, -350.0), 2), 0)
+            self.assertEqual(W.prewarm('dbc', 2), 0)
         self.assertEqual(len(stored), 4)
-        self.w.centre = B.lattice_centre((-1400.2, 120.0, -350.0))
-        self.w.origin = (point['x'], point['y'], 104.5)
-        self.assertEqual(B.cut_args(Flat(), 0, self.w.centre, self.w.origin, (-1, -1)), stored[0])
+        # A session landing on the point asks for the same squares of the level's lattice, whatever came before it.
+        self.w.land((point['x'], point['y'], 104.5))
+        S = self.w.spot()
+        node = B.node_of(self.w.centre, S[0], S[2])
+        first = (node[0] - 1, node[1] - 1)
+        self.assertEqual(self.args(first, self.w.at), stored[0])
+        self.assertNotIn('--under', stored[0])   # over the ground: the cut is the same for every session
         B.store_cut(stored[0])
-        self.assertIsNone(B.World.cut_cmd(self.w, (-1, -1))[0])
+        self.assertIsNone(B.World.cut_cmd(self.w, first)[0])
 
     def test_squares_as_the_window_wants_them(self):
         core, rest = W.square_order(4)

@@ -24,8 +24,8 @@ The rules, one place:
 
   wow_waypoints.py table DBC_DIR                    every point by team (DBC_DIR holds TaxiNodes.dbc)
   wow_waypoints.py stand DBC_DIR                    each point's height and the floor it lands on
-  wow_waypoints.py prewarm DBC_DIR [X Y Z FLOOR]    movement tiles round every point, ahead of the first trip, and with
-                                                    world mode's centre and floor side the squares a move lands on
+  wow_waypoints.py prewarm DBC_DIR [FLOOR]    movement tiles round every point, ahead of the first trip, and with
+                                                    world mode's floor side the squares a move lands on
                                                     (needs the server's map data: WOW_BG3_MAPS, _MMAPS, _VMAPS)
 Python 3.9, standard library only, except `stand` (wow_stand.py's needs).
 """
@@ -204,12 +204,12 @@ def square_order(floor):
     return core, rest
 
 
-def prewarm(dbc_dir, centre=None, floor=4, fixed=False):
+def prewarm(dbc_dir, floor=None):
     """Builds the movement tiles round every flight point ahead of the first trip there: a city's tile takes
     the generator 45 s, which a move would otherwise wait for. Tiles are kept, so a later run only looks. With
     `centre` also the cuts of the squares a move there lands on, every point's 2 x 2 before any point's rest: a cut takes
     up to 3 s, and a move would wait for 4 to 12 of them (world_bridge.py cut_cmd reads them; on this machine only).
-    `fixed`: a level of our own, where a move's centre is the point's own BG3 place (world_bridge.py fixed_pair).
+    `fixed`: a level of our own, whose lattice is the same in every session (world_bridge.py FIXED_CENTRE).
     Ends with the process that started it."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import wow_arena
@@ -221,10 +221,9 @@ def prewarm(dbc_dir, centre=None, floor=4, fixed=False):
         if os.getppid() != parent:
             return 0
         wow_arena.ensure_mmtiles(mmaps, maps, n['map'], n['x'], n['y'], PREWARM_REACH, busy=False)
-    if centre is None:
+    if floor is None:
         return 0
     import world_bridge as B
-    centre = B.lattice_centre(centre)
     B.prune_cuts()
     terrains, origins = {}, {}
     for squares in square_order(floor):
@@ -241,10 +240,13 @@ def prewarm(dbc_dir, centre=None, floor=4, fixed=False):
                             origins[n['id']] = (n['x'], n['y'], float(stand_z(n['map'], n['x'], n['y'], n['z'], terrain)))
                         except Exception:  # noqa: BLE001
                             origins[n['id']] = (n['x'], n['y'], n['z'])
-                    c, o = B.fixed_pair(origins[n['id']]) if fixed else (centre, origins[n['id']])
+                    c, o = B.FIXED_CENTRE, B.FIXED_ORIGIN
+                    w = origins[n['id']]  # the level's lattice: the squares round the point's node
+                    node = B.node_of(c, w[1] * B.YD, -w[0] * B.YD)
+                    ij = (ij[0] + node[0], ij[1] + node[1])
                     wx, wy = o[0] - (B.CELL * ij[1] + B.CELL / 2) / B.YD, o[1] + (B.CELL * ij[0] + B.CELL / 2) / B.YD
                     wow_arena.ensure_mmtiles(mmaps, maps, n['map'], wx, wy, B.CELL / 2 / B.YD + 3, busy=False)
-                    B.store_cut(B.cut_args(terrain, n['map'], c, o, ij))
+                    B.store_cut(B.cut_args(terrain, n['map'], c, o, ij, w))
                 except Exception:  # noqa: BLE001  a point off the height maps costs its move a cut, no more
                     continue
     return 0
@@ -253,8 +255,8 @@ def prewarm(dbc_dir, centre=None, floor=4, fixed=False):
 def main(argv):
     if len(argv) == 2 and argv[0] == 'prewarm':
         return prewarm(argv[1])
-    if len(argv) in (6, 7) and argv[0] == 'prewarm':
-        return prewarm(argv[1], (float(argv[2]), float(argv[3]), float(argv[4])), int(argv[5]), len(argv) == 7 and argv[6] == 'fixed')
+    if len(argv) == 3 and argv[0] == 'prewarm':
+        return prewarm(argv[1], int(argv[2]))
     if len(argv) != 2 or argv[0] not in ('table', 'stand'):
         print(__doc__)
         return 2

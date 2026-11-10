@@ -273,7 +273,7 @@ function M.Start(runId)
         if u ~= hero then return end
         -- Into the void: world mode's own Start. Undoing it put the hero on the host level's spot, inside camp's
         -- ground, about 5 s after each load whose world.json a killed bridge had left Active.
-        local c = w.Centre
+        local c = w.Spot or w.Centre
         if type(c) == "table" and math.sqrt((nx - c[1]) ^ 2 + (nz - c[3]) ^ 2) < M.VOID_REACH then return end
         local mine = own and ticks <= own.Until and math.sqrt((nx - own.X) ^ 2 + (nz - own.Z) ^ 2) < M.JUMP
         own = nil
