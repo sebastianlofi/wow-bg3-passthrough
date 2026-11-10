@@ -28,3 +28,4 @@ bc4437720bb5667a84c15346ba95628ec57caebfba25167c49095f3e512d2c61  0026-wowbg3-ho
 4d45d1ede3c737fd1c683ba8e4511efd749e9270eb201783d99857f510f585c5  0028-wowbg3-empty-loot-closes.patch
 eb5349600a572b5fb2e2f25d1a1f75bc44b9fb57bf4772259531ec784e4fc4f8  0029-wowbg3-corpse-where-the-body-lies.patch
 860cc5ba69e72d3471ceb24eff96e34908b2b99ad04edd6c074bba56185c04fc  0030-wowbg3-loot-list-at-wows-reach.patch
+71c2e4c42febfa2803fd62f0fccdf91c1d0dab978deddb9758ef2603f3107faa  0031-wowbg3-carried-corpse-kept.patch

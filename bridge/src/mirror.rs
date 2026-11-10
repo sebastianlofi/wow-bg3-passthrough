@@ -605,6 +605,8 @@ pub struct MirrorState {
     pub pos: Option<[f64; 3]>,
     /// A robbed NPC searching for the thief (`Searching`, Mirrors.lua): BG3 walks its stand-in.
     pub searching: bool,
+    /// A corpse in someone's inventory (`Carried`): BG3's own pick-up of a body.
+    pub carried: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
@@ -645,6 +647,7 @@ pub fn parse_status(v: &Value) -> Status {
                     dead: yes(m, "Dead"),
                     hit_by_tav: yes(m, "HitByTav"),
                     searching: yes(m, "Searching"),
+                    carried: yes(m, "Carried"),
                     pos: m.get("Pos").and_then(Value::as_array).and_then(|a| {
                         let v: Vec<f64> = a.iter().filter_map(Value::as_f64).collect();
                         (v.len() == 3 && v.iter().all(|x| x.is_finite()))
@@ -711,6 +714,8 @@ pub struct Mirror {
     wow_killed: HashMap<String, bool>,
     /// The bodies of dead stand-ins the server confirmed dead, by mob guid ([`Mirror::corpses_due`]).
     bodies: HashMap<String, Body>,
+    /// Carried bodies the server was told to keep, by mob guid: when it was last told ([`Mirror::carried_due`]).
+    held: HashMap<String, u64>,
 }
 
 /// A dead stand-in's body as BG3 has it.
@@ -726,6 +731,8 @@ struct Body {
 /// A body counts as lying still once two reads this far apart find it at the same place
 /// (`mirror-status.json` comes about three times a second; a thrown body is in the air for longer).
 const BODY_REST_MS: u64 = 600;
+/// How often the server hears that a body is still carried (it keeps one for half an hour a call).
+const HOLD_AGAIN_MS: u64 = 600_000;
 
 /// Set by SIGTERM or SIGINT once [`catch_stop`] ran: the bridge's loops end at the next
 /// [`Mirror::stop_if_asked`].
@@ -1069,10 +1076,31 @@ impl Mirror {
         }
     }
     /// A server line about kills. `hp ENC GUID killed|gone|dead ...` is WoW's word that the mob is
+    /// The dead mobs whose body someone in BG3 carries, for the server to keep (patch 0031): when the body is
+    /// picked up, and again every ten minutes while it is carried.
+    pub fn carried_due(&mut self, now: u64) -> Vec<String> {
+        let carried: Vec<String> = self
+            .status
+            .mobs
+            .iter()
+            .filter(|(g, s)| s.dead && s.carried && self.wow_killed.contains_key(*g))
+            .map(|(g, _)| g.clone())
+            .collect();
+        self.held.retain(|g, _| carried.contains(g));
+        let mut due = Vec::new();
+        for g in carried {
+            if self.held.get(&g).is_none_or(|t| now.saturating_sub(*t) >= HOLD_AGAIN_MS) {
+                self.held.insert(g.clone(), now);
+                due.push(g);
+            }
+        }
+        due
+    }
     /// The dead mobs whose WoW corpse does not lie where BG3's body has come to rest (a stand-in
     /// killed while a spell moved it), with the body's place in WoW yards: one line each for the
     /// server (patch 0029), again only when the body moves on. Only mobs the server confirmed
-    /// dead: before that WoW has no corpse to move.
+    /// dead: before that WoW has no corpse to move. Not a body someone carries (BG3's pick-up): it is on no
+    /// ground until it is dropped, and then it is new here and goes where it was dropped.
     pub fn corpses_due(&mut self, now: u64) -> Vec<(String, Point)> {
         let Some(map) = self.mapping.clone() else {
             return Vec::new();
@@ -1081,7 +1109,7 @@ impl Mirror {
             .status
             .mobs
             .iter()
-            .filter(|(g, s)| s.dead && self.wow_killed.contains_key(*g))
+            .filter(|(g, s)| s.dead && !s.carried && self.wow_killed.contains_key(*g))
             .filter_map(|(g, s)| Some((g.clone(), s.pos?)))
             .collect();
         self.bodies.retain(|g, _| dead.contains_key(g));
@@ -1190,7 +1218,14 @@ impl Mirror {
             .mobs
             .iter()
             .flat_map(|(g, s)| {
-                let first = if s.dead { format!("c {g}") } else { format!("m {g}") };
+                // A carried corpse lies nowhere: `x`, and benilla draws no body for it (patch 0131).
+                let first = if s.dead && s.carried {
+                    format!("x {g}")
+                } else if s.dead {
+                    format!("c {g}")
+                } else {
+                    format!("m {g}")
+                };
                 let search = (s.searching && !s.dead).then(|| format!("s {g}"));
                 std::iter::once(first).chain(search)
             })

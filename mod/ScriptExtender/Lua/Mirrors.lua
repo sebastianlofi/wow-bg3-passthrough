@@ -1184,8 +1184,15 @@ function M.Start(runId)
                 if m.Dead or q(Osi.IsDead, m.Uuid) == 1 or M.KnockedOut[m.Uuid] then
                     m.Dead = true
                     m.DiedAt = m.DiedAt or ticks
-                    local p = pos(m.Uuid)
-                    if ticks - m.DiedAt >= CORPSE_KEEP or not (p and onGround(p)) then remove(guid) end
+                    -- A corpse someone carries (BG3's own pick-up) is on no ground and does not go while it is
+                    -- carried; put down, it lies its time from then (WoW's server keeps its corpse the same way).
+                    if q(Osi.IsInInventory, m.Uuid) == 1 then
+                        m.Carried = true
+                    else
+                        if m.Carried then m.Carried, m.DiedAt = nil, ticks end
+                        local p = pos(m.Uuid)
+                        if ticks - m.DiedAt >= CORPSE_KEEP or not (p and onGround(p)) then remove(guid) end
+                    end
                 else
                     remove(guid)
                 end
@@ -1329,6 +1336,8 @@ function M.Start(runId)
                 HitByTav = hitByTav[m.Uuid] == true, Stage = m.Stage, Hostile = m.Hostile, Scale = m.Scale,
                 Friendly = m.Friendly, Guard = m.Guard, CrimeReady = friendlyAimed[m.Uuid] ~= nil,
                 Searching = searching[m.Uuid] ~= nil,
+                -- A corpse someone carries (BG3's own pick-up): in an inventory, on no ground.
+                Carried = m.Dead == true and q(Osi.IsInInventory, m.Uuid) == 1,
                 FriendlyReset = m.FriendlyReset,
                 Provoked = provoked[m.Uuid] == true, LeftCombat = m.LeftCombat,
                 Named = m.Named, NameText = m.NameText, NameError = m.NameError, Aimed = aimed[m.Uuid] and ticks - aimed[m.Uuid] or nil,

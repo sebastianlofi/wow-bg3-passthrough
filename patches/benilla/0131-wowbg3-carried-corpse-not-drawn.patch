@@ -1,0 +1,79 @@
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+index 90c4470..81ffb35 100644
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -183,6 +183,8 @@ struct Shared {
+     /// WOW-BG3 (patch 0060): dead mobs whose BG3 stand-in's corpse is still there (`mirrored.txt`
+     /// `c`): BG3 takes clicks on those corpses (its own loot window, filled with the WoW loot).
+     corpses: HashSet<u64>,
++    /// Patch 0131: dead mobs whose corpse someone in BG3 carries (`mirrored.txt` `x`): no body to draw.
++    carried: HashSet<u64>,
+ }
+ 
+ /// WoW's cursor kind as `wowhover.bin` carries it (BG3's `WowCursor.lua` reads the same order).
+@@ -758,6 +760,13 @@ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+         write_us: (0, 0),
+     })
+     .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
++    // Patch 0131: after the exterior election wrote the units' verdicts for the frame, as the party's bots are hidden.
++    .add_systems(
++        PostUpdate,
++        carried_corpses
++            .after(benilla_world::exterior_cull::ExteriorCullSet)
++            .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
++    )
+     // Patch 0105: right after the wire's movers (and a deck rider's), before everything that reads
+     // this frame's unit `Transform`, the ground ring and the blob shadow among them. The server's
+     // position is written over the model's every frame in `WorldStage::Net`; put back only in
+@@ -1068,6 +1077,7 @@ fn fight_tick(
+     if f.frame % 30 == 2 {
+         let text = std::fs::read_to_string(f.dir.join("mirrored.txt")).unwrap_or_default();
+         let (mut m, mut h, mut c) = (HashSet::new(), HashSet::new(), HashSet::new());
++        let mut carried = HashSet::new();
+         let mut searching = HashSet::new();
+         for line in text.lines() {
+             match line.split_once(' ') {
+@@ -1077,6 +1087,8 @@ fn fight_tick(
+                 Some(("s", g)) => searching.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 // Patch 0060: a mirrored mob's corpse (BG3's loot window).
+                 Some(("c", g)) => c.extend(u64::from_str_radix(g.trim(), 16).ok()),
++                // Patch 0131: a corpse BG3 carries.
++                Some(("x", g)) => carried.extend(u64::from_str_radix(g.trim(), 16).ok()),
+                 _ => {}
+             }
+         }
+@@ -1084,6 +1096,7 @@ fn fight_tick(
+             s.mirrored = m;
+             s.frozen = h;
+             s.corpses = c;
++            s.carried = carried;
+         }
+         // Patch 0067: while it searches, its model is held like a fight mob's and walks where BG3 walks
+         // its stand-in (`standins.bin`, MirrorsClient.lua outside a fight); once it stops searching it is
+@@ -2186,3 +2199,26 @@ mod tests {
+         assert_eq!(json_text("Defias \"Thug\"\\\n"), "Defias \\\"Thug\\\"\\\\");
+     }
+ }
++
++
++/// Patch 0131: a corpse someone in BG3 has picked up lies nowhere in the world: BG3 keeps it in an inventory, and
++/// WoW's body, which stayed on the ground (or lay at the carrier's feet), is not drawn while the bridge lists it as
++/// carried (`mirrored.txt` `x`). Dropped again, it is shown where BG3 dropped it (the server moves it there).
++fn carried_corpses(mut units: Query<(&Guid, &mut Visibility), Without<SelfPlayer>>, mut hidden: Local<HashSet<u64>>) {
++    let carried = SHARED.lock().map(|s| s.carried.clone()).unwrap_or_default();
++    if carried.is_empty() && hidden.is_empty() {
++        return;
++    }
++    for (g, mut vis) in &mut units {
++        if carried.contains(&g.0) {
++            if *vis != Visibility::Hidden {
++                *vis = Visibility::Hidden;
++            }
++            hidden.insert(g.0);
++        } else if hidden.remove(&g.0) && *vis == Visibility::Hidden {
++            // Put down again: nothing else shows it, the election writes a verdict only when it flips.
++            *vis = Visibility::Inherited;
++        }
++    }
++    hidden.retain(|g| carried.contains(g));
++}

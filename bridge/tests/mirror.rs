@@ -935,4 +935,17 @@ fn a_corpse_goes_where_the_body_came_to_rest() {
     m.status.mobs.insert(g.clone(), body([14.0, 1050.0, -26.0]));
     assert!(m.corpses_due(5300).is_empty());
     assert_eq!(m.corpses_due(6000).len(), 1, "moved on (a second push): sent again");
+    // Picked up (BG3's own): it lies nowhere, benilla is told so, and nothing is sent while it is carried.
+    let carried = MirrorState { dead: true, carried: true, pos: Some([30.0, 1050.0, -40.0]), ..Default::default() };
+    m.status.mobs.insert(g.clone(), carried);
+    assert!(m.corpses_due(7000).is_empty() && m.corpses_due(9000).is_empty());
+    assert_eq!(m.carried_due(7000), vec![g.clone()], "the server keeps the body");
+    assert!(m.carried_due(9000).is_empty(), "told once");
+    assert_eq!(m.carried_due(7000 + 600_000).len(), 1, "and again while it is carried");
+    assert_eq!(m.mirrored_text(), format!("x {g}\n"));
+    // Dropped: where it lies now, once it rests.
+    m.status.mobs.insert(g.clone(), body([33.0, 1050.0, -41.0]));
+    assert!(m.corpses_due(9300).is_empty());
+    assert_eq!(m.corpses_due(10000).len(), 1);
+    assert_eq!(m.mirrored_text(), format!("c {g}\n"));
 }

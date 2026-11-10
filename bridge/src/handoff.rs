@@ -60,6 +60,9 @@ pub enum Handoff {
     /// that dies while a spell pushes, pulls or throws it lands somewhere else than where it
     /// died, and WoW's corpse goes there. No encounter: the body may land after the fight's end.
     Corpse { mob: String, x: f64, y: f64, z: f64 },
+    /// Someone in BG3 carries this dead mob's body (server patch 0031): WoW keeps the corpse (no decay, no
+    /// respawn) until it is put down. Said again while it is carried.
+    CorpseHold { mob: String },
     /// Tav's hit points as BG3 has them (the WoW character's HP follows
     /// Tav's as a fraction; Tav dying kills it). Shape `hero ENC TAVHP TAVMAX`, agreed with the server patch.
     Hero {
@@ -108,6 +111,7 @@ impl Handoff {
                 z,
             } => format!(".wowbg3 pos {encounter} {mob} {x:.2} {y:.2} {z:.2}"),
             Self::Corpse { mob, x, y, z } => format!(".wowbg3 corpse {mob} {x:.2} {y:.2} {z:.2}"),
+            Self::CorpseHold { mob } => format!(".wowbg3 corpse {mob} hold"),
             Self::Hero {
                 encounter,
                 hp,

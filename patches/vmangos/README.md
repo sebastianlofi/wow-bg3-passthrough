@@ -36,6 +36,7 @@ fights, party members and the merged inventory.
 | 0028 empty-loot-closes | `loot list` on a corpse with nothing in it for the member releases the corpse again, as WoW's client closes an empty loot window: the corpse lost its lootable mark only when something was taken, so an empty one kept its sparkles (a playtest report) |
 | 0029 corpse-where-the-body-lies | `corpse GUID X Y Z` moves a dead mob's body to where BG3's body came to rest: a stand-in that dies while a spell pushes, pulls or throws it lands somewhere else than where it died, and `pos` (0004) knows only the place of death. Only a body the owner's side killed, on the owner's map, to a place within 60 yd of the owner |
 | 0030 loot-list-at-wows-reach | `loot list` measures the member's distance to the corpse as WoW's loot handlers do (`WowBg3::InLootReach`). It used a wider distance of its own, so between the two a listing went on to WoW's handler, which refused it and printed its red "too far away to loot that corpse" on the player's screen for each try |
+| 0031 carried-corpse-kept | `corpse GUID hold`: a body someone in BG3 carries (BG3's own pick-up) neither decays nor lets its mob respawn for half an hour from the call, which the bridge repeats while it is carried; `corpse GUID X Y Z` gives a body its own full corpse time again where it is put down |
 
 Upstream `Unit.cpp` uses CRLF line endings, so some hunks are CRLF: never convert line endings in
 these files.

@@ -1788,6 +1788,11 @@ pub fn kills_outside_fights(
 /// WoW's corpses go where BG3's bodies came to rest ([`Mirror::corpses_due`], server patch 0029).
 pub fn corpses_step(mirror: &mut Mirror, server: &mut dyn ServerHandoff) -> Result<(), Error> {
     let now = mirror.now();
+    for mob in mirror.carried_due(now) {
+        let h = Handoff::CorpseHold { mob };
+        println!("handoff: {}", h.describe());
+        server.send(&h)?;
+    }
     for (mob, at) in mirror.corpses_due(now) {
         let h = Handoff::Corpse { mob, x: at.0, y: at.1, z: at.2 };
         println!("handoff: {}", h.describe());

@@ -1,0 +1,74 @@
+diff --git a/src/game/Objects/Creature.h b/src/game/Objects/Creature.h
+index dc15106..63b7ee6 100644
+--- a/src/game/Objects/Creature.h
++++ b/src/game/Objects/Creature.h
+@@ -148,6 +148,16 @@ class Creature : public Unit
+         bool IsCorpse() const override { return GetDeathState() ==  CORPSE; }
+         bool IsDespawned() const { return GetDeathState() ==  DEAD; }
+         void SetCorpseDelay(uint32 delay) { m_corpseDelay = delay; }
++        // WOW-BG3 0031: this corpse lies for `secs` from now: neither its decay nor its respawn
++        // (which removes a corpse too) comes before. 0: its own full corpse time, from now.
++        void WowBg3KeepCorpse(uint32 secs)
++        {
++            if (!secs)
++                secs = m_corpseDelay;
++            m_corpseDecayTimer = secs * IN_MILLISECONDS;
++            if (m_respawnTime < time(nullptr) + time_t(secs))
++                m_respawnTime = time(nullptr) + time_t(secs);
++        }
+         bool IsRacialLeader() const { return GetCreatureInfo()->racial_leader; }
+         bool IsCivilian() const { return GetCreatureInfo()->civilian; }
+         bool IsTrigger() const { return HasExtraFlag(CREATURE_FLAG_EXTRA_INVISIBLE); }
+diff --git a/src/game/WowBg3Fights.cpp b/src/game/WowBg3Fights.cpp
+index 88d6e2c..fd97451 100644
+--- a/src/game/WowBg3Fights.cpp
++++ b/src/game/WowBg3Fights.cpp
+@@ -1116,12 +1116,39 @@ namespace
+             return out.Add(head + "refused notyours");
+         if (p->GetDistance(x, y, z, SizeFactor::None) > PLACE_RANGE)
+             return out.Add(head + "refused far");
++        // 0031: put down (or thrown) here, it lies its full corpse time from now: a body BG3
++        // carried was kept past it (CorpseHold).
++        c->WowBg3KeepCorpse(0);
+         if (c->GetDistance(x, y, z, SizeFactor::None) < 0.5f)
+             return out.Add(head + "ok same");
+         c->NearTeleportTo(x, y, z, c->GetOrientation());
+         out.Add(head + "ok");
+     }
+ 
++    // corpse <guid> hold (0031): someone in BG3 carries this body (BG3's own pick-up of a corpse).
++    // It lies nowhere, so it must not decay and the mob must not respawn under the carrier's
++    // hands: kept for HOLD_SECS from now; the bridge says so again while the body is carried, and
++    // `corpse <guid> x y z` gives it its own corpse time again where it is put down.
++    void CorpseHold(Player* p, std::string const& guidText, Out& out)
++    {
++        uint32 const HOLD_SECS = 1800;
++        ObjectGuid g;
++        if (!ParseGuid(guidText, g))
++            return out.Add("WOWBG3 corpse " + guidText + " refused badguid");
++        std::string const head = "WOWBG3 corpse " + Hex(g) + " ";
++        if (!p || !p->IsInWorld())
++            return out.Add(head + "refused offline");
++        Creature* c = FindMob(p->GetMapId(), p->GetInstanceId(), g, p);
++        if (!c)
++            return out.Add(head + "gone");
++        if (c->IsAlive())
++            return out.Add(head + "refused alive");
++        if (!c->HasLootRecipient() || !c->IsTappedBy(p))
++            return out.Add(head + "refused notyours");
++        c->WowBg3KeepCorpse(HOLD_SECS);
++        out.Add(head + "held");
++    }
++
+     // hero <enc|-> <tav hp> <tav max hp> [<killer guid>]: the owner's WoW health
+     // follows Tav's as a fraction (rounded, at least 1 while Tav lives), both
+     // ways. 0 is a normal WoW death: the
+@@ -1758,6 +1785,8 @@ namespace
+             Place(p, a[2], a[3], a[4], a[5], a[6], out);
+         else if (verb == "corpse" && a.size() == 6)
+             Corpse(p, a[2], a[3], a[4], a[5], out);
++        else if (verb == "corpse" && a.size() == 4 && a[3] == "hold")
++            CorpseHold(p, a[2], out);
+         else if (verb == "faction" && a.size() == 3 && (a[2] == "horde" || a[2] == "alliance" || a[2] == "own"))
+             Faction(p, a[2], out);
+         else if (verb == "hold" && a.size() >= 5 && a[3] == "guids")
