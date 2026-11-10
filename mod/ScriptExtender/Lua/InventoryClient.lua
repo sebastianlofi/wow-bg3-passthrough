@@ -49,6 +49,11 @@ local function loadAtlas(status)
         local root, se = assert(dataRoot(), "no data root"), assert(seRoot(), "no SE root")
         Ext.IO.AddPathOverride(GAME_LSX, fromRoot(root, se .. "/wow-bg3/gui/Icons_WowBg3.lsx"))
         Ext.IO.AddPathOverride(GAME_DDS, fromRoot(root, se .. "/wow-bg3/gui/Icons_WowBg3.dds"))
+        -- The GUI's own pictures of the atlas come through BG3's texture provider, which knows no file from outside
+        -- BG3's data: the plugin answers it for this one (op 110, as for the minimap's images). First, so no screen
+        -- asks for the texture before it can be had.
+        local tex = Ext.Require("WowNative.lua").Call(110, 1)
+        if tex.Err ~= 0 then status.Atlas = "plugin op 110: " .. tostring(tex.Why); return end
         local r = Ext.StaticData.LoadIconAtlas(root .. "/" .. GAME_LSX)
         if r == true then status.Atlas = "loaded"; status.Icons = #(list.Icons or {})
         elseif r == false then status.Atlas = "BG3 refused the atlas file"

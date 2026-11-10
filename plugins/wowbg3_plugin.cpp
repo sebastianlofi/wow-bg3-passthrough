@@ -5386,12 +5386,30 @@ bool code_at(std::uintptr_t va, unsigned char const* code, std::size_t n) {
 // optionally "?<anything>" (WowUi.lua makes each image's URI unique that way while benilla reuses
 // four files). The file is always io_dir()/link/minimap/<name>.
 std::atomic<int> g_uitex_logged{0};
+std::atomic<int> g_uitex_atlas_logged{0};
+std::atomic<int> g_uitex_all_logged{0};
+void* g_uitex_atlas = nullptr;         // the icon atlas's texture, kept (render thread only)
+void* g_uitex_atlas_device = nullptr;
+std::int64_t g_uitex_atlas_time = 0, g_uitex_atlas_size = 0;
+std::atomic<std::uint32_t> g_uitex_atlas_reused{0};
 std::string uitex_path(void const* uri) {
     static const NsUriStrFn str = code_at(kNsUriStr, kNsUriStrCode, sizeof(kNsUriStrCode))
         ? reinterpret_cast<NsUriStrFn>(g_api.LoadBias() + kNsUriStr) : nullptr;
     if (str == nullptr || uri == nullptr) return {};
     char const* s = str(uri);
     if (s == nullptr) return {};
+    // WoW's item icons (tools/wow_icons.py: Script Extender/wow-bg3/gui/Icons_WowBg3.dds, made on the player's
+    // machine after BG3 booted). BG3's atlas map takes the atlas while the game runs (bg3le's LoadIconAtlas), but the
+    // GUI's pictures of it come through this provider, which knows no file from outside BG3's own data: every WoW
+    // item was an empty square in the bag, the trade and the loot windows (a playtest report), while the equipment
+    // slots, drawn another way, had their pictures. BG3's GUI asks for an icon atlas by the atlas's id alone (its UUID
+    // in the .lsx: tools/wow_icons.py ATLAS_UUID). WOW_BG3_UITEX_LOG=1 logs what the GUI asks for (research).
+    if (std::getenv("WOW_BG3_UITEX_LOG") != nullptr && g_uitex_all_logged.fetch_add(1) < 400) logf("wowbg3 ui textures: asked %.200s", s);
+    static constexpr char kAtlas[] = "5d0c7e1a-9b34-4f6e-a2c8-71e3b6d4f905";
+    if (std::strcmp(s, kAtlas) == 0) {
+        if (g_uitex_atlas_logged.fetch_add(1) < 2) logf("wowbg3 ui textures: uri %.300s", s);
+        return io_dir() + "gui/Icons_WowBg3.dds";
+    }
     static constexpr char kTail[] = "/wow-bg3/link/minimap/";
     char const* at = std::strstr(s, kTail);
     if (at == nullptr) return {};
@@ -5409,15 +5427,50 @@ std::string uitex_path(void const* uri) {
 }
 
 // The DDS header of our images (legacy, A8R8G8B8, BGRA in memory): width and height, or false.
-bool uitex_header(unsigned char const* h, std::size_t n, std::uint32_t& w, std::uint32_t& ht) {
+bool uitex_header(unsigned char const* h, std::size_t n, std::uint32_t& w, std::uint32_t& ht, bool* dxt5 = nullptr) {
     if (n < 128 || std::memcmp(h, "DDS ", 4) != 0) return false;
     std::uint32_t v[32];
     std::memcpy(v, h, 128);
     ht = v[3];
     w = v[4];
+    if (dxt5 != nullptr) *dxt5 = false;
+    // The icon atlas: DXT5 (BC3), its first level right after the header.
+    if (dxt5 != nullptr && v[1] == 124 && (v[20] & 0x4) != 0 && std::memcmp(h + 84, "DXT5", 4) == 0 && w >= 4 && ht >= 4
+        && w <= 4096 && ht <= 4096 && w % 4 == 0 && ht % 4 == 0) {
+        *dxt5 = true;
+        return true;
+    }
     // v[20] pixel format flags (RGB, alpha), v[22] bits, v[23..26] R, G, B, A masks
     return v[1] == 124 && (v[20] & 0x40) != 0 && v[22] == 32 && v[23] == 0x00ff0000u && v[24] == 0x0000ff00u
         && v[25] == 0x000000ffu && w >= 1 && ht >= 1 && w <= 4096 && ht <= 4096;
+}
+
+// One DXT5 level (w, ht multiples of 4) to RGBA8.
+void uitex_dxt5(unsigned char const* src, std::uint32_t w, std::uint32_t ht, unsigned char* dst) {
+    for (std::uint32_t by = 0; by < ht; by += 4) {
+        for (std::uint32_t bx = 0; bx < w; bx += 4, src += 16) {
+            unsigned a[8] = {src[0], src[1]};
+            if (a[0] > a[1]) for (unsigned i = 1; i < 7; ++i) a[1 + i] = ((7 - i) * a[0] + i * a[1]) / 7;
+            else { for (unsigned i = 1; i < 5; ++i) a[1 + i] = ((5 - i) * a[0] + i * a[1]) / 5; a[6] = 0; a[7] = 255; }
+            std::uint64_t abits = 0;
+            for (int i = 0; i < 6; ++i) abits |= (std::uint64_t)src[2 + i] << (8 * i);
+            const unsigned c0 = src[8] | (src[9] << 8), c1 = src[10] | (src[11] << 8);
+            unsigned char c[4][3];
+            c[0][0] = (unsigned char)(((c0 >> 11) & 31) * 255 / 31); c[0][1] = (unsigned char)(((c0 >> 5) & 63) * 255 / 63); c[0][2] = (unsigned char)((c0 & 31) * 255 / 31);
+            c[1][0] = (unsigned char)(((c1 >> 11) & 31) * 255 / 31); c[1][1] = (unsigned char)(((c1 >> 5) & 63) * 255 / 63); c[1][2] = (unsigned char)((c1 & 31) * 255 / 31);
+            for (int k = 0; k < 3; ++k) { c[2][k] = (unsigned char)((2 * c[0][k] + c[1][k]) / 3); c[3][k] = (unsigned char)((c[0][k] + 2 * c[1][k]) / 3); }
+            const std::uint32_t cbits = (std::uint32_t)src[12] | ((std::uint32_t)src[13] << 8) | ((std::uint32_t)src[14] << 16) | ((std::uint32_t)src[15] << 24);
+            for (int py = 0; py < 4; ++py) {
+                unsigned char* o = dst + ((std::size_t)(by + py) * w + bx) * 4;
+                for (int px = 0; px < 4; ++px, o += 4) {
+                    const int i = py * 4 + px;
+                    const unsigned char* col = c[(cbits >> (2 * i)) & 3];
+                    o[0] = col[0]; o[1] = col[1]; o[2] = col[2];
+                    o[3] = (unsigned char)a[(abits >> (3 * i)) & 7];
+                }
+            }
+        }
+    }
 }
 
 bool uitex_read(std::string const& path, std::vector<unsigned char>& out, std::size_t want) {
@@ -5444,7 +5497,8 @@ void uitex_get_info(NsTextureInfo* ret, void* self, void const* uri) {
     *ret = NsTextureInfo{0, 0, 0, 0, 1.0f};
     std::vector<unsigned char> h;
     std::uint32_t w = 0, ht = 0;
-    if (uitex_read(path, h, 128) && uitex_header(h.data(), h.size(), w, ht)) {
+    bool dxt5 = false;
+    if (uitex_read(path, h, 128) && uitex_header(h.data(), h.size(), w, ht, &dxt5)) {
         ret->Width = w;
         ret->Height = ht;
         g_uitex_infos.fetch_add(1, std::memory_order_relaxed);
@@ -5472,31 +5526,62 @@ void uitex_load(void** ret, void* self, void const* uri, void* device) {
     }
     std::vector<unsigned char> h;
     std::uint32_t w = 0, ht = 0;
-    if (!uitex_read(path, h, 128) || !uitex_header(h.data(), h.size(), w, ht)) {
+    bool dxt5 = false;
+    if (!uitex_read(path, h, 128) || !uitex_header(h.data(), h.size(), w, ht, &dxt5)) {
         g_uitex_fails.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    std::vector<unsigned char> file;
-    if (!uitex_read(path, file, 128 + (std::size_t)w * ht * 4)) {
+    // The icon atlas is asked for by every screen that shows an item (seven times in a session's first minute) and is
+    // 64 MB as a texture: made once for a file, the same texture handed out again with a reference of its own (a
+    // Noesis object counts its references in the 32 bits after its vtable pointer; ours keeps it alive).
+    struct stat st {};
+    const bool statted = dxt5 && ::stat(path.c_str(), &st) == 0;
+    if (statted && g_uitex_atlas != nullptr && g_uitex_atlas_device == device && g_uitex_atlas_time == (std::int64_t)st.st_mtime
+        && g_uitex_atlas_size == (std::int64_t)st.st_size) {
+        reinterpret_cast<std::atomic<std::int32_t>*>((char*)g_uitex_atlas + 8)->fetch_add(1);
+        *ret = g_uitex_atlas;
+        g_uitex_atlas_reused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::vector<unsigned char> file, plain;
+    if (!uitex_read(path, file, 128 + (dxt5 ? (std::size_t)w * ht : (std::size_t)w * ht * 4))) {
         g_uitex_fails.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // BGRA -> RGBA in place (RenderDevice's RGBA8 is R first).
     unsigned char* px = file.data() + 128;
-    for (std::size_t i = 0, n = (std::size_t)w * ht; i < n; ++i) std::swap(px[i * 4], px[i * 4 + 2]);
+    if (dxt5) {
+        plain.resize((std::size_t)w * ht * 4);
+        uitex_dxt5(px, w, ht, plain.data());
+        px = plain.data();
+    } else {
+        // BGRA -> RGBA in place (RenderDevice's RGBA8 is R first).
+        for (std::size_t i = 0, n = (std::size_t)w * ht; i < n; ++i) std::swap(px[i * 4], px[i * 4 + 2]);
+    }
     void const* levels[1] = {px};
     void* tex = nullptr;
-    reinterpret_cast<NsCreateTexFn>(slots[kNsSlotCreateTexture])(&tex, device, "wowbg3-minimap", w, ht, 1, 0 /* RGBA8 */, levels);
+    reinterpret_cast<NsCreateTexFn>(slots[kNsSlotCreateTexture])(&tex, device, dxt5 ? "wowbg3-icons" : "wowbg3-minimap", w, ht, 1, 0 /* RGBA8 */, levels);
     if (tex == nullptr) {
         g_uitex_fails.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
+    if (statted) {
+        std::int32_t refs = 0;
+        if (safe_read((char*)tex + 8, &refs, sizeof(refs)) && refs == 1) {
+            reinterpret_cast<std::atomic<std::int32_t>*>((char*)tex + 8)->fetch_add(1);  // ours: an older one stays as it is
+            g_uitex_atlas = tex;
+            g_uitex_atlas_device = device;
+            g_uitex_atlas_time = (std::int64_t)st.st_mtime;
+            g_uitex_atlas_size = (std::int64_t)st.st_size;
+        } else if (g_uitex_atlas_logged.fetch_add(1) < 4) {
+            logf("wowbg3 ui textures: the atlas texture's reference count reads %d, not 1: not kept (each ask makes one)", (int)refs);
+        }
     }
     *ret = tex;  // the Ptr's reference moves to the caller
     const std::uint32_t us = (std::uint32_t)((mono_seconds() - t0) * 1e6);
     g_uitex_last_us.store(us);
     if (us > g_uitex_max_us.load()) g_uitex_max_us.store(us);
     if (g_uitex_loads.fetch_add(1, std::memory_order_relaxed) < 20) {
-        logf("wowbg3 ui textures: %ux%u minimap texture made in %.2f ms", w, ht, us / 1000.0);
+        logf("wowbg3 ui textures: %ux%u %s texture made in %.2f ms", w, ht, dxt5 ? "icon atlas" : "minimap", us / 1000.0);
     }
 }
 
@@ -5536,7 +5621,7 @@ bool ui_textures(Out& o, int mode) {
         g_uitex_orig_vptr = vptr;
         std::atomic_thread_fence(std::memory_order_release);
         reinterpret_cast<std::atomic<void* const*>*>(p)->store((void* const*)&g_uitex_vt[2]);
-        logf("wowbg3 ui textures: provider %p (vtable bg3+0x%lx) answers link/minimap images", p,
+        logf("wowbg3 ui textures: provider %p (vtable bg3+0x%lx) answers link/minimap images and the icon atlas", p,
              (unsigned long)((std::uintptr_t)vptr - bias));
         o.F[0] = 1.0f;
     } else if (mode == 0 && ours && p == g_uitex_provider && g_uitex_orig_vptr != nullptr) {

@@ -1,0 +1,20 @@
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index d5928a8..d2c0415 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -894,6 +894,15 @@ namespace
+             out.Add(head + "begin " + std::to_string(loot.gold) + " " + std::to_string(items.size()));
+             for (std::string const& l : items)
+                 out.Add(l);
++            // Nothing in it for this member: WoW's loot window closes again, as WoW's client closes the window of an
++            // empty corpse. Left open, the corpse was never released: it kept its lootable mark (the sparkles) for as
++            // long as it lay there, though BG3's corpse showed nothing to take.
++            if (items.empty() && loot.gold == 0)
++            {
++                WorldPackets::Loot::LootRelease rel;
++                rel.guid = g;
++                s->HandleLootReleaseOpcode(rel);
++            }
+             return out.Add(head + "end " + std::to_string(items.size()));
+         }
+         // take ENTRY[,ENTRY...] (0025: several in one call, the bridge's batch of BG3's takes from this corpse).
