@@ -352,8 +352,10 @@ BG3's camp is the rest in WOW-BG3, with WoW's food and drink as its supplies (`c
 with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
 
 - **Go to Camp and End the Day work as in BG3.** End the Day only brings on the night; press Long Rest again,
-  or click your bedroll, to open the rest panel. The party goes to BG3's camp and BG3 draws the picture;
-  the WoW character waits where it stood. Leaving camp puts the party back on the same spot.
+  or click your bedroll, to open the rest panel. The party goes to BG3's camp, a BG3 level of its own
+  (the mountain pass camp), through a loading screen; the WoW character waits where it stood, logged out. Leaving
+  camp puts the party back on the same spot, through a loading screen again while WoW comes back up. Long Rest
+  pressed out in the world goes to camp first.
 - **Long and short rests are BG3's own**, so spell slots, long-rest-only abilities and rest effects work
   as BG3 has them. BG3's story nights do not play: no story runs here, so a night is just sleep.
 - **Food and drink are the supplies.** Anything your party carries counts, buying it at a WoW vendor or

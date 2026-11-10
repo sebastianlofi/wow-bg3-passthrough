@@ -510,7 +510,8 @@ function M.Start(runId)
         local hero = Hero.Uuid()
         local active = q(function() return Osi.DB_ActiveCamp:Get(nil) end)
         if not hero or not active or not active[1] then return end -- the story has not set its camp yet
-        if q(Osi.IsInCombat, hero) == 1 or Ext.Require("Camp.lua").InTrip() then return end
+        -- In a level of our own the story knows its camp only in the camp's level (Camp.lua): there, then.
+        if q(Osi.IsInCombat, hero) == 1 or (not Hero.OWN and Ext.Require("Camp.lua").InTrip()) then return end
         campStarted = true
         for _, k in ipairs(KNOWN) do
             local ok, err = pcall(toCamp, k)

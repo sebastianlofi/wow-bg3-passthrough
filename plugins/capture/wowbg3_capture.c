@@ -1130,14 +1130,23 @@ static int has_word(const char* line, const char* w) {
 }
 static void compose_config(void) {
     struct stat st;
-    if (stat(outp("/compose"), &st) != 0) { if (g_cc.on) logf_("compose off"); g_cc.on = 0; return; }
-    if (st.st_mtim.tv_sec == g_cc.seen.tv_sec && st.st_mtim.tv_nsec == g_cc.seen.tv_nsec) return;
-    g_cc.seen = st.st_mtim;
-    FILE* f = fopen(outp("/compose"), "r");
-    if (!f) return;
     char line[256] = {0};
-    if (!fgets(line, sizeof line, f)) line[0] = 0;
-    fclose(f);
+    // No file: off, and every word off with it (an empty line is read). The words used to stay as they were, and
+    // the passes that ask only for their own word (WoW's ground, WoW's depth and picture in BG3's scene) went on
+    // drawing WoW's last frame into BG3's picture: seen in a BG3 level entered from world mode (the camp's level).
+    const int off = stat(outp("/compose"), &st) != 0;
+    if (off) {
+        if (!g_cc.on) return;
+        logf_("compose off");
+        memset(&g_cc.seen, 0, sizeof g_cc.seen);
+    } else {
+        if (st.st_mtim.tv_sec == g_cc.seen.tv_sec && st.st_mtim.tv_nsec == g_cc.seen.tv_nsec) return;
+        g_cc.seen = st.st_mtim;
+        FILE* f = fopen(outp("/compose"), "r");
+        if (!f) return;
+        if (!fgets(line, sizeof line, f)) line[0] = 0;
+        fclose(f);
+    }
     {
         const int camp = has_word(line, "camp");
         if (g_cc.camp && !camp) g_cc.camp_hold = 1;
@@ -1250,7 +1259,8 @@ static void compose_config(void) {
     const char* wg = strstr(line, "wowgamma=");
     g_cc.wgamma = wg ? strtof(wg + 9, NULL) : 1.0f;
     if (!(g_cc.wgamma >= 0.3f && g_cc.wgamma <= 3.0f)) g_cc.wgamma = 1.0f;
-    g_cc.on = 1;
+    g_cc.on = !off;
+    if (off) return;
     logf_("compose: WoW colour %s (gamma %.2f)", g_cc.wowraw ? "raw bytes (wowraw)" : "decoded once (code 2)", g_cc.wgamma);
     logf_("compose on: ui %d light %d fx %d bg3tav %d fxcopy %d (whole %d) void %d raw %d cpu %d fxsync %d wowbar %d fxsight %d ground %d surf %d (dbg %d pix %d"
           " decal %.2f forward %.2f floor %.4f tol %.2f m light %d) far %.0f m; pacing %s lag %d wait %.1f ms; screen backdrop %d",

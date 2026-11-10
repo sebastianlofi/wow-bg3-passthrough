@@ -41,8 +41,9 @@ This is the first public version. What we know is missing or rough:
   the outdoor world.
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
-  `/wowbg3 refill` stands in for a long rest). The camp is BG3's Act 3 farm whatever the zone, BG3's exploration
-  music stays off there, and the WoW side shows nothing while you are at camp. Food has no use from the bag (as in
+  `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass
+  camp (Wyrm's Lookout) whatever the zone: going there and coming back are loading screens (about 6 s there, about
+  20 s back while the WoW side comes up again), and the WoW side is down while you are at camp. Food has no use from the bag (as in
   BG3): it is eaten at camp, by a long rest.
 - The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
   in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.

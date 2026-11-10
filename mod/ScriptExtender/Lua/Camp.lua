@@ -83,8 +83,143 @@ local function noNights()
     end
 end
 
+-- A level of our own (Hero.OWN) has no camp: BG3's camps are places in the level the party plays in, set up by
+-- that act's story (DB_Camp, DB_MainCamp), and our level has neither. Camp is then a BG3 level of its own, by
+-- BG3's own level change: INT_Main_A, the mountain pass camp between Acts 2 and 3. Measured from our level: BG3's
+-- server runs there after 4.4 s with no more memory (Rivington: 112 s and 540 MB), the story of that level
+-- registers its camp on arrival (DB_Camp "INTMAIN", DB_ActiveCamp), and Party.lua's companions wait there.
+--   Go to Camp in our level: BG3's story has no camp to go to and does nothing; this module asks for the level
+--     change (TeleportPartiesToLevelWithMovie, the story's own call). The party arrives at the coordinates it
+--     left, so BG3's own Go to Camp (PROC_TeleportToFromCamp, the story has the camp now) brings it in.
+--   The WoW side: the hero is no longer in the host level, so the coordinator takes the WoW side down as at any
+--     load (the WoW character logs out where it stood, safe from mobs) and the launcher's loading-screen hold is
+--     released by this module once the hero stands in camp.
+--   Leave Camp (or a walk off the camp's area): the level change back. The hero is in the host level again, the
+--     WoW side comes up as after a load and world mode starts where the WoW character stands: the spot left.
+--   A save made at camp loads at camp: this module only looks at the level the party is in.
+-- That level's own story must not play: its opening cinematic is marked as played before the first visit
+-- (DB_OnlyOnce, as the story marks it), and its nights go with every other (noNights).
+M.LEVEL = "INT_Main_A"
+M.ENTRY = "S_CAMP_INT_EntryPoint_ffff4e4a-4e43-4bf1-a54f-bbf3798b90c0"
+M.BEATS = {"INT_EmperorRevealed_StartCinematic"}
+M.ENTER_EVERY = 60    -- ticks between asks to BG3's own Go to Camp while the hero is not in camp yet
+M.ENTER_TRIES = 5     -- then the party is put on the camp's entry point
+M.LET_IN_AFTER = 600  -- ticks in the camp level: the loading screen is released whatever happened
+local LAUNCHER = "wowbg3-launcher"
+local function level()
+    local rows = q(function() return Osi.DB_CurrentLevel:Get(nil) end)
+    return rows and rows[1] and rows[1][1] or nil
+end
+local function players()
+    local out = {}
+    for _, r in ipairs(q(function() return Osi.DB_Players:Get(nil) end) or {}) do out[#out + 1] = r[1] end
+    return out
+end
+local function startOwn(runId)
+    local ticks, asked, visit = 0, nil, nil
+    M.State = {Trips = 0, Own = true}
+    -- No trip of the borrowed-level kind: world mode's client and the bridge read this file.
+    Ext.IO.SaveFile("wow-bg3/camp-state.json", Ext.Json.Stringify({RunId = runId, Seq = 1, InCamp = false}))
+    local function send(to, why)
+        if asked and ticks < asked.Until then return end
+        asked = {To = to, Until = ticks + 600}
+        for _, b in ipairs(M.BEATS) do
+            if #(q(function() return Osi.DB_OnlyOnce:Get(b) end) or {1}) == 0 then Osi.DB_OnlyOnce(b) end
+        end
+        Ext.Utils.Print("WOW-BG3 camp: " .. why .. ": the party goes to " .. to)
+        Osi.TeleportPartiesToLevelWithMovie(to, "", "")
+    end
+    pcall(Ext.Osiris.RegisterListener, "TeleportToFromCamp", 1, "before", function(who)
+        local ok, err = pcall(function()
+            if #(q(function() return Osi.DB_Players:Get(who) end) or {}) == 0 then return end
+            local lv = level()
+            if lv == Hero.REGION then
+                -- BG3's own reasons against camp travel (a fight, a dialog, a blocked zone) hold here too: the
+                -- story's query for them (its QRY_Camp_IsPlayerBlockedFromTeleportToCamp also fails for having
+                -- no camp, which is the case here).
+                if q(Osi.QRY_WaypointTeleport_PlayerBlocked, who) then
+                    Ext.Utils.Print("WOW-BG3 camp: Go to Camp: BG3 blocks travel now")
+                    return
+                end
+                send(M.LEVEL, "Go to Camp")
+            elseif lv == M.LEVEL and inCampDb(who) and #(q(function() return Osi.DB_Camp_NightMode:Get(1) end) or {}) == 0 then
+                -- The story's own Leave Camp puts each player on the spot it came from, in this level: the
+                -- coordinates of our level, where this one has nothing. No spot, no such move.
+                for _, r in ipairs(q(function() return Osi.DB_LeaveCamp_ReturnPos:Get(nil, nil, nil, nil) end) or {}) do
+                    pcall(function() Osi.DB_LeaveCamp_ReturnPos:Delete(r[1], r[2], r[3], r[4]) end)
+                end
+                send(Hero.REGION, "Leave Camp")
+            end
+        end)
+        if not ok then Ext.Utils.Print("WOW-BG3 camp: " .. tostring(err)) end
+    end)
+    -- Long Rest pressed in our level (the story's End the Day gathers the party at camp first, and has no camp
+    -- here): the same trip. At camp the button is BG3's own again.
+    pcall(Ext.Osiris.RegisterListener, "EndTheDayRequested", 1, "before", function(who)
+        local ok, err = pcall(function()
+            if level() ~= Hero.REGION or #(q(function() return Osi.DB_Players:Get(who) end) or {}) == 0 then return end
+            if q(Osi.QRY_WaypointTeleport_PlayerBlocked, who) then return end
+            send(M.LEVEL, "Long Rest")
+        end)
+        if not ok then Ext.Utils.Print("WOW-BG3 camp: " .. tostring(err)) end
+    end)
+    M.InTrip = function() return level() == M.LEVEL end
+    Ext.Events.Tick:Subscribe(function()
+        ticks = ticks + 1
+        if ticks % 5 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
+        local ok, err = pcall(function()
+            if ticks % 30 == 0 then noNights() end
+            local lv = level()
+            if asked and lv == asked.To then asked = nil end
+            if lv ~= M.LEVEL then
+                if visit then Ext.Utils.Print("WOW-BG3 camp: back from camp") end
+                visit = nil
+                return
+            end
+            local hero = Hero.Uuid()
+            if not hero then return end
+            visit = visit or {Since = ticks, Tries = 0, Next = ticks, In = false, Out = 0, Let = false}
+            local inCamp = inCampDb(hero)
+            if inCamp and not visit.In then
+                visit.In = true
+                M.State.Trips = M.State.Trips + 1
+                Ext.Utils.Print("WOW-BG3 camp: at camp (" .. M.LEVEL .. "), the WoW side waits")
+            end
+            if not visit.In and ticks >= visit.Next then
+                visit.Tries, visit.Next = visit.Tries + 1, ticks + M.ENTER_EVERY
+                for _, p in ipairs(players()) do
+                    if visit.Tries <= M.ENTER_TRIES then
+                        pcall(Osi.PROC_TeleportToFromCamp, p)
+                    else
+                        pcall(Osi.TeleportTo, p, M.ENTRY, "", 1, 1, 1, 0, 1)
+                    end
+                end
+            end
+            -- The loading screen (held for a world-mode game until WoW's ground is placed): camp needs no WoW.
+            if not visit.Let and (visit.In or ticks - visit.Since > M.LET_IN_AFTER) then
+                visit.Let = true
+                if not visit.In then Ext.Utils.Print("WOW-BG3 camp: the hero is not in camp after " .. (ticks - visit.Since) .. " ticks; letting BG3 in") end
+                pcall(function()
+                    for _, p in ipairs(Ext.Plugins.List() or {}) do
+                        if p.Name == LAUNCHER and p.Loaded then Ext.Plugins.Set(LAUNCHER, "ready", 1) end
+                    end
+                end)
+            end
+            -- A walk off the camp's area is leaving, as Leave Camp is.
+            if visit.In then
+                visit.Out = inCamp and 0 or visit.Out + 5
+                if visit.Out >= M.LEFT_AFTER and #(q(function() return Osi.DB_Camp_NightMode:Get(1) end) or {}) == 0 then
+                    send(Hero.REGION, "a walk off camp")
+                end
+            end
+        end)
+        if not ok then M.State.Error = tostring(err) end
+    end)
+end
+
 function M.Start(runId)
     if not M.On() then return end
+    if Hero.OWN then return startOwn(runId) end
     local ticks, seq, pending, outFor = 0, 0, nil, 0
     local own = nil -- where this module just sent the hero: its Teleported arrives ticks later, no one's travel
     local regroup = nil -- after a walk off camp: the hero's walking away undid the party's following
