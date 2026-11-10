@@ -157,6 +157,9 @@ function Probe.Start(context)
         -- WoW's scene light as BG3's own light at the fight spot: sun direction, colour and strength.
         local okSky, errSky = pcall(function() Ext.Require("WowSky.lua").Start(report.RunId) end)
         if not okSky then Ext.Log.Print("WOW-BG3 wowsky: " .. tostring(errSky)) end
+        -- A level of our own: what BG3's story has to be told about it (no fog of war on its map).
+        local okOwn, errOwn = pcall(function() Ext.Require("OwnLevel.lua").Start(report.RunId) end)
+        if not okOwn then Ext.Log.Print("WOW-BG3 own level: " .. tostring(errOwn)) end
     end
     save("bootstrap")
     Ext.Events.GameStateChanged:Subscribe(function() save("state-change") end)

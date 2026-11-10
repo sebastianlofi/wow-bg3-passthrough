@@ -190,6 +190,26 @@ def write_scenery(path, spec, layer):
     open(path, "w").write(x)
 
 
+def write_minimap(path, spec):
+    """The level's map frame (WorldMap/MiniMap): where BG3's minimap and map page lay the level's map picture, here the
+    whole level with no picture. Without it the map's view model has no world size and nothing can be laid on the
+    minimap (WowUi.lua puts WoW's own minimap art there)."""
+    b = spec["Bounds"]
+    # The picture's size in pixels sets the map's scale: BG3's own levels have about 0.75 pixel a metre (BGO_Main_A:
+    # 4096 over 5441 m), and the minimap's zoom range is made for that.
+    px = lambda span: str(int(round(span * 0.7527)))
+    x = (HDR.replace('revision="9" build="0"', 'revision="9" build="310"')
+         + '\t<region id="WorldMapMetaData">\n\t\t<node id="WorldMapMetaData">\n'
+         + "".join("\t\t\t" + a + "\n" for a in [
+             attr("BuildingUUID", "FixedString", ""), attr("Floor", "int32", "0"), attr("Height", "uint32", px(b[5] - b[2])),
+             attr("RenderPatches", "bool", "False"), attr("TextureFilePath", "LSString", ""),
+             attr("TriggerId", "guid", "00000000-0000-0000-0000-000000000000"), attr("Width", "uint32", px(b[3] - b[0])),
+             attr("WorldHeight", "float", repr(float(b[5] - b[2]))), attr("WorldWidth", "float", repr(float(b[3] - b[0]))),
+             attr("WorldX", "float", repr((b[0] + b[3]) / 2.0)), attr("WorldZ", "float", repr((b[2] + b[5]) / 2.0))])
+         + "\t\t</node>\n\t</region>\n</save>\n")
+    open(path, "w").write(x)
+
+
 def write_layer(path, layer):
     open(path, "w").write('<?xml version="1.0" encoding="UTF-8"?>\n<save>\n    <version major="4" minor="0" revision="0" build="77"/>\n'
                           '    <region id="MetaData">\n        <node id="root">\n'
@@ -208,11 +228,12 @@ def build(spec, out):
         nx, nz = g.get("NX", g.get("N")), g.get("NZ", g.get("N"))
         spec["Subgrids"] = spec.get("Subgrids", []) + [{"X": g["X0"] + 64 * i, "Y": g["Y"], "Z": g["Z0"] + 64 * j, "Kind": "blank"}
                                                         for j in range(nz) for i in range(nx)]
-    for d in ("Ai", "Triggers", "Layers"):
+    for d in ("Ai", "Triggers", "Layers", "WorldMap"):
         os.makedirs(os.path.join(out, d), exist_ok=True)
     layer = uid(spec["Name"], "layer", "Triggers")
     write_meta(os.path.join(out, "meta.lsx"), spec)
     write_layer(os.path.join(out, "Layers", layer + ".lsx"), layer)
+    write_minimap(os.path.join(out, "WorldMap", "MiniMap.lsx"), spec)
     write_triggers(os.path.join(out, "Triggers", "_merged.lsx"), spec, layer)
     if spec.get("Scenery"):
         os.makedirs(os.path.join(out, "Scenery"), exist_ok=True)
