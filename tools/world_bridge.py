@@ -70,6 +70,16 @@ CUT_CACHE = None  # (folder, version) of the cuts made ahead, once asked for (cu
 # "Arrived": true (benilla 0041: WoW itself already moved the character, a hearthstone or a
 # graveyard port): no Via/Char and no server teleport; wait for benilla to stand on Map, then Start.
 CONTINENTS = {0: 'Eastern Kingdoms', 1: 'Kalimdor'}
+
+
+def map_name(map_id):
+    return CONTINENTS.get(map_id) or 'map %d' % map_id
+
+
+def has_ground(maps, map_id):
+    """Whether the server's data has ground for a WoW map: a continent, or an instance (a dungeon, a raid, the tram),
+    whose height maps the extractor writes like any other's."""
+    return any(Path(maps).glob('%03d????.map' % int(map_id)))
 MOVE = IO / 'world-move.json'
 MOVE_RESULT = IO / 'world-move-result.json'
 COVER_WAIT_S = 30.0  # a move's cover waits at most so long after the move for benilla's player at the new place
@@ -483,7 +493,7 @@ class World:
         self.ready = set()      # squares precut has cut and cut has not read yet
         # The WoW continent whose ground world mode cuts (Kalimdor too): the player's.
         self.map = map_id if map_id is not None else (player_map() or 0)
-        assert self.map in CONTINENTS, 'world mode has ground for Eastern Kingdoms and Kalimdor only (map %s)' % self.map
+        assert has_ground(a.maps, self.map), 'the server has no ground for WoW map %s' % self.map
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
         self.centre, self.origin = FIXED_CENTRE, FIXED_ORIGIN   # the level's mapping: the same in every session
         self.at = None       # WoW point the session's hero lands on
@@ -1098,8 +1108,8 @@ class World:
         except (TypeError, ValueError):
             answer(False, 'Wow must be [x, y, z or null], Map 0 or 1')
             return self
-        if target not in CONTINENTS:
-            answer(False, 'world mode has ground for Eastern Kingdoms and Kalimdor only')
+        if not has_ground(self.a.maps, target):
+            answer(False, 'the server has no ground for WoW map %d' % target)
             return self
         cross = target != self.map
         arrived = m.get('Arrived') is True
@@ -1192,7 +1202,7 @@ class World:
                 time.sleep(3)  # WoW's loading screen and the first placed packets
                 return None
             time.sleep(0.5)
-        return 'benilla did not arrive on %s within 90 s' % CONTINENTS[target]
+        return 'benilla did not arrive on %s within 90 s' % map_name(target)
 
     def worldport(self, char, via, target):
         """Server teleport of the WoW character to the game_tele place `via` (another continent),

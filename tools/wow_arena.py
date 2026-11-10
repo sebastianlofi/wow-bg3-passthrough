@@ -436,7 +436,7 @@ def main():
     p.add_argument('--walls', choices=['auto', 'all', 'none'], default='auto')
     p.add_argument('--margin', type=float, default=0.5)
     p.add_argument('--max-triangles', type=int, default=60000)
-    p.add_argument('--map', type=int, choices=[0, 1], default=0)
+    p.add_argument('--map', type=int, default=0, help='the WoW map: a continent (0, 1) or an instance')
     # WoW's own ground rule in the stamp: no tile whose surface is steeper than this (degrees) is
     # walkable, so BG3's movement circle covers what a WoW player can reach. 0 turns it off (the
     # earlier state: every movement-map polygon counted, NPC-only steep slopes included).
@@ -509,7 +509,10 @@ def main():
         for pts in buckets.get((int(math.floor(x / CELL)), int(math.floor(y / CELL))), ()):
             if inside(x, y, pts):
                 h = poly_height(x, y, pts)
-                if best is None or abs(h - th) < abs(best - th):
+                # Under the terrain the ground is the origin's own floors as well: the terrain above them (a mine's
+                # hillside 240 yd over the Deadmines) has polygons of its own, and with those as the ground layer BG3
+                # stood a mob's stand-in up there wherever the mine's own floor was not placed yet.
+                if (under_set is None or id(pts) in under_set) and (best is None or abs(h - th) < abs(best - th)):
                     best, wet, stp = h, pts.water, pts.steep
                 if not pts.water and (under_set is None or id(pts) in under_set):
                     hs.append(h)

@@ -37,8 +37,10 @@ This is the first public version. What we know is missing or rough:
 
 ## Game
 
-- Dungeons and instances are not levels of their own in 0.1.0: they are played inside the same hidden BG3 level as
-  the outdoor world.
+- Dungeons and raids are entered through WoW's own portals and played inside the same hidden BG3 level as the outdoor
+  world. Only the Deadmines has been entered so far (in and out, a fight, a companion, a defeat and a load); every
+  other instance goes the same way but is untested, and no boss has any hand-made rules. Inside, BG3 offers no camp
+  and no Long Rest. A raid needs no raid group; WoW's level minimums, keys and attunements still apply.
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass

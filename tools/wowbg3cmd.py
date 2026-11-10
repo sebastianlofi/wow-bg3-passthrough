@@ -375,8 +375,26 @@ CONT = {0: 'Eastern Kingdoms', 1: 'Kalimdor'}  # the continents world mode cuts 
 TELE_USAGE = 'tp ZONE X Y | tp X Y | tp PLACE | where | find TEXT (X and Y from 0 to 100)'
 
 
+_MAP_NAMES = None
+
+
+def map_names():
+    """WoW's own names of its maps, from the player's client data (Map.dbc, 1.12: id, internal name, type,
+    battleground flag, then the name by language, English first): a dungeon, a raid, the tram."""
+    global _MAP_NAMES
+    if _MAP_NAMES is None:
+        _MAP_NAMES = {}
+        try:
+            import wow_waypoints
+            for i, _, text in wow_waypoints.read_dbc(Path(dbc_dir()) / 'Map.dbc'):
+                _MAP_NAMES[i[0]] = text(i[4]) or text(i[1])
+        except (OSError, ValueError, ImportError, IndexError):
+            pass
+    return _MAP_NAMES
+
+
 def cont(m):
-    return CONT.get(m, 'map %d (not in world mode)' % m)
+    return CONT.get(m) or map_names().get(m) or 'map %d' % m
 
 
 def wdbc(name):
@@ -509,8 +527,9 @@ def tele(ctx, args, at=None):
             m, x, y = here()
         except OSError:
             raise CmdError('where: no WoW position yet (link/camera.bin)')
-        if not m:
-            raise CmdError('WoW %.1f %.1f: on no zone map of %s' % (x, y, cont(player_map())))
+        if not m:  # a dungeon, a raid: WoW has no zone map there, its map's own name says where
+            ctx.say('%s (WoW %.1f %.1f)' % (cont(player_map()), x, y))
+            return
         mx, my = to_map(m, x, y)
         ctx.say('%s %.1f %.1f (WoW %.1f %.1f, %s)' % (m['name'], mx, my, x, y, cont(m['map'])))
         return

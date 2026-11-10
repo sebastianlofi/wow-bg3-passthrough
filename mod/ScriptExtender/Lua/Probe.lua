@@ -163,6 +163,8 @@ function Probe.Start(context)
         if not okSky then Ext.Log.Print("WOW-BG3 wowsky: " .. tostring(errSky)) end
         -- A level of our own: what BG3's story has to be told about it (no fog of war on its map).
         local okOwn, errOwn = pcall(function() Ext.Require("OwnLevel.lua").Start(report.RunId) end)
+        local okIr, errIr = pcall(function() Ext.Require("InstanceRest.lua").Start(report.RunId) end)
+        if not okIr then Ext.Log.Print("WOW-BG3 instance rest unavailable: " .. tostring(errIr)) end
         if not okOwn then Ext.Log.Print("WOW-BG3 own level: " .. tostring(errOwn)) end
     end
     save("bootstrap")

@@ -75,6 +75,9 @@ class Base(unittest.TestCase):
         p = mock.patch.object(B, 'hero', lambda *_: {'Uuid': 'hero-1', 'Name': 'Tav'})
         p.start()
         self.addCleanup(p.stop)
+        p = mock.patch.object(B, 'has_ground', lambda maps, m: m in (0, 1, 36))
+        p.start()
+        self.addCleanup(p.stop)
         self.w = Fake(self.tmp)
 
     def camera(self, x, y):

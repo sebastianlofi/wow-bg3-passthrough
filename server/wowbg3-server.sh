@@ -248,7 +248,9 @@ start() {
         # Minutes"). Set at every start, so configs written before this get it too.
         # No reuse of item guids: a gap in today's table can be an item a BG3 save's snapshot brings back, and a
         # new item then had the guid of a restored one (wowsave.py keeps the highest above any snapshot).
-        set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0" "ReusableGuidPoolSize=0"
+        # A raid needs no raid group: a BG3 party is four at most and can never be one, so WoW's raids would be
+        # shut for good. Level minimums, keys and attunements stay WoW's.
+        set_conf "$V/etc/mangosd.conf" "AutoHonorRestart=0" "ReusableGuidPoolSize=0" "Instance.IgnoreRaid=1"
         rehome
         rm -f "$RUN/console"; mkfifo -m 600 "$RUN/console"
         # The console reads the fifo; a holder keeps it open so mangosd never sees end of input.
