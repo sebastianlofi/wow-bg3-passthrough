@@ -415,7 +415,7 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
 static void ground_bind(VkCommandBuffer cb);
 static void ground_view_seen(void);
 static void ground_end(DeviceData* d, VkCommandBuffer cb);
-static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin, uint32_t w, uint32_t h);  // wowbg3_shade.inc.c
+static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint32_t* layers, const int32_t* fin, uint32_t w, uint32_t h);  // wowbg3_shade.inc.c
 static void shade_view(VkCommandBuffer cb);
 static void shade_end(DeviceData* d, VkCommandBuffer cb);
 static void ground_submit(uint32_t n, const VkCommandBuffer* cbs);
@@ -533,7 +533,7 @@ static void check_request(void) {
 #define CB_CAP (1u << 13)
 
 typedef struct { uint64_t h; uint32_t id; VkFormat fmt; uint32_t w, hgt, depth, layers, mips; VkImageUsageFlags usage; VkSampleCountFlagBits samples; VkImageType type; uint64_t copy_src; } ImgInfo;
-typedef struct { uint64_t h; uint64_t image; } ViewInfo;
+typedef struct { uint64_t h; uint64_t image; uint32_t layer; } ViewInfo;  // layer: the view's first array layer
 typedef struct { uint64_t h; uint32_t n; uint64_t views[8]; } FbInfo;
 typedef struct { uint64_t h; uint32_t n; VkFormat fmts[8]; uint8_t load[8], store[8]; int32_t final[8], init[8]; } RpInfo;
 typedef struct {
@@ -684,6 +684,10 @@ static void img_desc(char* out, size_t cap, uint64_t image) {
 static uint64_t view_image(uint64_t view) {
     ViewInfo* v = view ? TABLE_FIND(g_view, VIEW_CAP, view, 0) : NULL;
     return v ? v->image : 0;
+}
+static uint32_t view_layer(uint64_t view) {
+    ViewInfo* v = view ? TABLE_FIND(g_view, VIEW_CAP, view, 0) : NULL;
+    return v ? v->layer : 0;
 }
 
 static CbLog* cb_log(VkCommandBuffer cb, int create) {
@@ -1953,7 +1957,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImageView(VkDevice device, con
     if (r == VK_SUCCESS && trace_tables()) {
         pthread_mutex_lock(&g_trace_lock);
         ViewInfo* v = TABLE_FIND(g_view, VIEW_CAP, (uint64_t)*out, 1);
-        if (v) v->image = (uint64_t)info->image;
+        if (v) { v->image = (uint64_t)info->image; v->layer = info->subresourceRange.baseArrayLayer; }
         pthread_mutex_unlock(&g_trace_lock);
     }
     return r;
@@ -2907,9 +2911,12 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         void_pass(cb, n, imgs);
         {  // the pass's layouts after it, for a draw of our own into a shadow map once it has ended (wowbg3_shade.inc.c)
             RpInfo* ps = TABLE_FIND(g_rp, RP_CAP, (uint64_t)rp, 0);
-            int32_t sfin[8];
-            for (uint32_t k = 0; k < n; k++) sfin[k] = ps && k < ps->n ? ps->final[k] : -1;
-            shade_pass(cb, n, imgs, sfin, w, h);
+            int32_t sfin[8]; uint32_t layers[8];
+            for (uint32_t k = 0; k < n; k++) {
+                sfin[k] = ps && k < ps->n ? ps->final[k] : -1;
+                layers[k] = view_layer(il ? (uint64_t)il->pAttachments[k] : f->views[k]);
+            }
+            shade_pass(cb, n, imgs, layers, sfin, w, h);
         }
         pthread_mutex_unlock(&g_trace_lock);
     }

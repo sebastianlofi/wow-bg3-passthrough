@@ -8,14 +8,15 @@
 // So what WoW calls shade is put where BG3's own lighting looks for it: in its sun shadow maps. After each of
 // BG3's world shadow passes that drew a kept character, a disc facing the light is drawn into that map between
 // each shaded figure and the sun, with the pass's own view (set 0 binding 2, the layout of the camera's block: an
-// orthographic reverse-Z light view). Its radius follows the figure's level, so the shade closes over the figure
+// orthographic reverse-Z light view). The sun's cascades are the layers of one image, a pass each: the disc goes into
+// the layer its pass drew (into the first layer alone, only a figure the nearest cascade covers was shaded). Its radius follows the figure's level, so the shade closes over the figure
 // with WoW's ramp. BG3's lighting then shadows the figure as it shadows anything: sunlight off, sky and bounce on,
 // its own filtering at the edge. WoW's pixels are not BG3's to light, so the disc shows on nothing else.
 // Compose word "noshade": off.
 #include "wowbg3_shade_spv.h"
 
 #define SHD_MAX 8
-#define SHD_FB 8
+#define SHD_FB 16
 static struct {
     pthread_mutex_t m;
     int n;
@@ -23,27 +24,26 @@ static struct {
     uint64_t read_at;
     int ready, failed; VkFormat fmt; VkRenderPass rp; int32_t rp_lay;
     VkPipelineLayout layout; VkPipeline pipe;
-    struct { uint64_t img; VkImageView view; VkFramebuffer fb; uint32_t w, h; } t[SHD_FB];
+    struct { uint64_t img; uint32_t layer; VkImageView view; VkFramebuffer fb; uint32_t w, h; } t[SHD_FB];
     uint64_t passes, drawn, discs, refused, nolayout, views;
 } g_shd = {.m = PTHREAD_MUTEX_INITIALIZER};
-static __thread struct { VkCommandBuffer cb; uint64_t img; int32_t fin; uint32_t w, h; int have; float vp[16], eye[3], fwd[3]; } t_shd;
+static __thread struct { VkCommandBuffer cb; uint64_t img; uint32_t layer; int32_t fin; uint32_t w, h; int have; float vp[16], eye[3], fwd[3]; } t_shd;
 
 // The pass on this thread: one of the world's sun shadow maps (depth only, square, 2048 or more: void_depth_only).
-static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin, uint32_t w, uint32_t h) {
+static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint32_t* layers, const int32_t* fin, uint32_t w, uint32_t h) {
     t_shd.cb = VK_NULL_HANDLE;
     if (!g_cc.on || g_cc.noshade) return;
-    int colors = 0; uint64_t dimg = 0; int32_t dfin = -1; uint32_t dw = 0, dh = 0;
+    int colors = 0; uint64_t dimg = 0; int32_t dfin = -1; uint32_t dw = 0, dh = 0, dlayer = 0, dlayers = 0;
     for (uint32_t k = 0; k < n; k++) {
         if (!imgs[k]) continue;
         ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
         if (!i) continue;
-        if (is_depth_format(i->fmt)) { dimg = imgs[k]; dfin = fin[k]; dw = i->w; dh = i->hgt; } else colors++;
+        if (is_depth_format(i->fmt)) { dimg = imgs[k]; dfin = fin[k]; dw = i->w; dh = i->hgt; dlayer = layers[k]; dlayers = i->layers; } else colors++;
     }
-    (void)w; (void)h;
     if (colors || !dimg || dimg == g_role.depth || dw != dh || dw < 2048) return;
-    { static int said; if (said < 3) { said++; logf_("shade: a world shadow pass, image %llx %ux%u, layout after it %d", (unsigned long long)dimg, dw, dh, (int)dfin); } }
+    { static int said; if (said < 6) { said++; logf_("shade: a world shadow pass, image %llx %ux%u layer %u of %u, render area %ux%u, layout after it %d", (unsigned long long)dimg, dw, dh, dlayer, dlayers, w, h, (int)dfin); } }
     if (dfin < 0) { __atomic_add_fetch(&g_shd.nolayout, 1, __ATOMIC_RELAXED); return; }
-    t_shd.cb = cb; t_shd.img = dimg; t_shd.fin = dfin; t_shd.w = dw; t_shd.h = dh; t_shd.have = 0;
+    t_shd.cb = cb; t_shd.img = dimg; t_shd.layer = dlayer; t_shd.fin = dfin; t_shd.w = dw; t_shd.h = dh; t_shd.have = 0;
 }
 // A kept character's draw in that pass: the pass's light view, from the block BG3 bound for it.
 static void shade_view(VkCommandBuffer cb) {
@@ -122,19 +122,19 @@ static void shade_end(DeviceData* d, VkCommandBuffer cb) {
     if (!ii || !shade_make(d, ii->fmt, t_shd.fin)) { g_shd.refused++; return; }
     pthread_mutex_lock(&g_shd.m);
     int slot = -1;
-    for (int i = 0; i < SHD_FB && slot < 0; i++) if (g_shd.t[i].img == t_shd.img) slot = i;
+    for (int i = 0; i < SHD_FB && slot < 0; i++) if (g_shd.t[i].img == t_shd.img && g_shd.t[i].layer == t_shd.layer) slot = i;
     if (slot < 0) {
         for (int i = 0; i < SHD_FB && slot < 0; i++) if (!g_shd.t[i].img) slot = i;
         if (slot >= 0) {
             VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, (VkImage)t_shd.img, VK_IMAGE_VIEW_TYPE_2D, ii->fmt,
-                {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}};
+                {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY}, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, t_shd.layer, 1}};
             VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_shd.rp, 1, &g_shd.t[slot].view, t_shd.w, t_shd.h, 1};
             if (d->CreateImageView(d->device, &vci, NULL, &g_shd.t[slot].view) != VK_SUCCESS ||
                 d->CreateFramebuffer(d->device, &fci, NULL, &g_shd.t[slot].fb) != VK_SUCCESS) {
                 if (g_shd.t[slot].view) d->DestroyImageView(d->device, g_shd.t[slot].view, NULL);
                 memset(&g_shd.t[slot], 0, sizeof g_shd.t[slot]);
                 slot = -1;
-            } else { g_shd.t[slot].img = t_shd.img; g_shd.t[slot].w = t_shd.w; g_shd.t[slot].h = t_shd.h; }
+            } else { g_shd.t[slot].img = t_shd.img; g_shd.t[slot].layer = t_shd.layer; g_shd.t[slot].w = t_shd.w; g_shd.t[slot].h = t_shd.h; }
         }
     }
     VkFramebuffer fb = slot >= 0 ? g_shd.t[slot].fb : VK_NULL_HANDLE;
@@ -160,6 +160,16 @@ static void shade_end(DeviceData* d, VkCommandBuffer cb) {
         d->CmdPushConstants(cb, g_shd.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 112, pc);
         d->CmdDraw(cb, 48, 1, 0, 0);
         discs++;
+        if (g_cc.wdlog) {  // where the disc's centre falls in this map (clip space, inside is -1..1 and depth 0..1)
+            static uint64_t said;
+            if (said++ % 2400 < 8) {
+                const float v[3] = {pc[20] - pc[16], pc[21] - pc[17], pc[22] - pc[18]};
+                float c[4];
+                for (int i = 0; i < 4; i++) c[i] = pc[i] * v[0] + pc[4 + i] * v[1] + pc[8 + i] * v[2] + pc[12 + i];
+                logf_("shade: disc %d of %d in map %llx layer %u %ux%u: level %.2f at %.2f %.2f %.2f, clip %.3f %.3f %.3f (w %.3f), light forward %.2f %.2f %.2f",
+                      k, n, (unsigned long long)t_shd.img, t_shd.layer, t_shd.w, t_shd.h, level[k], at[k][0], at[k][1], at[k][2], c[0], c[1], c[2], c[3], t_shd.fwd[0], t_shd.fwd[1], t_shd.fwd[2]);
+            }
+        }
     }
     d->CmdEndRenderPass(cb);
     __atomic_add_fetch(&g_shd.drawn, 1, __ATOMIC_RELAXED);
