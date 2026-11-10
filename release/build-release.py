@@ -104,6 +104,33 @@ def pak_files(version: str, native_plugins):
     # The stats of our own spells: never an empty file (an empty stats .txt hangs BG3's load).
     for p in sorted((MOD_SRC / f"Public/{FOLDER}/Stats/Generated/Data").glob("*.txt")):
         files.append((f"Public/{FOLDER}/Stats/Generated/Data/{p.name}", p.read_bytes()))
+    files += level_files()
+    return files
+
+
+def level_files():
+    """The levels of our own (release/levels/*.json, tools/wowbg3_level.py) and the lighting and atmosphere they name
+    (tools/wowbg3_lighting.py), as BG3 loads them: .lsf written by tools/lsf_write.py. Nothing of a BG3 level, of a BG3
+    lighting or of WoW is in them."""
+    import tempfile
+    sys.path.insert(0, str(ROOT / "tools"))
+    import lsf_write
+    import wowbg3_level
+    import wowbg3_lighting
+    files = [(f"Public/{FOLDER}/Content/Assets/Atmospheres/[PAK]_Atmospheres/_merged.lsf",
+              lsf_write.lsx_to_lsf(wowbg3_lighting.bank_lsx().encode("utf-8")))]
+    for spec in sorted((HERE / "levels").glob("*.json")):
+        with tempfile.TemporaryDirectory() as tmp:
+            name = wowbg3_level.build(json.loads(spec.read_text()), tmp)
+            for p in sorted(Path(tmp).rglob("*")):
+                if not p.is_file() or p.name == "spec-out.json":
+                    continue
+                rel = p.relative_to(tmp).as_posix()
+                data = p.read_bytes()
+                # BG3 reads a level's meta, triggers and scenery as .lsf; its layer files stay .lsx, as in BG3's own levels.
+                if rel.endswith(".lsx") and not rel.startswith("Layers/"):
+                    rel, data = rel[:-4] + ".lsf", lsf_write.lsx_to_lsf(data)
+                files.append((f"Mods/{FOLDER}/Levels/{name}/{rel}", data))
     return files
 
 

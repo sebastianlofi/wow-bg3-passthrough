@@ -20,7 +20,6 @@ local Hero = Ext.Require("Hero.lua")
 local Party = Ext.Require("Party.lua")
 local Session = Ext.Require("Session.lua")
 
-local VOID_X = -1000                         -- world mode's void lies west of this (Party.lua)
 M.BOOST = {day = "GameplayLight(30,false,0.1,true)", night = "GameplayLight(30,false,0.1,false)"}
 local CAUSE = "WOWBG3_WOWLIGHT"
 M.DAY, M.HYST = 90, 10                       -- luma of WoW's ground light: day at 100 and up, night under 80
@@ -47,7 +46,7 @@ local function status(extra)
 end
 local function inWorld()
     local ok, p = pcall(Hero.Position)
-    return ok and p and p[1] < VOID_X
+    return ok and Hero.InWorld(p)
 end
 
 local function step()

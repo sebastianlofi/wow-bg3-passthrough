@@ -38,7 +38,7 @@ local FAR_SWITCH_M = 100      -- a switch this far (BG3 m, flat) takes the cover
 local SWITCH_FADE_S = 0.2     -- over BG3's own switch fade, which is already going
 local SWITCH_MAX_MS = 20000   -- a switch's cover at most
 local EYE_AT_YD = 60          -- benilla's eye this near the new member (flat, WoW yd) is at it
-local VOID_X = -1000          -- world mode's void lies west of this (Party.lua)
+local Hero = Ext.Require("Hero.lua")
 local YD = 0.9144
 local CAMERA = "wow-bg3/link/camera.bin"
 local WORLD = "wow-bg3/link/world.json"
@@ -119,7 +119,7 @@ function M.StartServer()
     local function watchSwitch(now)
         local host, pos = hostAt()
         if host ~= lastHost and lastHost ~= nil then
-            local far = pos and lastPos and pos[1] < VOID_X and lastPos[1] < VOID_X
+            local far = pos and lastPos and Hero.InWorld(pos) and Hero.InWorld(lastPos)
                 and (pos[1] - lastPos[1]) ^ 2 + (pos[3] - lastPos[3]) ^ 2 > FAR_SWITCH_M * FAR_SWITCH_M
             -- false: world mode runs and the eye is not loaded there yet (nil: no world mode; true: it already is).
             if far and eyeLoadedAt(pos) == false then

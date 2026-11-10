@@ -55,7 +55,6 @@ local Hero = Ext.Require("Hero.lua")
 local Prog = Ext.Require("Progression.lua") -- WoW levels to BG3 levels
 local REGION = Hero.REGION -- host level (Hero.lua, host.json)
 local TUT_REGION = "TUT_Avernus_C" -- the tutorial level; the tutorial's own goals and procs run only there
-local VOID_X = -1000 -- world mode's void lies west of this (the level's AI grid starts at x -296)
 
 -- The companions this tool recruits (BG3's origin companions; a name or its first letters).
 local KNOWN = {
@@ -344,7 +343,7 @@ function M.Start(runId)
         -- Where it is now, for Remove (not a spot in world mode's void).
         local here, region = pos(u), q(Osi.GetRegion, u)
         local h = homes()
-        if here and region and not (region == REGION and here[1] < VOID_X) then
+        if here and region and not (region == REGION and Hero.InWorld(here)) then
             h[u] = {Region = region, Pos = here, OnStage = q(Osi.IsOnStage, u) == 1, Name = nameOf(u)}
             saveHomes(h)
         end

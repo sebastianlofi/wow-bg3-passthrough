@@ -25,7 +25,6 @@ M.LIGHTINGS = {"a7d3c1e9-5f2b-4c8e-9d16-3b0e7f4a2c58", "c4f81b27-3a6d-4e09-8b52-
 M.SUN_INTENSITY = 100000  -- stock Rivington's SkyLight.ScatteringSunIntensity
 M.REF_LUMA = 0.65         -- WoW's noon diffuse in Durotar, linear luminance (measured 0.651): BG3's sun is stock then
 M.EVERY_MS = 5000         -- at most one switch this often
-local VOID_X = -1000
 
 local function lin(c) return math.max(0, c) ^ 2.2 end
 
@@ -58,7 +57,7 @@ end
 local function step()
     if not Session.Live() then return end
     local ok, p = pcall(Hero.Position)
-    if not (ok and p and p[1] < VOID_X) then return end
+    if not (ok and Hero.InWorld(p)) then return end
     local line = Ext.IO.LoadFile("wow-bg3/link/wowsky.txt")
     if not line or line == lastLine then return end
     local now = Ext.Utils.MonotonicTime()

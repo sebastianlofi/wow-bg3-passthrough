@@ -25,6 +25,13 @@ pcall(function()
     if type(h) == "table" and type(h.Region) == "string" and h.Region:find("^[%w_]+$") then M.REGION = h.Region end
     if type(h) == "table" and type(h.Spot) == "table" and #h.Spot == 3 then M.SPOT = h.Spot end
 end)
+-- A level of our own (tools/wowbg3_level.py): all of it is WoW's world, each WoW point at its own place. In a borrowed
+-- BG3 level world mode has a spot far out in the level's void, west of x -1000, and the rest is BG3's.
+M.OWN = M.REGION:find("^WOWBG3_") ~= nil
+function M.InWorld(p)
+    if type(p) ~= "table" or not p[1] then return false end
+    return M.OWN or p[1] < -1000
+end
 -- The test save's custom character, for tools and logs only (never used to pick the hero).
 M.TAV = "24f08375-99c0-8433-10d1-e6c218008716"
 

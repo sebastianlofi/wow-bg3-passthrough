@@ -197,9 +197,8 @@ def write_layer(path, layer):
                           f'            {attr("Name", "LSString", "Triggers")}\n        </node>\n    </region>\n</save>\n')
 
 
-def main():
-    spec = json.load(open(sys.argv[1]))
-    out = sys.argv[2]
+def build(spec, out):
+    """The level folder of `spec` (a dict as SPEC.json) in `out`; returns the level's name."""
     spec.setdefault("Lighting", "375af627-6f3c-19e8-1046-29265ae9e8f7")    # stock resource ids (Basic_Level_A's defaults)
     spec.setdefault("Atmosphere", "73e03af9-7ab1-47a7-906b-a4e0362045ef")
     if spec.get("LightingList"): spec["Lighting"] = spec["LightingList"][0]      # the zone's first is the level's own
@@ -221,7 +220,16 @@ def main():
     n = write_aigrid(os.path.join(out, "Ai", "aigrid.data"), spec["Name"], spec["Subgrids"])
     json.dump(spec, open(os.path.join(out, "spec-out.json"), "w"), indent=1)
     print(f"{spec['Name']}: {len(spec['Subgrids'])} subgrids, aigrid {n} bytes ->", out)
+    return spec["Name"]
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(__doc__)
+        return 2
+    build(json.load(open(sys.argv[1])), sys.argv[2])
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

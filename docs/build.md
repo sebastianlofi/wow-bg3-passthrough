@@ -66,6 +66,11 @@ launcher configuration and settings (`release/`), the tools (`tools/`), the WoW 
 (`release/bg3le-install.py`) and the licence texts. `MANIFEST.txt` in the zip lists the sha256 of
 every file.
 
+The pak also carries the mod's own BG3 level and the lighting it names, written at build time by this tree's tools
+alone: `tools/wowbg3_level.py` (a level folder from `release/levels/*.json`), `tools/wowbg3_lighting.py` (the
+lighting and atmosphere resources) and `tools/lsf_write.py` (BG3's binary `.lsf` from the `.lsx` text). No BG3
+level, no BG3 lighting and nothing of WoW is in them.
+
 ## Reproducibility
 
 Rebuilt from this repository with the same toolchain and dependency folders, the launcher, main and

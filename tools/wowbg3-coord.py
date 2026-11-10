@@ -69,7 +69,7 @@ lifecycle.log = log  # the watcher's lines in the same log
 
 def settings():
     """WOW-BG3/settings.conf: `key = value` lines, # comments."""
-    s = {'debug_commands': '1', 'host': 'BGO_Main_A', 'wow_sound': '1', 'view_distance': '',
+    s = {'debug_commands': '1', 'host': 'WOWBG3_Azeroth_A', 'wow_sound': '1', 'view_distance': '',
          'compose': 'auto fxcopy void wowbar ground fxsight surf fxprops fxsolid fxglow', 'inventory': '1', 'mob_abilities': '1', 'companions': '1', 'camp': '1', 'waypoints': '1', 'scaling': '1', 'difficulty': 'balanced', 'wow_spells': '0'}
     try:
         for line in (HOME / 'settings.conf').read_text().splitlines():
@@ -309,7 +309,7 @@ def creature_stats():
 
 # ---- BG3's side files ----
 def host_json():
-    host = S.get('host') or 'BGO_Main_A'
+    host = S.get('host') or 'WOWBG3_Azeroth_A'
     f = IO / 'host.json'
     try:
         now = json.loads(f.read_text()).get('Region')
