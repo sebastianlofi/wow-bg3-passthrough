@@ -12,12 +12,15 @@ layout(set = 0, binding = 2) uniform sampler2D fwd;                // BG3's forw
 layout(set = 0, binding = 3) uniform sampler2D cmp0;               // BG3's composite before its effects pass (bit 4: this frame's)
 layout(set = 0, binding = 4) uniform sampler2D cmp1;               // and after it
 layout(set = 0, binding = 5) uniform sampler2D cur;                // TAA's input
-layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D late;  // what BG3 drew over a pure pixel after its composite: its share of the pixel a channel, a 1 where it has one
+layout(rgba16f, set = 0, binding = 6) uniform image2D late;  // read: BG3's share of a pixel it drew over before its composite (wowbg3_blmask.frag); written: with what it drew after, a 1 where there is any
 layout(location = 0) out vec4 o;
 layout(push_constant) uniform PC { uint dbg; } pc;
 void main() {
     ivec2 q = ivec2(gl_FragCoord.xy);
-    if (!(imageLoad(nob, q).r > 0.5)) { imageStore(late, q, vec4(0.0)); discard; }
+    float n0 = imageLoad(nob, q).r;
+    // 1: pure WoW ground at the composite; 0.3: WoW ground with something of BG3's drawn before the composite.
+    if (!(n0 > 0.25)) { imageStore(late, q, vec4(0.0)); discard; }
+    vec4 e = n0 < 0.5 ? imageLoad(late, q) : vec4(0.0);
     vec3 c = texelFetch(cur, q, 0).rgb;
     // Pure at the composite (wowbg3_blmask.frag: the forward buffer the composite read was what the feed wrote, the
     // G-buffer bare). This pass used to look at the forward image again here, at the TAA, and call the pixel touched
@@ -40,7 +43,15 @@ void main() {
         if (any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6))))
             l = vec4(mix(-(1.0 - a / max(b, vec3(1e-6))), (a - b) / max(a, vec3(1e-6)), step(b, a)), 1.0);
     }
+    if (e.a > 0.5) {
+        // With what was drawn before the composite: what both let through, and the light either added.
+        vec3 l1 = e.rgb, l2 = l.a > 0.5 ? l.rgb : vec3(0.0);
+        vec3 thru = (1.0 + min(l1, vec3(0.0))) * (1.0 + min(l2, vec3(0.0)));
+        vec3 add = 1.0 - (1.0 - max(l1, vec3(0.0))) * (1.0 - max(l2, vec3(0.0)));
+        l = vec4(mix(thru - 1.0, add, step(vec3(0.005), add)), 1.0);
+    }
     imageStore(late, q, l);
-    imageStore(nob, q, vec4((pc.dbg & 2u) == 0u ? 2.0 : 1.0));
+    // 2: pure and untouched by the bloom's cut; 0.4: WoW's colour with BG3's early addition, which keeps its bloom.
+    imageStore(nob, q, vec4(n0 < 0.5 ? 0.4 : ((pc.dbg & 2u) == 0u ? 2.0 : 1.0)));
     o = (pc.dbg & 1u) != 0u ? vec4(0.0, 8.0, 0.0, 1.0) : vec4(c, 1.0);
 }

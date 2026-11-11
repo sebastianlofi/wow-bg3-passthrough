@@ -1587,10 +1587,13 @@ bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind, glm::vec3 c
     // in front instead of the ground in the back"). The triangles keep WoW's winding; the cursor passes the ones
     // that face away from it.
     if (kind == 2 && glm::dot(n, ray) > 0.0f) return true;
-    // Over the ceiling measured over her, or over the storey clip benilla draws (its `wow_storey_clip`: a height,
-    // inside the building's footprint).
-    const bool over = p.y > f.Top
-        || (f.Clip && p.y > f.ClipTop && p.x >= f.ClipX0 && p.x <= f.ClipX1 && p.z >= f.ClipZ0 && p.z <= f.ClipZ1);
+    // Over the storey clip benilla draws (its `wow_storey_clip`: a height, inside the building's footprint), or,
+    // without one, over the ceiling measured over her.
+    // While benilla says what it clips, that alone: the ceiling measured here also passed walls that stand over it
+    // outside the building's footprint, which benilla draws.
+    const bool over = f.Clip
+        ? (p.y > f.ClipTop && p.x >= f.ClipX0 && p.x <= f.ClipX1 && p.z >= f.ClipZ0 && p.z <= f.ClipZ1)
+        : p.y > f.Top;
     // benilla 0097 and 0098: terrain is cut too, but for ground one can walk on.
     if (kind == 0 && !(f.Terrain && over)) return f.Cut && std::abs(n.y) <= kGroundNormalY && in_see_cut(f, p);
     return over || (f.Cut && in_see_cut(f, p));

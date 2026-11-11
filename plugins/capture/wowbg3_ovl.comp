@@ -13,7 +13,8 @@ layout(rgba16f, set = 0, binding = 3) uniform image2D late;
 void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
-    if (!(imageLoad(nob, q).r > 1.5)) return;
+    float n = imageLoad(nob, q).r;
+    if (!(n > 1.5 || (n > 0.35 && n < 0.45))) return;  // WoW's own colour shows here (wowbg3_post.frag)
     vec3 b = texelFetch(before, q, 0).rgb, a = texelFetch(after, q, 0).rgb;
     if (!any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6)))) return;
     // As wowbg3_post.frag keeps it: the added light's share (0..1), or minus the part of the light taken away (-1..0).

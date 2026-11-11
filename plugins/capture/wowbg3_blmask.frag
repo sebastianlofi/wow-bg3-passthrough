@@ -8,6 +8,7 @@ layout(r32f, set = 0, binding = 2) uniform writeonly image2D nob;
 layout(set = 0, binding = 3) uniform sampler2D b1;    // BG3's forward buffer, as the composite read it
 layout(set = 0, binding = 4) uniform sampler2D alb;   // BG3's G-buffer albedo
 layout(set = 0, binding = 5) uniform sampler2D surf;  // roughness, specular level, metalness, material byte
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D late;  // BG3's share of a pixel it drew over before its composite (wowbg3_post.frag goes on from it)
 layout(push_constant) uniform PC { uint cal; } pc;
 layout(location = 0) out vec4 o;
 void main() {
@@ -36,17 +37,29 @@ void main() {
     //     night ground like fog. WoW's colour gets the lightening the decal means instead (g: the decal's albedo over
     //     a ground albedo of 0.18), and a decal strong enough to hide the ground (t from its albedo) is BG3's pixel.
     float m = pure ? 1.0 : 0.0;
+    vec4 early = vec4(0.0);
     if (!pure && pc.cal == 0u && w.a > 0.5 && imageLoad(wmask, q).r > 0.0) {
         vec3 d = abs(f - w.rgb) / max(max(f, w.rgb), vec3(1e-5));
         float t = clamp((max(d.r, max(d.g, d.b)) - 0.04) / 0.96, 0.0, 1.0), g = 0.0;
         vec4 a = texelFetch(alb, q, 0);
         float al = max(a.r, max(a.g, a.b));
         if (al >= 0.5 / 255.0) {
+            // A decal on the ground: BG3's pixel by the strength of its albedo. A faint one leaves WoW's colour as it
+            // is. (It used to lighten WoW's colour by the decal's albedo, which showed a pale patch on the ground
+            // under every faint decal, a trace of blood among them: a playtest report.)
             t = smoothstep(0.06, 0.30, al);
-            g = min(dot(a.rgb, vec3(0.2126, 0.7152, 0.0722)) / 0.18, 0.99);
+            m = -(1.0 + floor(t * 255.0 + 0.5) + g);
+        } else {
+            // Something drawn over the bare ground before the composite (a glow at a caster's feet, a bolt): what it
+            // added is known a channel, what the feed wrote against what stands there now, as wowbg3_post.frag
+            // keeps what BG3's effects pass adds later. The pixel stays WoW's own colour with that on it (the mask
+            // says 0.3: wdpost and wdpostcas treat it as pure, the bloom keeps it). Before, such a pixel was
+            // cross-faded to BG3's own picture of the ground: a darker ragged patch under every such effect.
+            early = vec4(mix(-(1.0 - f / max(w.rgb, vec3(1e-6))), (f - w.rgb) / max(f, vec3(1e-6)), step(w.rgb, f)), 1.0);
+            m = 0.3;
         }
-        m = -(1.0 + floor(t * 255.0 + 0.5) + g);
     }
+    imageStore(late, q, early);
     imageStore(nob, q, vec4(m));
     o = vec4(0.0);
 }

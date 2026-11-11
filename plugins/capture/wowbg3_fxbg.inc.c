@@ -44,7 +44,7 @@ static struct {
 // ambient of the hero's figure, which indoors is the room's own, and that one is taken when the file has it), and the
 // feed adds what WoW's ambient term is, the material's colour times the ambient, to BG3's lit scene at each of BG3's
 // pixels, through the same table that brings WoW's ground into BG3's light (wowbg3_fxbg2.frag).
-static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; int nlit; float lit[FB_LIT][7]; int nlobe; float lobe[FB_LOBE][6]; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
+static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; int nlit; float lit[FB_LIT][7]; int nlobe; float lobe[FB_LOBE][6]; float sun[6]; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
 static void amb_present(void) {
     const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     if (!g_cc.on || (!(g_cc.wdamb > 0.0f) && !g_cc.wdwfog) || pr % (g_cc.wdwlit ? 6 : 30) != 1) return;
@@ -94,6 +94,7 @@ static void amb_present(void) {
     g_amb.nlit = nlit; memcpy(g_amb.lit, lit, sizeof lit);
     if (ok) { const float* a = oku ? v + 14 : v + 6; for (int i = 0; i < 3; i++) g_amb.rgb[i] = a[i] < 0 ? 0 : a[i] > 1 ? 1 : a[i]; g_amb.have = 1; }
     if (okf) { memcpy(g_amb.fog, v + 9, sizeof g_amb.fog); g_amb.have_fog = 1; }
+    if (ok) memcpy(g_amb.sun, v, sizeof g_amb.sun);  // toward the sun (WoW axes), its diffuse colour
     const uint64_t n = ++g_amb.reads;
     pthread_mutex_unlock(&g_amb.m);
     if (n % (g_cc.wdwlit ? 3000 : 600) == 1) logf_("wdamb: WoW's ambient %.3f %.3f %.3f (%s), share %.2f; fog %.3f %.3f %.3f from %.1f to %.1f yd (%s)", g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2], ok ? "read" : "kept: no wowsky.txt", g_cc.wdamb,
@@ -125,7 +126,7 @@ static void wfog_get(float* f) {
 // out: count, the ambient share, then a light each: its place in the camera's view (metres: right, up, forward),
 // its range (yards), its colour.
 static void wlit_put(float* out, int on, const float* eye, const float* fwd, const float* right, const float* up) {
-    out[0] = 0.0f; out[1] = g_cc.wdamb; out[2] = 0.0f;
+    out[0] = 0.0f; out[1] = g_cc.wdamb; out[2] = 0.0f; out[3] = 0.0f;
     // The room's lobes (with the ambient, whatever wdwlit says): toward each light in the camera's view (right, up,
     // forward; BG3's axes are WoW's y, z, -x), then its colour.
     if (on) {
@@ -140,8 +141,31 @@ static void wlit_put(float* out, int on, const float* eye, const float* fwd, con
             o8[2] = (float)(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
             o8[3] = 0.0f; o8[4] = l[3]; o8[5] = l[4]; o8[6] = l[5]; o8[7] = 0.0f;
         }
+        float sun[6]; memcpy(sun, g_amb.sun, sizeof sun);
         pthread_mutex_unlock(&g_amb.m);
         out[2] = (float)nb;
+        out[3] = nb > 0 ? 1.0f : 0.0f;  // a room's lobes: the outdoor law's point lights do not apply
+        // Outdoors, in WoW's shade: WoW lights a shadowed unit at intensity 0.5 where a lit one has 2.5, a fifth of
+        // the sun's diffuse by the facing, and the blocker that keeps BG3's sun off the figure takes all of it. That
+        // fifth comes back as one lobe toward the sun, by how far the hero's figure is in the shade.
+        if (nb == 0 && g_tav.seq) {
+            float lvl = 0.0f, best = 1e30f;
+            pthread_mutex_lock(&g_shd.m);
+            for (int k = 0; k < g_shd.n; k++) {
+                const float dx = g_shd.at[k][0] - (float)g_tav.centre[0], dz = g_shd.at[k][2] - (float)g_tav.centre[2];
+                if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; lvl = g_shd.level[k]; }
+            }
+            pthread_mutex_unlock(&g_shd.m);
+            if (lvl > 0.02f && best < 9.0f) {
+                const double w[3] = {sun[1], sun[2], -sun[0]};
+                float* o8 = out + 4 + FB_LIT * 8;
+                o8[0] = (float)(w[0] * right[0] + w[1] * right[1] + w[2] * right[2]);
+                o8[1] = (float)(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+                o8[2] = (float)(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
+                o8[3] = 0.0f; o8[4] = sun[3] * 0.2f * lvl; o8[5] = sun[4] * 0.2f * lvl; o8[6] = sun[5] * 0.2f * lvl; o8[7] = 0.0f;
+                out[2] = 1.0f;
+            }
+        }
     }
     { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; BG3's eye depth %s, ambient %s", g_amb.nlit, g_blv_z ? "found" : "not bound by its lighting pass", on || !g_blv_z ? "on" : "off"); }
     if (!on || !g_cc.wdwlit || !g_tav.seq) return;
@@ -693,10 +717,10 @@ static int bl_make(DeviceData* d) {
     if (g_blm.ready) return 1;
     if (g_blm.failed) return 0;
     g_blm.failed = 1;
-    VkDescriptorSetLayoutBinding mb[6] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+    VkDescriptorSetLayoutBinding mb[7] = {{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo mci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 6, mb};
+    VkDescriptorSetLayoutCreateInfo mci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 7, mb};
     VkDescriptorSetLayoutBinding cb1 = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo cci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &cb1};
     if (d->CreateDescriptorSetLayout(d->device, &mci, NULL, &g_blm.mdsl) != VK_SUCCESS || d->CreateDescriptorSetLayout(d->device, &cci, NULL, &g_blm.cdsl) != VK_SUCCESS) return 0;
@@ -710,7 +734,7 @@ static int bl_make(DeviceData* d) {
     g_blm.mp = bl_pipe(d, g_blm.ml, wowbg3_blmask_frag, sizeof wowbg3_blmask_frag, 0);  // writes nob only
     g_blm.cp = bl_pipe(d, g_blm.cl, wowbg3_blcut_frag, sizeof wowbg3_blcut_frag, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT);
     if (!g_blm.mp || !g_blm.cp) return 0;
-    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * FOG_SETS}};
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * FOG_SETS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2 * FOG_SETS, 2, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_blm.pool) != VK_SUCCESS) return 0;
     VkDescriptorSetLayout l[FOG_SETS];
@@ -819,16 +843,18 @@ static void fb_bmask(DeviceData* d, VkCommandBuffer cb) {
     VkDescriptorImageInfo i3 = {g_blm.smp, (VkImageView)t_blm_b1, (VkImageLayout)t_blm_b1lay};
     VkDescriptorImageInfo i4 = {g_blm.smp, (VkImageView)(g_blv_alb ? g_blv_alb : t_blm_b1), (VkImageLayout)(g_blv_alb ? g_blv_lalb : t_blm_b1lay)};
     VkDescriptorImageInfo i5 = {g_blm.smp, (VkImageView)(g_blv_surf ? g_blv_surf : t_blm_b1), (VkImageLayout)(g_blv_surf ? g_blv_lsurf : t_blm_b1lay)};
-    VkWriteDescriptorSet wr[6] = {
+    VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};  // BG3's early addition a pixel, for wdpost
+    VkWriteDescriptorSet wr[7] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i1, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i2, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i3, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i4, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i5, NULL, NULL}};
-    d->UpdateDescriptorSets(d->device, 6, wr, 0, NULL);
-    VkImage im[2] = {g_blm.wfed.img, g_blm.nob.img};  // the feed's writes before; the last cut's reads before
-    for (int i = 0; i < 2; i++)
+    d->UpdateDescriptorSets(d->device, 7, wr, 0, NULL);
+    VkImage im[3] = {g_blm.wfed.img, g_blm.nob.img, g_blm.late.img};  // the feed's writes before; the last cut's reads before; wdpostcas's reads before
+    for (int i = 0; i < 3; i++)
         sf_barrier(d, cb, im[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     uint32_t pc[4] = {g_cc.fxcal ? 1u : 0u, 0, 0, 0};

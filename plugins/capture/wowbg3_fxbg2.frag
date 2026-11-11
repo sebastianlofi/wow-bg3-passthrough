@@ -129,15 +129,21 @@ void main() {
             if (dot(N, P) > 0.0) N = -N;
             vec3 sum = vec3(0.0);
             if (nb > 0) {
-                // In a room WoW lights a unit by the room alone: the floor's baked light on its fixed axis and the
-                // room's lights, each its colour by the facing (after the point lights in the buffer: toward the
-                // light in this view, colour). The outdoor law's point lights do not apply there.
+                // Lobes, each its colour by the facing (after the point lights in the buffer: toward the light in
+                // this view, colour). In a room WoW lights a unit by the room alone: the floor's baked light on its
+                // fixed axis and the room's lights, and the outdoor law's point lights do not apply (the header's
+                // fourth number says so). Outdoors the one lobe is the sun's share WoW leaves a unit in the shade.
                 const int LB = LT + 4 + 8 * 8;
                 for (int i = 0; i < nb && i < 8; i++) {
                     int b = LB + i * 8;
-                    sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * max(dot(N, vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2])), 0.0);
+                    // WoW shades a unit through an order-2 SH probe of these lobes, not a hard N.L: a face turned from
+                    // the light keeps a little of it (0.094 at a right angle, 0.0625 straight away), which in a dim
+                    // room is as much as the ambient.
+                    float c = dot(N, vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]));
+                    sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * max(0.25 + 0.5 * c + 0.3125 * (1.5 * c * c - 0.5), 0.0);
                 }
-            } else {
+            }
+            if (!(tb.TAB[LT + 3] > 0.5)) {
                 float sd[3] = float[3](1e30, 1e30, 1e30); int sel[3] = int[3](0, 0, 0);
                 for (int i = 0; i < nl && i < 8; i++) {
                     int b = LT + 4 + i * 8;
@@ -170,4 +176,15 @@ void main() {
     if ((pc.flags & 64u) != 0u) { vec4 st = imageLoad(stimg, ivec2(gl_FragCoord.xy)); W = max((W - st.rgb) / max(st.a, 1e-4), vec3(0.0)); }
     o = vec4(W, 1.0);
     imageStore(wfed, ivec2(gl_FragCoord.xy), o);
+    // What BG3 laid on the ground here (a surface, a decal: its albedo over the placeholder's black) is lit by BG3's
+    // sun alone, as its characters were: black wherever that sun does not reach, in a shadow or behind the blocker
+    // that keeps the sun off a figure in WoW's shade. WoW's ambient for it, as for BG3's own pixels (after wfed: the
+    // mask compares the forward buffer with what stands there for WoW alone).
+    if (pc.amb.a > 0.5) {
+        vec3 al = texelFetch(galb, ivec2(gl_FragCoord.xy), 0).rgb;
+        if (max(al.r, max(al.g, al.b)) >= 0.5 / 255.0) {
+            vec3 tex = pow(clamp(al, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
+            o.rgb += max(inv3(tex * min(pc.amb.rgb, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex;
+        }
+    }
 }
