@@ -34,6 +34,7 @@ import relenv  # noqa: E402
 
 P = relenv.configure()
 import lifecycle  # noqa: E402
+import colour_table  # noqa: E402
 import wowsave  # noqa: E402
 import wowserver  # noqa: E402
 try:
@@ -523,6 +524,14 @@ class Release:
 
     def world_up(self):
         CAPTURE.mkdir(parents=True, exist_ok=True)
+        # The render plugin's colour table into the data folder, where the plugin reads it (colour_table.py says why:
+        # without it WoW's picture goes into BG3 as one grey and BG3's characters get none of WoW's light).
+        try:
+            ok, text = colour_table.place(HOME / colour_table.NAME, CAPTURE)
+        except OSError as e:
+            ok, text = False, 'NO COLOUR TABLE: not placed: %s' % e
+        if text:
+            log('world: ' + text)
         (CAPTURE / 'compose').write_text('compose %s\n' % S['compose'])
         for _ in range(60):
             if placed(0):

@@ -33,7 +33,7 @@ static struct {
     VkDescriptorPool pool; VkDescriptorSet set[2]; VkBuffer setbuf[2];
     struct { uint64_t img; VkImageView view; VkFramebuffer fb; } t[FB_IMGS];
     uint64_t fed_present, fed_img; uint64_t feeds, refused, nowow; uint64_t fedp[3], fedi[3], fogs;
-    VkBuffer tbuf; VkDeviceMemory tmem; float* tmap; struct timespec tseen;
+    VkBuffer tbuf; VkDeviceMemory tmem; float* tmap; struct timespec tseen; int thave;
     uint64_t ebuf[2], eoff[2]; int etype[2]; VkBuffer esetbuf[2][2];
     VkSampler asmp;
 } g_fbg;
@@ -1296,8 +1296,11 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     struct stat tst;
     if (present % 30 == 0 && stat(outp("/fxbg-table.bin"), &tst) == 0 && tst.st_mtim.tv_sec != g_fbg.tseen.tv_sec) {
         FILE* tf = fopen(outp("/fxbg-table.bin"), "rb");
-        if (tf) { size_t got = fread(g_fbg.tmap, sizeof(float), FB_TAB, tf); fclose(tf); g_fbg.tseen = tst.st_mtim; logf_("fxbg: table read, %zu values", got); }
+        if (tf) { size_t got = fread(g_fbg.tmap, sizeof(float), FB_TAB, tf); fclose(tf); g_fbg.tseen = tst.st_mtim; g_fbg.thave = got == FB_TAB; logf_("fxbg: table read, %zu values", got); }
     }
+    // No table: every colour reads as the same light, WoW's picture goes in as one grey and no ambient reaches BG3's
+    // pixels. Said in the log for as long as it lasts (a whole day of play reports came from a missing file).
+    if (!g_fbg.thave && present % 1800 == 0) logf_("fxbg: NO COLOUR TABLE (%s missing or short): WoW's picture is fed as one grey, BG3's characters get no WoW light", outp("/fxbg-table.bin"));
     pthread_mutex_lock(&g_sf.m);
     if (g_fbg.fedp[mode] == present + 1 && g_fbg.fedi[mode] == img) { pthread_mutex_unlock(&g_sf.m); return; }
     g_fbg.fedp[mode] = present + 1; g_fbg.fedi[mode] = img;

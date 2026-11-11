@@ -66,6 +66,10 @@ another WoW backend could implement the same channels later.
 ## Folders at runtime
 
 - `Mods/WOW-BG3/` (the install): plugins, `launcher.conf`, `settings.conf`, `server/`, `benilla/`,
+- `Mods/WOW-BG3/fxbg-table.bin`: the render plugin's colour table (a displayed colour to the light BG3 shows it
+  as). The coordinator copies it to `~/.local/share/wow-bg3/capture/` at every start of world mode, where the plugin
+  reads it. Without it WoW's picture goes into BG3 as one grey and BG3's characters get none of WoW's light;
+  the plugin's log then says `NO COLOUR TABLE`. `tools/colour_table.py` and `tools/test_colour_table.py`.
   `tools/`, `python/`, `bg3le/`, `WoW/` (the player's client), `LICENSES/`.
 - `~/.local/share/wow-bg3/`: server data and database, snapshots, logs, status files.
 - BG3's `Script Extender/wow-bg3/`: the link files between the mod and the WoW side.

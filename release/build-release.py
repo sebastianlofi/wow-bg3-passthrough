@@ -57,7 +57,7 @@ FOLDER = "WOWBG3"          # the release module's folder (and ModTable)
 LAUNCHER = "wowbg3-launcher.so"
 PLUGIN = "wowbg3.so"
 # The tools the coordinator runs (tools/relenv.py points them at the player's folders).
-TOOLS = ["lifecycle.py", "crashreport.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_bridge.py", "wow_arena.py", "wow_stand.py", "wow_waypoints.py",
+TOOLS = ["lifecycle.py", "colour_table.py", "crashreport.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_bridge.py", "wow_arena.py", "wow_stand.py", "wow_waypoints.py",
          "wow_vmap.py", "wow_mpq.py", "inventory_bridge.py", "wowlevel.py", "wow_items.py", "wow_items_rules.json"]
 TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthrough accounts, chat commands
                "tavtex.py", "bg3tex.py", "bg3pak.py", "bg3shade.py", "bg3index.py",  # Tav's textures (with --python)
@@ -217,6 +217,14 @@ def main():
     lspk.write(str(dist / "WOW-BG3.pak"), pak_files(a.version, plugins))
     shutil.copy2(HERE / "launcher.conf.in", folder / "launcher.conf")
     shutil.copy2(HERE / "settings.conf", folder / "settings.conf")
+    # The render plugin's colour table (a displayed colour to the light BG3 shows it as, measured once against BG3's
+    # display transform). The plugin reads it from the player's data folder, where wowbg3-coord.py puts this copy.
+    # Without it WoW's picture is fed into BG3 as one grey and nothing of WoW's light reaches BG3's characters.
+    table = HERE.parent / "plugins/capture/fxbg-table.bin"
+    if table.is_file():
+        shutil.copy2(table, folder / "fxbg-table.bin")
+    else:
+        missing.append("plugins/capture/fxbg-table.bin")
 
     # The portable server pack, with this tree's wowbg3-server.sh (run, WOWBG3_SERVER_VAR) and SQL download
     # (fetch-sql.py, sql.lock). An older pack's sql/ (vmangos' database) stays out.

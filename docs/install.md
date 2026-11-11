@@ -86,6 +86,10 @@ properly.
   `~/.local/share/wow-bg3/logs/` (`coord.log`, `server.log`, `benilla.log`) and bg3le's newest log
   in `~/.local/share/bg3le/logs/`.
 - When reporting a bug, attach those logs and `~/.local/share/wow-bg3/run/launcher.json`.
+- Characters are black with a pale ring round them, or the picture has a grey haze: the render plugin has no
+  colour table. Look for `NO COLOUR TABLE` in `~/.local/share/wow-bg3/capture/layer.log` and in
+  `~/.local/share/wow-bg3/logs/coord.log`. `Mods/WOW-BG3/fxbg-table.bin` must be there (it is part of the zip); the
+  mod copies it into `~/.local/share/wow-bg3/capture/` at the next start.
 - Nothing works any more after a stock bg3le install or update: it replaced WOW-BG3's patched
   library in `~/.local/share/bg3le`. Run WOW-BG3's `bg3le/install.py` again with Steam closed.
 - Known issues of this version: [known-issues.md](known-issues.md).
