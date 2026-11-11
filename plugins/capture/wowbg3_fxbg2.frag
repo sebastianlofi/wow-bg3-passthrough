@@ -41,6 +41,7 @@ float wow_z(uint x, uint y) {
     return d > 0.0 ? (pc.wnear / d + pc.wzoff) * 0.9144 : 1e30;
 }
 vec3 tab(int r, int g, int b) { int i = (r * 289 + g * 17 + b) * 3; return vec3(tb.TAB[i], tb.TAB[i + 1], tb.TAB[i + 2]); }
+const float ROOM_FLOOR = 0.30;  // the least light, as WoW counts it (0..1), on a BG3 character in a room
 // log2-free trilinear: the table holds log2(x) so dark colours stay accurate.
 vec3 inv3(vec3 w) {
     vec3 p = clamp(w, vec3(0.0), vec3(1.0)) * 16.0;
@@ -164,6 +165,12 @@ void main() {
             }
             lit += sum * tb.TAB[LT + 1];
         }
+        // In a room, never less than a small neutral light on BG3's own pixels (its characters and what they carry;
+        // the ground, surfaces and everything of WoW's are not these pixels). WoW's rule alone leaves a figure in a
+        // dark room near black: its units stay readable there by their bright painted textures, BG3's materials are
+        // far darker and take a dim blue room's light as almost nothing (the maintainer's call: a readable floor, on the
+        // characters alone).
+        if (tb.TAB[LT + 3] > 0.5) lit = max(lit, vec3(ROOM_FLOOR));
         o = vec4(max(inv3(tex * min(lit, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
         return;
     }
