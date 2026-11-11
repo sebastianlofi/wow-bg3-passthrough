@@ -211,6 +211,17 @@ def poly_height(px, py, pts):
             return w1 * a[2] + w2 * b[2] + w3 * c[2]
     return sum(p[2] for p in pts) / len(pts)
 
+# The height (yd) a map without terrain reads as: over every floor such a map has (measured over the movement
+# tiles of all twenty: -332 to 306 yd, Dire Maul the highest), and no farther, so a square's floors lie a few
+# hundred metres under its base as the Deadmines' do under their hill.
+NO_TERRAIN = 500.0
+
+
+def bare(maps, map_id):
+    """Whether the server's data has no height map at all for a WoW map (a map of buildings only)."""
+    return not any(Path(maps).glob('%03d????.map' % int(map_id)))
+
+
 class Terrain:
     """WoW's ground from the server's height maps (vmangos GridMap .map files): the surface WoW draws.
     Each 4.17 yd cell is four triangles fanned round its middle vertex (V9 corners, V8 middle), as the
@@ -219,6 +230,10 @@ class Terrain:
     float-to-int option) or one flat height; ADT holes (cave mouths) per 2 x 2 cells."""
     def __init__(self, maps, map_id=0):
         self.maps, self.cache, self.map = maps, {}, int(map_id)
+        # A map built of buildings only (most dungeons, the tram) has no height maps: WoW draws no terrain there.
+        # Its floors are then all "under the terrain" (see UNDER_CLEAR), as a mine's are under its hill: the
+        # terrain reads as one hole at NO_TERRAIN.
+        self.bare = bare(maps, map_id)
 
     def grid(self, gx, gy):
         g = self.cache.get((gx, gy))
@@ -256,6 +271,8 @@ class Terrain:
 
     def height(self, x, y):
         """WoW's terrain height (yards) at WoW (x, y); holes are ignored (the mesh around them)."""
+        if self.bare:
+            return NO_TERRAIN
         gx, gy, a, b, x, y = self._at(x, y)
         v9, v8, _ = self.grid(gx, gy)
         h1, h2 = v9[a * 129 + b], v9[(a + 1) * 129 + b]
@@ -275,6 +292,8 @@ class Terrain:
         """The angle (degrees from level) of the terrain face WoW draws at (x, y): the surface the
         client's movement rule tests. The same four triangles per cell as height(), so this is the
         drawn mesh's own slope, not a movement-map polygon's simplified one."""
+        if self.bare:
+            return 0.0
         gx, gy, a, b, x, y = self._at(x, y)
         v9, v8, _ = self.grid(gx, gy)
         h1, h2 = v9[a * 129 + b], v9[(a + 1) * 129 + b]
@@ -287,6 +306,8 @@ class Terrain:
         return math.degrees(math.atan(math.hypot(du, dv) / self.CELL_YD))
 
     def hole(self, x, y):
+        if self.bare:
+            return True
         gx, gy, a, b, _, _ = self._at(x, y)
         return self._cell_hole(self.grid(gx, gy)[2], a, b)
 
@@ -294,6 +315,8 @@ class Terrain:
         """WoW's terrain triangles (9 floats: WoW x, y, z of 3 corners, yards) of every cell reaching
         into the box, ADT holes left out."""
         out = []
+        if self.bare:
+            return out
         X = lambda i: (32 - i / 128) * GRID  # noqa: E731  full grid index -> WoW coordinate
         i0, i1 = int(math.floor(128 * (32 - x1 / GRID))), int(math.floor(128 * (32 - x0 / GRID)))
         j0, j1 = int(math.floor(128 * (32 - y1 / GRID))), int(math.floor(128 * (32 - y0 / GRID)))
@@ -392,8 +415,8 @@ def ensure_mmtiles(mmaps, maps, map_id, wx, wy, reach, busy=True):
         name = f'{map_id:03}{tx:02}{ty:02}'
         if (Path(mmaps) / f'{name}.mmtile').exists() or (Path(mmaps) / f'{name}.none').exists():
             continue
-        if not (Path(maps) / f'{name}.map').exists():
-            continue   # no ADT there: nothing to walk on
+        if not (Path(maps) / f'{name}.map').exists() and not bare(maps, map_id):
+            continue   # no ADT there: nothing to walk on (a map of buildings only has none anywhere)
         # wowbg3-server.sh mmtile MAP X Y writes MAP Y X: its X is our ty, its Y our tx.
         jobs.append((name, subprocess.Popen(['bash', str(script), 'mmtile', str(map_id), str(ty), str(tx)],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))

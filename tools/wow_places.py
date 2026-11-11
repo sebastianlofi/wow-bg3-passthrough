@@ -32,7 +32,9 @@ CELL = 64
 TILE = 533.33333 * YD      # one WoW map tile in metres
 BASE = (0.0, 1000.0, 0.0)  # the Eastern Kingdoms' centre (world_bridge.py FIXED_CENTRE): WoW's sea level at y 1000
 FLOOR = 4096.0             # metres between floors of the stacked layout
-BELOW, ABOVE = 1000.0, 2500.0   # a map's ground lies this far under and over its centre at most
+# A map's ground lies this far under and over its centre at most. Measured over every map's movement tiles:
+# -504 to 1970 yd (Kalimdor both); only the two unused test maps (13, 29) reach lower, to -1132 yd.
+BELOW, ABOVE = 1000.0, 2500.0
 GAP = 512.0                # metres kept between two maps (past any BG3 sight or spell reach)
 LAYOUT = 'stacked'
 EDGE = 16000 - 128         # the stacked level's usable half width

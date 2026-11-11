@@ -78,9 +78,11 @@ def map_name(map_id):
 
 
 def has_ground(maps, map_id):
-    """Whether the server's data has ground for a WoW map: a continent, or an instance (a dungeon, a raid, the tram),
-    whose height maps the extractor writes like any other's."""
-    return any(Path(maps).glob('%03d????.map' % int(map_id)))
+    """Whether the server's data has ground for a WoW map: height maps (a continent, an instance with terrain), or
+    for a map of buildings only (most dungeons, the tram) its collision tree, which its floors are cut from."""
+    if any(Path(maps).glob('%03d????.map' % int(map_id))):
+        return True
+    return (wow_stand.data_dir('WOW_BG3_VMAPS', 'vmaps') / ('%03d.vmtree' % int(map_id))).is_file()
 MOVE = IO / 'world-move.json'
 MOVE_RESULT = IO / 'world-move-result.json'
 COVER_WAIT_S = 30.0  # a move's cover waits at most so long after the move for benilla's player at the new place
