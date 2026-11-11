@@ -48,6 +48,15 @@ const float ROOM_FLOOR = 0.30;  // the least light, as WoW counts it (0..1), on 
 // shows as flat colour. The ambient falls by the facing instead: this much more on a face turned up, as much less
 // on one turned down, the same on one turned sideways.
 const float AMB_SHAPE = 0.35;
+// WoW's night on BG3's figures, softened. WoW's light at night is blue at the source, and on BG3's albedo, less
+// saturated than WoW's own textures, it reads far bluer than on WoW's models beside it (a playtest report: "I don't
+// like how blue characters look at night"). A light whose blue leads its red is taken toward its own luminance, by
+// up to NIGHT_SOFT (fully at (b - r) / b >= 0.5); daylight and torches (red leading) stay as WoW gives them.
+const float NIGHT_SOFT = 0.5;
+vec3 night_soft(vec3 c) {
+    float k = clamp((c.b - c.r) / max(c.b, 1e-3) * 2.0, 0.0, 1.0) * NIGHT_SOFT;
+    return mix(c, vec3(dot(c, vec3(0.299, 0.587, 0.114))), k);
+}
 // log2-free trilinear: the table holds log2(x) so dark colours stay accurate.
 vec3 inv3(vec3 w) {
     vec3 p = clamp(w, vec3(0.0), vec3(1.0)) * 16.0;
@@ -152,8 +161,24 @@ void main() {
                 // fixed axis and the room's lights, and the outdoor law's point lights do not apply (the header's
                 // fourth number says so). Outdoors the one lobe is the sun's share WoW leaves a unit in the shade.
                 const int LB = LT + 4 + 8 * 8;
+                // A lobe for one figure alone (the sun's share in WoW's shade; its fourth number says so) goes to the
+                // pixels of that figure: the one such lobe whose figure stands nearest the pixel on the screen, within
+                // its reach there. By the screen and not by the pixel's own place: BG3's eye depth for a pixel is not
+                // to be had after every change of place (after a teleport the lobe reached no figure by it), and of
+                // two figures side by side each pixel takes one lobe, not both.
+                int own = -1; float ownd = 1e30;
+                for (int i = 0; i < nb && i < 8; i++) {
+                    if (!(tb.TAB[LB + i * 8 + 3] > 0.5)) continue;
+                    int s4 = LX + 4 + i * 4;
+                    vec3 sp = vec3(tb.TAB[s4], tb.TAB[s4 + 1], tb.TAB[s4 + 2]);
+                    if (!(sp.z > 0.1)) continue;
+                    vec2 sn = vec2(sp.x / (sp.z * pc.fN.w), -sp.y / (sp.z * pc.rN.w));
+                    float dd = length((ndc - sn) * vec2(pc.fN.w, pc.rN.w) * sp.z);
+                    if (dd < tb.TAB[s4 + 3] && dd < ownd) { ownd = dd; own = i; }
+                }
                 for (int i = 0; i < nb && i < 8; i++) {
                     int b = LB + i * 8;
+                    if (tb.TAB[b + 3] > 0.5 && i != own) continue;
                     // WoW shades a unit through an order-2 SH probe of these lobes, not a hard N.L: a face turned from
                     // the light keeps a little of it (0.094 at a right angle, 0.0625 straight away), which in a dim
                     // room is as much as the ambient.
@@ -187,6 +212,9 @@ void main() {
         // dark room near black: its units stay readable there by their bright painted textures, BG3's materials are
         // far darker and take a dim blue room's light as almost nothing (the maintainer's call: a readable floor, on the
         // characters alone).
+        // In a room by the room's own light, pixel by pixel; outdoors by WoW's whole light there (the tail's last).
+        if (tb.TAB[LT + 3] > 0.5) lit = night_soft(lit);
+        else lit = mix(lit, vec3(dot(lit, vec3(0.299, 0.587, 0.114))), tb.TAB[LX + 4 + 8 * 4]);
         if (tb.TAB[LT + 3] > 0.5) lit = max(lit, vec3(ROOM_FLOOR * shape));
         o = vec4(max(inv3(tex * min(lit, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
         return;

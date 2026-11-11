@@ -26,7 +26,7 @@ static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[
 #define FB_TAB (17 * 17 * 17 * 3)
 #define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
 #define FB_LOBE 8                      // WoW's room light for the hero's figure: its lobes, after the point lights, 8 floats each
-#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4)  // and last: the world's up in the camera's view, 1 when BG3's G-buffer normal is bound
+#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4 + 4)  // then the world's up in the camera's view and 1 when BG3's G-buffer normal is bound; then, a lobe, the place in view and reach of the figure it is for; last, how far WoW's light outdoors is taken toward its own luminance (the night's softening)
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
@@ -144,29 +144,55 @@ static void wlit_put(float* out, int on, const float* eye, const float* fwd, con
             o8[3] = 0.0f; o8[4] = l[3]; o8[5] = l[4]; o8[6] = l[5]; o8[7] = 0.0f;
         }
         float sun[6]; memcpy(sun, g_amb.sun, sizeof sun);
+        const float amb3[3] = {g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2]};
         pthread_mutex_unlock(&g_amb.m);
+        // The night's softening outdoors, from WoW's whole light there (ambient and sun, as the client takes it for
+        // its own drawing of a BG3 figure): the same share for the ambient here and for the sun BG3 is given
+        // (WowSky.lua), so the two stay one colour.
+        {
+            const float tr = fminf(amb3[0] + sun[3], 1.0f), tb = fminf(amb3[2] + sun[5], 1.0f);
+            float k = (tb - tr) / fmaxf(tb, 1e-3f) * 2.0f;
+            out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4] = (k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k) * 0.5f;
+        }
         out[2] = (float)nb;
         out[3] = nb > 0 ? 1.0f : 0.0f;  // a room's lobes: the outdoor law's point lights do not apply
-        // Outdoors, in WoW's shade: WoW lights a shadowed unit at intensity 0.5 where a lit one has 2.5, a fifth of
-        // the sun's diffuse by the facing, and the blocker that keeps BG3's sun off the figure takes all of it. That
-        // fifth comes back as one lobe toward the sun, by how far the hero's figure is in the shade.
+        // Outdoors, in WoW's shade: the client lights a shadowed unit at intensity 0.5 where a lit one has 1 (it
+        // caps the original's 2.5 at 1), half of the sun's diffuse by the facing, and the blocker that keeps BG3's
+        // sun off a figure takes all of it. That half comes back as a lobe toward the sun for each of the party's
+        // figures in the shade, by how far it is in, on that figure's pixels (the lobe's fourth number says so, and its
+        // place in the camera's view follows the tail: the shader picks by the screen).
+        // Before, there was one lobe, a fifth of the sun, and it looked for the hero at the plan's anchor, which
+        // is not where the hero stands: no figure ever got it, and one in the shade, as every figure is by night,
+        // showed far darker than the client draws its own units there.
+        // SHADE_SUN: the client's half taken halfway to the full sun, as the whole match stands halfway between the
+        // rule alone and the client's own drawing of a BG3 figure, which knows no shade (the maintainer's objective): by
+        // the half alone a figure under trees at night was near black on BG3's dark materials.
+        #define SHADE_SUN 0.75f
         if (nb == 0 && g_tav.seq) {
-            float lvl = 0.0f, best = 1e30f;
+            float at[SHD_MAX][3], level[SHD_MAX]; int n;
             pthread_mutex_lock(&g_shd.m);
-            for (int k = 0; k < g_shd.n; k++) {
-                const float dx = g_shd.at[k][0] - (float)g_tav.centre[0], dz = g_shd.at[k][2] - (float)g_tav.centre[2];
-                if (dx * dx + dz * dz < best) { best = dx * dx + dz * dz; lvl = g_shd.level[k]; }
-            }
+            n = g_shd.n; memcpy(at, g_shd.at, sizeof at); memcpy(level, g_shd.level, sizeof level);
             pthread_mutex_unlock(&g_shd.m);
-            if (lvl > 0.02f && best < 9.0f) {
-                const double w[3] = {sun[1], sun[2], -sun[0]};
-                float* o8 = out + 4 + FB_LIT * 8;
+            const double w[3] = {sun[1], sun[2], -sun[0]};
+            const float shade_sun = g_cc.wdshade > 0.0f ? g_cc.wdshade : SHADE_SUN;
+            int k8 = 0;
+            for (int k = 0; k < n && k8 < FB_LOBE; k++) {
+                if (!(level[k] > 0.02f)) continue;
+                float* o8 = out + 4 + FB_LIT * 8 + k8 * 8;
                 o8[0] = (float)(w[0] * right[0] + w[1] * right[1] + w[2] * right[2]);
                 o8[1] = (float)(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
                 o8[2] = (float)(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
-                o8[3] = 0.0f; o8[4] = sun[3] * 0.2f * lvl; o8[5] = sun[4] * 0.2f * lvl; o8[6] = sun[5] * 0.2f * lvl; o8[7] = 0.0f;
-                out[2] = 1.0f;
+                o8[3] = 1.0f; o8[4] = sun[3] * shade_sun * level[k]; o8[5] = sun[4] * shade_sun * level[k]; o8[6] = sun[5] * shade_sun * level[k]; o8[7] = 0.0f;
+                const double p[3] = {at[k][0] - eye[0], at[k][1] + 1.0 - eye[1], at[k][2] - eye[2]};  // a metre above its feet
+                float* o4 = out + 4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + k8 * 4;
+                o4[0] = (float)(p[0] * right[0] + p[1] * right[1] + p[2] * right[2]);
+                o4[1] = (float)(p[0] * up[0] + p[1] * up[1] + p[2] * up[2]);
+                o4[2] = (float)(p[0] * fwd[0] + p[1] * fwd[1] + p[2] * fwd[2]);
+                o4[3] = 1.8f;  // on the screen, about the figure's middle: its height and a held weapon
+                k8++;
             }
+            out[2] = (float)k8;
+            { static uint64_t saidl; if (g_cc.wdlog && saidl++ % 1800 == 0) logf_("wdwlit: %d of %d figures in WoW's shade take the sun's share (first level %.2f, in view at %.2f %.2f %.2f m, lobe toward %.2f %.2f %.2f colour %.2f %.2f %.2f; eye %.1f %.1f %.1f, figure %.1f %.1f %.1f)", k8, n, n ? level[0] : 0.0f, out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 5], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 6], out[4 + FB_LIT * 8], out[4 + FB_LIT * 8 + 1], out[4 + FB_LIT * 8 + 2], out[4 + FB_LIT * 8 + 4], out[4 + FB_LIT * 8 + 5], out[4 + FB_LIT * 8 + 6], eye[0], eye[1], eye[2], n ? at[0][0] : 0.0f, n ? at[0][1] : 0.0f, n ? at[0][2] : 0.0f); }
         }
     }
     { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; BG3's eye depth %s, ambient %s", g_amb.nlit, g_blv_z ? "found" : "not bound by its lighting pass", on || !g_blv_z ? "on" : "off"); }

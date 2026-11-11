@@ -1065,7 +1065,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref, wdshade; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     float wdamb; int wdwfog, wdwlit;
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
@@ -1231,6 +1231,7 @@ static void compose_config(void) {
     { const char* ws = strstr(line, "wdskip="); g_cc.wdskip = ws ? strtoull(ws + 7, NULL, 16) : 0; }
     { const char* we = strstr(line, "wdexp="); g_cc.wdexp = we ? (float)atof(we + 6) : 0.0f; }
     { const char* wv = strstr(line, "wdevref="); g_cc.wdevref = wv ? strtof(wv + 8, NULL) : 0.0f; }  // patch61
+    { const char* wv = strstr(line, "wdshade="); g_cc.wdshade = wv ? strtof(wv + 8, NULL) : 0.0f; }  // a test dial: the sun's share for a figure in WoW's shade (0: the built-in one)
     { const char* wa = strstr(line, "wdamb="); g_cc.wdamb = wa ? strtof(wa + 6, NULL) : 0.0f; if (!(g_cc.wdamb >= 0.0f && g_cc.wdamb <= 4.0f)) g_cc.wdamb = 0.0f; }  // WoW's ambient on BG3's pixels
     if (g_cc.wdepth) { g_cc.fxbg = 1; g_cc.fxbgpass = 1; g_cc.fxbgfwd = 1; }
     g_cc.surfpost = has_word(line, "surfpost");
