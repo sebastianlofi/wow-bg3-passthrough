@@ -76,7 +76,12 @@ version is mostly complete.
   its pin on the map, or `/wowbg3 waypoint go NAME`. Free, no flight master needed, on either continent; Ironforge
   and Undercity too. Not in a fight, on a flight, dead, or at camp. `waypoints = 0` in `settings.conf` turns it off.
   A move (a waypoint or `tp`) is covered by BG3's own screen fade, which lifts once WoW's world is there: about
-  10 seconds on the same continent, longer to the other one.
+  8 seconds on the same continent, longer to the other one. It takes the character you control and the companions
+  chained to it; a companion you unchained stays where it stands.
+- **Lifts and the Deeprun Tram.** WoW's elevators and the tram carry your party. Each car is one of BG3's own moving
+  platforms, kept under WoW's car on WoW's own timetable: click on a car while it rests at a stop to walk onto it,
+  ride, and walk off at the other end. Ridden so far: Undercity's lifts and the Deeprun Tram. Zeppelins and boats
+  are not ridden yet (see below).
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
@@ -284,7 +289,9 @@ What works is listed above; this is what does not, or has not been tried:
 - **A party spread far apart** is partly built. Switching to a party member far from the one you
   controlled keeps BG3's fade until WoW's world there is loaded, and party members stay in the game
   when your hero travels to the other continent. Still to come: a member on another continent than
-  the hero, a flight point moving the whole group, and fights far from the hero.
+  the hero, and fights far from the hero.
+- **Zeppelins and boats** do not carry the party yet: a ship turns as it flies, and BG3's moving platforms only
+  slide. To cross, use a waypoint on the other continent.
 - **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
   Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
   says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and

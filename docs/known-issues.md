@@ -45,6 +45,18 @@ This is the first public version. What we know is missing or rough:
   Every other instance goes the same way but is untested, and no boss has any hand-made rules. Inside, BG3 offers
   no camp and no Long Rest. A raid needs no raid group; WoW's level minimums, keys and attunements still apply.
 
+- Lifts and the Deeprun Tram carry the party on BG3's own moving platforms (one under each of WoW's cars, moved
+  as WoW's client moves the car). Ridden in the harness: Undercity's three lifts and the Deeprun Tram, with a
+  companion. Limits: a platform's floor is round and a little wider than the car's, so at a tram car's ends a
+  character can stand a step beside WoW's deck; where a car's floor lies above the ground beside it (the tram's
+  deck, 0.7 m over the station floor) the last two metres of ground slope up to it, also while the car is away;
+  the other lifts of the world (Thousand Needles, Gnomeregan, Blackrock and so on) use the same code and are
+  untested. Open: BG3 crashed twice as Undercity's car left with more than the hero involved (a fight aboard; a
+  chained companion aboard), which keeps lifts out of a release until it is found. In a fight BG3 itself holds a
+  platform still until the fight is over (stock does the same on its own elevators). A companion added while the
+  hero stands on a car is not carried. Zeppelins and boats are not ridden: a ship turns, BG3's platform move does
+  not.
+
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass
   camp (Wyrm's Lookout) whatever the zone: going there and coming back are loading screens (about 6 s there, about
