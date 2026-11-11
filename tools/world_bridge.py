@@ -372,6 +372,7 @@ FIXED_ORIGIN = (0.0, 0.0, 0.0)
 
 
 LIFT_CLEAR_YD = 12.0   # a member this near a lift's shaft (past its car's radius) keeps the side its squares are cut for
+ANCHOR_YD = 150.0      # under the terrain: a member standing this far from the point its squares are cut for takes a new one
 LIFT_STOPS = {}   # WoW map -> [(x, y, z, radius)] in WoW yards: where each lift car a character can ride rests, at its floor
 
 
@@ -778,6 +779,8 @@ class World:
             was = self.below(w.at or self.at)
             now = z < th - wow_arena.UNDER_CLEAR if not was else z < th - wow_arena.UNDER_CLEAR + 5.0
             if now == was:
+                if now:
+                    self.anchor(w, p, (x, y, z))
                 continue
             # Not on a lift or beside its shaft: the squares there hold the floors at both of its ends whichever side
             # they were cut for (wow_arena.py --lift), and cutting them again as she arrived took the landing from
@@ -795,6 +798,33 @@ class World:
                     stale += 1
             print('%s is %s the terrain now (WoW %.1f %.1f %.1f, terrain %.1f): %d placed squares are cut again' % (
                 w.name, 'under' if now else 'over', x, y, z, th, stale), flush=True)
+
+    def stands(self, p):
+        """Whether BG3 point p is on a walkable tile of a placed square (the ground's or a level's), within 1.5 m."""
+        f = self.floor_at(p[0], p[2])
+        if f and f[0] and abs(f[1] - p[1]) <= 1.5:
+            return True
+        i, j = int(math.floor((p[0] - self.centre[0]) / CELL)), int(math.floor((p[2] - self.centre[2]) / CELL))
+        for ij in ((i, j), (i - 1, j), (i, j - 1), (i - 1, j - 1)):     # a level lies a tile off its square
+            for st in (self.cells.get(ij) or {}).get('storeys') or ():
+                c, r = int((p[0] - st['min'][0]) // 0.5), int((p[2] - st['min'][1]) // 0.5)
+                if 0 <= c < TILES and 0 <= r < TILES and st['floors'][(r * TILES + c) * 5] & 1 \
+                        and abs(struct.unpack_from('<f', st['floors'], (r * TILES + c) * 5 + 1)[0] - p[1]) <= 1.5:
+                    return True
+        return False
+
+    def anchor(self, w, p, at):
+        """Under the terrain a square is cut for the floors joined to one WoW point (cut_args' `at`), found in the
+        movement tiles round that square: far from the point no floor is found, and the square comes without ground
+        (harness: the Deeprun Tram set the hero down 2500 yd from where she came in). So the point follows a member:
+        wherever she stands on ground ANCHOR_YD from it, that is her point from then on. Riding a car she stands on
+        no ground, and the squares at its stops hold their floors whatever point they are cut for (--lift)."""
+        old = w.at or self.at
+        if (at[0] - old[0]) ** 2 + (at[1] - old[1]) ** 2 < ANCHOR_YD ** 2 or not self.stands(p):
+            return
+        w.at = at
+        print('%s stands %.0f yd from the point her squares are cut for: they are cut for WoW %.1f %.1f %.1f from now on' % (
+            w.name, math.hypot(at[0] - old[0], at[1] - old[1]), *at), flush=True)
 
     def carve_lifts(self, cell):
         """Where a lift car rests WoW's own floor under it is the car's (wow_lifts.carve): those tiles are not ground
@@ -1024,9 +1054,15 @@ class World:
     def write_triangles(self, squares):
         # What each triangle is (terrain, wall, WMO, M2, flat floor), for the plugin's camera clearance;
         # it reads both files at the next Rays command and ignores kinds of another count.
+        # False: none of these squares has a face of WoW's (a tunnel the tram runs through has no floor to stand on, so
+        # nothing is cut there). There is then no set to swap in, and BG3 keeps the one it has.
         cells = [self.cut(ij) for ij in squares if len(ij) == 2]   # storeys bring no triangles of their own
+        tris = b''.join(c['tris'] for c in cells)
+        if not tris:
+            return False
         atomic_write(IO / 'arena-triangles.kinds', b''.join(c['kinds'] for c in cells))
-        atomic_write(IO / 'arena-triangles.bin', b''.join(c['tris'] for c in cells))
+        atomic_write(IO / 'arena-triangles.bin', tris)
+        return True
 
     def pool_files(self):
         """Where the plugin says the pool subgrids are, per side: {k: (i, j) or None}."""
@@ -1360,8 +1396,7 @@ class World:
                 raise RuntimeError('the pool has no free square for the new place')
             cells = self.cells_for(pairs)
             squares = [ij for ij in (self.rays or []) if ij not in need] + need
-            self.write_triangles(squares)
-            seq = self.command('Jump', Spot=list(S), Cells=cells, Rays=True)
+            seq = self.command('Jump', Spot=list(S), Cells=cells, Rays=self.write_triangles(squares))
             ok, err = self.wait_done(seq, 60)
             if not ok:
                 raise RuntimeError('Jump refused: %s' % err)
@@ -1486,8 +1521,7 @@ class World:
         if not pairs and sorted(squares) == self.rays:
             return
         cells = self.cells_for(pairs)
-        self.write_triangles(squares)
-        seq = self.command('Stream', Cells=cells, Rays=True)
+        seq = self.command('Stream', Cells=cells, Rays=self.write_triangles(squares))
         ok, err = self.wait_done(seq, 45)
         if ok:
             self.rays = sorted(squares)
