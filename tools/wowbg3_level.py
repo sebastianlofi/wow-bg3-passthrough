@@ -20,6 +20,14 @@ What it writes: an empty level the size of a WoW continent, whose ground world m
                            i16 metadata = -1, i16 surface = -1 (runtime only)
   The .lsx files must be turned into .lsf (LSLib's converter) before BG3 reads them.
 
+A platform (BG3's own moving ground: a lift, a raft) is a level of its own, placed in another level as a level
+template and moved by Osiris PlatformMoveTo. "Platform": true makes a spec such a level (meta IsPlatformLevel, no
+start points or zones); "Root" is the id of its root template (root_templates_lsx: Type LevelTemplate, IsMoving,
+SubLevelName). A subgrid's "Owner" is the index of the spec's Scenery object it belongs to, as in BG3's own
+platform levels (the grid is the floor object's). A level places platforms with
+"LevelTemplates": [{"Root", "MapKey", "Name", "Pos"}] (LevelTemplates/_merged.lsx); "LiftPlatforms": true places
+the family BG3 keeps for WoW's lifts (tools/wow_lift_platforms.py: release/build-release.py adds its levels).
+
 Also in SPEC.json: "LightingList" / "AtmosphereList" (resource ids listed on the two zones, the first one the
 level's own), "LightingZone" / "AtmosphereZone" (fixed ids for the zone triggers, so the mod's Lua can name them),
 "BlankGrid" {"X0", "Z0", "N" or "NX" and "NZ", "Y"} (blank squares in rows from that corner: the pool world mode
@@ -29,6 +37,7 @@ SPEC.json: {"Name": "WOWBG3_Skel_A", "Bounds": [minx, miny, minz, maxx, maxy, ma
             "Start": [x, y, z],
             "Subgrids": [{"X": minx, "Y": y, "Z": minz, "W": 128, "H": 128, "Kind": "walk"|"blank"}, ...]}
   walk  : every tile open (state 0), flat at y: something to stand on
+  disc  : open tiles within "Radius" metres of the subgrid's middle, blank round them (a lift car's floor)
   blank : every tile 0x8005 (EMPTY | MOVEMENT_BLOCKED | BLOCKED_UNREACHABLE = "GenericBlock"), the
           state of BG3's own out-of-bounds layer tiles that the plugin's Pool takes for the treadmill
 """
@@ -68,15 +77,17 @@ def subgrid_id(obj_uuid):
     return ((x >> 32) ^ x) & 0xFFFFFFFF
 
 
-def tiles(w, h, kind):
+def tiles(w, h, kind, radius=None):
+    walk, blank = struct.pack("<Qhhhh", 0, 0, 0, -1, -1), struct.pack("<Qhhhh", 0x8005, 0, 0, -1, -1)
     if kind == "walk":
-        state, height = 0, 0
-    elif kind == "blank":
-        state, height = 0x8005, 0
-    else:
-        raise ValueError(kind)
-    one = struct.pack("<Qhhhh", state, height, height, -1, -1)
-    return one * (w * h)
+        return walk * (w * h)
+    if kind == "blank":
+        return blank * (w * h)
+    if kind == "disc":   # a round floor in the subgrid's middle (a lift car's), blank round it
+        cx, cz, r2 = w * 0.25, h * 0.25, radius * radius
+        return b"".join(walk if ((c + 0.5) * 0.5 - cx) ** 2 + ((r + 0.5) * 0.5 - cz) ** 2 <= r2 else blank
+                        for r in range(h) for c in range(w))
+    raise ValueError(kind)
 
 
 def cstr37(s):
@@ -90,13 +101,13 @@ def write_aigrid(path, name, subgrids):
     out += struct.pack("<I", len(subgrids))
     seen = set()
     for i, s in enumerate(subgrids):
-        obj = uid(name, "subgrid", i)
+        obj = uid(name, "scenery", s["Owner"]) if "Owner" in s else uid(name, "subgrid", i)
         sid = subgrid_id(obj)
         assert sid not in seen
         seen.add(sid)
         x, z = round(s["X"] * 2) / 2, round(s["Z"] * 2) / 2
         w, h = s.get("W", 128), s.get("H", 128)
-        lz = lz4_literals(tiles(w, h, s["Kind"]))
+        lz = lz4_literals(tiles(w, h, s["Kind"], s.get("Radius")))
         dz = zlib.compress(lz, 9)
         out += struct.pack("<IIIfff", sid, w, h, x, s["Y"], z)
         out += cstr37(obj) + cstr37("00000000-0000-0000-0000-000000000000")
@@ -123,7 +134,7 @@ def write_meta(path, spec):
     x = (HDR.replace('revision="9" build="0"', 'revision="0" build="77"')
          + '\t<region id="LevelData">\n\t\t<node id="LevelData">\n'
          + "".join("\t\t\t" + a + "\n" for a in [
-             attr("IsGameMasterLevel", "bool", "False"), attr("IsPlatformLevel", "bool", "False"),
+             attr("IsGameMasterLevel", "bool", "False"), attr("IsPlatformLevel", "bool", str(bool(spec.get("Platform")))),
              attr("LevelAtmosphere", "FixedString", spec["Atmosphere"]), attr("LevelLighting", "FixedString", spec["Lighting"]),
              attr("LevelTemplateBoundTrigger", "FixedString", ""), attr("VisualStreamingEnabled", "bool", "True")])
          + '\t\t\t<children>\n\t\t\t\t<node id="LevelBounds">\n'
@@ -190,6 +201,45 @@ def write_scenery(path, spec, layer):
     open(path, "w").write(x)
 
 
+def write_level_templates(path, spec, layer):
+    """LevelTemplates: the platforms placed in this level, each an instance of a root template (by id)."""
+    name = spec["Name"]
+    objs = []
+    for t in spec["LevelTemplates"]:
+        objs.append('<node id="GameObjects">' + attr("Flag", "int32", "1") + attr("LevelName", "FixedString", name)
+                    + attr("MapKey", "FixedString", t["MapKey"]) + attr("Name", "LSString", t["Name"])
+                    + attr("TemplateName", "FixedString", t["Root"]) + attr("Type", "FixedString", "LevelTemplate")
+                    + "<children>" + layer_list(name, layer) + transform(t["Pos"]) + "</children></node>")
+    x = (HDR + '\t<region id="Templates">\n\t\t<node id="Templates">\n\t\t\t<children>\n'
+         + "".join("\t\t\t\t" + o + "\n" for o in objs) + "\t\t\t</children>\n\t\t</node>\n\t</region>\n</save>\n")
+    open(path, "w").write(x)
+
+
+def root_templates_lsx(specs):
+    """The root templates of the platform levels among `specs` (the mod's Public/<mod>/RootTemplates): what a
+    level's LevelTemplates name. The attributes are those of BG3's own moving platforms, without their sounds."""
+    objs = []
+    for spec in specs:
+        if not spec.get("Platform"):
+            continue
+        objs.append('<node id="GameObjects">' + "".join([
+            attr("CameraOffset", "fvec3", "0 0 0"), attr("Flag", "int32", "0"), attr("GroupID", "uint32", "0"),
+            attr("HasGameplayValue", "bool", "False"), attr("IsDynamicLayer", "bool", "False"), attr("IsMoving", "bool", "True"),
+            attr("IsScrollingObject", "bool", "False"), attr("LevelName", "FixedString", ""), attr("LevelTemplateType", "uint8", "0"),
+            attr("MapKey", "FixedString", spec["Root"]), attr("MovablePlatformStartSound", "FixedString", ""),
+            attr("MovablePlatformStopSound", "FixedString", ""), attr("Name", "LSString", "LT_" + spec["Name"]),
+            attr("ParentTemplateId", "FixedString", ""), attr("PhysicsOpenTemplate", "FixedString", ""),
+            attr("PhysicsTemplate", "FixedString", ""), attr("ScrollingDirection", "fvec3", "1 0 0"),
+            attr("ScrollingDistance", "float", "0"), attr("ScrollingOffset", "float", "0"), attr("ScrollingOrigin", "fvec3", "0 0 0"),
+            attr("ScrollingSpeed", "float", "0"), attr("StartingActive", "bool", "False"), attr("StartingLoaded", "bool", "True"),
+            attr("SubLevelName", "FixedString", spec["Name"]), attr("TemplateAfterDestruction", "FixedString", ""),
+            attr("Type", "FixedString", "LevelTemplate"), attr("VisualTemplate", "FixedString", "")]) + "</node>")
+    if not objs:
+        return None
+    return (HDR + '\t<region id="Templates">\n\t\t<node id="Templates">\n\t\t\t<children>\n'
+            + "".join("\t\t\t\t" + o + "\n" for o in objs) + "\t\t\t</children>\n\t\t</node>\n\t</region>\n</save>\n")
+
+
 def write_minimap(path, spec):
     """The level's map frame (WorldMap/MiniMap): where BG3's minimap and map page lay the level's map picture, here the
     whole level with no picture. Without it the map's view model has no world size and nothing can be laid on the
@@ -228,16 +278,21 @@ def build(spec, out):
         nx, nz = g.get("NX", g.get("N")), g.get("NZ", g.get("N"))
         spec["Subgrids"] = spec.get("Subgrids", []) + [{"X": g["X0"] + 64 * i, "Y": g["Y"], "Z": g["Z0"] + 64 * j, "Kind": "blank"}
                                                         for j in range(nz) for i in range(nx)]
-    for d in ("Ai", "Triggers", "Layers", "WorldMap"):
+    platform = bool(spec.get("Platform"))
+    for d in ("Ai", "Layers") + (() if platform else ("Triggers", "WorldMap")):
         os.makedirs(os.path.join(out, d), exist_ok=True)
     layer = uid(spec["Name"], "layer", "Triggers")
     write_meta(os.path.join(out, "meta.lsx"), spec)
     write_layer(os.path.join(out, "Layers", layer + ".lsx"), layer)
-    write_minimap(os.path.join(out, "WorldMap", "MiniMap.lsx"), spec)
-    write_triggers(os.path.join(out, "Triggers", "_merged.lsx"), spec, layer)
+    if not platform:   # a platform is a piece of another level: that level's start points, zones and map
+        write_minimap(os.path.join(out, "WorldMap", "MiniMap.lsx"), spec)
+        write_triggers(os.path.join(out, "Triggers", "_merged.lsx"), spec, layer)
     if spec.get("Scenery"):
         os.makedirs(os.path.join(out, "Scenery"), exist_ok=True)
         write_scenery(os.path.join(out, "Scenery", "_merged.lsx"), spec, layer)
+    if spec.get("LevelTemplates"):
+        os.makedirs(os.path.join(out, "LevelTemplates"), exist_ok=True)
+        write_level_templates(os.path.join(out, "LevelTemplates", "_merged.lsx"), spec, layer)
     n = write_aigrid(os.path.join(out, "Ai", "aigrid.data"), spec["Name"], spec["Subgrids"])
     json.dump(spec, open(os.path.join(out, "spec-out.json"), "w"), indent=1)
     print(f"{spec['Name']}: {len(spec['Subgrids'])} subgrids, aigrid {n} bytes ->", out)

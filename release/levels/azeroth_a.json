@@ -60,5 +60,6 @@
   "NX": 5,
   "NZ": 20,
   "Y": -20
- }
+ },
+ "LiftPlatforms": true
 }

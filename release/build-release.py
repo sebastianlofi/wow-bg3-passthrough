@@ -58,7 +58,7 @@ LAUNCHER = "wowbg3-launcher.so"
 PLUGIN = "wowbg3.so"
 # The tools the coordinator runs (tools/relenv.py points them at the player's folders).
 TOOLS = ["lifecycle.py", "colour_table.py", "crashreport.py", "wowsave.py", "wowchar.py", "wowserver.py", "world_bridge.py", "wow_arena.py", "wow_stand.py", "wow_waypoints.py",
-         "wow_places.py", "wow_vmap.py", "wow_mpq.py", "inventory_bridge.py", "wowlevel.py", "wow_items.py", "wow_items_rules.json"]
+         "wow_places.py", "wow_lifts.py", "wow_vmap.py", "wow_mpq.py", "inventory_bridge.py", "wowlevel.py", "wow_items.py", "wow_items_rules.json"]
 TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthrough accounts, chat commands
                "tavtex.py", "bg3tex.py", "bg3pak.py", "bg3shade.py", "bg3index.py",  # Tav's textures (with --python)
                "wow_icons.py", "wowcursor.py",  # the icon atlas and the quest cursors (first run, with --python)
@@ -119,9 +119,21 @@ def level_files():
     import wowbg3_lighting
     files = [(f"Public/{FOLDER}/Content/Assets/Atmospheres/[PAK]_Atmospheres/_merged.lsf",
               lsf_write.lsx_to_lsf(wowbg3_lighting.bank_lsx().encode("utf-8")))]
-    for spec in sorted((HERE / "levels").glob("*.json")):
+    import wow_lift_platforms
+    specs = [json.loads(q.read_text()) for q in sorted((HERE / "levels").glob("*.json"))]
+    # BG3's own moving ground for WoW's lifts: a level that asks for it places the family of platforms, each a
+    # small level of its own with a root template the placement names (tools/wow_lift_platforms.py).
+    if any(s.get("LiftPlatforms") for s in specs):
+        for s in specs:
+            if s.get("LiftPlatforms"):
+                s["LevelTemplates"] = s.get("LevelTemplates", []) + wow_lift_platforms.instances()
+        specs += wow_lift_platforms.specs()
+    roots = wowbg3_level.root_templates_lsx(specs)
+    if roots:
+        files.append((f"Public/{FOLDER}/RootTemplates/WOWBG3_Platforms.lsf", lsf_write.lsx_to_lsf(roots.encode("utf-8"))))
+    for spec in specs:
         with tempfile.TemporaryDirectory() as tmp:
-            name = wowbg3_level.build(json.loads(spec.read_text()), tmp)
+            name = wowbg3_level.build(spec, tmp)
             for p in sorted(Path(tmp).rglob("*")):
                 if not p.is_file() or p.name == "spec-out.json":
                     continue

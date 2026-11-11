@@ -1,0 +1,244 @@
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -196,6 +196,8 @@
+ mod wowbg3_fx;
+ mod wowbg3_fx_render;
+ mod wowbg3_keys;
++// WOW-BG3 patch 0135: WoW's lifts for BG3's side of a ride.
++mod wowbg3_lifts;
+ mod wowbg3_lead;
+ mod wowbg3_offscreen;
+ mod wowbg3_pace;
+diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transport.rs
+--- a/crates/benilla-app/src/transport.rs
++++ b/crates/benilla-app/src/transport.rs
+@@ -116,6 +116,8 @@
+ /// (`Map::SendInitTransports`, `Map.cpp:1719`), so a lift is always on the viewer's map. At login
+ /// `CurrentMap` is still the startup seed when lifts arm, so a stamped map would hide them.
+ struct Lift {
++    /// WOW-BG3 (patch 0135): the template entry, for `wowlifts.bin`.
++    entry: u32,
+     frames: Arc<Vec<ElevatorKeyframe>>,
+     period_ms: u32,
+     base_pos: [f32; 3],
+@@ -196,12 +198,48 @@
+         }
+     }
+ 
++    /// WOW-BG3 (patch 0135): a lift as BG3's side of a ride needs it this frame (`wowbg3_lifts`):
++    /// where the car is, and the end of the keyframe span it is on with the time left to it. A
++    /// span is one straight move at one speed (or a rest), so BG3's own platform can make the
++    /// same move. `None` for a boat or a zeppelin.
++    pub(crate) fn lift_now(&self, anchor: &TransportAnchor) -> Option<LiftNow> {
++        let Drive::Lift(l) = &self.drive else {
++            return None;
++        };
++        let cycle = self.cycle_ms(anchor);
++        let (pos, moving) = elevator_sample(&l.frames, l.base_pos, l.quat, cycle);
++        let hi = l.frames.partition_point(|f| f.time_ms <= cycle).min(l.frames.len() - 1);
++        let end = l.frames[hi].time_ms;
++        let (to, _) = elevator_sample(&l.frames, l.base_pos, l.quat, end);
++        Some(LiftNow {
++            entry: l.entry,
++            period_ms: l.period_ms,
++            cycle_ms: cycle,
++            pos,
++            moving,
++            to,
++            to_ms: end.saturating_sub(cycle),
++        })
++    }
++
+     /// The live sample for an anchor, the pose the tick writes this frame; for instruments.
+     pub(crate) fn sample_at(&self, anchor: &TransportAnchor, here: u32) -> TransportSample {
+         self.sample(self.cycle_ms(anchor), here)
+     }
+ }
+ 
++/// WOW-BG3 (patch 0135): one lift this frame, in raw WoW coordinates ([`Transport::lift_now`]).
++pub(crate) struct LiftNow {
++    pub(crate) entry: u32,
++    pub(crate) period_ms: u32,
++    pub(crate) cycle_ms: u32,
++    pub(crate) pos: [f32; 3],
++    pub(crate) moving: bool,
++    /// The end of the keyframe span the car is on, and the ms left to it.
++    pub(crate) to: [f32; 3],
++    pub(crate) to_ms: u32,
++}
++
+ /// `TaxiPathNode.dbc` with the per-path timetables built from it (`None` in `built` is a failed
+ /// build, not retried), and the `TransportAnimation.dbc` lift keyframes, both shared by path.
+ #[derive(Resource, Default)]
+@@ -297,6 +335,7 @@
+             commands.entity(entity).remove::<ElevatorSeed>().insert((
+                 Transport {
+                     drive: Drive::Lift(Lift {
++                        entry: seed.entry,
+                         frames,
+                         period_ms,
+                         base_pos: seed.base_pos,
+@@ -773,6 +812,38 @@
+     }
+ 
+     #[test]
++    fn a_lift_says_where_its_span_ends() {
++        // Rest 1 s at the spawn, 2 s up 10 yd, rest 1 s (patch 0135).
++        let frames = Arc::new(vec![
++            ElevatorKeyframe { time_ms: 0, pos: [0.0; 3] },
++            ElevatorKeyframe { time_ms: 1000, pos: [0.0; 3] },
++            ElevatorKeyframe { time_ms: 3000, pos: [0.0, 0.0, 10.0] },
++            ElevatorKeyframe { time_ms: 4000, pos: [0.0, 0.0, 10.0] },
++        ]);
++        let t = Transport {
++            drive: Drive::Lift(Lift {
++                entry: 7,
++                frames,
++                period_ms: 4000,
++                base_pos: [100.0, 200.0, 50.0],
++                quat: [0.0, 0.0, 0.0, 1.0],
++                yaw: 0.0,
++            }),
++            was_moving: false,
++        };
++        let at = |ms: u32| TransportAnchor { progress_ms: ms, at: Instant::now() };
++        let rest = t.lift_now(&at(400)).unwrap();
++        assert!(!rest.moving && rest.entry == 7 && rest.period_ms == 4000);
++        assert_eq!(rest.to, [100.0, 200.0, 50.0]);
++        assert!((995..=1000).contains(&(rest.cycle_ms + rest.to_ms)));
++        let up = t.lift_now(&at(2000)).unwrap();
++        assert!(up.moving);
++        assert!((up.pos[2] - 55.0).abs() < 0.1, "{:?}", up.pos);
++        assert_eq!(up.to, [100.0, 200.0, 60.0]);
++        assert!((995..=1000).contains(&up.to_ms));
++    }
++
++    #[test]
+     fn a_lift_has_no_seam_to_reanchor() {
+         let lift = Transport {
+             drive: Drive::Lift(parked_lift()),
+@@ -788,6 +859,7 @@
+     /// A two-frame pause path at `base_pos`.
+     fn parked_lift() -> Lift {
+         Lift {
++            entry: 0,
+             frames: Arc::new(vec![
+                 ElevatorKeyframe {
+                     time_ms: 0,
+diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
+--- a/crates/benilla-app/src/wowbg3.rs
++++ b/crates/benilla-app/src/wowbg3.rs
+@@ -54,6 +54,8 @@
+         crate::wowbg3_cursors::build(app, PathBuf::from(&dir));
+         // Patch 0041: a server teleport in world mode moves BG3's character.
+         crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
++        // Patch 0135: WoW's lifts for BG3's side of a ride.
++        crate::wowbg3_lifts::build(app, PathBuf::from(&dir));
+         // Patch 0050: party bots' WoW bodies hidden, placed on their BG3 figures.
+         crate::wowbg3_party::build(app, PathBuf::from(&dir));
+         // Patch 0053: /wowbg3 commands typed in WoW's chat go to the WOW-BG3 helper.
+diff --git a/crates/benilla-app/src/wowbg3_lifts.rs b/crates/benilla-app/src/wowbg3_lifts.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/benilla-app/src/wowbg3_lifts.rs
+@@ -0,0 +1,99 @@
++//! WOW-BG3 (local fork, patch 0135): WoW's lifts for BG3's side of a ride.
++//!
++//! A lift (an elevator, a tram car: game object type 11) moves on the client's own clock along
++//! `TransportAnimation.dbc` (`transport`). BG3 carries its characters on a platform of its own that
++//! must make the same moves, so every frame in world mode `link/wowlifts.bin` says where each lift
++//! on the map is and where the keyframe span it is on ends, with the time left to that end: one
++//! straight move at one speed, which BG3's own platform move repeats (`Lifts.lua`).
++//!
++//! `wowlifts.bin`: `WBL1`, seq u32, count u32, count x (guid u64, entry u32, flags u32 (1 moving),
++//! period ms u32, cycle ms u32, WoW x y z now f32, WoW x y z of the span's end f32, ms to it
++//! u32), seq again. Written whole (a temporary file renamed over it).
++
++use std::path::PathBuf;
++
++use bevy::prelude::*;
++
++use crate::net::Guid;
++use crate::transport::{LiftNow, Transport, TransportAnchor};
++
++#[derive(Resource)]
++struct LiftsOut {
++    path: PathBuf,
++    seq: u32,
++    frames: u64,
++}
++
++pub(crate) fn build(app: &mut App, dir: PathBuf) {
++    app.insert_resource(LiftsOut { path: dir.join("wowlifts.bin"), seq: 0, frames: 0 })
++        .add_systems(Update, write_lifts.after(benilla_world::schedule::WorldStage::Input));
++    info!("wowbg3 lifts: WoW's lifts go to wowlifts.bin every frame in world mode");
++}
++
++/// One lift's record.
++fn encode(guid: u64, l: &LiftNow, out: &mut Vec<u8>) {
++    out.extend_from_slice(&guid.to_le_bytes());
++    out.extend_from_slice(&l.entry.to_le_bytes());
++    out.extend_from_slice(&u32::from(l.moving).to_le_bytes());
++    out.extend_from_slice(&l.period_ms.to_le_bytes());
++    out.extend_from_slice(&l.cycle_ms.to_le_bytes());
++    for v in l.pos.iter().chain(l.to.iter()) {
++        out.extend_from_slice(&v.to_le_bytes());
++    }
++    out.extend_from_slice(&l.to_ms.to_le_bytes());
++}
++
++fn write_lifts(mut out: ResMut<LiftsOut>, lifts: Query<(&Guid, &Transport, &TransportAnchor)>) {
++    if !crate::wowbg3_lead::body::active() {
++        return;
++    }
++    let mut body = Vec::new();
++    let mut n = 0u32;
++    for (guid, transport, anchor) in &lifts {
++        if let Some(l) = transport.lift_now(anchor) {
++            encode(guid.0, &l, &mut body);
++            n += 1;
++        }
++    }
++    out.seq = out.seq.wrapping_add(1).max(1);
++    let mut bytes = Vec::with_capacity(16 + body.len());
++    bytes.extend_from_slice(b"WBL1");
++    bytes.extend_from_slice(&out.seq.to_le_bytes());
++    bytes.extend_from_slice(&n.to_le_bytes());
++    bytes.extend_from_slice(&body);
++    bytes.extend_from_slice(&out.seq.to_le_bytes());
++    let tmp = out.path.with_extension("tmp");
++    if std::fs::write(&tmp, &bytes).is_ok() {
++        let _ = std::fs::rename(&tmp, &out.path);
++    }
++    out.frames += 1;
++    if out.frames.is_multiple_of(3000) {
++        info!("wowbg3 lifts: {} frames of wowlifts.bin, {n} lifts now", out.frames);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_record_is_52_bytes_in_the_documented_order() {
++        let l = LiftNow {
++            entry: 20649,
++            period_ms: 16667,
++            cycle_ms: 5000,
++            pos: [1.0, 2.0, 3.0],
++            moving: true,
++            to: [1.0, 2.0, 40.0],
++            to_ms: 250,
++        };
++        let mut b = Vec::new();
++        encode(0xF120_0050_A900_0001, &l, &mut b);
++        assert_eq!(b.len(), 52);
++        assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 0xF120_0050_A900_0001);
++        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 20649);
++        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 1);
++        assert_eq!(f32::from_le_bytes(b[44..48].try_into().unwrap()), 40.0);
++        assert_eq!(u32::from_le_bytes(b[48..52].try_into().unwrap()), 250);
++    }
++}
