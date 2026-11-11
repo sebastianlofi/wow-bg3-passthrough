@@ -1367,6 +1367,12 @@ std::atomic<float> g_pick_top{std::numeric_limits<float>::infinity()};
 std::atomic<bool> g_pick_terrain{false};
 constexpr float kPickTopSlackM = 0.3f;
 std::atomic<bool> g_indoors{false};  // she is under a ceiling: see IndoorMode; bit 2 of bg3cam.bin's flags
+// The storey clip as benilla draws it (its patch 0133, link/wowclip.txt: what lies over a height inside her building's
+// footprint is not drawn). The ceiling measured over her here is not that height: in a stairwell or under a tall hall
+// it is the roof far above, and what stands between the two is not drawn but took the click (a playtest report: a
+// click on the floor seen through the opened wall walked to that wall). Read ten times a second with her position.
+std::atomic<bool> g_clip_on{false};
+std::atomic<float> g_clip[5];        // the height, then the footprint's x and z minimum and maximum (BG3's world)
 std::atomic<float> g_pick_eye[3];    // the eye the see-through's capsule starts at, as served
 std::atomic<float> g_pick_her[3];    // and where it ends: her chest
 constexpr float kCutRadiusM = 4.4f * 0.9144f;  // benilla's SeeSettings: R, the cut reaches half of it
@@ -1536,6 +1542,8 @@ struct PickFilter {
     bool Terrain = false;
     bool Cut = false;
     glm::vec3 Eye{}, Her{};
+    bool Clip = false;
+    float ClipTop = 0.0f, ClipX0 = 0.0f, ClipZ0 = 0.0f, ClipX1 = 0.0f, ClipZ1 = 0.0f;
 };
 
 PickFilter pick_filter(int context) {
@@ -1545,6 +1553,12 @@ PickFilter pick_filter(int context) {
     f.Terrain = g_pick_terrain.load(std::memory_order_relaxed);
     f.Cut = true;  // benilla 0097: the see-through runs indoors and out
     f.On = f.Cut || std::isfinite(f.Top);
+    f.Clip = g_clip_on.load(std::memory_order_relaxed);
+    f.ClipTop = g_clip[0].load(std::memory_order_relaxed);
+    f.ClipX0 = g_clip[1].load(std::memory_order_relaxed);
+    f.ClipZ0 = g_clip[2].load(std::memory_order_relaxed);
+    f.ClipX1 = g_clip[3].load(std::memory_order_relaxed);
+    f.ClipZ1 = g_clip[4].load(std::memory_order_relaxed);
     for (int i = 0; i < 3; ++i) {
         f.Eye[i] = g_pick_eye[i].load(std::memory_order_relaxed);
         f.Her[i] = g_pick_her[i].load(std::memory_order_relaxed);
@@ -1567,10 +1581,19 @@ bool in_see_cut(PickFilter const& f, glm::vec3 const& p) {
     return glm::length(p - (f.Eye - toEye * t)) < reach;
 }
 
-bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind, glm::vec3 const& n) {
+bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind, glm::vec3 const& n, glm::vec3 const& ray) {
+    // A building's face seen from behind: WoW draws its walls one-sided, so from outside a room one looks through
+    // the near wall at the floor, and the click took that wall (a playtest report: "the character walks to the wall
+    // in front instead of the ground in the back"). The triangles keep WoW's winding; the cursor passes the ones
+    // that face away from it.
+    if (kind == 2 && glm::dot(n, ray) > 0.0f) return true;
+    // Over the ceiling measured over her, or over the storey clip benilla draws (its `wow_storey_clip`: a height,
+    // inside the building's footprint).
+    const bool over = p.y > f.Top
+        || (f.Clip && p.y > f.ClipTop && p.x >= f.ClipX0 && p.x <= f.ClipX1 && p.z >= f.ClipZ0 && p.z <= f.ClipZ1);
     // benilla 0097 and 0098: terrain is cut too, but for ground one can walk on.
-    if (kind == 0 && !(f.Terrain && p.y > f.Top)) return f.Cut && std::abs(n.y) <= kGroundNormalY && in_see_cut(f, p);
-    return p.y > f.Top || (f.Cut && in_see_cut(f, p));
+    if (kind == 0 && !(f.Terrain && over)) return f.Cut && std::abs(n.y) <= kGroundNormalY && in_see_cut(f, p);
+    return over || (f.Cut && in_see_cut(f, p));
 }
 
 bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
@@ -1600,7 +1623,7 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
                 if (kinds != kKindAll && ((kinds >> (r.Kind.empty() ? 0 : r.Kind[i])) & 1u) == 0) continue;
                 float t;
                 if (tri_hit(r.Tris[i], a, d, t) && t < best
-                    && (!pick.On || !pick_ignores(pick, a + d * t, r.Kind.empty() ? 0 : r.Kind[i], r.Tris[i].N))) {
+                    && (!pick.On || !pick_ignores(pick, a + d * t, r.Kind.empty() ? 0 : r.Kind[i], r.Tris[i].N, d))) {
                     best = t;
                     normal = r.Tris[i].N;
                 }
@@ -3419,6 +3442,29 @@ bool clear_eye(glm::vec3 const& eye0, glm::vec3 const& fwd, glm::vec3 const& tav
     ArenaRays const* r = g_scene[1].Rays.load(std::memory_order_acquire);
     if (r == nullptr || r->Tris.empty() || !inside_square(*r, eye0)) return false;
     const glm::vec3 herChest = tav + glm::vec3(0.0f, kChestM, 0.0f);
+    {
+        // benilla's storey clip (link/wowclip.txt: "WCL1 on height x0 z0 x1 z1", metres from her in BG3's axes).
+        static double readAt = 0.0;
+        const double now = mono_seconds();
+        if (now - readAt > 0.1) {
+            readAt = now;
+            int on = 0;
+            float v[5] = {};
+            bool ok = false;
+            if (std::FILE* cf = std::fopen((io_dir() + "link/wowclip.txt").c_str(), "r")) {
+                ok = std::fscanf(cf, "WCL1 %d %f %f %f %f %f", &on, &v[0], &v[1], &v[2], &v[3], &v[4]) == 6;
+                std::fclose(cf);
+            }
+            if (ok && on != 0) {
+                g_clip[0].store(tav.y + v[0], std::memory_order_relaxed);
+                g_clip[1].store(tav.x + v[1], std::memory_order_relaxed);
+                g_clip[2].store(tav.z + v[2], std::memory_order_relaxed);
+                g_clip[3].store(tav.x + v[3], std::memory_order_relaxed);
+                g_clip[4].store(tav.z + v[4], std::memory_order_relaxed);
+            }
+            g_clip_on.store(ok && on != 0, std::memory_order_relaxed);
+        }
+    }
     const bool sheUnder = under_terrain(*r, herChest);
     const glm::vec3 chest = clear_anchor(*r, eye0, fwd, tav, sheUnder);
     *anchor = chest;

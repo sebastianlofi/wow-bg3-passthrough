@@ -1,0 +1,60 @@
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index a2cb9b3..14b599e 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -309,6 +309,7 @@ fn tag_frame(
+     lighting: Option<Res<benilla_world::lighting::WowLighting>>,
+     figures: Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>,
+     rooms: Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::ShadeOnlyRoot)>,
++    clip: Option<Res<benilla_world::see_through::SeeClip>>,
+     mut tag: ResMut<FrameTag>,
+ ) {
+     if let Some(l) = lighting.as_ref() {
+@@ -324,6 +325,9 @@ fn tag_frame(
+     }
+     shade_export(&figures, &rooms); // patch 0126
+     unit_light_export(&rooms); // patch 0132
++    if let Some(clip) = clip.as_ref() {
++        clip_export(&rooms, clip); // patch 0133
++    }
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+@@ -412,6 +416,37 @@ fn shade_export(
+     }
+ }
+ 
++/// Patch 0133: the storey clip as it is drawn (patch 0095: what lies over a height inside her building's footprint is
++/// not drawn), for BG3's cursor: a click must go through what is not there. The plugin measured a ceiling of its own
++/// over her, which in a stairwell or under a tall hall is far above the height drawn from here, and clicks landed on
++/// walls nobody could see (a playtest report). `$WOW_BG3_LINK_DIR/wowclip.txt`, one line "WCL1 <1 while the clip
++/// shows, else 0> <height> <x0> <z0> <x1> <z1>": metres in BG3's axes from the hero's figure (BG3's x is WoW's y, its
++/// z WoW's -x, both this client's -x and z), written whole (rename) when a value moved 5 cm.
++fn clip_export(
++    rooms: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::ShadeOnlyRoot)>,
++    clip: &benilla_world::see_through::SeeClip,
++) {
++    static LAST: std::sync::Mutex<Option<[f32; 6]>> = std::sync::Mutex::new(None);
++    const M: f32 = 0.9144;
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let Some(h) = rooms.iter().find(|(name, _, _)| name.as_str() == "wowbg3 Tav").map(|(_, gt, _)| gt.translation()) else { return };
++    let v = if clip.level() > 0 {
++        [1.0, (clip.y - h.y) * M, -(clip.hi.x - h.x) * M, (clip.lo.y - h.z) * M, -(clip.lo.x - h.x) * M, (clip.hi.y - h.z) * M]
++    } else {
++        [0.0; 6]
++    };
++    let Ok(mut last) = LAST.lock() else { return };
++    if last.is_some_and(|p| p.iter().zip(v.iter()).all(|(a, b)| (a - b).abs() < 0.05)) {
++        return;
++    }
++    let text = format!("WCL1 {} {:.2} {:.2} {:.2} {:.2} {:.2}\n", v[0] as u8, v[1], v[2], v[3], v[4], v[5]);
++    let path = std::path::Path::new(&dir).join("wowclip.txt");
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
++        *last = Some(v);
++    }
++}
++
+ /// Patch 0132: the light WoW gives the hero's figure in a room, for BG3's own drawing of the party (the render plugin
+ /// lights BG3's pixels with it as WoW lights a unit indoors): `$WOW_BG3_LINK_DIR/wowunitlight.txt`, "WUL1 <count>"
+ /// then a line a lobe, "<toward the light x y z, WoW axes> <r g b>": the floor's baked light on WoW's fixed axis, then
