@@ -26,7 +26,7 @@ static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[
 #define FB_TAB (17 * 17 * 17 * 3)
 #define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
 #define FB_LOBE 8                      // WoW's room light for the hero's figure: its lobes, after the point lights, 8 floats each
-#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4 + 4)  // then the world's up in the camera's view and 1 when BG3's G-buffer normal is bound; then, a lobe, the place in view and reach of the figure it is for; last, how far WoW's light outdoors is taken toward its own luminance (the night's softening)
+#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4 + 4 + FB_LOBE * 4)  // then the world's up in the camera's view and 1 when BG3's G-buffer normal is bound; then, a lobe, the place in view and reach of the figure it is for; last, how far WoW's light outdoors is taken toward its own luminance (the night's softening), the test view, how many of the party's figures follow; then each figure's place in view (for a pixel BG3's image has no eye depth for)
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
@@ -129,6 +129,23 @@ static void wlit_put(float* out, int on, const float* eye, const float* fwd, con
     out[0] = 0.0f; out[1] = g_cc.wdamb; out[2] = 0.0f; out[3] = 0.0f;
     // The world's up in the camera's view (BG3's y), and whether BG3's own normal is there to read.
     { float* t = out + 4 + FB_LIT * 8 + FB_LOBE * 8; t[0] = right[1]; t[1] = up[1]; t[2] = fwd[1]; t[3] = g_blv_nrm ? 1.0f : 0.0f; }
+    // The party's figures in the camera's view (a metre above their feet), whatever their shade: the eye depth of
+    // BG3's pixels, which WoW's fog and point lights for a pixel go by (see eye_z in wowbg3_fxbg2.frag).
+    {
+        float* t = out + 4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4;
+        float fat[SHD_MAX][3]; int fn = 0;
+        if (g_tav.seq) { pthread_mutex_lock(&g_shd.m); fn = g_shd.n; memcpy(fat, g_shd.at, sizeof fat); pthread_mutex_unlock(&g_shd.m); }
+        if (fn > FB_LOBE) fn = FB_LOBE;
+        for (int k = 0; k < fn; k++) {
+            const double p[3] = {fat[k][0] - eye[0], fat[k][1] + 1.0 - eye[1], fat[k][2] - eye[2]};
+            float* f4 = t + 4 + k * 4;
+            f4[0] = (float)(p[0] * right[0] + p[1] * right[1] + p[2] * right[2]);
+            f4[1] = (float)(p[0] * up[0] + p[1] * up[1] + p[2] * up[2]);
+            f4[2] = (float)(p[0] * fwd[0] + p[1] * fwd[1] + p[2] * fwd[2]);
+            f4[3] = 1.0f;
+        }
+        t[0] = 0.0f; t[1] = g_cc.wdzdbg; t[2] = (float)fn; t[3] = 0.0f;
+    }
     // The room's lobes (with the ambient, whatever wdwlit says): toward each light in the camera's view (right, up,
     // forward; BG3's axes are WoW's y, z, -x), then its colour.
     if (on) {
@@ -195,7 +212,7 @@ static void wlit_put(float* out, int on, const float* eye, const float* fwd, con
             { static uint64_t saidl; if (g_cc.wdlog && saidl++ % 1800 == 0) logf_("wdwlit: %d of %d figures in WoW's shade take the sun's share (first level %.2f, in view at %.2f %.2f %.2f m, lobe toward %.2f %.2f %.2f colour %.2f %.2f %.2f; eye %.1f %.1f %.1f, figure %.1f %.1f %.1f)", k8, n, n ? level[0] : 0.0f, out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 5], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 6], out[4 + FB_LIT * 8], out[4 + FB_LIT * 8 + 1], out[4 + FB_LIT * 8 + 2], out[4 + FB_LIT * 8 + 4], out[4 + FB_LIT * 8 + 5], out[4 + FB_LIT * 8 + 6], eye[0], eye[1], eye[2], n ? at[0][0] : 0.0f, n ? at[0][1] : 0.0f, n ? at[0][2] : 0.0f); }
         }
     }
-    { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; BG3's eye depth %s, ambient %s", g_amb.nlit, g_blv_z ? "found" : "not bound by its lighting pass", on || !g_blv_z ? "on" : "off"); }
+    { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; ambient %s", g_amb.nlit, on ? "on" : "off"); }
     if (!on || !g_cc.wdwlit || !g_tav.seq) return;
     pthread_mutex_lock(&g_amb.m);
     const int n = g_amb.nlit;
@@ -563,9 +580,25 @@ static void bare_draw(VkCommandBuffer cb) {
             if (si->slot[b].type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || !si->slot[b].res) continue;
             uint64_t im = view_image(si->slot[b].res);
             if (im && im == g_gb_alb) { t_bare.alb = si->slot[b].res; t_bare.lalb = si->slot[b].layout; }
-            if (im && im == g_gb_z) { t_bare.z = si->slot[b].res; t_bare.lz = si->slot[b].layout; }
+            if (im && im == g_gb_z) { t_bare.z = si->slot[b].res; t_bare.lz = si->slot[b].layout; }  // bound for the test view alone (wdzdbg=2): no depth is in it
             if (im && im == g_gb_nrm) { t_bare.nrm = si->slot[b].res; t_bare.lnrm = si->slot[b].layout; }
             if (im && im == g_gb_surf) { t_bare.surf = si->slot[b].res; t_bare.lsurf = si->slot[b].layout; }
+        }
+    }
+    {   // once a G-buffer: every image the lighting pass samples (which of them holds the eye depth)
+        static uint64_t said_for;
+        if (said_for != g_gb_alb && g_gb_alb) {
+            said_for = g_gb_alb;
+            for (uint32_t s = 0; s < 4; s++) {
+                SetInfo* si = t_set[s] ? set_find(t_set[s]) : NULL;
+                for (uint32_t b = 0; si && b < DESC_SLOTS; b++) {
+                    if ((si->slot[b].type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && si->slot[b].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) || !si->slot[b].res) continue;
+                    uint64_t im = view_image(si->slot[b].res);
+                    ImgInfo* ii = im ? TABLE_FIND(g_img, IMG_CAP, im, 0) : NULL;
+                    logf_("wdbare: lighting pass samples set %u binding %u: image %llx format %d %ux%u layout %d%s%s", s, b, (unsigned long long)im, ii ? (int)ii->fmt : -1,
+                          ii ? ii->w : 0, ii ? ii->hgt : 0, (int)si->slot[b].layout, im == g_role.depth ? " (the scene depth)" : "", im == g_gb_z ? " (G-buffer target 4)" : "");
+                }
+            }
         }
     }
     t_bare.img = 0;
@@ -577,7 +610,6 @@ static void bare_draw(VkCommandBuffer cb) {
     if (!t_bare.img || !t_bare.alb || !t_bare.surf) { if (!said++) logf_("wdbare: pass found without its parts: target %llx albedo %llx surface %llx (G-buffer %llx %llx)", (unsigned long long)t_bare.img, (unsigned long long)t_bare.alb, (unsigned long long)t_bare.surf, (unsigned long long)g_gb_alb, (unsigned long long)g_gb_surf); return; }
     g_blv_alb = t_bare.alb; g_blv_lalb = t_bare.lalb; g_blv_surf = t_bare.surf; g_blv_lsurf = t_bare.lsurf;  // patch28
     g_blv_z = t_bare.z; g_blv_lz = t_bare.lz;
-    { static int saidz; if (g_cc.wdwfog && !t_bare.z && !saidz++) logf_("wdwfog: BG3's lighting pass binds no eye-depth image (G-buffer %llx): no fog on BG3's pixels", (unsigned long long)g_gb_z); }
     t_bare_cb = cb;
 }
 static int bare_make(DeviceData* d) {
@@ -1497,8 +1529,8 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     float pc[48];
     memset(pc, 0, sizeof pc);
     if (!fog && g_blv_alb && amb_get(pc + 40)) pc[43] = 1.0f;  // WoW's ambient, times the dial (amb_present)
-    if (!fog && g_blv_z) wfog_get(pc + 44);
-    if (!fog && g_fbg.tmap) wlit_put(g_fbg.tmap + FB_TAB, g_blv_z && pc[43] > 0.5f, eN, fN, rN, uN);  // WoW's fog: start and end (yards of eye depth), 1 when there is one, and its colour packed
+    if (!fog) wfog_get(pc + 44);
+    if (!fog && g_fbg.tmap) wlit_put(g_fbg.tmap + FB_TAB, pc[43] > 0.5f, eN, fN, rN, uN);  // WoW's fog: start and end (yards of eye depth), 1 when there is one, and its colour packed
     memcpy(pc + 0, fN, 12); pc[3] = txN; memcpy(pc + 4, rN, 12); pc[7] = tyN; memcpy(pc + 8, uN, 12); pc[11] = 1.0f / (float)ii->w;
     memcpy(pc + 12, eK, 12); pc[15] = txK; memcpy(pc + 16, fK, 12); pc[19] = tyK; memcpy(pc + 20, rK, 12); pc[23] = 1.0f / (float)ii->hgt; memcpy(pc + 24, uK, 12);
     uint32_t* u = (uint32_t*)(pc + 28);

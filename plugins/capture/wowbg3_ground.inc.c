@@ -109,7 +109,7 @@ static void wd_mark(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkBuffer
 // The G-buffer pass being recorded on this thread: its command buffer, images, size; the frame's camera.
 static __thread VkCommandBuffer t_gr_cb;
 static __thread uint64_t t_gr_img[4];
-static uint64_t g_gb_alb, g_gb_surf, g_gb_z;  // BG3's G-buffer albedo, surface and eye-depth (metres) images (wdbare; the feed's fog)
+static uint64_t g_gb_alb, g_gb_surf, g_gb_z;  // BG3's G-buffer albedo and surface images (wdbare) and its fourth colour target (RGBA8: not a depth; the eye depth is the lighting pass's R32F image, bare_draw)
 static __thread int32_t t_gr_lay[4];
 static __thread uint32_t t_gr_w, t_gr_h;
 static __thread int t_gr_cam;
@@ -285,6 +285,15 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
     ImgInfo* i1 = TABLE_FIND(g_img, IMG_CAP, col[1], 0);
     ImgInfo* i2 = TABLE_FIND(g_img, IMG_CAP, col[2], 0);
     if (!i0 || !i1 || !i2 || i0->fmt != VK_FORMAT_R16G16_SFLOAT || i0->samples > 1) return;
+    {   // once a G-buffer: what its five colour targets are (the fourth is read as the eye depth)
+        static uint64_t said_for;
+        if (said_for != col[0]) {
+            said_for = col[0];
+            char b[256]; int n = 0;
+            for (uint32_t k = 0; k < nc && k < 5; k++) { ImgInfo* ik = TABLE_FIND(g_img, IMG_CAP, col[k], 0); n += snprintf(b + n, sizeof b - (size_t)n, " %d:%ux%u", ik ? (int)ik->fmt : -1, ik ? ik->w : 0, ik ? ik->hgt : 0); }
+            logf_("ground: BG3's G-buffer targets (format:size)%s, pass %ux%u", b, w, h);
+        }
+    }
     t_gr_cb = cb;
     t_gr_img[0] = g_role.depth; t_gr_img[1] = col[0]; t_gr_img[2] = col[1]; t_gr_img[3] = col[2];
     if (g_gb_nrm != col[0]) { g_gb_nrm = col[0]; g_blv_nrm = 0; }  // a rebuilt G-buffer: its normal has no view known yet
