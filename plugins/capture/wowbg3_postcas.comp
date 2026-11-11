@@ -40,8 +40,8 @@ void main() {
     }
     vec4 c = texelFetch(cin, q, 0);
     if (!(n > 1.5 && w.a > 0.5)) { imageStore(cout, q, c); return; }
-    // WoW's own colour, and over it what BG3 drew there after its composite: that share of BG3's displayed pixel
-    // (a glow adds, smoke takes away).
+    // WoW's own colour, and over it what BG3 drew there after its composite: a glow adds its share of BG3's displayed
+    // pixel, smoke takes its part of WoW's colour away.
     vec4 l = texelFetch(late, q, 0);
-    imageStore(cout, q, vec4(l.a > 0.5 ? clamp(w.rgb + c.rgb * l.rgb, vec3(0.0), vec3(1.0)) : w.rgb, 1.0));
+    imageStore(cout, q, vec4(l.a > 0.5 ? clamp(mix(w.rgb * (1.0 + l.rgb), w.rgb + c.rgb * l.rgb, step(vec3(0.0), l.rgb)), vec3(0.0), vec3(1.0)) : w.rgb, 1.0));
 }

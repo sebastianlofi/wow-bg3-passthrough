@@ -1,7 +1,7 @@
 // WOW-BG3 capture layer (wdpost, wowbg3_fxbg.inc.c): after one of BG3's overlay passes (between its TAA and its display
 // transform, there only while something is aimed or highlighted: an ability's area on the ground, an outline), what the
 // pass changed at a pure WoW pixel. The pass reads the scene and writes it again with its overlay: where the two differ,
-// the overlay's share of the written pixel a channel (1 - before / after) joins what BG3's effects pass drew there
+// the overlay's share of the written pixel a channel joins what BG3's effects pass drew there
 // (wowbg3_post.frag) in the same image, shares multiplied as the passes follow each other. wdpostcas adds that share
 // of BG3's displayed pixel to WoW's own colour.
 #version 450
@@ -16,8 +16,13 @@ void main() {
     if (!(imageLoad(nob, q).r > 1.5)) return;
     vec3 b = texelFetch(before, q, 0).rgb, a = texelFetch(after, q, 0).rgb;
     if (!any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6)))) return;
-    vec3 l2 = clamp((a - b) / max(a, vec3(1e-6)), vec3(-8.0), vec3(1.0));
+    // As wowbg3_post.frag keeps it: the added light's share (0..1), or minus the part of the light taken away (-1..0).
+    vec3 l2 = mix(-(1.0 - a / max(b, vec3(1e-6))), (a - b) / max(a, vec3(1e-6)), step(b, a));
     vec4 l = imageLoad(late, q);
     vec3 l1 = l.a > 0.5 ? l.rgb : vec3(0.0);
-    imageStore(late, q, vec4(clamp(1.0 - (1.0 - l1) * (1.0 - l2), vec3(-8.0), vec3(1.0)), 1.0));
+    // The two in a row: what both let through, and the light either added; one number a channel holds the light when
+    // there is any, else the loss.
+    vec3 thru = (1.0 + min(l1, vec3(0.0))) * (1.0 + min(l2, vec3(0.0)));
+    vec3 add = 1.0 - (1.0 - max(l1, vec3(0.0))) * (1.0 - max(l2, vec3(0.0)));
+    imageStore(late, q, vec4(mix(thru - 1.0, add, step(vec3(0.005), add)), 1.0));
 }

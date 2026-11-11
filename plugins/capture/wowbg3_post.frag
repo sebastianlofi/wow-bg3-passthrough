@@ -28,13 +28,17 @@ void main() {
     // BG3 draws more after its composite, straight into the composite's image (its effects pass): the aura of a
     // character aiming, an ability's area on the ground, the wisps and glow of a spell. That image is copied before and
     // after the pass: where the two differ, the difference is what BG3 drew over WoW's ground, kept as its share of the
-    // pixel a channel (1 - before / after: 0 nothing, towards 1 a glow that outshines the ground, negative where it
-    // darkened). wdpostcas adds that share of BG3's displayed pixel to WoW's own colour.
+    // pixel a channel: where it added light, the light's share of the pixel (1 - before / after: towards 1 a glow that
+    // outshines the ground), and wdpostcas adds that share of BG3's displayed pixel to WoW's own colour; where it took
+    // light away (smoke, a dark particle), minus the part taken (after / before - 1), and WoW's colour loses the same
+    // part. Not a difference of displayed colours there: BG3's picture of the ground can be far brighter than WoW's
+    // (its exposure during a bright cast), and taking that much off WoW's night ground left it black.
     vec4 l = vec4(0.0);
     if ((pc.dbg & 4u) != 0u) {
         vec3 b = texelFetch(cmp0, q, 0).rgb, a = texelFetch(cmp1, q, 0).rgb;
         // The same image twice: equal bit for bit where nothing was drawn.
-        if (any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6)))) l = vec4(clamp((a - b) / max(a, vec3(1e-6)), vec3(-8.0), vec3(1.0)), 1.0);
+        if (any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6))))
+            l = vec4(mix(-(1.0 - a / max(b, vec3(1e-6))), (a - b) / max(a, vec3(1e-6)), step(b, a)), 1.0);
     }
     imageStore(late, q, l);
     imageStore(nob, q, vec4((pc.dbg & 2u) == 0u ? 2.0 : 1.0));
