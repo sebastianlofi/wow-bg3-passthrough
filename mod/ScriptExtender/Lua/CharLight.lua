@@ -1,48 +1,38 @@
--- CharLight.lua: BG3's own character light follows WoW's ambient level (client).
+-- CharLight.lua: BG3's own close-up character light is off in WoW's world (client).
 --
--- BG3 lights every character with a small light of its own that follows the head (the CharacterLight component, a
--- setup of up to three lights), so a character stays readable wherever it stands. That light does not know WoW's time
--- of day: by WoW's night it kept the party twice as bright as WoW shows a unit there (measured against WoW's own
--- drawing of the hero), and with it off the party fell to half. So its strength follows WoW's ambient colour (link/
--- wowsky.txt, benilla patch 0125): as BG3 set it at the ambient the game's light was matched at (Northshire's noon),
--- less in proportion under a darker one, never more. Outside WoW's world (camp) it is BG3's again.
+-- BG3 lights every character with a small setup of its own that follows the head (the CharacterLight component: a
+-- key, a fill and rim lights on the "character only" light channel). BG3 fades that setup in as the camera comes
+-- close (in full within about 4.4 m of camera distance, gone by 5.3 m), so a figure's light changed with the zoom:
+-- bright and modelled up close, and a step further out only what WoW's light gives it (a playtest report: "why does
+-- zooming in and out change my character's lighting"). WoW has no such light: a unit is lit the same at every
+-- camera distance, and WoW's light for BG3's figures comes from the render plugin (WoW's ambient, its room and
+-- point lights, on BG3's own normals). So in WoW's world the component is switched off, and outside it (camp)
+-- it is as BG3 set it.
+--
+-- Before, this file scaled each light's LightDesc.Amount by WoW's ambient level. That value has no effect on what
+-- BG3 draws (held at 0 and at 1, at both zooms: no change in the picture), so it never did what it said.
 local M = {}
 
-M.REF = 0.2157      -- linear luminance of the ambient the light was matched under (0.4078 0.5098 0.6039)
 M.EVERY = 30        -- ticks
 
-local function lin(c) return math.max(0, c) ^ 2.2 end
-
--- The share of BG3's own strength for one wowsky.txt line, or nil. Pure.
-function M.Share(line)
-    local v = {}
-    for x in tostring(line):gmatch("%S+") do v[#v + 1] = tonumber(x) or x end
-    if v[1] ~= "WSK1" or #v < 10 or type(v[8]) ~= "number" or type(v[9]) ~= "number" or type(v[10]) ~= "number" then return nil end
-    -- The ambient WoW lights the hero's figure with when the file has it (benilla patch 0132: a room's own indoors).
-    local a = (type(v[16]) == "number" and type(v[17]) == "number" and type(v[18]) == "number") and {v[16], v[17], v[18]} or {v[8], v[9], v[10]}
-    local luma = 0.2126 * lin(a[1]) + 0.7152 * lin(a[2]) + 0.0722 * lin(a[3])
-    return math.max(0, math.min(1, luma / M.REF))
-end
-
-local own = {}      -- "<entity> <setup> <index>" -> the Amount BG3 gave that light
+local own = {}      -- "<entity>" -> the Enabled BG3 gave that character's light
 local last = nil
 
-local function apply(share)
+-- Pure: what a character light's Enabled should be. `inWorld`: WoW's world is what shows; `bg3`: what BG3 gave it.
+function M.Want(inWorld, bg3)
+    if inWorld then return false end
+    return bg3
+end
+
+local function apply(inWorld)
     local n = 0
     for _, e in ipairs(Ext.Entity.GetAllEntitiesWithComponent("CharacterLight")) do
         local cl = e.CharacterLight
-        for setup, lists in pairs(cl and cl.Lights or {}) do
-            for _, list in pairs(lists) do
-                for i, l in pairs(list) do
-                    local d = l.TimelineLight and l.TimelineLight.LightDesc
-                    if d then
-                        local key = tostring(e) .. " " .. tostring(setup) .. " " .. tostring(i)
-                        if own[key] == nil then own[key] = d.Amount end
-                        local want = own[key] * share
-                        if math.abs(d.Amount - want) > 1e-4 then d.Amount = want; n = n + 1 end
-                    end
-                end
-            end
+        if cl then
+            local key = tostring(e)
+            if own[key] == nil then own[key] = cl.Enabled end
+            local want = M.Want(inWorld, own[key])
+            if cl.Enabled ~= want then cl.Enabled = want; n = n + 1 end
         end
     end
     return n
@@ -54,15 +44,12 @@ function M.Start(runId)
         ticks = ticks + 1
         if ticks % M.EVERY ~= 7 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
-            local share = 1
             local okW, w = pcall(Ext.Json.Parse, Ext.IO.LoadFile("wow-bg3/link/world.json") or "")
-            if okW and type(w) == "table" and w.Active == true then
-                share = M.Share(Ext.IO.LoadFile("wow-bg3/link/wowsky.txt")) or 1
-            end
-            local n = apply(share)
-            if n > 0 and (not last or math.abs(share - last) > 0.02) then
-                Ext.Log.Print(string.format("WOW-BG3 charlight: BG3's character light at %.2f of its own (%d lights set)", share, n))
-                last = share
+            local inWorld = okW and type(w) == "table" and w.Active == true
+            local n = apply(inWorld)
+            if n > 0 and last ~= inWorld then
+                Ext.Log.Print(string.format("WOW-BG3 charlight: BG3's close-up character light %s (%d characters set)", inWorld and "off in WoW's world" or "as BG3 set it", n))
+                last = inWorld
             end
         end)
         if not ok then Ext.Log.Print("WOW-BG3 charlight: " .. tostring(err)) end

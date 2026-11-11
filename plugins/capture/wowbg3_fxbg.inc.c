@@ -26,7 +26,7 @@ static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[
 #define FB_TAB (17 * 17 * 17 * 3)
 #define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
 #define FB_LOBE 8                      // WoW's room light for the hero's figure: its lobes, after the point lights, 8 floats each
-#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8)
+#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4)  // and last: the world's up in the camera's view, 1 when BG3's G-buffer normal is bound
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
@@ -127,6 +127,8 @@ static void wfog_get(float* f) {
 // its range (yards), its colour.
 static void wlit_put(float* out, int on, const float* eye, const float* fwd, const float* right, const float* up) {
     out[0] = 0.0f; out[1] = g_cc.wdamb; out[2] = 0.0f; out[3] = 0.0f;
+    // The world's up in the camera's view (BG3's y), and whether BG3's own normal is there to read.
+    { float* t = out + 4 + FB_LIT * 8 + FB_LOBE * 8; t[0] = right[1]; t[1] = up[1]; t[2] = fwd[1]; t[3] = g_blv_nrm ? 1.0f : 0.0f; }
     // The room's lobes (with the ambient, whatever wdwlit says): toward each light in the camera's view (right, up,
     // forward; BG3's axes are WoW's y, z, -x), then its colour.
     if (on) {
@@ -318,12 +320,12 @@ static int fb_make(DeviceData* d) {
     VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &cr, NULL, NULL, 0, NULL};
     VkRenderPassCreateInfo rci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &at, 1, &sp, 0, NULL};
     if (d->CreateRenderPass(d->device, &rci, NULL, &g_fbg.rp) != VK_SUCCESS) return 0;
-    VkDescriptorSetLayoutBinding b[10] = {{8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+    VkDescriptorSetLayoutBinding b[11] = {{10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 10, b};
+    VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 11, b};
     if (d->CreateDescriptorSetLayout(d->device, &dci, NULL, &g_fbg.dsl) != VK_SUCCESS) return 0;
     VkSamplerCreateInfo smi = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0, VK_FALSE, 1, VK_FALSE, VK_COMPARE_OP_NEVER, 0, 0, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE};
@@ -353,7 +355,7 @@ static int fb_make(DeviceData* d) {
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_fbg.layout, g_fbg.rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_fbg.pipe) != VK_SUCCESS) return 0;
-    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}};
+    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2, 4, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_fbg.pool) != VK_SUCCESS) return 0;
     VkDescriptorSetLayout l[2] = {g_fbg.dsl, g_fbg.dsl};
@@ -492,7 +494,7 @@ static int fog_st_pass(DeviceData* d) {
 }
 
 // wdbare: the lighting buffer's image and layout, and BG3's own views of its G-buffer albedo and surface (recording thread).
-static __thread struct { uint64_t img; int32_t lay; uint64_t alb, surf, z; int32_t lalb, lsurf, lz; } t_bare;
+static __thread struct { uint64_t img; int32_t lay; uint64_t alb, surf, z, nrm; int32_t lalb, lsurf, lz, lnrm; } t_bare;
 static struct {
     int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe; VkSampler smp;
     VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring;
@@ -528,7 +530,7 @@ static void fb_forget_image(DeviceData* d, VkImage img) {
 }
 static void bare_draw(VkCommandBuffer cb) {
     // BG3's sets at its draw: the views of its albedo and surface images.
-    t_bare.alb = t_bare.surf = t_bare.z = 0;
+    t_bare.alb = t_bare.surf = t_bare.z = t_bare.nrm = 0;
     for (uint32_t s = 0; s < 4; s++) {
         SetInfo* si = t_set[s] ? set_find(t_set[s]) : NULL;
         for (uint32_t b = 0; si && b < DESC_SLOTS; b++) {
@@ -536,6 +538,7 @@ static void bare_draw(VkCommandBuffer cb) {
             uint64_t im = view_image(si->slot[b].res);
             if (im && im == g_gb_alb) { t_bare.alb = si->slot[b].res; t_bare.lalb = si->slot[b].layout; }
             if (im && im == g_gb_z) { t_bare.z = si->slot[b].res; t_bare.lz = si->slot[b].layout; }
+            if (im && im == g_gb_nrm) { t_bare.nrm = si->slot[b].res; t_bare.lnrm = si->slot[b].layout; }
             if (im && im == g_gb_surf) { t_bare.surf = si->slot[b].res; t_bare.lsurf = si->slot[b].layout; }
         }
     }
@@ -1385,6 +1388,14 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             VkDescriptorImageInfo i9 = {g_fbg.asmp, zv, g_blv_z ? (VkImageLayout)g_blv_lz : VK_IMAGE_LAYOUT_GENERAL};
             VkWriteDescriptorSet wr9 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i9, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr9, 0, NULL);
+        }
+        // Binding 10: BG3's G-buffer normal (R16G16, as its lighting pass bound it): the facing WoW's light falls on,
+        // with the detail of BG3's own materials. Until that pass has been seen, an image of our own (the table's
+        // tail says which, and the facing comes from the eye depths).
+        {
+            VkDescriptorImageInfo i10 = {g_fbg.asmp, g_blv_nrm ? (VkImageView)g_blv_nrm : g_blm.wdsp.view, g_blv_nrm ? (VkImageLayout)g_blv_lnrm : VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet wr10 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i10, NULL, NULL};
+            d->UpdateDescriptorSets(d->device, 1, &wr10, 0, NULL);
         }
         static VkImageView seen7[2];
         if (seen7[k] != g_blm.wdsp.view) {

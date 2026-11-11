@@ -24,6 +24,7 @@ layout(rgba16f, set = 0, binding = 5) uniform readonly image2D stimg;
 layout(rgba32f, set = 0, binding = 6) uniform writeonly image2D wfed;  // patch28: what the feed wrote (wdbloom)  // wdfogst: BG3's S and T at the last composite
 layout(set = 0, binding = 9) uniform sampler2D gz;    // BG3's G-buffer eye depth, metres (WoW's fog on BG3's pixels)
 layout(set = 0, binding = 8) uniform sampler2D galb;  // BG3's G-buffer albedo (WoW's ambient on BG3's pixels)
+layout(set = 0, binding = 10) uniform sampler2D gn;   // BG3's G-buffer normal (the facing WoW's light falls on)
 layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D wdsp;  // WoW's own displayed colour at this pixel, no jitter (a 1): wdpostcas
 float s2l(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 vec3 wow_disp(uint x, uint y) {
@@ -42,6 +43,11 @@ float wow_z(uint x, uint y) {
 }
 vec3 tab(int r, int g, int b) { int i = (r * 289 + g * 17 + b) * 3; return vec3(tb.TAB[i], tb.TAB[i + 1], tb.TAB[i + 2]); }
 const float ROOM_FLOOR = 0.30;  // the least light, as WoW counts it (0..1), on a BG3 character in a room
+// WoW's ambient is one colour whatever a face's direction, and WoW's textures carry their own painted shading under
+// it. BG3's albedo carries none (its form comes from light on its normals), so under a flat ambient a BG3 figure
+// shows as flat colour. The ambient falls by the facing instead: this much more on a face turned up, as much less
+// on one turned down, the same on one turned sideways.
+const float AMB_SHAPE = 0.35;
 // log2-free trilinear: the table holds log2(x) so dark colours stay accurate.
 vec3 inv3(vec3 w) {
     vec3 p = clamp(w, vec3(0.0), vec3(1.0)) * 16.0;
@@ -109,25 +115,36 @@ void main() {
         vec3 al = texelFetch(galb, q, 0).rgb;
         if (max(al.r, max(al.g, al.b)) < 0.5 / 255.0) return;
         vec3 tex = pow(clamp(al, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
-        // WoW's light sum for a unit: the ambient, and its three nearest point lights within their range (after the
-        // table in its buffer: count, share, then place in this view, range, colour a light).
-        vec3 lit = pc.amb.rgb;
         const int LT = 17 * 17 * 17 * 3;
+        const int LX = LT + 4 + 8 * 8 + 8 * 8;  // the tail's last four: the world's up in this view, 1 with BG3's normal bound
         int nl = int(tb.TAB[LT]), nb = int(tb.TAB[LT + 2]);
-        if (nl > 0 || nb > 0) {
-            // The pixel's place in this view (right, up, forward: metres) and its facing, from the eye depths beside
-            // it: on each axis the neighbour nearer in depth, so the step at a figure's edge gives no wild facing.
-            float z = texelFetch(gz, q, 0).r;
-            vec3 P = vpos(ndc, z);
+        // The pixel's place in this view (right, up, forward: metres) and its facing. BG3's own normal for it when
+        // its lighting pass has bound one (its materials' detail is in it: BG3 decodes s = xy * 3.5554 - 1.7777,
+        // n = (s * 2 / (|s|^2 + 1), 1 - 2 / (|s|^2 + 1))); else from the eye depths beside it: on each axis the
+        // neighbour nearer in depth, so the step at a figure's edge gives no wild facing.
+        float z = texelFetch(gz, q, 0).r;
+        vec3 P = vpos(ndc, z);
+        vec3 N;
+        if (tb.TAB[LX + 3] > 0.5) {
+            vec2 e = texelFetch(gn, q, 0).rg * 3.5554 - 1.7777;
+            float k = 2.0 / (dot(e, e) + 1.0);
+            N = vec3(e * k, 1.0 - k);
+        } else {
             vec2 px = vec2(pc.uN.w, pc.rK.w) * 2.0;
             float zl = texelFetch(gz, q + ivec2(-1, 0), 0).r, zr = texelFetch(gz, q + ivec2(1, 0), 0).r;
             float zu = texelFetch(gz, q + ivec2(0, -1), 0).r, zd = texelFetch(gz, q + ivec2(0, 1), 0).r;
             vec3 dx = abs(zr - z) < abs(zl - z) ? vpos(ndc + vec2(px.x, 0.0), zr) - P : P - vpos(ndc - vec2(px.x, 0.0), zl);
             vec3 dy = abs(zd - z) < abs(zu - z) ? vpos(ndc + vec2(0.0, px.y), zd) - P : P - vpos(ndc - vec2(0.0, px.y), zu);
-            vec3 N = cross(dx, dy);
+            N = cross(dx, dy);
             float nn = dot(N, N);
             N = nn > 1e-20 ? N / sqrt(nn) : vec3(0.0, 0.0, -1.0);
             if (dot(N, P) > 0.0) N = -N;
+        }
+        float shape = 1.0 + AMB_SHAPE * dot(N, vec3(tb.TAB[LX], tb.TAB[LX + 1], tb.TAB[LX + 2]));
+        // WoW's light sum for a unit: the ambient, and its three nearest point lights within their range (after the
+        // table in its buffer: count, share, then place in this view, range, colour a light).
+        vec3 lit = pc.amb.rgb * shape;
+        if (nl > 0 || nb > 0) {
             vec3 sum = vec3(0.0);
             if (nb > 0) {
                 // Lobes, each its colour by the facing (after the point lights in the buffer: toward the light in
@@ -170,7 +187,7 @@ void main() {
         // dark room near black: its units stay readable there by their bright painted textures, BG3's materials are
         // far darker and take a dim blue room's light as almost nothing (the maintainer's call: a readable floor, on the
         // characters alone).
-        if (tb.TAB[LT + 3] > 0.5) lit = max(lit, vec3(ROOM_FLOOR));
+        if (tb.TAB[LT + 3] > 0.5) lit = max(lit, vec3(ROOM_FLOOR * shape));
         o = vec4(max(inv3(tex * min(lit, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
         return;
     }
