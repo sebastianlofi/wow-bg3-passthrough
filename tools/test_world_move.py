@@ -121,31 +121,25 @@ class BareMaps(unittest.TestCase):
 
     def test_its_squares_are_cut_as_under_the_terrain(self):
         # The Stockade's entrance, z -18: under NO_TERRAIN by more than UNDER_CLEAR, so the cut takes its own floors.
-        args = B.cut_args(B.wow_arena.Terrain(self.maps, 34), 34, B.FIXED_CENTRE, B.FIXED_ORIGIN, (0, 0), (54.2, 0.3, -18.3))
+        args = B.cut_args(B.wow_arena.Terrain(self.maps, 34), 34, B.centre_of(34), B.FIXED_ORIGIN, (0, 0), (54.2, 0.3, -18.3))
         self.assertIn('--under', args)
 
 
 class OwnPlaces(Base):
-    """WOW_BG3_LAYOUT: every WoW map has its own centre (wow_places.py)."""
-    def test_unset_every_map_uses_the_one_centre(self):
+    """Every WoW map has its own centre (wow_places.py)."""
+    def test_a_map_has_its_own_centre(self):
         self.assertEqual(B.centre_of(0), B.FIXED_CENTRE)
-        self.assertEqual(B.centre_of(1), B.FIXED_CENTRE)
-
-    def test_set_a_map_has_its_own(self):
-        with mock.patch.object(B, 'LAYOUT', 'stacked'):
-            self.assertEqual(B.centre_of(0), B.FIXED_CENTRE)
-            self.assertNotEqual(B.centre_of(1), B.FIXED_CENTRE)
-            self.assertNotEqual(B.centre_of(36), B.centre_of(1))
-            with self.assertRaises(KeyError):
-                B.centre_of(999)
+        self.assertNotEqual(B.centre_of(1), B.FIXED_CENTRE)
+        self.assertNotEqual(B.centre_of(36), B.centre_of(1))
+        with self.assertRaises(KeyError):
+            B.centre_of(999)
 
     def test_the_same_wow_point_on_two_maps_is_two_bg3_places(self):
-        with mock.patch.object(B, 'LAYOUT', 'stacked'):
-            a, b = Fake(self.tmp), Fake(self.tmp)
-            a.centre, b.centre = B.centre_of(0), B.centre_of(1)
-            pa, pb = a.to_bg3((100.0, 200.0, 30.0)), b.to_bg3((100.0, 200.0, 30.0))
-            self.assertGreater(abs(pa[1] - pb[1]), 1000.0)
-            self.assertEqual(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2]))
+        a, b = Fake(self.tmp), Fake(self.tmp)
+        a.centre, b.centre = B.centre_of(0), B.centre_of(1)
+        pa, pb = a.to_bg3((100.0, 200.0, 30.0)), b.to_bg3((100.0, 200.0, 30.0))
+        self.assertGreater(abs(pa[1] - pb[1]), 1000.0)
+        self.assertEqual(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2]))
 
 
 class Moves(Base):

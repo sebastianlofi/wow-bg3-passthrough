@@ -7,23 +7,21 @@ gets a place of its own in the level: a centre, and from it world mode's mapping
 
   BG3 = centre(map) + (wow y, wow z, -wow x) * 0.9144
 
-The Eastern Kingdoms keep the centre world mode has always used. Every centre is a whole number of 64 m
-squares from it, so one lattice holds every map's squares. Two layouts:
+The level keeps the width of one continent and has three floors, FLOOR metres apart: the Eastern Kingdoms
+where world mode has always had them, Kalimdor above them, every other map in rows on the third floor. Every
+centre is a whole number of 64 m squares from the first, so one lattice holds every map's squares.
+(A level of one floor, wide enough for everything side by side, was tried: BG3 loads it, world mode does
+not start in it.)
 
-  stacked   the level keeps its width; Kalimdor lies FLOOR metres above the Eastern Kingdoms and every
-            other map in rows on a third floor
-  flat      everything on one floor in a wider level
+  places()              {map: centre}
+  centre(map)           KeyError for a map WoW's data has no ground for
+  box(map)              (x0, y0, z0, x1, y1, z1) in BG3: all the map's ground can lie in
+  bounds()              the level's bounds that hold every box
+  to_bg3(map, wow)      to_wow(map, bg3)      map_at(bg3)
+  level(spec)           a level's spec (release/levels/*.json) with bounds that hold every place
 
-  places(layout)            {map: centre}
-  centre(map, layout)       KeyError for a map WoW's data has no ground for
-  box(map, layout)          (x0, y0, z0, x1, y1, z1) in BG3: all the map's ground can lie in
-  bounds(layout)            the level's bounds that hold every box
-  to_bg3(map, wow, layout)  to_wow(map, bg3, layout)  map_at(bg3, layout)
-  level(spec, layout)       a level's spec (release/levels/*.json) fitted to a layout: bounds that hold every
-                            place; the corner squares, the start square and the parked pool clear of every place
-
-  wow_places.py table [LAYOUT]
-  wow_places.py level SPEC.json [LAYOUT]   the fitted spec on stdout
+  wow_places.py table
+  wow_places.py level SPEC.json   the fitted spec on stdout
 
 A place is in every save and every kept cut: TILES and the rules below must not change once released.
 """
@@ -34,13 +32,12 @@ YD = 0.9144
 CELL = 64
 TILE = 533.33333 * YD      # one WoW map tile in metres
 BASE = (0.0, 1000.0, 0.0)  # the Eastern Kingdoms' centre (world_bridge.py FIXED_CENTRE): WoW's sea level at y 1000
-FLOOR = 4096.0             # metres between floors of the stacked layout
+FLOOR = 4096.0             # metres between floors
 # A map's ground lies this far under and over its centre at most. Measured over every map's movement tiles:
 # -504 to 1970 yd (Kalimdor both); only the two unused test maps (13, 29) reach lower, to -1132 yd.
 BELOW, ABOVE = 1000.0, 2500.0
 GAP = 512.0                # metres kept between two maps (past any BG3 sight or spell reach)
-LAYOUT = 'stacked'
-EDGE = 16000 - 128         # the stacked level's usable half width
+EDGE = 16000 - 128         # the level's usable half width
 
 # The 1.12 client's maps with ground: the tiles (first index from WoW x, second from WoW y, both 0 to 63)
 # that the server's height maps or movement tiles exist for: (first lo, first hi, second lo, second hi).
@@ -85,84 +82,56 @@ def _rows(maps, xlo, xhi, zlo):
     return out
 
 
-def places(layout=LAYOUT):
-    """{map: centre} for a layout."""
-    if layout in _cache:
-        return _cache[layout]
-    rest = sorted(m for m in TILES if m not in CONTINENTS)
-    out = {0: BASE}
-    if layout == 'stacked':
-        out[1] = (BASE[0], BASE[1] + FLOOR, BASE[2])
+def places():
+    """{map: centre}."""
+    if not _cache:
+        _cache[0] = BASE
+        _cache[1] = (BASE[0], BASE[1] + FLOOR, BASE[2])
+        rest = sorted(m for m in TILES if m not in CONTINENTS)
         for m, (ox, oz) in _rows(rest, -EDGE, EDGE, -EDGE).items():
-            out[m] = (BASE[0] + ox, BASE[1] + 2 * FLOOR, BASE[2] + oz)
-    elif layout == 'flat':
-        ex0, ez0, ex1, ez1 = _flat_box(0)
-        kx0, kz0, kx1, kz1 = _flat_box(1)
-        kx = _up(ex1 + GAP - kx0)
-        out[1] = (BASE[0] + kx, BASE[1], BASE[2])
-        zlo = _up(max(ez1, kz1) + GAP)
-        for m, (ox, oz) in _rows(rest, -_up(-ex0), kx + kx1, zlo).items():
-            out[m] = (BASE[0] + ox, BASE[1], BASE[2] + oz)
-    else:
-        raise ValueError('no layout %r' % layout)
-    _cache[layout] = out
-    return out
+            _cache[m] = (BASE[0] + ox, BASE[1] + 2 * FLOOR, BASE[2] + oz)
+    return _cache
 
 
-def centre(m, layout=LAYOUT):
-    return places(layout)[int(m)]
+def centre(m):
+    return places()[int(m)]
 
 
-def box(m, layout=LAYOUT):
-    c = centre(m, layout)
+def box(m):
+    c = centre(m)
     x0, z0, x1, z1 = _flat_box(int(m))
     return c[0] + x0, c[1] - BELOW, c[2] + z0, c[0] + x1, c[1] + ABOVE, c[2] + z1
 
 
-def bounds(layout=LAYOUT):
-    """(x0, y0, z0, x1, y1, z1) of a level that holds every map, with room at the edges."""
-    boxes = [box(m, layout) for m in places(layout)]
-    lo = [min(b[i] for b in boxes) for i in range(3)]
-    hi = [max(b[i + 3] for b in boxes) for i in range(3)]
-    if layout == 'stacked':
-        return -16000, -100, -16000, 16000, int(_up(hi[1] + 128)), 16000
-    return (-int(_up(128 - lo[0])), -100, -int(_up(128 - lo[2])),
-            int(_up(hi[0] + 128)), int(_up(hi[1] + 128)), int(_up(hi[2] + 128)))
+def bounds():
+    """(x0, y0, z0, x1, y1, z1) of the level: its proven width, as high as the top floor needs."""
+    top = max(box(m)[4] for m in places())
+    return -16000, -100, -16000, 16000, int(_up(top + 128)), 16000
 
 
-def to_bg3(m, w, layout=LAYOUT):
-    c = centre(m, layout)
+def to_bg3(m, w):
+    c = centre(m)
     return c[0] + w[1] * YD, c[1] + w[2] * YD, c[2] - w[0] * YD
 
 
-def to_wow(m, b, layout=LAYOUT):
-    c = centre(m, layout)
+def to_wow(m, b):
+    c = centre(m)
     return -(b[2] - c[2]) / YD, (b[0] - c[0]) / YD, (b[1] - c[1]) / YD
 
 
-def map_at(b, layout=LAYOUT):
+def map_at(b):
     """The map whose box a BG3 point lies in, or None."""
-    for m in places(layout):
-        x0, y0, z0, x1, y1, z1 = box(m, layout)
+    for m in places():
+        x0, y0, z0, x1, y1, z1 = box(m)
         if x0 <= b[0] <= x1 and y0 <= b[1] <= y1 and z0 <= b[2] <= z1:
             return m
     return None
 
 
-def level(spec, layout=LAYOUT):
-    """A level's spec fitted to a layout. The stacked layout keeps the level's width, so only its height
-    changes. The flat layout is wider: the two corner squares BG3 sizes its maps by go to the new corners,
-    the start square and the parked pool to the low corner, which no map reaches."""
-    b = bounds(layout)
-    out = dict(spec, Bounds=list(b))
-    if layout == 'stacked':
-        return out
-    pool = dict(spec['BlankGrid'], X0=b[0] + 320, Z0=b[2] + 128)
-    out.update(Start=[b[0] + 160, 0, b[2] + 160], BlankGrid=pool,
-               Subgrids=[{'X': b[0] + 128, 'Y': 0, 'Z': b[2] + 128, 'Kind': 'walk'},
-                         {'X': b[0], 'Y': pool['Y'], 'Z': b[2], 'Kind': 'blank'},
-                         {'X': b[3] - CELL, 'Y': pool['Y'], 'Z': b[5] - CELL, 'Kind': 'blank'}])
-    return out
+def level(spec):
+    """A level's spec with the bounds that hold every place. The level keeps its width, so its own squares
+    (the two corners BG3 sizes its maps by, the start square, the parked pool) stay where they are."""
+    return dict(spec, Bounds=list(bounds()))
 
 
 def level_squares(spec):
@@ -175,16 +144,15 @@ def level_squares(spec):
 
 
 def main(argv):
-    if len(argv) >= 3 and argv[1] == 'level':
+    if len(argv) == 3 and argv[1] == 'level':
         import json
-        print(json.dumps(level(json.load(open(argv[2])), argv[3] if len(argv) > 3 else LAYOUT), indent=1))
+        print(json.dumps(level(json.load(open(argv[2]))), indent=1))
         return 0
-    if len(argv) >= 2 and argv[1] == 'table':
-        layout = argv[2] if len(argv) > 2 else LAYOUT
-        print(layout, 'bounds', bounds(layout))
-        for m in sorted(places(layout)):
-            b = box(m, layout)
-            print('%4d  centre %9.0f %7.0f %9.0f   x %7.0f..%7.0f  z %7.0f..%7.0f' % ((m,) + centre(m, layout) + (b[0], b[3], b[2], b[5])))
+    if len(argv) == 2 and argv[1] == 'table':
+        print('bounds', bounds())
+        for m in sorted(places()):
+            b = box(m)
+            print('%4d  centre %9.0f %7.0f %9.0f   x %7.0f..%7.0f  z %7.0f..%7.0f' % ((m,) + centre(m) + (b[0], b[3], b[2], b[5])))
         return 0
     print(__doc__)
     return 2

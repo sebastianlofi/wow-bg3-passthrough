@@ -367,15 +367,13 @@ def camera_wow():
 FIXED_Y0 = 1000.0
 FIXED_CENTRE = (0.0, FIXED_Y0, 0.0)
 FIXED_ORIGIN = (0.0, 0.0, 0.0)
-# Every WoW map its own place in the level (wow_places.py): WOW_BG3_LAYOUT names the layout (stacked, flat).
-# Unset, every map still uses the one centre above, so the continents and instances lie over each other; the
-# level's bounds must hold the layout before it is switched on (wowbg3_level.py, wow_places.bounds).
-LAYOUT = os.environ.get('WOW_BG3_LAYOUT', '')
+# Every WoW map has its own place in the level (wow_places.py): the Eastern Kingdoms at FIXED_CENTRE, Kalimdor a
+# floor above them, every other map on the third floor. The level's bounds hold them (release/levels).
 
 
 def centre_of(map_id):
     """The BG3 centre of a WoW map's mapping. KeyError: a map WoW's data has no ground for."""
-    return wow_places.centre(map_id, LAYOUT) if LAYOUT else FIXED_CENTRE
+    return wow_places.centre(map_id)
 
 
 def node_of(centre, bx, bz):
