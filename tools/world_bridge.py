@@ -843,6 +843,15 @@ class World:
                 spots.append((math.floor(b[0] * 2 + 0.5) / 2, b[1], math.floor(b[2] * 2 + 0.5) / 2, r))
         if not spots:
             return
+        # A resting car's floor and the slope up to it as faces too (wow_lifts.deck_faces, slope_faces; the slope from
+        # the tiles as they were cut): the square's one triangle set holds its storeys' as well. Floors WoW draws
+        # nothing at (kind 4).
+        faces = wow_lifts.deck_faces(spots) + wow_lifts.slope_faces(cell['tiles'], 5, minx, minz, spots)
+        for st in cell.get('storeys') or []:
+            faces += wow_lifts.slope_faces(st['floors'], 5, st['min'][0], st['min'][1], spots)
+        if faces:
+            cell['tris'] += b''.join(struct.pack('<9f', *f) for f in faces)
+            cell['kinds'] += bytes([4]) * len(faces)
         # A subgrid holds 1300 m over its base (the asserts in cut): a carved tile goes up, not past that.
         n = 0
         top = cell['base'] + 1290.0

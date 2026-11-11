@@ -234,6 +234,74 @@ class Carve(unittest.TestCase):
         s, _ = L.carve(self.section(5, 962.2), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)], seam=0)
         self.assertEqual(s[(64 * 128 + 64 + 8) * 5], 1)
 
+    def test_the_ground_slopes_up_to_the_cars_floor(self):
+        # The tram's deck lies 0.7 m over the station floor: WoW walks up that step, BG3 only a slope.
+        deck, floor = 962.9, 962.2
+        for rec in (5, 9):
+            for seam in (12, 0):                                    # the walk and fall copies slope the same way
+                s, _ = L.carve(self.section(rec, floor), rec, 0.0, 0.0, [(32.0, deck, 32.0, 4.0)], seam=seam)
+                def h(c):
+                    return [struct.unpack_from('<f', s, (64 * 128 + c) * rec + o)[0] for o in range(1, rec, 4)]
+                last = deck
+                for c in range(64 + 8, 64 + 16):                    # outwards from the floor's edge (4.25 m ... 7.75 m)
+                    for v in h(c):
+                        self.assertLessEqual(v, last + 1e-4)
+                        self.assertLessEqual(last - v, 0.5 * L.RISE + 1e-4, (rec, c))   # 0.2 m a tile at most
+                    last = h(c)[0]
+                self.assertAlmostEqual(h(64 + 8)[0], deck, places=3)                 # the ring of seams: the car's floor
+                self.assertAlmostEqual(h(64 + 9)[0], deck, places=3)
+                self.assertAlmostEqual(h(64 + 11)[0], deck - 0.7554 * L.RISE, places=3)   # 1.75 m out: three quarters of a metre down the slope
+                self.assertAlmostEqual(h(64 + 14)[0], floor, places=3)               # the slope is 1.75 m long: plain ground
+                self.assertAlmostEqual(h(64 + 30)[0], floor, places=3)
+        # A car resting below the ground beside it: the slope goes down to it.
+        s, _ = L.carve(self.section(5, 962.2), 5, 0.0, 0.0, [(32.0, 961.9, 32.0, 4.0)])
+        v = struct.unpack_from('<f', s, (64 * 128 + 64 + 8) * 5 + 1)[0]
+        self.assertTrue(961.9 < v < 962.2)
+        # Level with the ground (Undercity's car): no tile's height changes.
+        s, _ = L.carve(self.section(5, 962.3), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)])
+        self.assertAlmostEqual(struct.unpack_from('<f', s, (64 * 128 + 64 + 8) * 5 + 1)[0], 962.3, places=4)
+        # A floor more than a step away is another storey, not the way on.
+        s, _ = L.carve(self.section(5, 964.0), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)])
+        self.assertAlmostEqual(struct.unpack_from('<f', s, (64 * 128 + 64 + 8) * 5 + 1)[0], 964.0, places=4)
+
+    def test_the_slope_is_faces_too(self):
+        # BG3 stands a character on WoW's faces, not on the tiles: the slope has to be there for its rays.
+        deck, floor = 962.9, 962.2
+        faces = L.slope_faces(self.section(5, floor), 5, 0.0, 0.0, [(32.0, deck, 32.0, 4.0)])
+        self.assertTrue(faces)
+        def height(x, z):
+            for f in faces:
+                a, b, c = f[0:3], f[3:6], f[6:9]
+                d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2])
+                u = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / d
+                v = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / d
+                if u >= -1e-6 and v >= -1e-6 and u + v <= 1 + 1e-6:
+                    return u * a[1] + v * b[1] + (1 - u - v) * c[1]
+        self.assertAlmostEqual(height(36.6, 32.1), deck, places=2)               # the ring beside the car: its floor's height
+        self.assertAlmostEqual(height(37.9, 32.1), deck - 0.9 * L.RISE, places=2)   # 0.9 m down the slope
+        self.assertIsNone(height(40.0, 32.1))                                    # past the slope: WoW's own floor
+        self.assertIsNone(height(34.0, 32.1))                                    # under the car: the platform's
+        for f in faces:                                                          # every face looks up
+            u, v = [f[3 + k] - f[k] for k in range(3)], [f[6 + k] - f[k] for k in range(3)]
+            self.assertGreater(u[2] * v[0] - u[0] * v[2], 0)
+            self.assertTrue(all(floor - 1e-4 <= f[k] <= deck + 1e-4 for k in (1, 4, 7)))
+        # A car's floor level with the ground or under it: no faces (WoW's own floor is the one to stand on).
+        self.assertEqual(L.slope_faces(self.section(5, 962.3), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)]), [])
+        self.assertEqual(L.slope_faces(self.section(5, 962.6), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)]), [])
+        self.assertEqual(L.slope_faces(self.section(5, 960.0), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)]), [])
+
+    def test_a_resting_cars_floor_is_a_face(self):
+        faces = L.deck_faces([(32.0, 962.3, 32.0, 4.0), (10.0, 950.0, 10.0, 6.0)])
+        self.assertEqual(len(faces), 2 * L.DECK_SIDES)
+        area = 0.0
+        for f in faces[:L.DECK_SIDES]:
+            u, v = [f[3 + k] - f[k] for k in range(3)], [f[6 + k] - f[k] for k in range(3)]
+            up = u[2] * v[0] - u[0] * v[2]
+            self.assertGreater(up, 0)                                            # looks up
+            area += up / 2
+            self.assertTrue(all(abs(f[k] - (962.3 + L.DECK_OVER)) < 1e-4 for k in (1, 4, 7)))   # just over the platform's tiles
+        self.assertLess(abs(area - 3.14159 * 16) / 50.3, 0.02)                   # the platform's disc
+
     def test_another_floor_in_the_same_column_stays(self):
         s, n = L.carve(self.section(5, 990.0), 5, 0.0, 0.0, [(32.0, 962.0, 32.0, 4.0)])
         self.assertEqual(n, 0)

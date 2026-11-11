@@ -27,6 +27,7 @@ answers with the client's own rule (benilla-formats `elevators.rs`, the 1.12 cli
 Nothing here moves anything: it is the timetable the BG3 side needs to move its platform in step with
 WoW's car.
 """
+import math
 import struct
 import sys
 from pathlib import Path
@@ -220,6 +221,7 @@ def stop_points(frames, spawn, quat):
 
 
 AWAY_M = 300.0   # a tile under a resting car is moved this far up, out of BG3's reach from the car's floor
+RISE = 0.4       # the slope from the ground up to a resting car's floor: metres of height per metre (0.2 m a tile)
 
 
 def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.0, step=1.0):
@@ -233,11 +235,15 @@ def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.
     y lose the walkable bit and go AWAY_M up (not past `top`, the highest a tile of this section may lie; then
     they only lose the bit). Walkable tiles in the `ring` metres beyond it, within `step` of the floor, get the
     `seam` bits: BG3's path finder steps from one subgrid to another only on such tiles, and the platform's rim has
-    them too (wowbg3_level.py). (bytes, how many taken away)."""
+    them too (wowbg3_level.py). The ring lies at the car's floor and the ground beyond it slopes to it (RISE): WoW walks up
+    the step onto a car (the Deeprun Tram's deck lies 0.7 m over its boarding ledge and the station floor) and BG3
+    walks no step of that height (harness: sent onto the car, the party took the ramp down to the track bed under
+    it). Everywhere else WoW's steps reach BG3 as slopes already, through the movement map's polygons; a car has
+    none. (bytes, how many taken away)."""
     n = int(round((len(section) // rec) ** 0.5))
     out, cut = None, 0
     for bx, by, bz, radius in spots:
-        far = radius + ring
+        far = radius + ring + step / RISE
         c0, c1 = int((bx - far - minx) // 0.5), int((bx + far - minx) // 0.5)
         r0, r1 = int((bz - far - minz) // 0.5), int((bz + far - minz) // 0.5)
         for r in range(max(r0, 0), min(r1, n - 1) + 1):
@@ -249,10 +255,19 @@ def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.
                     continue
                 floor = struct.unpack_from('<f', section, k + 1)[0]
                 if d2 > radius * radius:
-                    if section[k] & 1 and abs(floor - by) <= step and seam:
-                        if out is None:
+                    if section[k] & 1 and abs(floor - by) <= step:
+                        d = d2 ** 0.5 - radius
+                        run = max(abs(floor - by) / RISE, 1e-6)      # the slope's length for this step
+                        if out is None and (seam or d < ring + run):
                             out = bytearray(section)
-                        out[k] |= seam
+                        if seam and d <= ring:
+                            out[k] |= seam
+                        # The ring of seams lies at the car's floor (a step of 0.4 m there still stopped BG3's
+                        # path finder at the rim, harness); the slope begins beyond it.
+                        if d < ring + run:
+                            for o in range(1, rec, 4):
+                                h = struct.unpack_from('<f', section, k + o)[0]
+                                struct.pack_into('<f', out, k + o, by + (h - by) * max(0.0, d - ring) / run)
                     continue
                 if abs(floor - by) > reach:
                     continue
@@ -265,6 +280,60 @@ def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.
                         struct.pack_into('<f', out, k + o, up)
                 cut += 1
     return (bytes(out) if out is not None else section), cut
+
+
+DECK_SIDES = 24
+DECK_OVER = 0.02   # the deck's face lies this far over the platform's tiles: a point on it is over them, not under
+
+
+def deck_faces(spots):
+    """A resting car's floor as faces, for BG3's rays: [9 floats] per triangle, a disc of the platform's radius at
+    each stop. A car is a game object, not in WoW's static collision, so a ray through it went on to whatever lies
+    under it; and BG3 sends a walker to the highest floor at or under the point named (harness: sent onto the tram
+    car from the station, 0.8 m under its deck, she went down the ramp to the track bed under the car; named 0.7 m
+    over the deck she walked onto it). With the deck there a click on the car is a point on the car."""
+    out = []
+    for bx, by, bz, radius in spots:
+        y = by + DECK_OVER
+        rim = [(bx + radius * math.cos(2 * math.pi * i / DECK_SIDES), y, bz + radius * math.sin(2 * math.pi * i / DECK_SIDES))
+               for i in range(DECK_SIDES)]
+        for i in range(DECK_SIDES):
+            out.append((bx, y, bz) + rim[(i + 1) % DECK_SIDES] + rim[i])      # wound to face up
+    return out
+
+
+def slope_faces(section, rec, minx, minz, spots, ring=1.0, step=1.0):
+    """The same slope as faces, for BG3's rays: [9 floats] per triangle in BG3 metres, from a square's tile records
+    as they are before carve. BG3 stands a character at the height its rays find on WoW's own faces, and those
+    keep the step: led up to the car by the tiles' slope alone, the hero stayed 0.8 m under the Deeprun Tram's
+    deck, was never on the platform's tile and dropped into the trench under the car (harness). Two triangles a
+    tile, over every tile carve slopes and its ring; none where the car's floor lies under the ground beside it
+    (WoW's own face is the higher one there, and stepping down needs none)."""
+    n = int(round((len(section) // rec) ** 0.5))
+    out = []
+    for bx, by, bz, radius in spots:
+        far = radius + ring + step / RISE
+        c0, c1 = int((bx - far - minx) // 0.5), int((bx + far - minx) // 0.5)
+        r0, r1 = int((bz - far - minz) // 0.5), int((bz + far - minz) // 0.5)
+        for r in range(max(r0, 0), min(r1, n - 1) + 1):
+            for c in range(max(c0, 0), min(c1, n - 1) + 1):
+                k = (r * n + c) * rec
+                x, z = minx + (c + 0.5) * 0.5, minz + (r + 0.5) * 0.5
+                d = ((x - bx) ** 2 + (z - bz) ** 2) ** 0.5 - radius
+                floor = struct.unpack_from('<f', section, k + 1)[0]
+                if not section[k] & 1 or d <= 0 or by - floor > step or by - floor < 0.05:
+                    continue
+                run = (by - floor) / RISE
+                if d >= ring + run:
+                    continue
+                def at(px, pz):
+                    dc = ((px - bx) ** 2 + (pz - bz) ** 2) ** 0.5 - radius
+                    return (px, by + (floor - by) * min(1.0, max(0.0, dc - ring) / run), pz)
+                x0, z0 = minx + c * 0.5, minz + r * 0.5
+                p00, p10, p11, p01 = at(x0, z0), at(x0 + 0.5, z0), at(x0 + 0.5, z0 + 0.5), at(x0, z0 + 0.5)
+                out.append(p00 + p01 + p11)        # wound to face up
+                out.append(p00 + p11 + p10)
+    return out
 
 
 def read_live(raw):
