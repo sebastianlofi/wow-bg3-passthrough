@@ -18,7 +18,9 @@ function M.Share(line)
     local v = {}
     for x in tostring(line):gmatch("%S+") do v[#v + 1] = tonumber(x) or x end
     if v[1] ~= "WSK1" or #v < 10 or type(v[8]) ~= "number" or type(v[9]) ~= "number" or type(v[10]) ~= "number" then return nil end
-    local luma = 0.2126 * lin(v[8]) + 0.7152 * lin(v[9]) + 0.0722 * lin(v[10])
+    -- The ambient WoW lights the hero's figure with when the file has it (benilla patch 0132: a room's own indoors).
+    local a = (type(v[16]) == "number" and type(v[17]) == "number" and type(v[18]) == "number") and {v[16], v[17], v[18]} or {v[8], v[9], v[10]}
+    local luma = 0.2126 * lin(a[1]) + 0.7152 * lin(a[2]) + 0.0722 * lin(a[3])
     return math.max(0, math.min(1, luma / M.REF))
 end
 

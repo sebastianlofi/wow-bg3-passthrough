@@ -112,8 +112,8 @@ void main() {
         // table in its buffer: count, share, then place in this view, range, colour a light).
         vec3 lit = pc.amb.rgb;
         const int LT = 17 * 17 * 17 * 3;
-        int nl = int(tb.TAB[LT]);
-        if (nl > 0) {
+        int nl = int(tb.TAB[LT]), nb = int(tb.TAB[LT + 2]);
+        if (nl > 0 || nb > 0) {
             // The pixel's place in this view (right, up, forward: metres) and its facing, from the eye depths beside
             // it: on each axis the neighbour nearer in depth, so the step at a figure's edge gives no wild facing.
             float z = texelFetch(gz, q, 0).r;
@@ -127,23 +127,34 @@ void main() {
             float nn = dot(N, N);
             N = nn > 1e-20 ? N / sqrt(nn) : vec3(0.0, 0.0, -1.0);
             if (dot(N, P) > 0.0) N = -N;
-            float sd[3] = float[3](1e30, 1e30, 1e30); int sel[3] = int[3](0, 0, 0);
-            for (int i = 0; i < nl && i < 8; i++) {
-                int b = LT + 4 + i * 8;
-                vec3 dv = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
-                float d2 = dot(dv, dv), rg = tb.TAB[b + 3];
-                if (d2 > rg * rg) continue;
-                if (d2 < sd[0]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = sd[0]; sel[1] = sel[0]; sd[0] = d2; sel[0] = b; }
-                else if (d2 < sd[1]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = d2; sel[1] = b; }
-                else if (d2 < sd[2]) { sd[2] = d2; sel[2] = b; }
-            }
             vec3 sum = vec3(0.0);
-            for (int s = 0; s < 3; s++) {
-                if (sd[s] > 9.9e29) break;
-                int b = sel[s];
-                vec3 tl = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
-                float d = length(tl);
-                sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * (max(dot(N, tl / max(d, 1e-4)), 0.0) / (0.7 * d + 0.03 * d * d));
+            if (nb > 0) {
+                // In a room WoW lights a unit by the room alone: the floor's baked light on its fixed axis and the
+                // room's lights, each its colour by the facing (after the point lights in the buffer: toward the
+                // light in this view, colour). The outdoor law's point lights do not apply there.
+                const int LB = LT + 4 + 8 * 8;
+                for (int i = 0; i < nb && i < 8; i++) {
+                    int b = LB + i * 8;
+                    sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * max(dot(N, vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2])), 0.0);
+                }
+            } else {
+                float sd[3] = float[3](1e30, 1e30, 1e30); int sel[3] = int[3](0, 0, 0);
+                for (int i = 0; i < nl && i < 8; i++) {
+                    int b = LT + 4 + i * 8;
+                    vec3 dv = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
+                    float d2 = dot(dv, dv), rg = tb.TAB[b + 3];
+                    if (d2 > rg * rg) continue;
+                    if (d2 < sd[0]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = sd[0]; sel[1] = sel[0]; sd[0] = d2; sel[0] = b; }
+                    else if (d2 < sd[1]) { sd[2] = sd[1]; sel[2] = sel[1]; sd[1] = d2; sel[1] = b; }
+                    else if (d2 < sd[2]) { sd[2] = d2; sel[2] = b; }
+                }
+                for (int s = 0; s < 3; s++) {
+                    if (sd[s] > 9.9e29) break;
+                    int b = sel[s];
+                    vec3 tl = (vec3(tb.TAB[b], tb.TAB[b + 1], tb.TAB[b + 2]) - P) / 0.9144;
+                    float d = length(tl);
+                    sum += vec3(tb.TAB[b + 4], tb.TAB[b + 5], tb.TAB[b + 6]) * (max(dot(N, tl / max(d, 1e-4)), 0.0) / (0.7 * d + 0.03 * d * d));
+                }
             }
             lit += sum * tb.TAB[LT + 1];
         }

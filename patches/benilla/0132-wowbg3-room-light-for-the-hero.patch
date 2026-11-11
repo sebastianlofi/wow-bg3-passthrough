@@ -1,0 +1,209 @@
+diff --git a/crates/benilla-app/src/wowbg3_pace.rs b/crates/benilla-app/src/wowbg3_pace.rs
+index c2bf46f..a2cb9b3 100644
+--- a/crates/benilla-app/src/wowbg3_pace.rs
++++ b/crates/benilla-app/src/wowbg3_pace.rs
+@@ -308,14 +308,22 @@ fn tag_frame(
+     p: Res<Pace>,
+     lighting: Option<Res<benilla_world::lighting::WowLighting>>,
+     figures: Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>,
++    rooms: Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::ShadeOnlyRoot)>,
+     mut tag: ResMut<FrameTag>,
+ ) {
+     if let Some(l) = lighting.as_ref() {
+         // Patch 0129: with the fog WoW would draw the hero's figure with.
+         let indoor = figures.iter().any(|(name, _, shade)| name.as_str() == "wowbg3 Tav" && shade.is_indoor());
+-        sky_export(l, indoor); // patch 0125
++        // Patch 0132: the ambient WoW lights the hero's figure with, a room's own over its baked floor.
++        let unit_ambient = rooms
++            .iter()
++            .find(|(name, _, _)| name.as_str() == "wowbg3 Tav")
++            .and_then(|(_, _, root)| root.room_light())
++            .map_or(l.ambient, |r| r.0);
++        sky_export(l, indoor, unit_ambient); // patch 0125
+     }
+-    shade_export(&figures); // patch 0126
++    shade_export(&figures, &rooms); // patch 0126
++    unit_light_export(&rooms); // patch 0132
+     *tag = FrameTag {
+         packet: p.current.as_ref().map_or(0, |k| k.frame),
+         cam: crate::wowbg3_lead::camera_seq(),
+@@ -336,22 +344,24 @@ fn tag_frame(
+ /// Patch 0129: five more numbers, "<fog r g b> <fog start> <fog end>" (the colour as WoW blends it, sRGB 0..1; the
+ /// distances in yards of eye depth): the fog of the place the hero's figure stands in, a room's when it is indoors.
+ /// The render plugin fogs BG3's own pixels with it as WoW fogs a unit.
+-fn sky_export(l: &benilla_world::lighting::WowLighting, indoor: bool) {
+-    static LAST: std::sync::Mutex<Option<[f32; 14]>> = std::sync::Mutex::new(None);
++/// Patch 0132: three more, "<unit ambient r g b>": the ambient WoW lights the hero's figure with, the sky's outdoors
++/// and the room's own indoors (the unit's ramped ambient word). BG3's characters take this one.
++fn sky_export(l: &benilla_world::lighting::WowLighting, indoor: bool, unit_ambient: [f32; 3]) {
++    static LAST: std::sync::Mutex<Option<[f32; 17]>> = std::sync::Mutex::new(None);
+     let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
+     let to_sun = benilla_assets::coords::bevy_to_wow(-l.sun_dir.normalize_or_zero());
+     let (fog, fog_start, fog_end) = l.unit_fog(indoor);
+     let v = [
+         to_sun[0], to_sun[1], to_sun[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.ambient[0], l.ambient[1], l.ambient[2],
+-        fog[0], fog[1], fog[2], fog_start, fog_end,
++        fog[0], fog[1], fog[2], fog_start, fog_end, unit_ambient[0], unit_ambient[1], unit_ambient[2],
+     ];
+     let Ok(mut last) = LAST.lock() else { return };
+-    if last.is_some_and(|p| p.iter().zip(v.iter()).enumerate().all(|(i, (a, b))| (a - b).abs() < if i < 12 { 0.002 } else { 0.5 })) {
++    if last.is_some_and(|p| p.iter().zip(v.iter()).enumerate().all(|(i, (a, b))| (a - b).abs() < if i < 12 || i > 13 { 0.002 } else { 0.5 })) {
+         return;
+     }
+     let text = format!(
+-        "WSK1 {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.1} {:.1}\n",
+-        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]
++        "WSK1 {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} {:.1} {:.1} {:.4} {:.4} {:.4}\n",
++        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16]
+     );
+     let path = std::path::Path::new(&dir).join("wowsky.txt");
+     let tmp = path.with_extension("tmp");
+@@ -365,15 +375,21 @@ fn sky_export(l: &benilla_world::lighting::WowLighting, indoor: bool) {
+ /// ("wowbg3 Tav", "wowbg3 companion N": hidden, still sampled and ramped like any unit) say what WoW would show:
+ /// `$WOW_BG3_LINK_DIR/wowshade.txt`, "WSH1 <count>" then one line a figure, "<x y z, WoW yards> <0 lit .. 1
+ /// shadowed>", written whole (rename) when a figure moved 0.3 yd or its level 0.02.
+-fn shade_export(figures: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>) {
++fn shade_export(
++    figures: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::GroundShade)>,
++    rooms: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::ShadeOnlyRoot)>,
++) {
+     static LAST: std::sync::Mutex<Vec<[f32; 4]>> = std::sync::Mutex::new(Vec::new());
+     let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
+     let mut now: Vec<[f32; 4]> = figures
+         .iter()
+         .filter(|(name, _, _)| name.as_str().starts_with("wowbg3 "))
+-        .map(|(_, gt, shade)| {
++        .map(|(name, gt, shade)| {
+             let p = benilla_assets::coords::bevy_to_wow(gt.translation());
+-            [p[0], p[1], p[2], shade.shadowed()]
++            // Patch 0132: over a room's baked floor WoW lights a unit by the room, never by the sun: fully shadowed
++            // for BG3's sun.
++            let room = rooms.iter().any(|(n, g, r)| n == name && g.translation() == gt.translation() && r.room_light().is_some());
++            [p[0], p[1], p[2], if room { 1.0 } else { shade.shadowed() }]
+         })
+         .collect();
+     now.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+@@ -396,6 +412,44 @@ fn shade_export(figures: &Query<(&Name, &GlobalTransform, &benilla_world::entity
+     }
+ }
+ 
++/// Patch 0132: the light WoW gives the hero's figure in a room, for BG3's own drawing of the party (the render plugin
++/// lights BG3's pixels with it as WoW lights a unit indoors): `$WOW_BG3_LINK_DIR/wowunitlight.txt`, "WUL1 <count>"
++/// then a line a lobe, "<toward the light x y z, WoW axes> <r g b>": the floor's baked light on WoW's fixed axis, then
++/// the room's lights as they reach the figure. The ambient that goes with them is wowsky.txt's unit ambient.
++/// Count 0 outdoors, or where WoW has no room light for it. Written whole (rename) when a value moved.
++fn unit_light_export(rooms: &Query<(&Name, &GlobalTransform, &benilla_world::entity_shade::ShadeOnlyRoot)>) {
++    static LAST: std::sync::Mutex<Option<Vec<[f32; 6]>>> = std::sync::Mutex::new(None);
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let Some((_, _, root)) = rooms.iter().find(|(name, _, _)| name.as_str() == "wowbg3 Tav") else { return };
++    let now: Vec<[f32; 6]> = root
++        .room_light()
++        .map(|(_, lobes)| {
++            lobes
++                .iter()
++                .filter(|(_, c)| c.iter().any(|v| *v > 0.001))
++                .take(8)
++                .map(|(d, c)| {
++                    let w = benilla_assets::coords::bevy_to_wow(*d);
++                    [w[0], w[1], w[2], c[0], c[1], c[2]]
++                })
++                .collect()
++        })
++        .unwrap_or_default();
++    let Ok(mut last) = LAST.lock() else { return };
++    if last.as_ref().is_some_and(|p| p.len() == now.len() && p.iter().zip(now.iter()).all(|(a, b)| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 0.004))) {
++        return;
++    }
++    let mut text = format!("WUL1 {}\n", now.len());
++    for l in &now {
++        text.push_str(&format!("{:.4} {:.4} {:.4} {:.4} {:.4} {:.4}\n", l[0], l[1], l[2], l[3], l[4], l[5]));
++    }
++    let path = std::path::Path::new(&dir).join("wowunitlight.txt");
++    let tmp = path.with_extension("tmp");
++    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
++        *last = Some(now);
++    }
++}
++
+ /// Patch 0052: the terrain pass's light on level ground in full sun (`terrain.wgsl`: `clamp(ambient +
+ /// diffuse × max(N·L, 0))` per channel, gamma), as bytes, byte 3 = 1.
+ fn ground_light(l: &benilla_world::lighting::WowLighting) -> [u8; 4] {
+diff --git a/crates/benilla-world/src/entity_shade.rs b/crates/benilla-world/src/entity_shade.rs
+index 1ea3b13..451b71b 100644
+--- a/crates/benilla-world/src/entity_shade.rs
++++ b/crates/benilla-world/src/entity_shade.rs
+@@ -242,6 +242,19 @@ pub struct ShadeOnlyRoot {
+     asked: bool,
+     last: Vec3,
+     generation: u32,
++    /// Patch 0132: over a room's baked floor, the light WoW gives a unit standing here ([`Self::room_light`]).
++    room: Option<([f32; 3], Vec<(Vec3, [f32; 3])>)>,
++}
++
++impl ShadeOnlyRoot {
++    /// WOW-BG3 patch 0132: the light WoW gives a unit at this root in a room, as the interior fold takes it once its
++    /// ramps have settled: the ambient word (cap96 of the floor's MOCV), and the lobes of
++    /// [`interior_lobes`](crate::terrain_stream::interior_lobes), each (toward the light in Bevy space, colour): the
++    /// floor's floor-168 word on the fixed axis and the room's MOLR lights as they reach the figure's middle.
++    /// `None` outdoors and on the day/night law.
++    pub fn room_light(&self) -> Option<&([f32; 3], Vec<(Vec3, [f32; 3])>)> {
++        self.room.as_ref()
++    }
+ }
+ 
+ fn classify_shade_only_roots(
+@@ -279,6 +292,14 @@ fn classify_shade_only_roots(
+         if shade.indoor != indoor {
+             shade.indoor = indoor;
+         }
++        // Patch 0132: the room's light for the figure BG3 draws here (the settled words: the indoor intensity is 1).
++        root.room = match &verdict {
++            crate::wmo_portal::IndoorVerdict::Baked { mocv, lobes } => Some((
++                benilla_assets::cap96(*mocv),
++                crate::terrain_stream::interior_lobes(benilla_assets::floor168(*mocv), pos + Vec3::Y, lobes),
++            )),
++            _ => None,
++        };
+         root.asked = true;
+         root.last = pos;
+         root.generation = residency.generation();
+diff --git a/crates/benilla-world/src/terrain_stream.rs b/crates/benilla-world/src/terrain_stream.rs
+index e91f46b..80f2b6d 100644
+--- a/crates/benilla-world/src/terrain_stream.rs
++++ b/crates/benilla-world/src/terrain_stream.rs
+@@ -43,7 +43,7 @@ use spawn::spawn_loaded_placements;
+ use weld::{flush_hull_welds, HullWelds};
+ pub use window::StreamWindow;
+ // The WMO prop-light items, for the interior classifier and the app's WMO props.
+-pub use spawn::prop_light::{fold_interior_probe, hex_word, interior_light_up, PropLobeLight};
++pub use spawn::prop_light::{fold_interior_probe, hex_word, interior_light_up, interior_lobes, PropLobeLight};
+ // The placed-model assembler and off-thread collider build, shared with WMO gameobject props.
+ pub use collider::{build_collider_task, placement_collider_data, PendingCollider};
+ pub use spawn::{m2_anim_bound, m2_fade, point_light, spawn_model_entities, SpawnedModel};
+diff --git a/crates/benilla-world/src/terrain_stream/spawn/prop_light.rs b/crates/benilla-world/src/terrain_stream/spawn/prop_light.rs
+index 016427a..6fea36e 100644
+--- a/crates/benilla-world/src/terrain_stream/spawn/prop_light.rs
++++ b/crates/benilla-world/src/terrain_stream/spawn/prop_light.rs
+@@ -110,6 +110,13 @@ pub fn fold_interior_probe(
+     ref_point: Vec3,
+     lights: &[PropLobeLight],
+ ) -> [bevy::math::Vec4; 7] {
++    crate::lighting::prop_probe_coeffs(ambient, &interior_lobes(diffuse, ref_point, lights))
++}
++
++/// The lobes of [`fold_interior_probe`], each (toward the light in Bevy space, colour): the footprint's diffuse on
++/// the reference's fixed axis, then the room's MOLR lights windowed by their distance from `ref_point`.
++/// Patch 0132 (WOW-BG3) hands them to BG3's own figures.
++pub fn interior_lobes(diffuse: [f32; 3], ref_point: Vec3, lights: &[PropLobeLight]) -> Vec<(Vec3, [f32; 3])> {
+     // Toward-light, Bevy space: wow (0.30822, 0.30822, 0.9) → (−y, z, −x).
+     let mut lobes: Vec<(Vec3, [f32; 3])> = vec![(Vec3::new(-0.30822, 0.9, -0.30822), diffuse)];
+     for l in lights {
+@@ -126,7 +133,7 @@ pub fn fold_interior_probe(
+             lobes.push((dv / dist.max(1e-4), l.color_i.map(|c| c * gain)));
+         }
+     }
+-    crate::lighting::prop_probe_coeffs(ambient, &lobes)
++    lobes
+ }
+ 
+ #[cfg(test)]

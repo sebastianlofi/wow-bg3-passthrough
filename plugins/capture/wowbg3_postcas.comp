@@ -33,9 +33,31 @@ void main() {
         return;
     }
     if (!(n > 0.5)) {
-        // BG3's own pixel with WoW's fog for it (the feed: the fog's colour, alpha 2 + WoW's factor): blended as WoW
-        // blends, in displayed colours.
-        if (w.a >= 2.0 && w.a < 2.999) imageStore(cout, q, vec4(mix(w.rgb, imageLoad(cout, q).rgb, w.a - 2.0), 1.0));
+        // BG3's own pixel. At a figure's edge BG3's TAA has blended the figure with BG3's picture of the ground behind
+        // it, which is not the ground shown beside it (WoW's own colour, darker at night; BG3's is washed near white
+        // during a bright cast): a light ring around every figure. Where a neighbour is pure WoW ground, the pixel's
+        // share of ground is found from the three colours BG3 displayed (this pixel, the ground beside it, the figure
+        // two pixels further in) and BG3's ground in it is changed for WoW's.
+        vec3 o = imageLoad(cout, q).rgb;
+        const ivec2 D[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        vec3 pg = vec3(0.0), wg = vec3(0.0); vec2 dir = vec2(0.0); float k = 0.0;
+        for (int i = 0; i < 4; i++) {
+            ivec2 r = clamp(q + D[i], ivec2(0), sz - 1);
+            vec4 wr = texelFetch(wdsp, r, 0);
+            if (imageLoad(nob, r).r > 1.5 && wr.a > 0.5 && wr.a < 1.5) { pg += texelFetch(cin, r, 0).rgb; wg += wr.rgb; dir += vec2(D[i]); k += 1.0; }
+        }
+        if (k > 0.5 && k < 3.5) {
+            pg /= k; wg /= k;
+            ivec2 in2 = clamp(q - ivec2(round(normalize(dir + vec2(1e-4)) * 2.0)), ivec2(0), sz - 1);
+            if (!(imageLoad(nob, in2).r > 0.5) && !(imageLoad(nob, in2).r < 0.0)) {
+                vec3 fg = texelFetch(cin, in2, 0).rgb - pg, me = texelFetch(cin, q, 0).rgb - pg;
+                float ff = dot(fg, fg);
+                if (ff > 0.0004) o = clamp(o + (1.0 - clamp(dot(me, fg) / ff, 0.0, 1.0)) * (wg - pg), vec3(0.0), vec3(1.0));
+            }
+            imageStore(cout, q, vec4(o, 1.0));
+        }
+        // WoW's fog for it (the feed: the fog's colour, alpha 2 + WoW's factor): blended as WoW blends, in displayed colours.
+        if (w.a >= 2.0 && w.a < 2.999) imageStore(cout, q, vec4(mix(w.rgb, o, w.a - 2.0), 1.0));
         return;
     }
     vec4 c = texelFetch(cin, q, 0);

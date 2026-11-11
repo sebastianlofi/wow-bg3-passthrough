@@ -25,7 +25,8 @@ static struct { uint64_t p; float j[2]; } g_jit[8];
 static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[2];
 #define FB_TAB (17 * 17 * 17 * 3)
 #define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
-#define FB_TAIL (4 + FB_LIT * 8)
+#define FB_LOBE 8                      // WoW's room light for the hero's figure: its lobes, after the point lights, 8 floats each
+#define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8)
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
@@ -39,20 +40,22 @@ static struct {
 // WoW's ambient on BG3's own pixels (compose word "wdamb=K", K the share of WoW's ambient, 0 or absent: off).
 // BG3 lights its characters with its sun and little else: the level of our own has no light probe, so a side turned
 // from the sun is near black, where WoW lights every unit with the zone's ambient colour first. benilla writes that
-// colour (link/wowsky.txt, patch 0125: the last three numbers, as WoW samples Light.dbc for the time of day), and the
+// colour (link/wowsky.txt, patch 0125: the sky's ambient as WoW samples Light.dbc for the time of day; patch 0132: the
+// ambient of the hero's figure, which indoors is the room's own, and that one is taken when the file has it), and the
 // feed adds what WoW's ambient term is, the material's colour times the ambient, to BG3's lit scene at each of BG3's
 // pixels, through the same table that brings WoW's ground into BG3's light (wowbg3_fxbg2.frag).
-static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; int nlit; float lit[FB_LIT][7]; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
+static struct { pthread_mutex_t m; float rgb[3]; int have; uint64_t reads; float fog[5]; int have_fog; int nlit; float lit[FB_LIT][7]; int nlobe; float lobe[FB_LOBE][6]; } g_amb = {.m = PTHREAD_MUTEX_INITIALIZER};
 static void amb_present(void) {
     const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     if (!g_cc.on || (!(g_cc.wdamb > 0.0f) && !g_cc.wdwfog) || pr % (g_cc.wdwlit ? 6 : 30) != 1) return;
     char path[1100];
     snprintf(path, sizeof path, "%s/wowsky.txt", link_dir());
-    float v[14]; int ok = 0, okf = 0;
+    float v[17]; int ok = 0, okf = 0, oku = 0;
     FILE* f = fopen(path, "r");
     if (f) {
         ok = fscanf(f, "WSK1 %f %f %f %f %f %f %f %f %f", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, v + 8) == 9;
         okf = ok && fscanf(f, "%f %f %f %f %f", v + 9, v + 10, v + 11, v + 12, v + 13) == 5;  // benilla patch 0129: fog r g b, start, end
+        oku = okf && fscanf(f, "%f %f %f", v + 14, v + 15, v + 16) == 3;  // benilla patch 0132: the ambient WoW lights the hero's figure with (a room's indoors)
         fclose(f);
     }
     // WoW's point lights near the hero (benilla patch 0130: link/wowlights.txt).
@@ -71,15 +74,32 @@ static void amb_present(void) {
             fclose(lf);
         }
     }
+    // WoW's room light for the hero's figure (benilla patch 0132: link/wowunitlight.txt): each lobe toward its light
+    // (WoW axes) and its colour. None outdoors.
+    float lobe[FB_LOBE][6]; int nlobe = 0;
+    snprintf(path, sizeof path, "%s/wowunitlight.txt", link_dir());
+    FILE* uf = fopen(path, "r");
+    if (uf) {
+        int count = 0;
+        if (fscanf(uf, "WUL1 %d", &count) == 1)
+            for (int k = 0; k < count && nlobe < FB_LOBE; k++) {
+                float* l6 = lobe[nlobe];
+                if (fscanf(uf, "%f %f %f %f %f %f", l6, l6 + 1, l6 + 2, l6 + 3, l6 + 4, l6 + 5) != 6) break;
+                nlobe++;
+            }
+        fclose(uf);
+    }
     pthread_mutex_lock(&g_amb.m);
+    g_amb.nlobe = nlobe; memcpy(g_amb.lobe, lobe, sizeof lobe);
     g_amb.nlit = nlit; memcpy(g_amb.lit, lit, sizeof lit);
-    if (ok) { for (int i = 0; i < 3; i++) g_amb.rgb[i] = v[6 + i] < 0 ? 0 : v[6 + i] > 1 ? 1 : v[6 + i]; g_amb.have = 1; }
+    if (ok) { const float* a = oku ? v + 14 : v + 6; for (int i = 0; i < 3; i++) g_amb.rgb[i] = a[i] < 0 ? 0 : a[i] > 1 ? 1 : a[i]; g_amb.have = 1; }
     if (okf) { memcpy(g_amb.fog, v + 9, sizeof g_amb.fog); g_amb.have_fog = 1; }
     const uint64_t n = ++g_amb.reads;
     pthread_mutex_unlock(&g_amb.m);
     if (n % (g_cc.wdwlit ? 3000 : 600) == 1) logf_("wdamb: WoW's ambient %.3f %.3f %.3f (%s), share %.2f; fog %.3f %.3f %.3f from %.1f to %.1f yd (%s)", g_amb.rgb[0], g_amb.rgb[1], g_amb.rgb[2], ok ? "read" : "kept: no wowsky.txt", g_cc.wdamb,
                          g_amb.fog[0], g_amb.fog[1], g_amb.fog[2], g_amb.fog[3], g_amb.fog[4], !g_cc.wdwfog ? "off" : okf ? "read" : "none in wowsky.txt");
     if (g_cc.wdwlit && n % 3000 == 1) logf_("wdwlit: %d of WoW's point lights near the hero", nlit);
+    if (n % 600 == 1) logf_("wdamb: %d lobes of WoW's room light for the hero's figure", nlobe);
 }
 // WoW's fog on BG3's own pixels (compose word "wdwfog"). WoW fogs everything it draws by its eye depth, a straight
 // blend towards the fog colour between a start and an end distance, in the colours it displays. BG3's characters and
@@ -105,7 +125,24 @@ static void wfog_get(float* f) {
 // out: count, the ambient share, then a light each: its place in the camera's view (metres: right, up, forward),
 // its range (yards), its colour.
 static void wlit_put(float* out, int on, const float* eye, const float* fwd, const float* right, const float* up) {
-    out[0] = 0.0f; out[1] = g_cc.wdamb;
+    out[0] = 0.0f; out[1] = g_cc.wdamb; out[2] = 0.0f;
+    // The room's lobes (with the ambient, whatever wdwlit says): toward each light in the camera's view (right, up,
+    // forward; BG3's axes are WoW's y, z, -x), then its colour.
+    if (on) {
+        pthread_mutex_lock(&g_amb.m);
+        const int nb = g_amb.nlobe;
+        for (int i = 0; i < nb; i++) {
+            const float* l = g_amb.lobe[i];
+            const double w[3] = {l[1], l[2], -l[0]};
+            float* o8 = out + 4 + FB_LIT * 8 + i * 8;
+            o8[0] = (float)(w[0] * right[0] + w[1] * right[1] + w[2] * right[2]);
+            o8[1] = (float)(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+            o8[2] = (float)(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
+            o8[3] = 0.0f; o8[4] = l[3]; o8[5] = l[4]; o8[6] = l[5]; o8[7] = 0.0f;
+        }
+        pthread_mutex_unlock(&g_amb.m);
+        out[2] = (float)nb;
+    }
     { static uint64_t said; if (g_cc.wdwlit && said++ % 1800 == 0) logf_("wdwlit: %d lights; BG3's eye depth %s, ambient %s", g_amb.nlit, g_blv_z ? "found" : "not bound by its lighting pass", on || !g_blv_z ? "on" : "off"); }
     if (!on || !g_cc.wdwlit || !g_tav.seq) return;
     pthread_mutex_lock(&g_amb.m);
