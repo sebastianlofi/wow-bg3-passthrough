@@ -19,8 +19,11 @@ squares from it, so one lattice holds every map's squares. Two layouts:
   box(map, layout)          (x0, y0, z0, x1, y1, z1) in BG3: all the map's ground can lie in
   bounds(layout)            the level's bounds that hold every box
   to_bg3(map, wow, layout)  to_wow(map, bg3, layout)  map_at(bg3, layout)
+  level(spec, layout)       a level's spec (release/levels/*.json) fitted to a layout: bounds that hold every
+                            place; the corner squares, the start square and the parked pool clear of every place
 
   wow_places.py table [LAYOUT]
+  wow_places.py level SPEC.json [LAYOUT]   the fitted spec on stdout
 
 A place is in every save and every kept cut: TILES and the rules below must not change once released.
 """
@@ -146,7 +149,36 @@ def map_at(b, layout=LAYOUT):
     return None
 
 
+def level(spec, layout=LAYOUT):
+    """A level's spec fitted to a layout. The stacked layout keeps the level's width, so only its height
+    changes. The flat layout is wider: the two corner squares BG3 sizes its maps by go to the new corners,
+    the start square and the parked pool to the low corner, which no map reaches."""
+    b = bounds(layout)
+    out = dict(spec, Bounds=list(b))
+    if layout == 'stacked':
+        return out
+    pool = dict(spec['BlankGrid'], X0=b[0] + 320, Z0=b[2] + 128)
+    out.update(Start=[b[0] + 160, 0, b[2] + 160], BlankGrid=pool,
+               Subgrids=[{'X': b[0] + 128, 'Y': 0, 'Z': b[2] + 128, 'Kind': 'walk'},
+                         {'X': b[0], 'Y': pool['Y'], 'Z': b[2], 'Kind': 'blank'},
+                         {'X': b[3] - CELL, 'Y': pool['Y'], 'Z': b[5] - CELL, 'Kind': 'blank'}])
+    return out
+
+
+def level_squares(spec):
+    """[(x0, y0, z0, x1, y1, z1)]: every square a level's spec places itself (corners, start, parked pool)."""
+    g = spec['BlankGrid']
+    nx, nz = g.get('NX', g.get('N')), g.get('NZ', g.get('N'))
+    sq = [(q['X'], q['Y'], q['Z']) for q in spec['Subgrids']]
+    sq += [(g['X0'] + CELL * i, g['Y'], g['Z0'] + CELL * j) for i in range(nx) for j in range(nz)]
+    return [(x, y, z, x + CELL, y, z + CELL) for x, y, z in sq]
+
+
 def main(argv):
+    if len(argv) >= 3 and argv[1] == 'level':
+        import json
+        print(json.dumps(level(json.load(open(argv[2])), argv[3] if len(argv) > 3 else LAYOUT), indent=1))
+        return 0
     if len(argv) >= 2 and argv[1] == 'table':
         layout = argv[2] if len(argv) > 2 else LAYOUT
         print(layout, 'bounds', bounds(layout))

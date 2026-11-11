@@ -4,6 +4,7 @@
   python3 tools/test_wow_places.py
 """
 import itertools
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wow_places as P  # noqa: E402
 
 LAYOUTS = ('stacked', 'flat')
+SPEC = json.loads((Path(__file__).resolve().parents[1] / 'release/levels/azeroth_a.json').read_text())
 
 
 def apart(a, b, gap):
@@ -101,6 +103,41 @@ class Mapping(unittest.TestCase):
         for layout in LAYOUTS:
             a, b = P.to_bg3(0, (100.0, 200.0, 30.0), layout), P.to_bg3(1, (100.0, 200.0, 30.0), layout)
             self.assertGreater(max(abs(x - y) for x, y in zip(a, b)), 1000.0)
+
+
+class Level(unittest.TestCase):
+    def test_the_levels_bounds_are_the_layouts(self):
+        for layout in LAYOUTS:
+            self.assertEqual(tuple(P.level(SPEC, layout)['Bounds']), P.bounds(layout))
+
+    def test_stacked_changes_only_the_height(self):
+        lv = P.level(SPEC, 'stacked')
+        self.assertEqual({k: v for k, v in lv.items() if k != 'Bounds'}, {k: v for k, v in SPEC.items() if k != 'Bounds'})
+        self.assertEqual(lv['Bounds'][:4] + lv['Bounds'][5:], SPEC['Bounds'][:4] + SPEC['Bounds'][5:])
+
+    def test_the_levels_own_squares_lie_inside_it_and_clear_of_every_place(self):
+        for layout in LAYOUTS:
+            lv = P.level(SPEC, layout)
+            b = lv['Bounds']
+            boxes = [P.box(m, layout) for m in P.places(layout)]
+            for q in P.level_squares(lv):
+                self.assertTrue(b[0] <= q[0] and q[3] <= b[3] and b[2] <= q[2] and q[5] <= b[5], (layout, q))
+                for box in boxes:
+                    self.assertTrue(apart(q, box, 1), (layout, q, box))
+
+    def test_two_corner_squares_span_the_level(self):
+        # BG3 sizes its spatial grid and region map by the squares at the level's two corners.
+        for layout in LAYOUTS:
+            lv = P.level(SPEC, layout)
+            b, sq = lv['Bounds'], P.level_squares(lv)
+            self.assertIn((b[0], b[2]), [(q[0], q[2]) for q in sq], layout)
+            self.assertIn((b[3], b[5]), [(q[3], q[5]) for q in sq], layout)
+
+    def test_the_start_point_stands_on_the_walk_square(self):
+        for layout in LAYOUTS:
+            lv = P.level(SPEC, layout)
+            w = [q for q in lv['Subgrids'] if q['Kind'] == 'walk'][0]
+            self.assertTrue(w['X'] < lv['Start'][0] < w['X'] + 64 and w['Z'] < lv['Start'][2] < w['Z'] + 64, layout)
 
 
 if __name__ == '__main__':
