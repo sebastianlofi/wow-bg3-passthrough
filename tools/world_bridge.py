@@ -371,6 +371,43 @@ FIXED_ORIGIN = (0.0, 0.0, 0.0)
 # floor above them, every other map on the third floor. The level's bounds hold them (release/levels).
 
 
+LIFT_STOPS = {}   # WoW map -> [(x, y, z, radius)] in WoW yards: where each lift car a character can ride rests, at its floor
+
+
+def load_lifts(maps):
+    """WoW's lifts, once a bridge: link/lifts.json for Lifts.lua (the floor of every car a character can ride, in
+    metres, by template entry: wow_lifts.decks, each car's own collision model in the player's data) and LIFT_STOPS
+    (where each such car rests: its spawn in the server's table and its path in the client's TransportAnimation.dbc),
+    for World.cut. Without the server's tables or the models there is no file and no lift carries anyone: the log says so."""
+    try:
+        import wow_lifts
+        import wow_vmap
+        import wowsave
+        rows = [line.split() for line in wowsave.sql(
+            'select t.entry, t.displayId, ifnull(g.map, -1), ifnull(g.position_x, 0), ifnull(g.position_y, 0), ifnull(g.position_z, 0), '
+            'ifnull(g.rotation0, 0), ifnull(g.rotation1, 0), ifnull(g.rotation2, 0), ifnull(g.rotation3, 1) '
+            'from mangos.gameobject_template t left join mangos.gameobject g on g.id = t.entry where t.type = 11;').splitlines()]
+        rows = [r for r in rows if len(r) == 10]
+        decks = wow_lifts.decks(sorted({(int(r[0]), int(r[1])) for r in rows}), wow_stand.data_dir('WOW_BG3_VMAPS', 'vmaps'), wow_vmap.read_model)
+        atomic_write(LINK / 'lifts.json', json.dumps({'Format': 1, 'Decks': {str(k): v for k, v in sorted(decks.items())}}).encode())
+        paths = wow_lifts.read_paths(Path(maps).parent / '5875' / 'dbc')
+        LIFT_STOPS.clear()
+        for r in rows:
+            entry, m = int(r[0]), int(r[2])
+            if m < 0 or entry not in decks or entry not in paths:
+                continue
+            spawn, quat = tuple(float(v) for v in r[3:6]), tuple(float(v) for v in r[6:10])
+            if sum(q * q for q in quat) < 0.5:
+                quat = (0.0, 0.0, 0.0, 1.0)
+            d = decks[entry]
+            for x, y, z in wow_lifts.stop_points(paths[entry], spawn, quat):
+                LIFT_STOPS.setdefault(m, []).append((x, y, z + d['Floor'] / YD, d['Radius'] / YD))
+        print('lifts: %d lift objects with a floor to ride (link/lifts.json), %d stops on %d maps' % (
+            len(decks), sum(len(v) for v in LIFT_STOPS.values()), len(LIFT_STOPS)), flush=True)
+    except Exception as e:  # noqa: BLE001  world mode runs without lifts
+        print('lifts: no floors for the lifts (%s): none carries anyone' % e, flush=True)
+
+
 def centre_of(map_id):
     """The BG3 centre of a WoW map's mapping. KeyError: a map WoW's data has no ground for."""
     return wow_places.centre(map_id)
@@ -492,6 +529,8 @@ class Walker:
         self.fall_said = 0.0
         self.faces_read = 0.0
         self.seen = 0.0
+        self.pos = None          # its BG3 position as last read
+        self.at = None           # the WoW point its squares are cut for (World.at_for), None: the session's
 
 
 class World:
@@ -507,6 +546,7 @@ class World:
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
         self.centre, self.origin = centre_of(self.map), FIXED_ORIGIN   # this map's mapping: the same in every session
         self.at = None       # WoW point the session's hero lands on
+        self.jumping = None  # (BG3 spot, WoW point) of a jump whose squares are being cut
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
         self.pinned = {}        # pool index -> until when it is not moved (something stood on it)
@@ -572,9 +612,22 @@ class World:
         return False, 'no report from the mod in %d s' % timeout
 
     # ---- squares ----
+    def at_for(self, ij):
+        """The WoW point square ij is cut for (cut_args' `at`: under the terrain there, the cut takes that place's
+        own floors): the one of the member nearest the square (its own after a jump left it behind, else the
+        session's), or the jump's own while its squares are cut."""
+        cx, cz = self.centre[0] + CELL * (ij[0] + 0.5), self.centre[2] + CELL * (ij[1] + 0.5)
+        now = time.time()
+        anchors = [(w.pos, w.at or self.at) for w in self.walkers.values() if w.pos and now - w.seen < 10.0]
+        if self.jumping:
+            anchors.append(self.jumping)
+        if not anchors:
+            return self.at
+        return min(anchors, key=lambda a: (a[0][0] - cx) ** 2 + (a[0][2] - cz) ** 2)[1]
+
     def cut_cmd(self, ij):
         """The wow_arena.py command for square ij, and its output folder; no command for one made ahead."""
-        args = cut_args(self.terrain, self.map, self.centre, self.origin, ij, self.at)
+        args = cut_args(self.terrain, self.map, self.centre, self.origin, ij, self.at_for(ij))
         ahead = cached_cut(args)
         if ahead:
             return None, ahead
@@ -674,6 +727,7 @@ class World:
                     assert max(struct.unpack_from('<f', st, k * 5 + 1)[0] for k in range(TILES * TILES)) - lv['base'] < 1300, \
                         'a storey spans more height than a subgrid holds'
                 cell['storey'] = cell['storeys'][0]
+        self.carve_lifts(cell)
         self.cells[ij] = cell
         # Every placed square stays cached (its triangles go to the plugin at every Stream, and the
         # fall alarm reads its floors and faces): a pool of up to 128 squares, plus room for squares coming in.
@@ -684,6 +738,36 @@ class World:
                 break
             self.cells.pop(old)
         return cell
+
+    def carve_lifts(self, cell):
+        """Where a lift car rests WoW's own floor under it is the car's (wow_lifts.carve): those tiles are not ground
+        in this square or its storeys, so a rider stands on the platform that carries the car's floor (Lifts.lua)."""
+        stops = LIFT_STOPS.get(self.map)
+        if not stops:
+            return
+        import wow_lifts
+        minx, minz = cell['min']
+        spots = []
+        for x, y, z, radius in stops:
+            b = self.to_bg3((x, y, z))
+            r = radius * YD + 0.5
+            if minx - r - 1 <= b[0] <= minx + CELL + r + 1 and minz - r - 1 <= b[2] <= minz + CELL + r + 1:
+                spots.append((b[0], b[1], b[2], r))
+        if not spots:
+            return
+        # A subgrid holds 1300 m over its base (the asserts in cut): a carved tile goes up, not past that.
+        n = 0
+        top = cell['base'] + 1290.0
+        cell['section'], k = wow_lifts.carve(cell['section'], len(cell['section']) // (TILES * TILES), minx, minz, spots, top=top)
+        n += k
+        cell['tiles'], _ = wow_lifts.carve(cell['tiles'], 5, minx, minz, spots, top=top)
+        for st in cell.get('storeys') or []:
+            sx, sz = st['min']
+            st['section'], k = wow_lifts.carve(st['section'], 5, sx, sz, spots, top=st['base'] + 1290.0)
+            st['floors'], _ = wow_lifts.carve(st['floors'], 5, sx, sz, spots, top=st['base'] + 1290.0)
+            n += k
+        if n:
+            print('lifts: %d tiles under a resting car are not ground in square %s' % (n, cell['ij']), flush=True)
 
     def window(self, w, bx, bz):
         """One member's squares as (core, rest): core the 2 x 2 round its lattice node (with
@@ -757,6 +841,7 @@ class World:
         h = hero(self.run)
         hero_uuid = (h or {}).get('Uuid') or 'hero'
         self.hero_walker = self.walker(hero_uuid, (h or {}).get('Name') or 'hero')
+        self.hero_walker.pos = tuple(hero_pos)
         out = [(self.hero_walker, hero_pos, False)]
         try:
             party = json.loads((IO / 'party.json').read_text())
@@ -782,6 +867,7 @@ class World:
                         continue
                     w = self.walker(u, m.get('Name') or u[:8])
                     w.summon = summon
+                    w.pos = tuple(p)
                     out.append((w, tuple(p), bool(m.get('Dead'))))
         except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
             pass
@@ -936,12 +1022,14 @@ class World:
         if y is None and login:
             self.land((at[0], at[1], self.terrain.height(at[0], at[1])))
             print('start: no raised floor under WoW\'s player, the terrain', flush=True)
-            self.cells.clear()
+            for ij in want:
+                self.cells.pop(ij, None)
             cut_all()
         elif y is not None and abs(y - S[1]) > wow_arena.STOREY_CLEAR * YD:
             self.land((at[0], at[1], at[2] + (y - S[1]) / YD))
             print('move: the cut has no floor at z %.1f here, z %.1f instead' % (at[2], self.at[2]), flush=True)
-            self.cells.clear()
+            for ij in want:
+                self.cells.pop(ij, None)
             cut_all()
         # A Start holds 12 squares: the level under the hero first, the others stream in after it.
         S = self.spot()
@@ -1149,6 +1237,14 @@ class World:
             # Once the cover is black (the cuts of a re-origin take that time first): the old mapping is off.
             cover_wait(black)
             self.publish(False)
+        if not cross:
+            # The same WoW map: the controlled character and its chained group jump; nothing stops.
+            cover_wait(black)
+            why = self.jump((x, y, z))
+            if why is None:
+                answer(True, {'Origin': list(self.at), 'Map': target})
+                return self
+            print('move: no jump (%s); the whole party moves through a Stop and a Start' % why, flush=True)
         covered()
         seq = self.command('Stop')
         ok, err = self.wait_done(seq, 60)
@@ -1179,6 +1275,66 @@ class World:
                 time.sleep(3)
         answer(False, 'Start at the new place failed: %s' % last)
         return self.again()
+
+    def jump(self, at):
+        """A move on this session's own WoW map: nothing stops. The squares at the new place are cut and placed
+        beside the ones every member already has, then the mod sends the controlled character there with the
+        members chained to it (WorldMode.lua Jump, Party.lua Move: BG3's own group teleport); a member left behind
+        keeps its ground, and its squares are still cut for the place it stands at. None, or why it could not."""
+        old_at, old_node = self.at, {u: w.node for u, w in self.walkers.items()}
+        held = [w for w in self.walkers.values() if w.at is None]
+        for w in held:
+            w.at = old_at        # whoever stays keeps the place its squares are cut for
+        try:
+            self.land(at)
+            S = self.spot()
+            self.jumping = (S, self.at)
+            j = Walker('jump', 'jump')
+            j.node = node_of(self.centre, S[0], S[2])
+            want, _ = self.window(j, S[0], S[2])
+            ups = self.landing(at, False, want)
+            S = self.spot()
+            self.jumping = (S, self.at)
+            need = list(want) + [u for u in ups[:8] if u not in want]
+            keep = [ij for ij in self.wanted(self.members) if ij not in need]
+            pairs = [(k, ij) for k, ij in self.moves(need + keep) if ij in need]
+            if len(pairs) < len([ij for ij in need if ij not in self.placed.values()]):
+                raise RuntimeError('the pool has no free square for the new place')
+            cells = self.cells_for(pairs)
+            squares = [ij for ij in (self.rays or []) if ij not in need] + need
+            self.write_triangles(squares)
+            seq = self.command('Jump', Spot=list(S), Cells=cells, Rays=True)
+            ok, err = self.wait_done(seq, 60)
+            if not ok:
+                raise RuntimeError('Jump refused: %s' % err)
+            self.rays = sorted(squares)
+            for k, ij in pairs:
+                self.took(k, ij)
+            # Who went (Party.lua Move): the session's place is theirs now.
+            moved = set()
+            try:
+                r = json.loads((IO / 'party-result.json').read_text())
+                v = r.get('Value') if r.get('RunId') == self.run else None
+                if isinstance(v, dict) and isinstance(v.get('Moved'), list):
+                    moved = {str(u) for u in v['Moved']}
+            except (FileNotFoundError, json.JSONDecodeError, AttributeError):
+                pass
+            hero_w = getattr(self, 'hero_walker', None)
+            for w in self.walkers.values():
+                if w.uuid in moved or (not moved and w is hero_w):
+                    w.at, w.node, w.pos = None, node_of(self.centre, S[0], S[2]), tuple(S)
+            self.jumping = None
+            print('jump: %d squares placed at the new place, %d of the party went' % (len(pairs), len(moved)), flush=True)
+            return None
+        except Exception as e:  # noqa: BLE001  the caller moves the old way
+            self.jumping = None
+            self.at = old_at
+            for w in held:
+                w.at = None
+            for u, n in old_node.items():
+                if u in self.walkers:
+                    self.walkers[u].node = n
+            return str(e)
 
     def again(self):
         """World mode again where WoW's player stands (after a failed move), tried a few times."""
@@ -1407,6 +1563,7 @@ def main():
     stop = {'now': False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     signal.signal(signal.SIGINT, lambda *_: stop.update(now=True))
+    load_lifts(a.maps)
     w.start()
     sight = FarSight(w)
     sight.start()
