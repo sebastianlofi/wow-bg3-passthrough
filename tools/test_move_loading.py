@@ -14,6 +14,8 @@ Osi = {GetHostCharacter = function() return "HOST" end,
        ScreenFadeTo = function(c, d, s, id) calls[#calls + 1] = "to " .. id .. " " .. d end,
        ClearScreenFade = function(c, d, id, f) calls[#calls + 1] = "clear " .. id end}
 Ext = {IO = {LoadFile = function(p) return files[p] end},
+       -- Hero.lua: the far switch's cover asks it whether a place is in WoW's world; every place of these cases is.
+       Require = function(name) return {InWorld = function() return true end} end,
        Log = {Print = function(s) end},
        Osiris = {RegisterListener = function(name, arity, when, fn) listeners[name] = fn end},
        Utils = {MonotonicTime = function() return clock end, GetGameState = function() return state end},

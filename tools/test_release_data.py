@@ -34,7 +34,9 @@ def test_nothing_ships_the_sql_or_a_seed():
 
 
 def test_first_start_stats_wait():
-    """bg3le patch 0008 follows 0006 on its file, and the coordinator writes the file it waits on."""
+    """bg3le patch 0008 follows 0006 on its file. Its wait is for a file the coordinator no longer writes: BG3's boot
+    never waits for the WoW side (nothing of it runs before the first load), so the patch finds no wait file and goes
+    on at once; the coordinator still writes the overrides file BG3's loader reads the copies through."""
     import hashlib, json
     lock = json.loads((ROOT / 'patches/bg3le/build.lock.json').read_text())
     after = {}
@@ -48,7 +50,8 @@ def test_first_start_stats_wait():
     assert any('0008-first-start-stats-wait' in p['file'] for p in lock['runtime_patches'])
     patch = (ROOT / 'patches/bg3le/0008-first-start-stats-wait.patch').read_text()
     coord = (ROOT / 'tools/wowbg3-coord.py').read_text()
-    assert '".wait"' in patch and "'boot-path-overrides.wait'" in coord and 'ws.st_mtime < 10' in patch.replace('std::time(nullptr) - ', '')
+    assert '".wait"' in patch and 'ws.st_mtime < 10' in patch.replace('std::time(nullptr) - ', '')
+    assert "'boot-path-overrides.txt'" in coord and "'boot-path-overrides.wait'" not in coord
 
 
 def test_usage_shows_the_whole_header():
