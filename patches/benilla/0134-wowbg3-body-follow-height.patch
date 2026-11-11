@@ -1,0 +1,72 @@
+diff --git a/crates/benilla-app/src/wowbg3_body.rs b/crates/benilla-app/src/wowbg3_body.rs
+--- a/crates/benilla-app/src/wowbg3_body.rs
++++ b/crates/benilla-app/src/wowbg3_body.rs
+@@ -11,9 +11,13 @@
+ //! the pose `wowbg3_tav` draws her with: the first object marked as her root (pose flags bit 0),
+ //! mapped with the mapping of `tavmesh.bin` and lowered by the ground lock, as `TavFeet`. Only while
+ //! world mode runs, which `tav.bin` says (`WorldMode.lua` writes it only then, with her position in
+-//! WoW from the live mapping): a fresh `tav.bin` within [`MATCH`] yd of the packet's root. Without
++//! WoW from the live mapping): a fresh `tav.bin` within [`MATCH`] yd of the packet's root, and no
++//! more than [`MATCH_UP`] yd over or under it ([`same_place`]). Without
+ //! that gate a world-mode Stop (she goes home into BG3's level while the layer still sends poses)
+-//! put the body 1608 yd away in the harness, where it fell to its death. A jump of more than
++//! put the body 1608 yd away in the harness, where it fell to its death; and a move to another WoW
++//! map whose place in BG3's level lies straight over or under the old one (patch 0134: Kalimdor a
++//! floor over the Eastern Kingdoms) put it 4398 yd under the ground through the old map's mapping,
++//! which `tavmesh.bin` still held, and the server sent the character to a graveyard. A jump of more than
+ //! [`FAR`] yd (a release as a ghost) waits until the aim has held for [`FAR_HOLD`] s. The
+ //! controller (`player::controller`) then drives the body there through its own mover: forward,
+ //! along her bearing, at the speed that lands it on her this frame ([`steer`]), facing her own
+@@ -40,6 +44,10 @@
+ /// Yards between the packet's root and `tav.bin`'s position that still read as the same world mode
+ /// (`tav.bin` is up to three BG3 ticks and four WoW frames older).
+ const MATCH: f32 = 4.0;
++/// Yards the packet's root may lie over or under `tav.bin`'s position (patch 0134). Wide: the ground
++/// lock and a fall between the two records are height only. The places of two WoW maps in BG3's
++/// level are thousands of yards apart, so another map's mapping never passes.
++const MATCH_UP: f32 = 100.0;
+ /// Milliseconds a `tav.bin` record stays fresh.
+ const TAV_FRESH_MS: u64 = 300;
+ /// Yards of a jump that waits for a steady aim ([`FAR_HOLD`] seconds).
+@@ -261,6 +269,11 @@
+     m.0.iter().chain(m.1.iter()).all(|v| v.is_finite()).then_some(m)
+ }
+ 
++/// Whether the packet's root (Bevy world) is where `tav.bin` says she is: the gate of the follow.
++fn same_place(tav: Vec3, at: Vec3) -> bool {
++    Vec2::new(tav.x - at.x, tav.z - at.z).length() < MATCH && (tav.y - at.y).abs() < MATCH_UP
++}
++
+ /// Her root in this frame's packet, for [`steer`].
+ fn aim(
+     mut a: ResMut<BodyAim>,
+@@ -291,7 +304,7 @@
+     let tav = follow.as_deref().and_then(|t| t.tav).filter(|_| {
+         seen != 0 && super::clock_ms().saturating_sub(seen) < TAV_FRESH_MS
+     });
+-    let matched = aim.filter(|x| tav.is_some_and(|t| Vec2::new(t.x - x.at.x, t.z - x.at.z).length() < MATCH));
++    let matched = aim.filter(|x| tav.is_some_and(|t| same_place(t, x.at)));
+     // Patch 0041: after a server teleport the body stays where the server put it
+     // until BG3's character has been moved there too (`wowbg3_teleport`).
+     let matched = matched.filter(|x| !crate::wowbg3_teleport::held_away(x.at));
+@@ -372,6 +385,20 @@
+     }
+ 
+     #[test]
++    fn the_gate_takes_height_too() {
++        let tav = Vec3::new(10.0, 80.0, -20.0);
++        // The same place: a few yards beside, the ground lock or a fall over or under.
++        assert!(same_place(tav, Vec3::new(12.0, 80.0, -21.0)));
++        assert!(same_place(tav, Vec3::new(10.0, 80.0 - 30.0, -20.0)));
++        // Not world mode's place: beside by more than MATCH.
++        assert!(!same_place(tav, Vec3::new(10.0 + MATCH, 80.0, -20.0)));
++        // The mapping of another WoW map, a floor of BG3's level over or under: the same x and z,
++        // 4096 m (4479 yd) away in height.
++        assert!(!same_place(tav, Vec3::new(10.0, 80.0 - 4479.0, -20.0)));
++        assert!(!same_place(tav, Vec3::new(10.0, 80.0 + 4479.0, -20.0)));
++    }
++
++    #[test]
+     fn steers_onto_her_this_frame() {
+         *SHARED.lock().unwrap() = Some(Shared::default());
+         SHARED.lock().unwrap().as_mut().unwrap().aim =

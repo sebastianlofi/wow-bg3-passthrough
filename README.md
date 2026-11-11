@@ -279,8 +279,8 @@ What works is listed above; this is what does not, or has not been tried:
 - **Balance and pacing are a first guess.** The numbers that map WoW's mobs, health, damage, levels
   and XP onto BG3's were set by hand to make things playable, not tuned. A BG3 level 1 character
   out-damages a level 4 WoW human today, and the 1 to 60 pace is unknown.
-- **Most of the play so far was in Elwynn Forest.** Of the dungeons only the Deadmines has been entered; the other
-  start zones and the Horde side have had little or no testing.
+- **Most of the play so far was in Elwynn Forest.** Of the dungeons only the Deadmines has been entered and the
+  Stockade stood in; the other start zones and the Horde side have had little or no testing.
 - **A party spread far apart** is partly built. Switching to a party member far from the one you
   controlled keeps BG3's fade until WoW's world there is loaded, and party members stay in the game
   when your hero travels to the other continent. Still to come: a member on another continent than
