@@ -22,6 +22,9 @@ This is the first public version. What we know is missing or rough:
   itself does not cover.
 - BG3's characters are shaded as WoW shades its own: as a whole, when the ground they stand on is in a tree's or a
   building's baked shadow. A shadow's edge does not cross a body.
+- BG3's characters are lit by WoW's light at WoW's time of day, the same at every camera distance: BG3's own
+  close-up character light (the key and rim light it adds when the camera comes near) is off in WoW's world. In a
+  dark room a character keeps a small neutral light of its own, so it stays readable; the room itself does not.
 
 - Enemy vision cones show on WoW's ground while you sneak (BG3's own overlay, composited), but their
   edges are ragged: BG3 tests each 0.5 m tile's height, and where WoW's ground is more than about half
