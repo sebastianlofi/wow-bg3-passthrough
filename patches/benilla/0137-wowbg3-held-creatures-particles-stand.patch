@@ -1,0 +1,69 @@
+diff --git a/crates/benilla-world/src/particles.rs b/crates/benilla-world/src/particles.rs
+--- a/crates/benilla-world/src/particles.rs
++++ b/crates/benilla-world/src/particles.rs
+@@ -89,6 +89,13 @@
+         self.def.bone
+     }
+ }
++
++/// WOW-BG3 (patch 0137): on a model, its particle clouds stand as they are: nothing is born, moves or ages, and
++/// what is there stays drawn. BG3's turn-based mode stops a creature on its frame (patch 0136), and a fire
++/// elemental's flames or a torch's smoke went on burning over the still model. ([`ParticleEmitter::set_frozen`]
++/// is another thing: it hides the cloud.)
++#[derive(Component)]
++pub struct ParticlesHeld;
+ 
+ /// One spawned emitter: def, placement, live pool and emission state.
+ #[derive(Component)]
+diff --git a/crates/benilla-world/src/particles/sim.rs b/crates/benilla-world/src/particles/sim.rs
+--- a/crates/benilla-world/src/particles/sim.rs
++++ b/crates/benilla-world/src/particles/sim.rs
+@@ -175,6 +175,8 @@
+     transforms:
+         Query<'w, 's, &'static GlobalTransform, (Without<ParticleEmitter>, Without<ChildDraw>)>,
+     visibility: Query<'w, 's, &'static InheritedVisibility>,
++    /// WOW-BG3 (patch 0137): the models whose clouds stand still ([`super::ParticlesHeld`]).
++    held: Query<'w, 's, (), With<super::ParticlesHeld>>,
+     /// The transport the owner's model rides, if any: world-mode particles' stored frame.
+     rides: crate::ride_frame::RideFrames<'w, 's>,
+ }
+@@ -496,6 +498,9 @@
+         if is_booth {
+             emitter.gated = false;
+         }
++        // WOW-BG3 (patch 0137): a held model's cloud takes no time this frame. A step of a microsecond, not
++        // of nothing: the rates below divide by it, and at this size nothing is born and nothing moves.
++        let dt = if emitter.anchor.is_some_and(|a| owners.held.contains(a)) { 1.0e-6 } else { dt };
+         let (draw_cam, e_cam_pos, e_right, e_up) = match booth {
+             Some((cam_entity, tf, ..)) => {
+                 let (_, rot, _) = tf.to_scale_rotation_translation();
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -2239,7 +2239,10 @@
+ /// animation driver passes it over ([`turn_frozen`]), so nothing new starts on it: no gait change when the
+ /// server's stop arrives, no fidget, and none of the sounds an animation plays. Let go (the environment's turn,
+ /// the mode left, a fight took it), it goes on from that frame.
+-fn turn_freeze(mut units: Query<(Entity, &Guid, &mut AnimationPlayer), Without<SelfPlayer>>) {
++fn turn_freeze(
++    mut commands: Commands,
++    mut units: Query<(Entity, &Guid, &mut AnimationPlayer), Without<SelfPlayer>>,
++) {
+     let held: HashSet<u64> =
+         SHARED.lock().map(|s| s.frozen.difference(&s.held).copied().collect()).unwrap_or_default();
+     let Ok(mut frozen) = TURN_FROZEN.lock() else {
+@@ -2253,9 +2256,14 @@
+         if held.contains(&guid.0) {
+             // Each frame: whatever another system started on it since stands still too.
+             player.pause_all();
++            if !frozen.contains(&entity) {
++                // Patch 0137: its particle clouds stand with it.
++                commands.entity(entity).try_insert(benilla_world::particles::ParticlesHeld);
++            }
+             now.insert(entity);
+         } else if frozen.contains(&entity) {
+             player.resume_all();
++            commands.entity(entity).try_remove::<benilla_world::particles::ParticlesHeld>();
+         }
+     }
+     if now.len() != frozen.len() {

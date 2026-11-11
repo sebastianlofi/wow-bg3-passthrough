@@ -269,6 +269,21 @@ class Move(Base):
         self.assertEqual(started, [TARGET])
         self.assertEqual(self.w.at, (0.0, 0.0, 100.0))     # the jump left the session as it was
 
+    def test_a_place_under_the_terrain_is_no_jump(self):
+        # The city inside the mountain: its squares are cut for its own floors, the ones held are the mountain's.
+        self.w.terrain = SimpleNamespace(height=lambda x, y: TARGET[2] + 320.0)
+        result, started, answer = self.run_move(self.request())
+        self.assertIsNot(result, self.w)
+        self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
+        self.assertEqual(started, [TARGET])
+        # And out of it again: the squares held there are the city's.
+        self.w.sent.clear()
+        self.w.terrain = SimpleNamespace(height=lambda x, y: 100.0 if x < -8000 else 500.0)
+        self.assertTrue(self.w.under_terrain(self.w.at))
+        self.assertFalse(self.w.under_terrain(TARGET))
+        result, started, answer = self.run_move(self.request())
+        self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
+
     def test_who_stays_keeps_the_place_its_squares_are_cut_for(self):
         w = self.w
         old = w.at
@@ -475,6 +490,51 @@ class Cache(Base):
         self.assertEqual(sorted(core), sorted(want))
         self.assertEqual(sorted(rest), sorted(block))
         self.assertEqual(W.square_order(2)[1], [])
+
+
+class CreatureGround(Base):
+    """Every creature WoW has loaded stands on ground of ours, so that it can have its stand-in."""
+
+    def mobs(self, rows, name='mobs.txt'):
+        f = self.tmp / 'link' / name
+        f.parent.mkdir(exist_ok=True)
+        f.write_text('seq 1\nhero 0000000000000002 0 0 100 0 50 50 1 0\n' + ''.join(
+            'mob f13000000001%04x 299 5 %d %.1f %.1f 100.0 0.0 %d 50 0 Wolf\n' % (i, 1, x, y, hp) for i, (x, y, hp) in enumerate(rows)))
+
+    def test_a_creature_past_the_window_gets_its_square(self):
+        w = self.w
+        w.a.floor = 4
+        w.ground_pool = w.pool = 40
+        hero = w.walker('h', 'h')
+        S = w.spot()
+        base = w.wanted([(hero, S, None)])
+        self.assertEqual(len(base), 16)
+        # One creature inside the block, one 161 yd off, a dead one farther still.
+        far, dead = (0.0, 161.0, 50), (0.0, -400.0, 0)
+        self.mobs([(10.0, 10.0, 50), far, dead])
+        want = w.wanted([(hero, S, None)])
+        b = w.to_bg3((far[0], far[1], 100.0))
+        self.assertEqual(want[:16], base)                      # the party's own ground first, unchanged
+        self.assertEqual(want[16:], [w.under(b[0], b[2])])     # then the far creature's square; none for the dead
+        self.assertNotIn(want[16], base)
+        floor = json.loads((self.tmp / 'floor.json').read_text())['Squares']
+        self.assertIn([w.centre[0] + B.CELL * want[16][0], w.centre[2] + B.CELL * want[16][1]], floor)
+
+    def test_a_members_feed_counts_while_it_is_fresh_and_the_pool_bounds_it(self):
+        w = self.w
+        w.a.floor = 4
+        w.ground_pool = w.pool = 18
+        hero = w.walker('h', 'h')
+        S = w.spot()
+        self.mobs([], 'mobs.txt')
+        self.mobs([(0.0, 300.0 + 70.0 * k, 50) for k in range(5)], 'feed/astarion.txt')
+        want = w.wanted([(hero, S, None)])
+        self.assertEqual(len(want), 18)                        # 16 of the window, 2 of 5 creature squares: the nearest
+        near = [w.under(*(lambda b: (b[0], b[2]))(w.to_bg3((0.0, 300.0 + 70.0 * k, 100.0)))) for k in range(2)]
+        self.assertEqual(want[16:], near)
+        old = time.time() - 60
+        os.utime(self.tmp / 'link/feed/astarion.txt', (old, old))
+        self.assertEqual(len(w.wanted([(hero, S, None)])), 16)  # a feed that stopped: its creatures are gone
 
 
 class InTheLevel(Base):

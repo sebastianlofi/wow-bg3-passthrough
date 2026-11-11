@@ -413,6 +413,36 @@ def centre_of(map_id):
     return wow_places.centre(map_id)
 
 
+FEED_FRESH_S = 5.0   # a member's creature feed older than this is a member gone (the fight bridge's own rule)
+
+
+def loaded_creatures():
+    """[(x, y, z)] in WoW yards: every living creature WoW has loaded round the party, as the fight bridge reads
+    them for the stand-ins (bridge/src/mirror.rs read_feed): benilla's link/mobs.txt and the members' fresh
+    link/feed/*.txt, lines `mob GUID ENTRY LEVEL REACTION X Y Z O HP ...`."""
+    files = [LINK / 'mobs.txt']
+    try:
+        files += [f for f in sorted((LINK / 'feed').glob('*.txt')) if time.time() - f.stat().st_mtime < FEED_FRESH_S]
+    except OSError:
+        pass
+    out = []
+    for f in files:
+        try:
+            text = f.read_text(errors='replace')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            w = line.split()
+            if len(w) >= 10 and w[0] == 'mob':
+                try:
+                    x, y, z, hp = float(w[5]), float(w[6]), float(w[7]), int(w[9])
+                except ValueError:
+                    continue
+                if hp > 0 and all(map(math.isfinite, (x, y, z))):
+                    out.append((x, y, z))
+    return out[:1024]
+
+
 def node_of(centre, bx, bz):
     """The lattice node nearest a BG3 point."""
     return (int(math.floor((bx - centre[0]) / CELL + 0.5)), int(math.floor((bz - centre[2]) / CELL + 0.5)))
@@ -880,7 +910,8 @@ class World:
     def wanted(self, members):
         """Every member's squares from one pool, in tiers (see the module notes): the square under
         each member, then each member's 2 x 2, then the rest of each window, members nearest the
-        camera first; cut to the pool."""
+        camera first, then the squares under the creatures WoW has loaded past those (creature_squares);
+        cut to the pool."""
         tiers = [[], [], []]
         for w, p, _ in members:
             if w.node is None:
@@ -889,6 +920,7 @@ class World:
             tiers[0].append(self.under(p[0], p[2]))
             tiers[1].extend(core)
             tiers[2].extend(rest)
+        tiers.append(self.creature_squares([p for _, p, _ in members]))
         out = []
         for t in tiers:
             for ij in t:
@@ -902,6 +934,24 @@ class World:
             ups = [ij + (k + 1,) for k in range(len(wow_arena.STOREY_OFFSETS)) for ij in out
                    if k < len((self.cells.get(ij) or {}).get('storeys') or ())]
             out = out + ups[:max(0, self.pool - len(out))]
+        return out
+
+    def creature_squares(self, where):
+        """The squares under the creatures WoW has loaded (loaded_creatures), the one nearest a member first. A
+        stand-in is only put on ground (floor.json, Mirrors.lua), so a creature WoW shows past the members' windows
+        had none: in the open any creature beyond the block's near edge (64 m from a member at worst, and WoW shows
+        them to about 90 m), and the few WoW keeps loaded farther (Stormwind: an officer at 161 yd). They come after
+        every member's own window, so the pool goes to the party's ground first."""
+        if not where:
+            return []
+        far = []
+        for c in loaded_creatures():
+            b = self.to_bg3(c)
+            far.append((min(math.hypot(b[0] - p[0], b[2] - p[2]) for p in where), self.under(b[0], b[2])))
+        out = []
+        for _, ij in sorted(far):
+            if ij not in out:
+                out.append(ij)
         return out
 
     def write_floor(self, squares):
@@ -1276,11 +1326,21 @@ class World:
         answer(False, 'Start at the new place failed: %s' % last)
         return self.again()
 
+    def under_terrain(self, at):
+        """Whether a WoW point lies so far under the terrain that its squares are cut for its own floors (cut_args)."""
+        return bool(STOREYS and at and at[2] < self.terrain.height(at[0], at[1]) - wow_arena.UNDER_CLEAR)
+
     def jump(self, at):
         """A move on this session's own WoW map: nothing stops. The squares at the new place are cut and placed
         beside the ones every member already has, then the mod sends the controlled character there with the
         members chained to it (WorldMode.lua Jump, Party.lua Move: BG3's own group teleport); a member left behind
         keeps its ground, and its squares are still cut for the place it stands at. None, or why it could not."""
+        # A place under the terrain (Ironforge, Undercity, a mine) has its squares cut for its own floors
+        # (cut_args --under, by the point landed on), and the squares this session holds are cut for another
+        # place's: a jump kept them. (Harness: from the mountain over Ironforge into the city, 320 yd down, the jump
+        # placed no new square and the party stood on the mountain again.) Such a move is a Stop and a Start.
+        if self.under_terrain(at) or self.under_terrain(self.at):
+            return 'the place left or the new one lies under the terrain, where squares are cut for one place only'
         old_at, old_node = self.at, {u: w.node for u, w in self.walkers.items()}
         held = [w for w in self.walkers.values() if w.at is None]
         for w in held:

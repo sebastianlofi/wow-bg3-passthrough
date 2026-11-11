@@ -542,6 +542,7 @@ function M.Start(runId)
         local ok, err = pcall(walk, Ext.UI.GetRoot(), 0)
         if not ok then Ext.Log.Print("WOW-BG3 world: place banner left as is: " .. tostring(err)) end
     end
+    local stop -- below; a failed start runs it too
     local function start(c)
         local function vec(t, n)
             if type(t) ~= "table" or #t ~= n then return false end
@@ -556,6 +557,11 @@ function M.Start(runId)
         assert(okFlag and flagOn == true, "world mode is off for this game (WorldFlag: "
             .. (okFlag and tostring(flagOn) or tostring(flagOn)) .. ")")
         state = {Centre = c.Centre, Spot = vec(c.Spot, 3) and c.Spot or c.Centre, WowOrigin = c.WowOrigin, Layer = tonumber(c.Layer) or -15.262, At = ticks}
+        -- A start that fails part way is taken back whole. The pool is taken and the squares are placed before
+        -- the rays and the hero's teleport; a failure after that (Ironforge: the plugin refused the triangles)
+        -- left them so, every later Start answered "the pool is in use", and world mode could not come up
+        -- again in that BG3 session, not even where WoW's character stood. Stop's own steps undo what was done.
+        local ok, err = pcall(function()
         camp.Last, camp.Hold = nil, nil -- a new session's teleport is no trip
         -- Several out-of-bounds layers (plugin 0.2.9): Layers lists their heights.
         if type(c.Layers) == "table" and #c.Layers > 0 then state.Layers = c.Layers end
@@ -621,6 +627,13 @@ function M.Start(runId)
         hookInput()
         placeBanner("Visible")
         Ext.Log.Print("WOW-BG3 world: started at " .. Ext.Json.Stringify(S))
+        end)
+        if not ok then
+            Ext.Log.Print("WOW-BG3 world: start failed and is taken back: " .. tostring(err))
+            pcall(stop)
+            state = nil
+            error(err, 0)
+        end
     end
     local function stream(c)
         assert(state and state.Started, "world mode not started")
@@ -661,7 +674,7 @@ function M.Start(runId)
         wait(30)
         Ext.Log.Print("WOW-BG3 world: jumped to " .. Ext.Json.Stringify(S))
     end
-    local function stop()
+    stop = function()
         if not state then return end
         -- Stop publishing first: Tav is sent back to her BG3 position below, and benilla would
         -- otherwise walk the WoW character toward that spot's mapping while Stop runs.

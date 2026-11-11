@@ -2567,8 +2567,12 @@ bool rays_on(int side, float const* tris, std::size_t n, std::uint8_t const* kin
             g.Max = glm::max(g.Max, v);
         }
     }
+    // A cluster's height costs nothing here (the cells below are over x and z only), so it is held to the largest
+    // span a cluster may ever have, not to the 400 m it was: under Ironforge's peak the mountain's surface (WoW z 820)
+    // and the city's floor (z 500) stand in one cluster with the storeys under them, over 400 m, and every start
+    // there was refused ("triangles span more than the arena limit"), the teleport and the walk in alike.
     for (auto& g : r->Grids) {
-        if (g.Max.x - g.Min.x > g_max_span || g.Max.z - g.Min.z > g_max_span || g.Max.y - g.Min.y > 400.0f) {
+        if (g.Max.x - g.Min.x > g_max_span || g.Max.z - g.Min.z > g_max_span || g.Max.y - g.Min.y > kMaxSpanLimit) {
             *why = "triangles span more than the arena limit (max_span_m)";
             return false;
         }
