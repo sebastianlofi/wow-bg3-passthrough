@@ -87,6 +87,24 @@ vec3 wow_at(vec2 ndc) {
 }
 // A pixel's place in frame N's view from its eye depth: right, up, forward (metres).
 vec3 vpos(vec2 ndc, float z) { return vec3(ndc.x * pc.fN.w * z, -ndc.y * pc.rN.w * z, z); }
+// The eye depth (metres) of a pixel of BG3's: the depth of the party's figure the pixel lies nearest on the screen
+// (the table's tail lists them, a metre above their feet). BG3 gives the feed no image of its pixels' depths: the
+// G-buffer's fourth colour target, read as one before, is RGBA8 and holds no depth (0 on a body), and the one R32F
+// image its composite samples does not change with the camera's distance. A figure is a metre or two deep, so a
+// pixel's fog and its distance to a light are right to that. 0: no figure known.
+float eye_z(ivec2 q, vec2 ndc) {
+    const int LF = 17 * 17 * 17 * 3 + 4 + 8 * 8 + 8 * 8 + 4 + 8 * 4;
+    int nf = int(tb.TAB[LF + 2]);
+    float best = 1e30, zb = 0.0;
+    for (int i = 0; i < nf && i < 8; i++) {
+        vec3 sp = vec3(tb.TAB[LF + 4 + i * 4], tb.TAB[LF + 5 + i * 4], tb.TAB[LF + 6 + i * 4]);
+        if (!(sp.z > 0.1)) continue;
+        vec2 sn = vec2(sp.x / (sp.z * pc.fN.w), -sp.y / (sp.z * pc.rN.w));
+        float dd = length((ndc - sn) * vec2(pc.fN.w, pc.rN.w) * sp.z);
+        if (dd < best) { best = dd; zb = sp.z; }
+    }
+    return zb;
+}
 void main() {
     float ex = max(e0.a.y * e1.a.x, 1e-6);  // BG3's exposure: the x that shows as w is the table's over this
     // patch61: e0 is BG3's newest eye state (the exposure this frame's lighting pre-exposes with): WoW's radiance
@@ -114,7 +132,7 @@ void main() {
         ivec2 q = ivec2(gl_FragCoord.xy);
         vec4 fg = vec4(0.0);
         if (pc.fogon > 0.5 && !zero) {
-            float zy = texelFetch(gz, q, 0).r / 0.9144;
+            float zy = eye_z(q, ndc) / 0.9144;
             float f = clamp((pc.fog1 - zy) / max(pc.fog1 - pc.fog0, 0.001), 0.0, 1.0);
             if (zy < 1e6) fg = vec4(float(pc.fogc & 1023u), float((pc.fogc >> 10) & 1023u), float((pc.fogc >> 20) & 1023u), 0.0) / 1023.0 + vec4(0.0, 0.0, 0.0, 2.0 + f);
         }
@@ -127,11 +145,10 @@ void main() {
         const int LT = 17 * 17 * 17 * 3;
         const int LX = LT + 4 + 8 * 8 + 8 * 8;  // the tail's last four: the world's up in this view, 1 with BG3's normal bound
         int nl = int(tb.TAB[LT]), nb = int(tb.TAB[LT + 2]);
-        // The pixel's place in this view (right, up, forward: metres) and its facing. BG3's own normal for it when
-        // its lighting pass has bound one (its materials' detail is in it: BG3 decodes s = xy * 3.5554 - 1.7777,
-        // n = (s * 2 / (|s|^2 + 1), 1 - 2 / (|s|^2 + 1))); else from the eye depths beside it: on each axis the
-        // neighbour nearer in depth, so the step at a figure's edge gives no wild facing.
-        float z = texelFetch(gz, q, 0).r;
+        // The pixel's place in this view (right, up, forward: metres) and its facing: BG3's own normal for it (its
+        // materials' detail is in it: BG3 decodes s = xy * 3.5554 - 1.7777, n = (s * 2 / (|s|^2 + 1), 1 - 2 /
+        // (|s|^2 + 1))), once one of its passes has bound it.
+        float z = eye_z(q, ndc);
         vec3 P = vpos(ndc, z);
         vec3 N;
         if (tb.TAB[LX + 3] > 0.5) {
@@ -139,20 +156,14 @@ void main() {
             float k = 2.0 / (dot(e, e) + 1.0);
             N = vec3(e * k, 1.0 - k);
         } else {
-            vec2 px = vec2(pc.uN.w, pc.rK.w) * 2.0;
-            float zl = texelFetch(gz, q + ivec2(-1, 0), 0).r, zr = texelFetch(gz, q + ivec2(1, 0), 0).r;
-            float zu = texelFetch(gz, q + ivec2(0, -1), 0).r, zd = texelFetch(gz, q + ivec2(0, 1), 0).r;
-            vec3 dx = abs(zr - z) < abs(zl - z) ? vpos(ndc + vec2(px.x, 0.0), zr) - P : P - vpos(ndc - vec2(px.x, 0.0), zl);
-            vec3 dy = abs(zd - z) < abs(zu - z) ? vpos(ndc + vec2(0.0, px.y), zd) - P : P - vpos(ndc - vec2(0.0, px.y), zu);
-            N = cross(dx, dy);
-            float nn = dot(N, N);
-            N = nn > 1e-20 ? N / sqrt(nn) : vec3(0.0, 0.0, -1.0);
-            if (dot(N, P) > 0.0) N = -N;
+            N = vec3(0.0, 0.0, -1.0);  // no normal of BG3's bound yet: toward the eye
         }
-        // Compose word wdzdbg=1 (a test view): a pixel of BG3's by the eye depth read for it: red its depth over 20 m,
-        // green 1 where that depth is none (0), blue the facing's part toward the eye.
+        // Compose word wdzdbg=1 (a test view): a pixel of BG3's by its eye depth: red the depth over 20 m, green 1 where
+        // none is known, blue the facing's part toward the eye.
         if (tb.TAB[LX + 4 + 8 * 4 + 1] > 0.5) {
-            vec3 dbg = vec3(clamp(z / 20.0, 0.0, 1.0), z < 0.01 ? 1.0 : 0.0, clamp(-N.z, 0.0, 1.0));
+            vec3 dbg = vec3(clamp(z / 20.0, 0.0, 1.0), z > 0.0 ? 0.0 : 1.0, clamp(-N.z, 0.0, 1.0));
+            // wdzdbg=2: the image's own number: red it times 50, green it times 1000 (its fraction), blue 1 above 0.
+            if (tb.TAB[LX + 4 + 8 * 4 + 1] > 1.5) { float r0 = texelFetch(gz, q, 0).r; dbg = vec3(clamp(r0 * 50.0, 0.0, 1.0), fract(r0 * 1000.0), r0 > 0.0 ? 1.0 : 0.0); }
             o = vec4(inv3(dbg) / ex, 0.0);
             return;
         }
