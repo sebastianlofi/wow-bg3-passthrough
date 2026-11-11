@@ -13,6 +13,7 @@ One verb each, no domain word in front:
   wowbg3cmd.py xprate [N]       the server's XP rate (kill, elite kill, quest, exploration); no N: show
   wowbg3cmd.py learn SPELL | unlearn SPELL   give the hero a BG3 spell or take it back (test helper)
   wowbg3cmd.py waypoint [list] | waypoint go NAME   fast travel between known flight points (wow_waypoints.py)
+  wowbg3cmd.py cross [list | NAME]   at a ship's or zeppelin's dock: over to the dock at its other end (wow_docks.py)
   wowbg3cmd.py help
   --json on any party verb: the mod's whole answer
 
@@ -410,8 +411,8 @@ def wdbc(name):
 
 
 def zones():
-    """AreaTable.dbc (1.12): id, map, parent zone, enUS name at field 11."""
-    return [{'id': i[0], 'map': i[1], 'parent': i[2], 'name': t(i[11])} for i, _, t in wdbc('AreaTable.dbc')]
+    """AreaTable.dbc (1.12): id, map, parent zone, the area's value in the server's map files, enUS name at field 11."""
+    return [{'id': i[0], 'map': i[1], 'parent': i[2], 'bit': i[3], 'name': t(i[11])} for i, _, t in wdbc('AreaTable.dbc')]
 
 
 def maps():
@@ -719,6 +720,77 @@ def waypoint(ctx, args):
             raise CmdError(re.sub(r'^tp: ', 'waypoint: ', str(e)))
 
 
+CROSS_USAGE = 'cross | cross NAME (where two vessels stop at one dock) | cross list'
+
+
+def crossings():
+    """WoW's ships and zeppelins as routes between docks (wow_docks.py): the server's type 15 game objects and the
+    client's taxi paths."""
+    import wow_docks
+    rows = [l.split('\t') for l in sql('SELECT entry, name, data0 FROM gameobject_template WHERE type=15;', 'mangos').splitlines() if l.count('\t') == 2]
+    return wow_docks.routes(rows, wow_docks.read_nodes(dbc_dir()))
+
+
+def zone_at(map_id, x, y):
+    """A point's place as the server names it: "Ratchet, The Barrens", or the zone alone, or the continent where
+    the map files name no area (wow_docks.area_bit)."""
+    import wow_docks
+    import wow_stand
+    bit = wow_docks.area_bit(wow_stand.data_dir('WOW_BG3_MAPS', 'maps'), map_id, x, y)
+    zs = zones()
+    area = next((z for z in zs if z['map'] == map_id and z['bit'] == bit and z['name']), None)
+    if not area:
+        return cont(map_id)
+    zone = next((z for z in zs if z['id'] == area['parent'] and z['name']), None)
+    return '%s, %s' % (area['name'], zone['name']) if zone else area['name']
+
+
+def cross(ctx, args):
+    """BG3 has no ship to ride in our level, so a crossing is a move: standing at a ship's or a zeppelin's dock,
+    the party goes to the dock at the vessel's other end, as it does to a flight point."""
+    import wow_docks
+
+    def kind(r):
+        # The server's own names for the vessels are its makers' ("TEST Ship"): what it is says more.
+        return 'ship' if r['Stops'][0]['Z'] < wow_docks.SEA else 'zeppelin'
+    if len(args) > 1 and args[0].lower() == 'list':
+        raise Usage(CROSS_USAGE)
+    routes = crossings()
+    if args and args[0].lower() == 'list':
+        ctx.say('Ships and zeppelins (stand at a dock and type /wowbg3 cross):')
+        for r in routes:
+            ctx.say('  %s (%s)' % (' - '.join(zone_at(s['Map'], s['X'], s['Y']) for s in r['Stops']), kind(r)))
+        return
+    try:
+        raw = open(ctx.link / 'camera.bin', 'rb').read()
+        x, y, _ = struct.unpack_from('<3f', raw, 72)
+        here_map = struct.unpack_from('<I', raw, 84)[0]
+    except (OSError, struct.error):
+        raise CmdError('cross: no WoW position yet (link/camera.bin)')
+    ways = [(r, s) for r, i, _ in wow_docks.near(routes, here_map, x, y) for s in wow_docks.other(r, i)]
+    if not ways:
+        raise CmdError('cross: no ship or zeppelin stops within %d yards of you ("cross list" names them all)' % wow_docks.REACH)
+    names = ['%s (%s)' % (zone_at(s['Map'], s['X'], s['Y']), kind(r)) for r, s in ways]
+    if args:
+        text = ' '.join(args).lower()
+        pick = [k for k, n in enumerate(names) if text in n.lower()]
+        if len(pick) != 1:
+            raise CmdError('cross: %s here: %s' % ('no crossing like %r' % text if not pick else 'which one?', '; '.join(names)))
+        k = pick[0]
+    elif len(ways) > 1:
+        raise CmdError('cross: where to? ' + '; '.join(names) + ' (cross NAME)')
+    else:
+        k = 0
+    r, s = ways[k]
+    at = wow_docks.landing(s['Map'], s['X'], s['Y'], s['Z'])
+    if not at:
+        raise CmdError('cross: no place to stand found at the dock at %s' % zone_at(s['Map'], s['X'], s['Y']))
+    try:
+        tele(ctx, ['cross'], at=(at[0], at[1], at[2], s['Map'], 'the dock at ' + names[k]))
+    except CmdError as e:
+        raise CmdError(re.sub(r'^tp: ', 'cross: ', str(e)))
+
+
 def waypoint_panel(ctx):
     """waypoint-panel.json for BG3's own panel (Waypoints.lua). Nothing written when waypoints are off."""
     if not waypoints_on():
@@ -929,7 +1001,7 @@ def learn(ctx, verb, args):
 
 # One verb each, no domain word in front and no second name for anything.
 VERBS = tuple(PARTY_ACTIONS) + tuple(LEARN_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate',
-                                                       'waypoint', 'report')
+                                                       'waypoint', 'cross', 'report')
 TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate') + tuple(LEARN_ACTIONS)
 
 
@@ -962,6 +1034,8 @@ def do(ctx, verb, args, as_json=False, wow_bg3_only=False):
         ctx.say('Send this one file: %s' % str(crashreport.make(' '.join(args) or 'asked')).replace(str(Path.home()), '~'))
     elif verb == 'waypoint':
         waypoint(ctx, args)
+    elif verb == 'cross':
+        cross(ctx, args)
     elif verb == 'level':
         level(ctx, args, wow_bg3_only=wow_bg3_only)
     elif verb in LEARN_ACTIONS:
@@ -975,6 +1049,7 @@ def help_lines(debug):
     out += ['/wowbg3 ' + l for l in PARTY_HELP]
     if waypoints_on():
         out.append('/wowbg3 waypoint | waypoint go NAME - the flight points you have discovered; fast travel to one')
+    out.append('/wowbg3 cross - at a ship\'s or zeppelin\'s dock: go to the dock at its other end (cross list: every route)')
     out.append('/wowbg3 help - this list')
     if debug:
         out += ['test commands:',

@@ -77,6 +77,10 @@ version is mostly complete.
   and Undercity too. Not in a fight, on a flight, dead, or at camp. `waypoints = 0` in `settings.conf` turns it off.
   A move (a waypoint or `tp`) is covered by BG3's own screen fade, which lifts once WoW's world is there: about
   10 seconds on the same continent, longer to the other one.
+- **Ships and zeppelins.** You cannot ride one: stand at its dock (the pier, or the zeppelin tower's platform) and
+  type `/wowbg3 cross` in WoW's chat, and the party goes to the dock at the vessel's other end, as it goes to a
+  waypoint. Where two vessels stop at one dock, `cross` names both and `cross NAME` takes one; `cross list` shows
+  every route. Not in a fight or at camp.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.

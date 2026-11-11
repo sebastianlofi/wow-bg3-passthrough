@@ -141,40 +141,36 @@ def detour_polys(path):
             continue
         # Recast space (x, y, z) = WoW (y, z, x)
         pts = [(verts[3 * v + 2], verts[3 * v], verts[3 * v + 1]) for v in vidx[:nv]]
-        polys.append(Poly(pts, flags))
+        polys.append(Poly(pts, flags, (str(path), i)))
     return polys
 
 def main_polys(polys, at=None):
-    """The polygons (their id()) in the largest set the movement map joins by shared edges; with `at`
-    (x, y, z), in the set of the polygon nearest that point instead (empty if none lies over it)."""
-    par = list(range(len(polys)))
-    def find(a):
-        while par[a] != a:
-            par[a] = par[par[a]]
-            a = par[a]
-        return a
-    edges = {}
-    for i, p in enumerate(polys):
-        for k in range(len(p)):
-            a, b = p[k], p[(k + 1) % len(p)]
-            ka, kb = (round(a[0], 1), round(a[1], 1), round(a[2])), (round(b[0], 1), round(b[1], 1), round(b[2]))
-            j = edges.setdefault((ka, kb) if ka < kb else (kb, ka), i)
-            if j != i:
-                par[find(i)] = find(j)
+    """The polygons (their id()) in the largest set the movement map joins; with `at` (x, y, z), in the set of the
+    polygon nearest that point instead (empty if none lies over it). Joined as the movement map itself joins them:
+    Detour's neighbour links inside a tile and along the tiles' borders (wow_stand.joined), each polygon found by
+    the tile and index it was read from. (It was by the corners two polygons share, their heights rounded to a
+    whole yard: two tiles' copies of one border corner differ by hundredths, and at 13.51 and 13.49 they were two
+    corners. Auberdine and its pier, 323 polygons, hung on one such edge and were a piece of their own, so the cut
+    gave the pier no floor and whoever was moved onto it stood on the sea bed.)"""
+    import wow_stand
+    find, _ = wow_stand.joined({t: wow_stand.read_tile(Path(t)) for t in {p.at[0] for p in polys}})
+    root = [find(p.at) for p in polys]
     size = {}
-    for i in range(len(polys)):
-        size[find(i)] = size.get(find(i), 0) + 1
+    for r in root:
+        size[r] = size.get(r, 0) + 1
     big = max(size, key=size.get) if size else None
     if at:
         over = [(abs(poly_height(at[0], at[1], p) - at[2]), i) for i, p in enumerate(polys) if inside(at[0], at[1], p)]
-        big = find(min(over)[1]) if over else None
-    return {id(p) for i, p in enumerate(polys) if find(i) == big}
+        big = root[min(over)[1]] if over else None
+    return {id(p) for p, r in zip(polys, root) if r == big}
+
 
 class Poly(list):
     """A movement-map polygon: its corners in WoW space plus vmangos's NavTerrain flags."""
-    def __init__(self, pts, flags):
+    def __init__(self, pts, flags, at=None):
         super().__init__(pts)
         self.flags = flags
+        self.at = at    # (the tile's file, its index there): what Detour's own links name it by (main_polys)
 
     @property
     def water(self):

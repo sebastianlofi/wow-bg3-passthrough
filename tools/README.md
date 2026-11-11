@@ -23,6 +23,7 @@ header. The tools' own folder constants are development defaults that `relenv.py
 | `wowsave.py`, `wowchar.py`, `wowaccount.py`, `wowserver.py` | WoW character snapshots, BG3 to WoW character mapping, playthrough accounts, the server's console and database |
 | `world_bridge.py`, `wow_arena.py`, `wow_stand.py`, `wow_vmap.py`, `wow_mpq.py` | world mode's ground squares from the server's map data |
 | `wow_places.py` | where each WoW map lies in the one BG3 level: three floors (Eastern Kingdoms, Kalimdor, every other map) |
+| `wow_docks.py` | WoW's ships and zeppelins as crossings between docks, from the server's game objects and the client's taxi paths; where to stand at a dock (`/wowbg3 cross`); `test_wow_docks.py` |
 | `wow_lifts.py` | WoW's elevators and tram cars from the client's own table: position, stops, journeys |
 | `inventory_bridge.py`, `wow_items.py`, `wow_icons.py` | the merged inventory, item data and the icon atlas |
 | `wow_abilities.py`, `wow_abilities_rules.json` | the BG3 abilities each WoW mob's stand-in gets (link/abilities.json, and the stats files BG3's loader reads); `localseed` makes this PC's seed from the server's database once it is imported, from which every later start builds them (when the rules or a player's overlay change) with no database; nothing of it is shipped |

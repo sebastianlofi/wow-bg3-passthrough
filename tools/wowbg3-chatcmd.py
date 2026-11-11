@@ -95,7 +95,7 @@ def kind_of(text):
         return 'other'
     if verb in W.PARTY_ACTIONS:
         return 'party'
-    if verb in ('tp', 'where', 'find') or (verb == 'waypoint' and rest[:1] == ['go']):
+    if verb in ('tp', 'where', 'find') or (verb == 'waypoint' and rest[:1] == ['go']) or verb == 'cross':
         return 'tele'
     if verb in ('level', 'xprate'):
         return 'server'
@@ -111,7 +111,7 @@ def is_move(text):
         verb, rest = W.verb_of(text.split())
     except Exception:  # noqa: BLE001  W.run reports it
         return False
-    return verb == 'tp' or (verb == 'waypoint' and rest[:1] == ['go'])
+    return verb == 'tp' or (verb == 'waypoint' and rest[:1] == ['go']) or (verb == 'cross' and rest[:1] != ['list'])
 
 
 def handle(replies, seq, who, text, refused=None):

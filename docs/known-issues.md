@@ -75,6 +75,9 @@ This is the first public version. What we know is missing or rough:
 - Camp food: a save from before camp can hold stray single copies of food, and a rest can then take the whole
   stack.
 
+- Ships and zeppelins are drawn by WoW and cannot be boarded: `/wowbg3 cross` at a dock takes the party to the
+  dock at the other end instead.
+
 ## Levels and progression
 
 - Your WoW levels 1 to 4 each open a party slot; every WoW level from 5 on earns one BG3 level-up (two at

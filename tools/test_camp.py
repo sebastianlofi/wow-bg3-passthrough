@@ -162,6 +162,7 @@ class Publish(unittest.TestCase):
           where = {-2600, 120, -1000}
           Probe = {HostPosition = function() return where end}
           Hero = {Entity = function() return {TurnBased = nil} end}
+          MusicRule = {Flags = function() return 0 end}   -- which game's music plays: not this test's matter
           function bg3Muted() return false end
           function toWow(p) return p end
           function arena(c) end
