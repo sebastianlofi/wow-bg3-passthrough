@@ -3611,6 +3611,7 @@ double g_pin_at = -1e9;
 bool g_pin_on = false;
 constexpr float kRigidLiftM = 0.82f;   // what BG3's camera looks at, over her feet (measured outdoors)
 constexpr float kRigidEaseS = 0.12f;   // a step of the height eases over this
+constexpr float kWishOffM = 2.5f;  // a wish's look point this far off BG3's own line of sight is of another state (rigid_pose)
 constexpr double kWishStaleS = 1.0;    // no word from the client for this long: BG3's own camera
 
 void read_wish(double now) {
@@ -3684,6 +3685,18 @@ bool rigid_pose(glm::vec3 const& eye0, glm::mat3 const& rot0, glm::vec3 const& t
     rot = glm::mat3(side, up, f);
     eye = glm::vec3(look.x, g_pin_y, look.z) - f * g_wish.Distance;
     settling = std::abs(look.y - g_pin_y) > 1e-3f;  // the height still eases: computed again next frame
+    // The wish is a tick behind BG3's own camera at most. After a move that takes the camera's target elsewhere at
+    // once (a waypoint, a move of the group, a lift's far stop) BG3's own camera is there already and the wish is
+    // not: the pose built from that pair went into the cache under BG3's new state, BG3's camera then stood still,
+    // and the stale pose was served for good (harness: after a 75 m move the picture stayed at the old place with
+    // the hero out of it, and clicks picked there, until the first zoom or turn). BG3's own camera looks at its
+    // target (its line of sight passes 0.8 m from the wish's look point, measured), so a wish whose look point lies
+    // off that line is not of this state: its pose is for this frame only.
+    {
+        const glm::vec3 fw = glm::normalize(rot0[2]);
+        const glm::vec3 to = g_wish.Look - eye0;
+        if (glm::length(to - fw * glm::dot(to, fw)) > kWishOffM) settling = true;
+    }
     if (++g_wish.Served % 600 == 1) {
         logf("camera: rigid, distance %.2f pitch %.1f (BG3's forward y %.2f) look %.1f %.1f height %.2f (tav %.2f); BG3's own eye %.1f over the height, ours %.1f",
              g_wish.Distance, g_wish.Pitch, rot0[2].y, g_wish.Look.x, g_wish.Look.z, g_wish.Height, tav.y, eye0.y - look.y, eye.y - look.y);
