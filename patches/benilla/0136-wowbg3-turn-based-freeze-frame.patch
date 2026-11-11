@@ -1,0 +1,89 @@
+diff --git a/crates/benilla-app/src/wowbg3_fight.rs b/crates/benilla-app/src/wowbg3_fight.rs
+--- a/crates/benilla-app/src/wowbg3_fight.rs
++++ b/crates/benilla-app/src/wowbg3_fight.rs
+@@ -178,7 +178,8 @@
+     server_aggro: VecDeque<u64>,
+     /// Mobs with a BG3 stand-in (`mirrored.txt` `m`): BG3 takes clicks on them.
+     mirrored: HashSet<u64>,
+-    /// Mobs held by a turn-based freeze (`mirrored.txt` `h`).
++    /// Creatures BG3's turn-based mode outside a fight holds (`mirrored.txt` `h`, the bridge's word on what
++    /// the server's hold has): patch 0136 stops their models on the frame they are in ([`turn_freeze`]).
+     frozen: HashSet<u64>,
+     /// WOW-BG3 (patch 0060): dead mobs whose BG3 stand-in's corpse is still there (`mirrored.txt`
+     /// `c`): BG3 takes clicks on those corpses (its own loot window, filled with the WoW loot).
+@@ -574,6 +575,14 @@
+ 
+ /// The yaw a held model must turn in a frame to latch a turn shuffle (the client's 1e-5 band).
+ const TURN_LATCH: f32 = 1.0e-5;
++
++/// Patch 0136: the units BG3's turn-based mode holds outside a fight, by entity ([`turn_freeze`] keeps it).
++static TURN_FROZEN: LazyLock<Mutex<HashSet<Entity>>> = LazyLock::new(Default::default);
++
++/// Whether turn-based mode holds this unit on its frame: the animation driver leaves such a unit alone.
++pub(crate) fn turn_frozen(entity: Entity) -> bool {
++    TURN_FROZEN.lock().is_ok_and(|s| s.contains(&entity))
++}
+ 
+ /// A held fight mob's motion ([`WALKERS`]): None when the entity is not held.
+ pub(crate) fn held_motion(entity: Entity) -> Option<Option<f32>> {
+@@ -759,7 +768,7 @@
+         frames: 0,
+         write_us: (0, 0),
+     })
+-    .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send))
++    .add_systems(Update, (fight_tick, fight_walk.after(fight_tick), m5_send, turn_freeze.after(fight_tick)))
+     // Patch 0131: after the exterior election wrote the units' verdicts for the frame, as the party's bots are hidden.
+     .add_systems(
+         PostUpdate,
+@@ -2222,3 +2231,35 @@
+     }
+     hidden.retain(|g| carried.contains(g));
+ }
++
++/// Patch 0136. BG3 stops every character its turn-based mode takes on the frame it is in (their time factor is
++/// 0) until the environment's turn. WoW's creatures the mode holds stood still under the server's hold and went
++/// on breathing, looking about and hammering: a playtest report asked for BG3's freeze frame. A unit the bridge
++/// lists as held (`mirrored.txt` `h`) and no fight has taken has its animations paused where they are, and the
++/// animation driver passes it over ([`turn_frozen`]), so nothing new starts on it: no gait change when the
++/// server's stop arrives, no fidget, and none of the sounds an animation plays. Let go (the environment's turn,
++/// the mode left, a fight took it), it goes on from that frame.
++fn turn_freeze(mut units: Query<(Entity, &Guid, &mut AnimationPlayer), Without<SelfPlayer>>) {
++    let held: HashSet<u64> =
++        SHARED.lock().map(|s| s.frozen.difference(&s.held).copied().collect()).unwrap_or_default();
++    let Ok(mut frozen) = TURN_FROZEN.lock() else {
++        return;
++    };
++    if held.is_empty() && frozen.is_empty() {
++        return;
++    }
++    let mut now = HashSet::new();
++    for (entity, guid, mut player) in &mut units {
++        if held.contains(&guid.0) {
++            // Each frame: whatever another system started on it since stands still too.
++            player.pause_all();
++            now.insert(entity);
++        } else if frozen.contains(&entity) {
++            player.resume_all();
++        }
++    }
++    if now.len() != frozen.len() {
++        info!("wowbg3 turn freeze: {} models on their frame (were {})", now.len(), frozen.len());
++    }
++    *frozen = now;
++}
+diff --git a/crates/benilla-app/src/creature_anim/driver.rs b/crates/benilla-app/src/creature_anim/driver.rs
+--- a/crates/benilla-app/src/creature_anim/driver.rs
++++ b/crates/benilla-app/src/creature_anim/driver.rs
+@@ -439,6 +439,12 @@
+         ),
+     ) in &mut units
+     {
++        // WOW-BG3 (patch 0136): a creature BG3's turn-based mode holds stands on the frame it was in
++        // (`wowbg3_fight::turn_freeze` paused its animations): nothing here may start, cross-fade or
++        // retire anything on it until it is let go.
++        if crate::wowbg3_fight::turn_frozen(entity) {
++            continue;
++        }
+         // A mount child drives from its host's movement view, so it plays the locomotion the
+         // rider suppresses; a vanished host reads as stationary. `ridden_by_self` feeds only the
+         // trace, never `is_self`: the sheath reconcile and wire echoes mean the player's own unit.

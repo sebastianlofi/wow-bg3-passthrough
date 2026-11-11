@@ -71,6 +71,11 @@ fn guid_lines<'a>(h: &str, verb: &str, guids: impl Iterator<Item = &'a String>) 
 impl TurnHold {
     /// Reads turnhold.json (at most every [`READ_MS`]) and returns the verbs to send. `now` is the
     /// bridge clock in ms.
+    /// The creatures the server holds for turn-based mode right now (none while nothing is held): the
+    /// ones whose WoW models stand on their frame (`mirrored.txt` `h`).
+    pub fn held_guids(&self) -> impl Iterator<Item = &String> + '_ {
+        self.held.iter().flat_map(|_| self.guids.iter())
+    }
     pub fn step(&mut self, link: &Path, now: u64) -> Vec<Handoff> {
         let mut out = Vec::new();
         if !self.started {
@@ -188,6 +193,11 @@ mod tests {
             vec![".wowbg3 hold tb-5ba0566e-1 guids f130000045013888,f13000012b01389b"]
         );
         assert!(lines(t.step(&dir, 600)).is_empty());
+        // What is held is what benilla stops on its frame (`mirrored.txt` `h`).
+        assert_eq!(
+            t.held_guids().cloned().collect::<Vec<_>>(),
+            vec!["f130000045013888", "f13000012b01389b"]
+        );
         assert_eq!(lines(t.step(&dir, 400 + REPEAT_MS)).len(), 1);
         // BG3 let one go: dropped, the other held again.
         write(&dir, on(3, 12, json!(["f130000045013888"])));
@@ -214,6 +224,7 @@ mod tests {
             vec![".wowbg3 unhold tb-5ba0566e-1"]
         );
         assert!(lines(t.step(&dir, 20_200)).is_empty());
+        assert_eq!(t.held_guids().count(), 0);
         // A heartbeat that stops while held lets go.
         write(&dir, on(6, 24, json!(["f130000045013888"])));
         assert_eq!(

@@ -19,7 +19,8 @@
 -- The backend (today the fight bridge, bridge/src, with the server's hold verbs, vmangos 0026) turns it
 -- into "hold exactly these creatures", "let these go" and "release".
 -- Guids: every WoW creature loaded round a member in turn-based mode (mirror.json Mobs, the list stand-ins
--- are made from, within WoW's visibility of that member, M.Seen; the list also holds what other members
+-- are made from: all the hero's own client has loaded while the hero is in the mode, and round another member
+-- what lies within WoW's visibility of it, M.Seen; the list also holds what other members
 -- far away see, and those stay free) and every creature whose stand-in BG3's turn-based mode froze
 -- (WOWBG3MirrorOwned, Mirrors.lua: stand-in uuid -> WoW guid).
 -- A creature in a fight stays the fight's. Seq goes up when that set changes too.
@@ -156,9 +157,18 @@ local function heldGuids(frozen, members)
         end
         return false
     end
+    -- With the hero in the mode, every creature the hero's own WoW client has loaded (mirror.json Client: it came
+    -- in benilla's list, WoW's visible set): what WoW shows round the hero stops, whatever distance WoW loads to on
+    -- this map (a dungeon's is more than M.Seen). Round another member the list is its bot's feed, asked for well
+    -- past what WoW would show a player, so there the distance stays.
+    local heroIn = false
+    local hero = uuidOf(q(Hero.Uuid))
+    for _, b in ipairs(members) do
+        if hero and b.Uuid == hero then heroIn = true end
+    end
     for _, m in ipairs(mobs) do
         local g = m.Guid
-        if type(g) == "string" and g:match("^%x+$") and not fight[g] and seen(m.Pos) then add(g) end
+        if type(g) == "string" and g:match("^%x+$") and not fight[g] and ((heroIn and m.Client == true) or seen(m.Pos)) then add(g) end
     end
     table.sort(out)
     return out, #mobs

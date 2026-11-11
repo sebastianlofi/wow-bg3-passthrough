@@ -33,8 +33,8 @@
 //!   on it) and `c GUID` per dead one whose stand-in's corpse is still there (BG3 takes clicks on
 //!   that corpse too: BG3's own loot window, filled with the WoW loot by `Inventory.lua`, not WoW's),
 //!   and `s GUID` per robbed NPC searching for the thief (BG3 walks its stand-in; benilla 0067).
-//!   (`h GUID` lines for the old turn-based freeze are gone: TurnHold.lua and the server's
-//!   hold verbs replace it.)
+//!   `h GUID` per creature the turn-based hold holds (TurnHold.lua and the server's hold verbs stop
+//!   it; benilla stops its model on the frame, [`Mirror::mirrored_text`]).
 //!
 //! Per party member (party-multiplayer-design.md): mobs are mirrored
 //! round every member, not only the hero. `party-wow.json` (`world_bridge.py`, Format 1) gives each
@@ -98,6 +98,9 @@ pub struct WowUnit {
     /// The hero's state (benilla 0025): 0 alive, 1 dead (a corpse), 2 a ghost; 0 for mobs and
     /// for an older benilla.
     pub state: u32,
+    /// The hero's own WoW client has it loaded (it came in `mobs.txt`, WoW's visible set), not only a
+    /// member's feed: `TurnHold.lua` holds every such creature while the hero is in turn-based mode.
+    pub client: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -206,6 +209,7 @@ pub fn parse_cr(line: &str) -> Option<(String, Option<WowUnit>)> {
             .take(64)
             .collect(),
         state: 0,
+        client: false,
     };
     Some((member, unit.pos.valid().then_some(unit)))
 }
@@ -435,6 +439,9 @@ impl PartyLink {
 /// replaces or fills these files; nothing else changes.
 pub fn read_feed(link: &Path) -> Option<Mobs> {
     let mut out = parse_mobs(&read_text(&link.join("mobs.txt")).ok()?);
+    for m in &mut out.mobs {
+        m.client = true;
+    }
     if let Ok(dir) = fs::read_dir(link.join("feed")) {
         let mut names: Vec<_> = dir
             .filter_map(Result::ok)
@@ -496,6 +503,7 @@ pub fn parse_mobs(text: &str) -> Mobs {
                         flags: 0,
                         name: String::new(),
                         state: u(9).filter(|s| *s <= 2).unwrap_or(0),
+                        client: false,
                     })
                 })();
                 if let Some(h) = parsed.filter(|h| h.pos.valid()) {
@@ -524,6 +532,7 @@ pub fn parse_mobs(text: &str) -> Mobs {
                             .take(64)
                             .collect(),
                         state: 0,
+                        client: false,
                     })
                 })();
                 if let Some(m) = parsed.filter(|m| m.pos.valid() && m.hp > 0) {
@@ -963,6 +972,7 @@ impl Mirror {
                 // Friendly NPCs: BG3's crime reaction for a guard (it calls for help and fights)
                 // or for anyone else (the narrator's line, then the fight); see Mirrors.lua.
                 v["Friendly"] = json!(m.friendly);
+                v["Client"] = json!(m.client);
                 v["Guard"] = json!(
                     m.friendly
                         && stats
@@ -1235,6 +1245,15 @@ impl Mirror {
                 .iter()
                 .filter(|g| !self.status.mobs.contains_key(*g))
                 .map(|g| format!("m {g}")),
+        );
+        // Turn-based mode outside a fight (`TurnHold.lua`, [`crate::turnhold`]): `h GUID` per creature this
+        // hold holds. benilla stops such a model on the frame it is in, as BG3 stops its own characters
+        // (before, a held creature stood still and went on breathing and looking about).
+        lines.extend(
+            self.turnhold
+                .held_guids()
+                .filter(|g| !self.in_fight.contains(*g))
+                .map(|g| format!("h {g}")),
         );
         lines.sort();
         lines.join("\n") + "\n"

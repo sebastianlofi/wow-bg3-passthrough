@@ -667,6 +667,47 @@ fn feed_files_add_mobs_round_far_members() {
             .any(|u| u.guid == "f130000000099003" && u.hp == 40)
     );
     assert_eq!(feed.hero, parse_mobs(MOBS).hero);
+    // What the hero's own client has loaded is marked: the turn-based hold takes all of it.
+    assert!(feed.mobs.iter().any(|u| u.client));
+    assert!(
+        feed.mobs
+            .iter()
+            .all(|u| u.client == (u.guid != "f130000000099003"))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_turn_based_hold_names_its_creatures_for_benilla() {
+    let dir = std::env::temp_dir().join(format!("wowbg3-turnheld-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut m = mirror();
+    assert!(!m.mirrored_text().contains("h "));
+    std::fs::write(
+        dir.join("turnhold.json"),
+        json!({"Schema": 1, "RunId": "5ba0566e", "Seq": 1, "Tick": 6, "Hold": true,
+               "Guids": ["f130000000012b01", "f130000000012b02"], "Members": []})
+        .to_string(),
+    )
+    .unwrap();
+    m.turnhold.step(&dir, 0);
+    m.turnhold.step(&dir, 200);
+    let text = m.mirrored_text();
+    assert!(text.contains("h f130000000012b01\n") && text.contains("h f130000000012b02\n"));
+    // One a fight took is the fight's: BG3 plays it, its model is not stopped on a frame.
+    m.in_fight = vec!["f130000000012b02".into()];
+    let text = m.mirrored_text();
+    assert!(text.contains("h f130000000012b01\n") && !text.contains("h f130000000012b02"));
+    // The hold let go (the environment's turn, or the mode left): nothing stays stopped.
+    std::fs::write(
+        dir.join("turnhold.json"),
+        json!({"Schema": 1, "RunId": "5ba0566e", "Seq": 2, "Tick": 12, "Hold": false, "Guids": [], "Members": []})
+            .to_string(),
+    )
+    .unwrap();
+    m.turnhold.step(&dir, 400);
+    assert!(!m.mirrored_text().contains("h "));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
