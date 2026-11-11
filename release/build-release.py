@@ -131,6 +131,12 @@ def level_files():
                 if rel.endswith(".lsx") and not rel.startswith("Layers/"):
                     rel, data = rel[:-4] + ".lsf", lsf_write.lsx_to_lsf(data)
                 files.append((f"Mods/{FOLDER}/Levels/{name}/{rel}", data))
+    # The names BG3 shows for these levels (the load list, the loading screen): a key a level and its English text.
+    # Without them BG3 shows the level's folder name.
+    import loca_write
+    lsx, texts = loca_write.level_names([json.loads(p.read_text()) for p in sorted((HERE / "levels").glob("*.json"))])
+    files.append((f"Mods/{FOLDER}/Localization/Levels.lsf", lsf_write.lsx_to_lsf(lsx.encode("utf-8"))))
+    files.append((f"Localization/English/{FOLDER}.loca", loca_write.loca(texts)))
     return files
 
 

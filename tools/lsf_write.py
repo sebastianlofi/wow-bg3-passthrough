@@ -12,7 +12,7 @@ files have it:
            elsewhere as bucket << 16 | index in the bucket, the bucket chosen by LSLib's hash of the name
   nodes:   12 bytes each: name, index of its first attribute (-1: none), index of its parent (-1: a region's root)
   attrs:   12 bytes each: name, type | length << 6, its node; values follow one another in this order
-  values:  the attributes' bytes
+  values:  the attributes' bytes (a TranslatedString: u16 version, i32 handle length with its NUL, the handle)
 
 A region is a root node; a node's children are written grouped by name, names in the order they first appear
 (LSLib keeps them in a dictionary by name), so a file from here is byte for byte the one LSLib's converter writes.
@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 TYPES = {'uint8': 1, 'int16': 2, 'uint16': 3, 'int32': 4, 'uint32': 5, 'float': 6, 'double': 7, 'ivec2': 8, 'ivec3': 9,
          'ivec4': 10, 'fvec2': 11, 'fvec3': 12, 'fvec4': 13, 'mat2x2': 14, 'mat3x3': 15, 'mat3x4': 16, 'mat4x3': 17,
          'mat4x4': 18, 'bool': 19, 'string': 20, 'path': 21, 'FixedString': 22, 'LSString': 23, 'uint64': 24,
-         'int64': 26, 'int8': 27, 'guid': 31}
+         'int64': 26, 'int8': 27, 'TranslatedString': 28, 'guid': 31}
 NUMBERS = {1: '<B', 2: '<h', 3: '<H', 4: '<i', 5: '<I', 6: '<f', 7: '<d', 24: '<Q', 26: '<q', 27: '<b'}
 VECTORS = {8: (2, 'i'), 9: (3, 'i'), 10: (4, 'i'), 11: (2, 'f'), 12: (3, 'f'), 13: (4, 'f'), 14: (4, 'f'), 15: (9, 'f'),
            16: (12, 'f'), 17: (12, 'f'), 18: (16, 'f')}
@@ -88,7 +88,11 @@ def lsx_to_lsf(xml):
         nodes.extend(struct.pack('<Iii', name(node.get('id')), counts[1] if own else -1, parent))
         for a in own:
             t = TYPES[a.get('type')] if not a.get('type').isdigit() else int(a.get('type'))
-            v = value_bytes(t, a.get('value') or '', swap_guids)
+            if t == 28:  # a translated string: u16 version, i32 length of the handle with its NUL, the handle
+                h = (a.get('handle') or '').encode('utf-8') + b'\0'
+                v = struct.pack('<Hi', int(a.get('version') or 1), len(h)) + h
+            else:
+                v = value_bytes(t, a.get('value') or '', swap_guids)
             attrs.extend(struct.pack('<IIi', name(a.get('id')), t | len(v) << 6, me))
             values.extend(v)
             counts[1] += 1
