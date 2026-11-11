@@ -240,7 +240,7 @@ def prewarm(dbc_dir, floor=None):
                             origins[n['id']] = (n['x'], n['y'], float(stand_z(n['map'], n['x'], n['y'], n['z'], terrain)))
                         except Exception:  # noqa: BLE001
                             origins[n['id']] = (n['x'], n['y'], n['z'])
-                    c, o = B.FIXED_CENTRE, B.FIXED_ORIGIN
+                    c, o = B.centre_of(n['map']), B.FIXED_ORIGIN
                     w = origins[n['id']]  # the level's lattice: the squares round the point's node
                     node = B.node_of(c, w[1] * B.YD, -w[0] * B.YD)
                     ij = (ij[0] + node[0], ij[1] + node[1])

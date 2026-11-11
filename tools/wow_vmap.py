@@ -10,7 +10,8 @@ Format: vmangos VMAP_7.0 (vmangos/core src/game/vmap: MapTree, ModelInstance, Wo
 checked against the test server's extracted data. Little endian throughout.
   vmap space: x = 32 * 533.33333 - WoW x, y = 32 * 533.33333 - WoW y, z = WoW z (yards).
   MMM.vmtree        'VMAP_7.0', uint8 tiled, 'NODE' + BIH over all spawns, 'GOBJ' (+ spawns when
-                    not tiled). Map 0 is tiled: its spawns live in the tiles. Not read here.
+                    not tiled). Map 0 is tiled: its spawns live in the tiles. A map of buildings
+                    only (most dungeons, the tram) is not: its one building's spawn is read from here.
   MMM_YY_XX.vmtile  one per ADT tile, YY = int(32 - WoW y / 533.33), XX = int(32 - WoW x / 533.33)
                     (Northshire Abbey: 000_32_48). 'VMAP_7.0', uint32 n, n x {ModelSpawn, uint32
                     tree node}. A spawn whose bounds reach into several tiles is listed in each.
@@ -66,6 +67,23 @@ class Spawn:
         return MID - hi[0], MID - lo[0], MID - hi[1], MID - lo[1], lo[2], hi[2]
 
 
+def _spawn(raw, off):
+    """One ModelSpawn at `off`: (Spawn, the offset after its name)."""
+    s = Spawn()
+    s.flags, _adt, s.id, px, py, pz, rx, ry, rz, s.scale = struct.unpack_from('<IHI7f', raw, off)
+    off += 38
+    s.pos, s.rot = (px, py, pz), (rx, ry, rz)
+    if s.flags & HAS_BOUND:
+        s.lo, s.hi = struct.unpack_from('<3f', raw, off), struct.unpack_from('<3f', raw, off + 12)
+        off += 24
+    else:
+        s.lo = s.hi = None
+    ln, = struct.unpack_from('<I', raw, off)
+    s.name = raw[off + 4:off + 4 + ln].split(b'\0', 1)[0].decode('latin-1')
+    s.node = 0
+    return s, off + 4 + ln
+
+
 def read_spawns(path):
     raw = path.read_bytes()
     if raw[:8] != MAGIC:
@@ -73,23 +91,27 @@ def read_spawns(path):
     n, = struct.unpack_from('<I', raw, 8)
     off, out = 12, []
     for _ in range(n):
-        s = Spawn()
-        s.flags, _adt, s.id, px, py, pz, rx, ry, rz, s.scale = struct.unpack_from('<IHI7f', raw, off)
-        off += 38
-        s.pos, s.rot = (px, py, pz), (rx, ry, rz)
-        if s.flags & HAS_BOUND:
-            s.lo, s.hi = struct.unpack_from('<3f', raw, off), struct.unpack_from('<3f', raw, off + 12)
-            off += 24
-        else:
-            s.lo = s.hi = None
-        ln, = struct.unpack_from('<I', raw, off)
-        s.name = raw[off + 4:off + 4 + ln].split(b'\0', 1)[0].decode('latin-1')
-        s.node, = struct.unpack_from('<I', raw, off + 4 + ln)
-        off += 8 + ln
+        s, off = _spawn(raw, off)
+        s.node, = struct.unpack_from('<I', raw, off)
+        off += 4
         out.append(s)
     if off != len(raw):
         raise ValueError('%s: %d bytes left over' % (path, len(raw) - off))
     return out
+
+
+def read_tree_spawns(path):
+    """The spawns a map's .vmtree holds itself: the one building a map without tiles is made of (most dungeons,
+    the tram), in the same vmap space as a tile's. [] for a tiled map, whose spawns live in its tiles."""
+    raw = path.read_bytes()
+    if raw[:8] != MAGIC:
+        raise ValueError('%s: not a VMAP_7.0 tree' % path)
+    tiled = raw[8]
+    off = _skip_bih(raw, _expect(raw, 9, b'NODE'))
+    off = _expect(raw, off, b'GOBJ')
+    if tiled or off >= len(raw):
+        return []
+    return [_spawn(raw, off)[0]]   # one spawn, as vmangos reads it (StaticMapTree::InitMap); what follows is not ours
 
 
 def _expect(raw, off, tag):
@@ -245,13 +267,16 @@ class VMap:
         self.models, self.tiles, self.cells = {}, {}, {}
         self.thick = {}
         self.stats = {'cells_cut': 0, 'cells_read': 0, 'models_read': 0}
+        tree = self.dir / ('%03d.vmtree' % map_id)
+        self.tree = tree
+        self.whole = read_tree_spawns(tree) if tree.exists() else []   # a map without tiles: its one building
 
     def tile_path(self, ty, tx):
         return self.dir / ('%03d_%02d_%02d.vmtile' % (self.map, ty, tx))
 
     def tile_key(self, ty, tx):
         try:
-            st = self.tile_path(ty, tx).stat()
+            st = (self.tree if self.whole else self.tile_path(ty, tx)).stat()
             return st.st_size, st.st_mtime_ns
         except FileNotFoundError:
             return 0, 0
@@ -259,7 +284,7 @@ class VMap:
     def spawns(self, ty, tx):
         if (ty, tx) not in self.tiles:
             p = self.tile_path(ty, tx)
-            self.tiles[(ty, tx)] = read_spawns(p) if p.exists() else []
+            self.tiles[(ty, tx)] = (read_spawns(p) if p.exists() else []) + self.whole
         return self.tiles[(ty, tx)]
 
     def model(self, name):

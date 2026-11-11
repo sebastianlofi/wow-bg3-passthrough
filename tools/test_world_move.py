@@ -91,6 +91,57 @@ class Base(unittest.TestCase):
         return json.loads((self.tmp / 'link/world.json').read_text())['Active']
 
 
+class BareMaps(unittest.TestCase):
+    """A WoW map of buildings only has no height maps; its floors still count as ground."""
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.maps, self.vmaps = Path(d.name) / 'maps', Path(d.name) / 'vmaps'
+        self.maps.mkdir()
+        self.vmaps.mkdir()
+        (self.maps / '0003232.map').write_bytes(b'')
+        (self.vmaps / '034.vmtree').write_bytes(b'')
+        p = mock.patch.dict(os.environ, {'WOW_BG3_VMAPS': str(self.vmaps)})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_has_ground(self):
+        self.assertTrue(B.has_ground(self.maps, 0))     # height maps
+        self.assertTrue(B.has_ground(self.maps, 34))    # the Stockade: a collision tree only
+        self.assertFalse(B.has_ground(self.maps, 999))  # neither
+
+    def test_its_terrain_is_one_hole_over_every_floor(self):
+        t = B.wow_arena.Terrain(self.maps, 34)
+        self.assertTrue(t.bare)
+        self.assertEqual(t.height(54.2, 0.3), B.wow_arena.NO_TERRAIN)
+        self.assertTrue(t.hole(54.2, 0.3))
+        self.assertEqual(t.triangles(0, 60, -30, 30), [])
+        self.assertEqual(t.slope(54.2, 0.3), 0.0)
+        self.assertFalse(B.wow_arena.Terrain(self.maps, 0).bare)
+
+    def test_its_squares_are_cut_as_under_the_terrain(self):
+        # The Stockade's entrance, z -18: under NO_TERRAIN by more than UNDER_CLEAR, so the cut takes its own floors.
+        args = B.cut_args(B.wow_arena.Terrain(self.maps, 34), 34, B.centre_of(34), B.FIXED_ORIGIN, (0, 0), (54.2, 0.3, -18.3))
+        self.assertIn('--under', args)
+
+
+class OwnPlaces(Base):
+    """Every WoW map has its own centre (wow_places.py)."""
+    def test_a_map_has_its_own_centre(self):
+        self.assertEqual(B.centre_of(0), B.FIXED_CENTRE)
+        self.assertNotEqual(B.centre_of(1), B.FIXED_CENTRE)
+        self.assertNotEqual(B.centre_of(36), B.centre_of(1))
+        with self.assertRaises(KeyError):
+            B.centre_of(999)
+
+    def test_the_same_wow_point_on_two_maps_is_two_bg3_places(self):
+        a, b = Fake(self.tmp), Fake(self.tmp)
+        a.centre, b.centre = B.centre_of(0), B.centre_of(1)
+        pa, pb = a.to_bg3((100.0, 200.0, 30.0)), b.to_bg3((100.0, 200.0, 30.0))
+        self.assertGreater(abs(pa[1] - pb[1]), 1000.0)
+        self.assertEqual(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2]))
+
+
 class Moves(Base):
     def test_a_new_square_takes_a_free_subgrid(self):
         w = self.w

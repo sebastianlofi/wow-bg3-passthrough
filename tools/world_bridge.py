@@ -48,6 +48,7 @@ CELLS = Path('/tmp/wowbg3/cells')  # wow_arena.py output per square (tmpfs, over
 sys.path.insert(0, str(ROOT / 'link/tools'))
 import wow_arena  # noqa: E402
 import wow_stand  # noqa: E402
+import wow_places  # noqa: E402
 
 
 YD = 0.9144
@@ -77,9 +78,11 @@ def map_name(map_id):
 
 
 def has_ground(maps, map_id):
-    """Whether the server's data has ground for a WoW map: a continent, or an instance (a dungeon, a raid, the tram),
-    whose height maps the extractor writes like any other's."""
-    return any(Path(maps).glob('%03d????.map' % int(map_id)))
+    """Whether the server's data has ground for a WoW map: height maps (a continent, an instance with terrain), or
+    for a map of buildings only (most dungeons, the tram) its collision tree, which its floors are cut from."""
+    if any(Path(maps).glob('%03d????.map' % int(map_id))):
+        return True
+    return (wow_stand.data_dir('WOW_BG3_VMAPS', 'vmaps') / ('%03d.vmtree' % int(map_id))).is_file()
 MOVE = IO / 'world-move.json'
 MOVE_RESULT = IO / 'world-move-result.json'
 COVER_WAIT_S = 30.0  # a move's cover waits at most so long after the move for benilla's player at the new place
@@ -364,6 +367,13 @@ def camera_wow():
 FIXED_Y0 = 1000.0
 FIXED_CENTRE = (0.0, FIXED_Y0, 0.0)
 FIXED_ORIGIN = (0.0, 0.0, 0.0)
+# Every WoW map has its own place in the level (wow_places.py): the Eastern Kingdoms at FIXED_CENTRE, Kalimdor a
+# floor above them, every other map on the third floor. The level's bounds hold them (release/levels).
+
+
+def centre_of(map_id):
+    """The BG3 centre of a WoW map's mapping. KeyError: a map WoW's data has no ground for."""
+    return wow_places.centre(map_id)
 
 
 def node_of(centre, bx, bz):
@@ -495,7 +505,7 @@ class World:
         self.map = map_id if map_id is not None else (player_map() or 0)
         assert has_ground(a.maps, self.map), 'the server has no ground for WoW map %s' % self.map
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
-        self.centre, self.origin = FIXED_CENTRE, FIXED_ORIGIN   # the level's mapping: the same in every session
+        self.centre, self.origin = centre_of(self.map), FIXED_ORIGIN   # this map's mapping: the same in every session
         self.at = None       # WoW point the session's hero lands on
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
