@@ -48,6 +48,7 @@ CELLS = Path('/tmp/wowbg3/cells')  # wow_arena.py output per square (tmpfs, over
 sys.path.insert(0, str(ROOT / 'link/tools'))
 import wow_arena  # noqa: E402
 import wow_stand  # noqa: E402
+import wow_places  # noqa: E402
 
 
 YD = 0.9144
@@ -364,6 +365,15 @@ def camera_wow():
 FIXED_Y0 = 1000.0
 FIXED_CENTRE = (0.0, FIXED_Y0, 0.0)
 FIXED_ORIGIN = (0.0, 0.0, 0.0)
+# Every WoW map its own place in the level (wow_places.py): WOW_BG3_LAYOUT names the layout (stacked, flat).
+# Unset, every map still uses the one centre above, so the continents and instances lie over each other; the
+# level's bounds must hold the layout before it is switched on (wowbg3_level.py, wow_places.bounds).
+LAYOUT = os.environ.get('WOW_BG3_LAYOUT', '')
+
+
+def centre_of(map_id):
+    """The BG3 centre of a WoW map's mapping. KeyError: a map WoW's data has no ground for."""
+    return wow_places.centre(map_id, LAYOUT) if LAYOUT else FIXED_CENTRE
 
 
 def node_of(centre, bx, bz):
@@ -495,7 +505,7 @@ class World:
         self.map = map_id if map_id is not None else (player_map() or 0)
         assert has_ground(a.maps, self.map), 'the server has no ground for WoW map %s' % self.map
         self.terrain = wow_arena.Terrain(Path(a.maps), self.map)
-        self.centre, self.origin = FIXED_CENTRE, FIXED_ORIGIN   # the level's mapping: the same in every session
+        self.centre, self.origin = centre_of(self.map), FIXED_ORIGIN   # this map's mapping: the same in every session
         self.at = None       # WoW point the session's hero lands on
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first

@@ -91,6 +91,29 @@ class Base(unittest.TestCase):
         return json.loads((self.tmp / 'link/world.json').read_text())['Active']
 
 
+class OwnPlaces(Base):
+    """WOW_BG3_LAYOUT: every WoW map has its own centre (wow_places.py)."""
+    def test_unset_every_map_uses_the_one_centre(self):
+        self.assertEqual(B.centre_of(0), B.FIXED_CENTRE)
+        self.assertEqual(B.centre_of(1), B.FIXED_CENTRE)
+
+    def test_set_a_map_has_its_own(self):
+        with mock.patch.object(B, 'LAYOUT', 'stacked'):
+            self.assertEqual(B.centre_of(0), B.FIXED_CENTRE)
+            self.assertNotEqual(B.centre_of(1), B.FIXED_CENTRE)
+            self.assertNotEqual(B.centre_of(36), B.centre_of(1))
+            with self.assertRaises(KeyError):
+                B.centre_of(999)
+
+    def test_the_same_wow_point_on_two_maps_is_two_bg3_places(self):
+        with mock.patch.object(B, 'LAYOUT', 'stacked'):
+            a, b = Fake(self.tmp), Fake(self.tmp)
+            a.centre, b.centre = B.centre_of(0), B.centre_of(1)
+            pa, pb = a.to_bg3((100.0, 200.0, 30.0)), b.to_bg3((100.0, 200.0, 30.0))
+            self.assertGreater(abs(pa[1] - pb[1]), 1000.0)
+            self.assertEqual(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2]))
+
+
 class Moves(Base):
     def test_a_new_square_takes_a_free_subgrid(self):
         w = self.w
