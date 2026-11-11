@@ -58,16 +58,23 @@ class Family(unittest.TestCase):
         for spec in LP.specs():
             sg = spec['Subgrids'][0]
             raw = wowbg3_level.tiles(sg['W'], sg['H'], sg['Kind'], sg['Radius'])
-            walk = sum(1 for k in range(sg['W'] * sg['H']) if struct.unpack_from('<Q', raw, k * 16)[0] == 0)
+            states = [struct.unpack_from('<Q', raw, k * 16)[0] for k in range(sg['W'] * sg['H'])]
+            walk = sum(1 for st in states if st != 0x8005)
             want = 3.14159 * sg['Radius'] ** 2
             self.assertLess(abs(walk * 0.25 - want) / want, 0.06, spec['Name'])
             self.assertEqual(sg['X'], -sg['W'] * 0.25)      # the disc's middle is the platform's own origin
+            # Its outer metre is seams (SubgridEdge and SubgridIntersection), the middle plain floor.
+            seams = sum(1 for st in states if st == wowbg3_level.SEAM_FLAGS)
+            ring = 3.14159 * (sg['Radius'] ** 2 - (sg['Radius'] - 1.0) ** 2)
+            self.assertLess(abs(seams * 0.25 - ring) / ring, 0.15, spec['Name'])
+            self.assertEqual(states[(sg['H'] // 2) * sg['W'] + sg['W'] // 2], 0)
+            self.assertEqual(wowbg3_level.SEAM_FLAGS, (0x200 | 0x800) << 46)
 
-    def test_the_smallest_floor_a_car_fits_in(self):
-        self.assertEqual(LP.pick(7.68), 8.0)       # Undercity's car, 8.4 yd
-        self.assertEqual(LP.pick(5.03), 5.0)       # within the slack
-        self.assertEqual(LP.pick(5.4), 6.5)
-        self.assertIsNone(LP.pick(14.0))
+    def test_the_smallest_floor_a_metre_past_the_cars(self):
+        self.assertEqual(LP.pick(7.68), 9.0)       # Undercity's car, 8.4 yd
+        self.assertEqual(LP.pick(5.03), 7.0)
+        self.assertEqual(LP.pick(2.0), 3.0)
+        self.assertIsNone(LP.pick(13.0))
 
     def test_the_level_builds_with_them(self):
         spec = json.loads((ROOT / 'release/levels/azeroth_a.json').read_text())
@@ -117,9 +124,10 @@ class Driver(unittest.TestCase):
 
     def test_the_floors_place_is_world_modes_mapping_raised_by_the_floor(self):
         p = self.L.eval('function(M) return M.ToBg3({1544.2, 240.8, 55.7}, {0, 1000, 0}, -0.686) end')(self.M)
-        self.assertAlmostEqual(p[1], 240.8 * 0.9144, places=3)
+        # x and z on BG3's half-metre tile lattice (240.8 yd is 220.19 m, 1544.2 yd is 1412.02 m).
+        self.assertEqual(p[1], 220.0)
         self.assertAlmostEqual(p[2], 1000 + 55.7 * 0.9144 - 0.686, places=3)
-        self.assertAlmostEqual(p[3], -1544.2 * 0.9144, places=3)
+        self.assertEqual(p[3], -1412.0)
 
     def test_a_moving_car_orders_its_spans_end_at_the_speed_that_arrives_with_it(self):
         order = self.L.eval("""function(M)
@@ -145,8 +153,8 @@ class Driver(unittest.TestCase):
 
     def test_size(self):
         size = self.L.eval('function(M, r) return M.Size(r) end')
-        self.assertEqual(self.M.PLATFORMS[size(self.M, 7.68)].Radius, 8.0)
-        self.assertIsNone(size(self.M, 14.0))
+        self.assertEqual(self.M.PLATFORMS[size(self.M, 7.68)].Radius, 9.0)
+        self.assertIsNone(size(self.M, 13.0))
 
 
 if __name__ == '__main__':

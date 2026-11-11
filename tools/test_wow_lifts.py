@@ -221,6 +221,19 @@ class Carve(unittest.TestCase):
         self.assertAlmostEqual(struct.unpack_from('<f', s, k + 1)[0], 962.18, places=2)
         self.assertGreater(n, 0)
 
+    def test_the_ground_beside_the_car_is_seams(self):
+        # BG3 steps from a square's subgrid onto the platform's only on seam tiles (flags 4 and 8).
+        s, _ = L.carve(self.section(5, 962.2), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)])
+        self.assertEqual(s[(64 * 128 + 64 + 8) * 5], 1 | 12)       # 4.25 m from the middle: the ring beside the floor
+        self.assertEqual(s[(64 * 128 + 64 + 11) * 5], 1)           # 5.75 m: plain ground
+        self.assertEqual(s[(64 * 128 + 64) * 5] & 13, 0)            # under the car: taken away, no seam
+        # A floor at another height beside the shaft is no way onto the car.
+        s, _ = L.carve(self.section(5, 970.0), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)])
+        self.assertEqual(s[(64 * 128 + 64 + 8) * 5], 1)
+        # The walk and fall copies of the tiles get no seam bits.
+        s, _ = L.carve(self.section(5, 962.2), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)], seam=0)
+        self.assertEqual(s[(64 * 128 + 64 + 8) * 5], 1)
+
     def test_another_floor_in_the_same_column_stays(self):
         s, n = L.carve(self.section(5, 990.0), 5, 0.0, 0.0, [(32.0, 962.0, 32.0, 4.0)])
         self.assertEqual(n, 0)

@@ -77,16 +77,28 @@ def subgrid_id(obj_uuid):
     return ((x >> 32) ^ x) & 0xFFFFFFFF
 
 
+SEAM_FLAGS = (0x200 | 0x800) << 46   # AiGridTile flags SubgridEdge and SubgridIntersection (the plugin's kEdgeBit, kIntersectionBit)
+
+
 def tiles(w, h, kind, radius=None):
     walk, blank = struct.pack("<Qhhhh", 0, 0, 0, -1, -1), struct.pack("<Qhhhh", 0x8005, 0, 0, -1, -1)
     if kind == "walk":
         return walk * (w * h)
     if kind == "blank":
         return blank * (w * h)
-    if kind == "disc":   # a round floor in the subgrid's middle (a lift car's), blank round it
-        cx, cz, r2 = w * 0.25, h * 0.25, radius * radius
-        return b"".join(walk if ((c + 0.5) * 0.5 - cx) ** 2 + ((r + 0.5) * 0.5 - cz) ** 2 <= r2 else blank
-                        for r in range(h) for c in range(w))
+    if kind == "disc":
+        # A round floor in the subgrid's middle (a lift car's), blank round it. Its outer metre is seams: BG3's path
+        # finder steps from one subgrid to another only on tiles flagged SubgridEdge and SubgridIntersection, and a
+        # platform at a stop lies inside a ground square's own subgrid (the plugin's Place sets the same two bits
+        # where a storey meets the ground).
+        seam = struct.pack("<Qhhhh", SEAM_FLAGS, 0, 0, -1, -1)
+        cx, cz, r2, in2 = w * 0.25, h * 0.25, radius * radius, max(radius - 1.0, 0.0) ** 2
+        out = []
+        for r in range(h):
+            for c in range(w):
+                d2 = ((c + 0.5) * 0.5 - cx) ** 2 + ((r + 0.5) * 0.5 - cz) ** 2
+                out.append(blank if d2 > r2 else seam if d2 > in2 else walk)
+        return b"".join(out)
     raise ValueError(kind)
 
 

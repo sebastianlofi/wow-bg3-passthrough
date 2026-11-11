@@ -477,6 +477,75 @@ class Cache(Base):
         self.assertEqual(W.square_order(2)[1], [])
 
 
+class Zones(Base):
+    """A lift takes a member to the other side of the terrain without a move: its squares are cut again for there."""
+    def setUp(self):
+        super().setUp()
+        w = self.w                                   # the terrain is at 100 yd; the session came over it
+        w.placed = {0: (0, 0), 1: (1, 0)}
+        for ij in w.placed.values():
+            w.cut(ij)['under'] = False
+        self.hero = w.walker('hero-1', 'Tav')
+
+    def at(self, z):
+        p = self.w.to_bg3((5.0, 5.0, z))
+        self.hero.pos = p
+        return [(self.hero, p, False)]
+
+    def test_down_a_shaft_her_squares_are_cut_again(self):
+        w = self.w
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR - 1.0))
+        self.assertAlmostEqual(self.hero.at[2], 69.0)
+        self.assertTrue(w.below(self.hero.at))
+        self.assertEqual(w.restamp, {(0, 0), (1, 0)})
+        self.assertNotIn((0, 0), w.cells)            # cut again when next asked for
+        # Standing there: nothing more.
+        w.restamp.clear()
+        w.follow_zones(self.at(60.0))
+        self.assertEqual(w.restamp, set())
+        self.assertAlmostEqual(self.hero.at[2], 69.0)
+
+    def test_beside_a_lifts_shaft_her_side_stays(self):
+        w = self.w
+        with mock.patch.object(B, 'LIFT_STOPS', {0: [(8.0, 5.0, 60.0, 8.4)]}):
+            w.follow_zones(self.at(60.0))                 # on the car, 3 yd from its middle: no change yet
+            self.assertIsNone(self.hero.at)
+            self.assertEqual(w.restamp, set())
+            p = w.to_bg3((40.0, 5.0, 60.0))               # 32 yd on: past the shaft
+            self.hero.pos = p
+            w.follow_zones([(self.hero, p, False)])
+            self.assertTrue(w.below(self.hero.at))
+
+    def test_on_the_ground_nothing_changes(self):
+        self.w.follow_zones(self.at(100.0))
+        self.assertIsNone(self.hero.at)
+        self.assertEqual(self.w.restamp, set())
+
+    def test_back_up_with_five_yards_of_slack(self):
+        w = self.w
+        w.follow_zones(self.at(60.0))
+        w.restamp.clear()
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR + 3.0))     # just over the line: still under
+        self.assertTrue(w.below(self.hero.at))
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR + 6.0))
+        self.assertFalse(w.below(self.hero.at))
+
+    def test_a_stale_square_is_placed_again_where_it_lies(self):
+        w = self.w
+        w.rays = [(0, 0), (1, 0)]
+        members = self.at(60.0)
+        w.follow_zones(members)
+        w.members = members
+        with mock.patch.object(B, 'tav', lambda *_: (None, self.hero.pos)), mock.patch.object(w, 'read_members', lambda _p: members), \
+                mock.patch.object(w, 'fall_alarm', lambda *_: None), mock.patch.object(w, 'publish_party', lambda: None), \
+                mock.patch.object(w, 'wanted', lambda _m: [(0, 0), (1, 0)]):
+            w.follow()
+        self.assertEqual(w.sent[-1][0], 'Stream')
+        self.assertEqual(sorted(c[0] for c in w.sent[-1][1]['Cells']), [0, 1])     # the same pool subgrids
+        self.assertEqual(w.placed, {0: (0, 0), 1: (1, 0)})
+        self.assertEqual(w.restamp, set())
+
+
 class InTheLevel(Base):
     """A member stands in the level's own ground only outside every WoW map's place. The level's AI grid spans the
     whole level, so its bounds must not decide: with them every companion got no ground of its own."""

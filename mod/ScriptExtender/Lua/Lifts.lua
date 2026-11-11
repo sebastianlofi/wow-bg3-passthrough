@@ -19,14 +19,19 @@ local M = {}
 
 -- The platforms the level keeps (tools/wow_lift_platforms.py lua; tools/test_wow_lift_platforms.py holds the two
 -- together): a floor's radius, where each one is parked, each one's id in the level.
-M.SLACK = 0.25
+M.MARGIN = 1
 M.PLATFORMS = {
     {Radius = 3, Park = {{-15700, -60, -15500}, {-15660, -60, -15500}, {-15620, -60, -15500}}, Keys = {"220f65b4-9d06-5eb8-ba9b-5cc6b626e1fd", "8a90c2da-f97c-5819-9cee-4d1ca915c9b3", "22d1ec38-9e6f-5c1d-81d5-33f372e25c7e"}},
-    {Radius = 5, Park = {{-15700, -60, -15460}, {-15660, -60, -15460}, {-15620, -60, -15460}}, Keys = {"301ee89f-fada-5f01-99ce-502e0e5b9d8a", "ad780899-e497-5f8b-ab06-cece00a1f29e", "44a36d1b-fa43-5a35-a272-af6b2907d1d3"}},
-    {Radius = 6.5, Park = {{-15700, -60, -15420}, {-15660, -60, -15420}, {-15620, -60, -15420}}, Keys = {"29ea571b-1b36-5f17-9020-e4fdc5875d7e", "e065d746-7a84-5c02-83b7-b4dabc889a8f", "569ba09d-8408-5ff2-8630-d6ddd14907b8"}},
-    {Radius = 8, Park = {{-15700, -60, -15380}, {-15660, -60, -15380}, {-15620, -60, -15380}}, Keys = {"96c792fb-ee15-5999-82ef-9318dde41a99", "2179f7f3-a3fb-5b03-ac87-69e3082f7174", "08bf5761-9d6f-51d7-82ef-789406d5ccaa"}},
-    {Radius = 10, Park = {{-15700, -60, -15340}, {-15660, -60, -15340}, {-15620, -60, -15340}}, Keys = {"fdc0a767-ed88-525e-8100-3636ca1cba0b", "1acc403e-86cb-51d2-b488-106cfbf86662", "e6e8fc01-84b8-5148-b042-78007060fe81"}},
-    {Radius = 12.5, Park = {{-15700, -60, -15300}, {-15660, -60, -15300}, {-15620, -60, -15300}}, Keys = {"2254d232-4b91-547b-b962-af20f3139a31", "764139ce-5ac3-5d3d-a312-bb71c5a6c6c9", "9d3f12e8-b115-5ce7-8cf0-5d43e0225c3d"}},
+    {Radius = 4, Park = {{-15700, -60, -15460}, {-15660, -60, -15460}, {-15620, -60, -15460}}, Keys = {"cb651fd2-586d-598f-a97b-7af338ff47b8", "640b6074-815a-502b-92e3-b798698f5412", "509abf70-1773-591d-8e0b-d2890580ad2c"}},
+    {Radius = 5, Park = {{-15700, -60, -15420}, {-15660, -60, -15420}, {-15620, -60, -15420}}, Keys = {"301ee89f-fada-5f01-99ce-502e0e5b9d8a", "ad780899-e497-5f8b-ab06-cece00a1f29e", "44a36d1b-fa43-5a35-a272-af6b2907d1d3"}},
+    {Radius = 6, Park = {{-15700, -60, -15380}, {-15660, -60, -15380}, {-15620, -60, -15380}}, Keys = {"d03eadc5-6649-5b6f-b864-5c56a8090239", "e0a60539-e02e-5fd8-b07d-1c223083f4f6", "5403cc5a-282d-5b1e-bd99-dbfb32ac6fec"}},
+    {Radius = 7, Park = {{-15700, -60, -15340}, {-15660, -60, -15340}, {-15620, -60, -15340}}, Keys = {"0f602d5b-72e4-5e70-b45a-346b1f418635", "8d5f9632-6499-5938-a514-c0cf85da88fa", "1c47f144-fc4d-5c84-af69-12af73995304"}},
+    {Radius = 8, Park = {{-15700, -60, -15300}, {-15660, -60, -15300}, {-15620, -60, -15300}}, Keys = {"96c792fb-ee15-5999-82ef-9318dde41a99", "2179f7f3-a3fb-5b03-ac87-69e3082f7174", "08bf5761-9d6f-51d7-82ef-789406d5ccaa"}},
+    {Radius = 9, Park = {{-15700, -60, -15260}, {-15660, -60, -15260}, {-15620, -60, -15260}}, Keys = {"6cd121b5-6b65-5f54-8d6e-de8110a646e7", "36d379bb-8dde-5924-9b1c-da756db54337", "5c873def-7d32-525e-b53d-6a3596afb49f"}},
+    {Radius = 10, Park = {{-15700, -60, -15220}, {-15660, -60, -15220}, {-15620, -60, -15220}}, Keys = {"fdc0a767-ed88-525e-8100-3636ca1cba0b", "1acc403e-86cb-51d2-b488-106cfbf86662", "e6e8fc01-84b8-5148-b042-78007060fe81"}},
+    {Radius = 11, Park = {{-15700, -60, -15180}, {-15660, -60, -15180}, {-15620, -60, -15180}}, Keys = {"778cccdd-1195-54a4-8bd8-367974bc14d2", "aef67ace-983a-5f63-bf93-061c1527fa14", "f0d8bf76-8f44-5641-93aa-fe25e760b094"}},
+    {Radius = 12, Park = {{-15700, -60, -15140}, {-15660, -60, -15140}, {-15620, -60, -15140}}, Keys = {"65c326bd-e32a-50ed-ba0c-8d01b4dcf013", "01d41cc9-c5d3-5b69-bd0a-b284d1946b9b", "23e9df94-d29c-5f8f-ad4b-e61d49ff324c"}},
+    {Radius = 13.5, Park = {{-15700, -60, -15100}, {-15660, -60, -15100}, {-15620, -60, -15100}}, Keys = {"26506ce0-573a-599c-b210-5aa41fdfa77d", "9db9bdfc-05a3-52aa-a7f0-994e38505adf", "55ea08aa-ceee-5116-a009-a46a2cab1f3b"}},
 }
 
 M.NEAR = 160.0      -- metres from a party member within which a car gets its platform
@@ -51,14 +56,19 @@ function M.Parse(raw)
 end
 
 -- The floor's place in BG3 for a car at WoW point w: world mode's mapping, raised by the floor's height in the car.
+-- Its x and z go to the nearest half metre, BG3's tile lattice: the platform's tiles then lie on the ground squares'
+-- own tiles, so the floor's rim and the ground beside it are neighbours with no half tile between (the bridge takes
+-- the ground away under the same rounded disc: world_bridge.py carve_lifts). The car is at most 35 cm beside.
 function M.ToBg3(w, centre, floor)
-    return {centre[1] + w[2] * YD, centre[2] + w[3] * YD + floor, centre[3] - w[1] * YD}
+    local function half(v) return math.floor(v * 2 + 0.5) / 2 end
+    return {half(centre[1] + w[2] * YD), centre[2] + w[3] * YD + floor, half(centre[3] - w[1] * YD)}
 end
 
--- The index in M.PLATFORMS of the smallest floor a car's fits in, or nil.
+-- The index in M.PLATFORMS of the smallest floor that reaches M.MARGIN past a car's own (onto the landings: see
+-- tools/wow_lift_platforms.py), or nil.
 function M.Size(radius)
     for i, p in ipairs(M.PLATFORMS) do
-        if p.Radius >= radius - M.SLACK then return i end
+        if p.Radius >= radius + M.MARGIN then return i end
     end
     return nil
 end

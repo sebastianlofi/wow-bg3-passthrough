@@ -142,12 +142,12 @@ diff --git a/crates/benilla-app/src/wowbg3_lifts.rs b/crates/benilla-app/src/wow
 new file mode 100644
 --- /dev/null
 +++ b/crates/benilla-app/src/wowbg3_lifts.rs
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,96 @@
 +//! WOW-BG3 (local fork, patch 0135): WoW's lifts for BG3's side of a ride.
 +//!
 +//! A lift (an elevator, a tram car: game object type 11) moves on the client's own clock along
 +//! `TransportAnimation.dbc` (`transport`). BG3 carries its characters on a platform of its own that
-+//! must make the same moves, so every frame in world mode `link/wowlifts.bin` says where each lift
++//! must make the same moves, so every frame `link/wowlifts.bin` says where each lift
 +//! on the map is and where the keyframe span it is on ends, with the time left to that end: one
 +//! straight move at one speed, which BG3's own platform move repeats (`Lifts.lua`).
 +//!
@@ -172,7 +172,7 @@ new file mode 100644
 +pub(crate) fn build(app: &mut App, dir: PathBuf) {
 +    app.insert_resource(LiftsOut { path: dir.join("wowlifts.bin"), seq: 0, frames: 0 })
 +        .add_systems(Update, write_lifts.after(benilla_world::schedule::WorldStage::Input));
-+    info!("wowbg3 lifts: WoW's lifts go to wowlifts.bin every frame in world mode");
++    info!("wowbg3 lifts: WoW's lifts go to wowlifts.bin every frame");
 +}
 +
 +/// One lift's record.
@@ -189,9 +189,6 @@ new file mode 100644
 +}
 +
 +fn write_lifts(mut out: ResMut<LiftsOut>, lifts: Query<(&Guid, &Transport, &TransportAnchor)>) {
-+    if !crate::wowbg3_lead::body::active() {
-+        return;
-+    }
 +    let mut body = Vec::new();
 +    let mut n = 0u32;
 +    for (guid, transport, anchor) in &lifts {

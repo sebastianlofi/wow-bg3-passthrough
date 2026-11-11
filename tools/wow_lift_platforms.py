@@ -23,9 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wowbg3_level  # noqa: E402
 
 LEVEL = 'WOWBG3_Azeroth_A'
-RADII = (3.0, 5.0, 6.5, 8.0, 10.0, 12.5)   # metres
+RADII = (3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.5)   # metres
 EACH = 3                                    # Undercity has three cars in sight of each other
-SLACK = 0.25                                # a car's floor may be this much wider than its platform's
+# A platform's floor reaches this far past the car's own: the walkable ground of a landing ends short of the shaft's
+# edge (WoW's movement map keeps a walker's width from every edge), and BG3's path finder needs the platform's rim
+# and the landing's ground to be neighbouring tiles. At a stop the platform takes the place of the ground it lies
+# over (world_bridge.py carve_lifts). With 25 cm the hero could not step off Undercity's car at the top (harness).
+MARGIN = 1.0
 # Parked in the level's low corner, beside its start square and off every WoW map's place (test_wow_lift_platforms.py).
 PARK = (-15700.0, -60.0, -15500.0)
 STEP = 40.0
@@ -66,14 +70,14 @@ def instances():
 
 
 def pick(radius):
-    return next((r for r in RADII if r >= radius - SLACK), None)
+    return next((r for r in RADII if r >= radius + MARGIN), None)
 
 
 def lua():
     rows = ['    {Radius = %s, Park = {%s}, Keys = {%s}},' % (
         ('%g' % r), ', '.join('{%g, %g, %g}' % park(r, i) for i in range(EACH)), ', '.join('"%s"' % key(r, i) for i in range(EACH)))
         for r in RADII]
-    return 'M.SLACK = %g\nM.PLATFORMS = {\n%s\n}' % (SLACK, '\n'.join(rows))
+    return 'M.MARGIN = %g\nM.PLATFORMS = {\n%s\n}' % (MARGIN, '\n'.join(rows))
 
 
 if __name__ == '__main__':

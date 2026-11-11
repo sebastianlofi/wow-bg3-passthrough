@@ -222,27 +222,38 @@ def stop_points(frames, spawn, quat):
 AWAY_M = 300.0   # a tile under a resting car is moved this far up, out of BG3's reach from the car's floor
 
 
-def carve(section, rec, minx, minz, spots, reach=2.0, top=None):
-    """A square's tile records without the ground a lift car rests on. Where a car stops, WoW's own floor under it
-    is the car's; BG3 stands a walker on the tile nearest its height, so with the static tile left at its height
-    (12 cm from the platform's in Undercity) the rider stood on that tile and stayed behind when the car left
-    (harness). `section`: n x n records of `rec` bytes, the first a flags byte (1 walkable), then one float
-    floor (rec 5) or two, low and high (rec 9), in BG3 m; (minx, minz) the square's corner; `spots` [(x, y, z,
-    radius)] in BG3 metres, y the car's floor. Tiles within the radius whose floor lies within `reach` of it lose
-    the walkable bit and go AWAY_M up (not past `top`, the highest a tile of this section may lie; then they
-    only lose the bit). (bytes, how many)."""
+def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.0, step=1.0):
+    """A square's tile records without the ground a lift car rests on, and with seams round it. Where a car stops,
+    WoW's own floor under it is the car's; BG3 stands a walker on the tile nearest its height, so with the static
+    tile left at its height (12 cm from the platform's in Undercity) the rider stood on that tile and stayed behind
+    when the car left (harness). `section`: n x n records of `rec` bytes, the first a flags byte (1 walkable, 4 and
+    8 a seam), then one float floor (rec 5) or two, low and high (rec 9), in BG3 m; (minx, minz) the square's
+    corner; `spots` [(x, y, z, radius)] in BG3 metres: the platform's place at the stop (x and z on the half
+    metre lattice, y its floor) and its floor's radius. Tiles within the radius whose floor lies within `reach` of
+    y lose the walkable bit and go AWAY_M up (not past `top`, the highest a tile of this section may lie; then
+    they only lose the bit). Walkable tiles in the `ring` metres beyond it, within `step` of the floor, get the
+    `seam` bits: BG3's path finder steps from one subgrid to another only on such tiles, and the platform's rim has
+    them too (wowbg3_level.py). (bytes, how many taken away)."""
     n = int(round((len(section) // rec) ** 0.5))
     out, cut = None, 0
     for bx, by, bz, radius in spots:
-        c0, c1 = int((bx - radius - minx) // 0.5), int((bx + radius - minx) // 0.5)
-        r0, r1 = int((bz - radius - minz) // 0.5), int((bz + radius - minz) // 0.5)
+        far = radius + ring
+        c0, c1 = int((bx - far - minx) // 0.5), int((bx + far - minx) // 0.5)
+        r0, r1 = int((bz - far - minz) // 0.5), int((bz + far - minz) // 0.5)
         for r in range(max(r0, 0), min(r1, n - 1) + 1):
             for c in range(max(c0, 0), min(c1, n - 1) + 1):
                 k = (r * n + c) * rec
                 x, z = minx + (c + 0.5) * 0.5, minz + (r + 0.5) * 0.5
-                if (x - bx) ** 2 + (z - bz) ** 2 > radius * radius:
+                d2 = (x - bx) ** 2 + (z - bz) ** 2
+                if d2 > far * far:
                     continue
                 floor = struct.unpack_from('<f', section, k + 1)[0]
+                if d2 > radius * radius:
+                    if section[k] & 1 and abs(floor - by) <= step and seam:
+                        if out is None:
+                            out = bytearray(section)
+                        out[k] |= seam
+                    continue
                 if abs(floor - by) > reach:
                     continue
                 if out is None:
