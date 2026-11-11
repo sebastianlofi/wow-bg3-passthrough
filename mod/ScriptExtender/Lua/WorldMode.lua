@@ -7,6 +7,9 @@
 --
 -- Driven by wow-bg3/world-command.json (one command per sequence, client context):
 --   Start  {Centre = {x,y,z}, WowOrigin = {x,y,z}, Spot = {x,y,z} (where the hero lands), Cells = {{K, MinX, MinZ, BaseY}...}, PoolSize, Layer}
+--   Jump   {Spot = {x,y,z}, Cells, Rays}: a move on the same WoW map (a flight point). The squares at the new place
+--          are placed as a Stream places them, then the controlled character goes there with the members chained
+--          to it (Party.lua Move: BG3's own group teleport). Nothing stops: a member left behind keeps its ground.
 --          ground (pool subgrids placed as 64 m squares of WoW ground on the level's one lattice, the files
 --          wow-bg3/section-<K>.bin and arena-triangles.bin written by the WoW side) + teleport + lead
 --   Stream {Cells, Rays}                  Tav walked on: move those pool subgrids, swap the triangles
@@ -647,6 +650,17 @@ function M.Start(runId)
             arena({Action = "Rays", Void = true, Mask = 2096, SkipContexts = 0, Seconds = MAX_SECONDS})
         end
     end
+    local function jump(c)
+        assert(state and state.Started, "world mode not started")
+        local S = c.Spot
+        assert(type(S) == "table" and #S == 3 and tonumber(S[1]) and tonumber(S[2]) and tonumber(S[3]), "Spot required")
+        stream(c)
+        state.Spot = S
+        camp.Last, camp.Hold = nil, nil -- the teleport is no trip to camp
+        party({Action = "Move", Position = {S[1], S[2] + 1, S[3]}})
+        wait(30)
+        Ext.Log.Print("WOW-BG3 world: jumped to " .. Ext.Json.Stringify(S))
+    end
     local function stop()
         if not state then return end
         -- Stop publishing first: Tav is sent back to her BG3 position below, and benilla would
@@ -761,7 +775,7 @@ function M.Start(runId)
         local c = readJson("world-command.json")
         if not c or c.RunId ~= runId or math.type(c.Sequence) ~= "integer" or c.Sequence <= sequence then return end
         sequence = c.Sequence
-        local fn = ({Start = start, Stream = stream, Stop = stop, Research = research})[c.Action]
+        local fn = ({Start = start, Stream = stream, Jump = jump, Stop = stop, Research = research})[c.Action]
         if not fn then writeStatus({Last = tostring(c.Action), Seq = c.Sequence, OK = false, Error = "unknown action"}); return end
         jobs[#jobs + 1] = {name = c.Action, seq = c.Sequence, co = coroutine.create(function() return fn(c) end)}
     end)

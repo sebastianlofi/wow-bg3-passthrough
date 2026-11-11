@@ -25,6 +25,10 @@
 --   Gather {Position, Upkeep}  (WorldMode.lua) every companion next to the hero (or Position) and
 --                     chained, each with its summons (BG3's teleport takes them along); Upkeep true while
 --                     world mode runs (below), false at its Stop
+--   Move {Position}   (WorldMode.lua's Jump: a flight point, a move on the same WoW map) the controlled character
+--                     to Position with the members chained to it (BG3's own follow group, InSamePartyGroup), as at
+--                     a BG3 waypoint; an unchained member stays where it is. Value.Moved lists the uuids that went
+--                     (the leader first)
 --   Refill            ("a command to refill my resources (spell slots, rage, etc)")
 --                     BG3's own full restore, Osiris RestoreParty on the hero (every party member's HP and
 --                     action resources), then ResetCooldowns on each member; anything still under its
@@ -526,6 +530,27 @@ function M.Start(runId)
         end
     end
 
+    -- The controlled character and the members chained to it (BG3's own follow group) to c.Position, which is what a
+    -- BG3 waypoint does with a group. Nobody else is touched.
+    local function move(c)
+        local hero = heroOrFail()
+        local at = c.Position
+        assert(type(at) == "table" and #at == 3 and tonumber(at[1]) and tonumber(at[2]) and tonumber(at[3]), "Position required")
+        local leader = hero
+        local host = uuidOf(q(Osi.GetHostCharacter))
+        for _, u in ipairs(M.Party()) do if u == host then leader = host end end
+        local moved = {leader}
+        for _, u in ipairs(M.Party()) do
+            if u ~= leader and q(Osi.IsOnStage, u) == 1 and q(Osi.InSamePartyGroup, u, leader) == 1 then moved[#moved + 1] = u end
+        end
+        -- source, x, y, z, event, linked characters, party followers, summons, leave combat, snap. The followers
+        -- flag alone left a chained Shadowheart where she stood (harness), so each one is placed, as Gather does.
+        Osi.TeleportToPosition(leader, at[1], at[2], at[3], "", 0, 0, 1, 0, 1)
+        for i = 2, #moved do placeNear(moved[i], at, i - 2) end
+        Ext.Utils.Print(string.format("WOW-BG3 party: Move %s and %d chained to %.1f %.1f %.1f", nameOf(leader), #moved - 1, at[1], at[2], at[3]))
+        return {Moved = moved, Leader = leader, At = at}
+    end
+
     -- Every companion next to the hero (or c.Position) and chained (world mode's Start and Stop).
     local function gather(c)
         local hero = heroOrFail()
@@ -721,13 +746,13 @@ function M.Start(runId)
         local okj, c = pcall(Ext.Json.Parse, raw or "")
         if not okj or type(c) ~= "table" or c.RunId ~= runId or math.type(c.Sequence) ~= "integer" or c.Sequence <= sequence then return end
         sequence = c.Sequence
-        local fn = ({List = list, Add = add, Remove = remove, Gather = gather, Refill = refill, Pool = pool,
+        local fn = ({List = list, Add = add, Remove = remove, Gather = gather, Move = move, Refill = refill, Pool = pool,
             LevelUp = levelUp, Catchup = catchup, Reset = reset})[c.Action]
         if not fn then
             Ext.IO.SaveFile("wow-bg3/party-result.json", Ext.Json.Stringify({RunId = runId, Sequence = c.Sequence,
                 Action = tostring(c.Action), OK = false, Value = c.Action == "Level"
                     and "Level is retired: BG3 levels come from the WoW levels now (party.sh pool, party.sh levelup NAME)"
-                    or "unknown action (List, Add, Remove, Gather, Refill, Pool, LevelUp, Catchup, Reset)"}))
+                    or "unknown action (List, Add, Remove, Gather, Move, Refill, Pool, LevelUp, Catchup, Reset)"}))
             return
         end
         jobs[#jobs + 1] = {name = c.Action, seq = c.Sequence, co = coroutine.create(function() return fn(c) end)}
