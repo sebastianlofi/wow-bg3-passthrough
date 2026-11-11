@@ -245,45 +245,13 @@ class Move(Base):
             result = w.move(m)
         return result, started, json.loads(B.MOVE_RESULT.read_text())
 
-    def test_the_same_map_is_a_jump_and_nothing_stops(self):
-        result, started, answer = self.run_move(self.request())
-        self.assertIs(result, self.w)
-        self.assertEqual([a for a, _ in self.w.sent], ['Jump'])
-        self.assertEqual(started, [])
-        jump = self.w.sent[0][1]
-        S = self.w.to_bg3(TARGET)
-        self.assertEqual(jump['Spot'], list(S))
-        # The 2 x 2 round the new place, each in a pool subgrid of its own.
-        self.assertEqual(len(jump['Cells']), 4)
-        node = B.node_of(self.w.centre, S[0], S[2])
-        want = sorted((node[0] + i, node[1] + j) for i in (-1, 0) for j in (-1, 0))
-        self.assertEqual(sorted(ij for ij in self.w.placed.values() if ij in want), want)
-        self.assertEqual(answer['Value'], {'Origin': list(TARGET), 'Map': 0})
-        self.assertEqual(self.w.at, TARGET)
-
-    def test_a_refused_jump_moves_the_whole_party_through_stop_and_start(self):
-        self.w.answers = [(False, 'Place refused: something stands on pool 4')]
+    def test_same_continent_is_stop_and_start_too(self):
         result, started, answer = self.run_move(self.request())
         self.assertIsNot(result, self.w)
-        self.assertEqual([a for a, _ in self.w.sent], ['Jump', 'Stop'])
+        self.assertEqual([a for a, _ in self.w.sent], ['Stop'])
         self.assertEqual(started, [TARGET])
-        self.assertEqual(self.w.at, (0.0, 0.0, 100.0))     # the jump left the session as it was
-
-    def test_who_stays_keeps_the_place_its_squares_are_cut_for(self):
-        w = self.w
-        old = w.at
-        stay = w.walker('stay', 'Shadowheart')
-        stay.pos = w.to_bg3((10.0, 5.0, 100.0))
-        go = w.walker('hero-1', 'Tav')
-        go.pos = w.to_bg3((0.0, 0.0, 100.0))
-        w.hero_walker = go
-        (self.tmp / 'party-result.json').write_text(json.dumps({'RunId': 'r1', 'Sequence': 1, 'OK': True, 'Value': {'Moved': ['hero-1']}}))
-        self.run_move(self.request())
-        self.assertEqual(stay.at, old)
-        self.assertIsNone(go.at)
-        S = w.to_bg3(TARGET)
-        self.assertEqual(w.at_for(B.node_of(w.centre, S[0], S[2])), TARGET)            # at the new place
-        self.assertEqual(w.at_for(B.node_of(w.centre, stay.pos[0], stay.pos[2])), old)  # where she stayed
+        self.assertEqual(answer['Value'], {'Origin': list(TARGET), 'Map': 0})
+        self.assertFalse(self.active())
 
     def test_another_continent(self):
         with mock.patch.object(self.w, 'arrive', lambda t: None):
