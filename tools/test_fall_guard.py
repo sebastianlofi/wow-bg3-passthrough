@@ -45,7 +45,7 @@ class Alarm(unittest.TestCase):
     def world(self, tris=HILL + FLOOR, placed=True):
         return types.SimpleNamespace(
             centre=(0.0, 0.0, 0.0), run='r', placed={0: (0, 0)} if placed else {}, cells={(0, 0): {'tris': tris}},
-            floor_at=lambda x, z: (True, 25.0) if placed else None, in_level=lambda p: False)
+            floor_at=lambda x, z: (True, 25.0) if placed else None, here=lambda p: True)
 
     def run_it(self, world, walker, y, x=2.0, z=2.0):
         out = io.StringIO()

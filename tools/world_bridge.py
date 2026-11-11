@@ -742,21 +742,13 @@ class World:
         w.name = name or w.name
         return w
 
-    def in_level(self, p):
-        """Whether a BG3 point lies in the level's own AI grid (64 m round it), as WorldMode measured it
-        at Start (world-status.json LevelBounds)."""
-        if not hasattr(self, '_bounds'):
-            self._bounds = None
-        if self._bounds is None:
-            try:
-                st = json.loads((IO / 'world-status.json').read_text())
-                b = st.get('LevelBounds') if st.get('RunId') == self.run else None
-                if isinstance(b, list) and len(b) == 4:
-                    self._bounds = [float(v) for v in b]
-            except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-                pass
-        b = self._bounds
-        return bool(b) and b[0] - 64 <= p[0] <= b[2] + 64 and b[1] - 64 <= p[2] <= b[3] + 64
+    def here(self, p):
+        """Whether a BG3 point lies in this session's WoW map: inside its place in the level (wow_places.py).
+        Outside every place is the level's own ground (its start square), where world mode keeps no squares;
+        another map's place is another world. (The level's own AI grid spans the whole level, corner to
+        corner, so its bounds say nothing: with them every companion read as standing in the level and got no
+        ground, no stand-in on the server and no fall alarm.)"""
+        return wow_places.map_at(p) == self.map
 
     def read_members(self, hero_pos):
         """[(Walker, BG3 position, dead)]: the hero (tav.bin's position) first, then every other
@@ -785,9 +777,8 @@ class World:
                         continue
                     if not isinstance(p, list) or len(p) != 3 or not all(isinstance(v, (int, float)) for v in p):
                         continue
-                    # Only members in the void (the treadmill's lattice), never one standing in the level
-                    # itself (its own AI grid, world-status.json LevelBounds, 64 m round it).
-                    if abs(p[0] - self.centre[0]) > 20000 or abs(p[2] - self.centre[2]) > 20000 or self.in_level(p):
+                    # Only members in WoW's world, never one standing in the level's own ground (its start square).
+                    if abs(p[0] - self.centre[0]) > 20000 or abs(p[2] - self.centre[2]) > 20000 or not self.here(p):
                         continue
                     w = self.walker(u, m.get('Name') or u[:8])
                     w.summon = summon
@@ -1068,7 +1059,7 @@ class World:
         f = self.floor_at(bx, bz)
         if f is None:
             # Off every placed square, in the level's own grid (a member at camp, say) or on no ground at all.
-            if not self.in_level((bx, by, bz)) and not camp_state(self.run) and now - w.fall_said >= FALL_SAY_S:
+            if self.here((bx, by, bz)) and not camp_state(self.run) and now - w.fall_said >= FALL_SAY_S:
                 w.fall_said = now
                 print(time.strftime('%H:%M:%S'), 'fall alarm: %s at %.1f %.1f %.1f, no square placed under it; placed %d'
                       % (w.name, bx, by, bz, len(self.placed)), flush=True)
@@ -1326,7 +1317,7 @@ class FarSight:
             p = m.get('Pos')
             if not isinstance(p, list) or len(p) != 3 or not all(isinstance(v, (int, float)) for v in p):
                 return None
-            if abs(p[0] - w.centre[0]) > 20000 or abs(p[2] - w.centre[2]) > 20000 or w.in_level(p):
+            if abs(p[0] - w.centre[0]) > 20000 or abs(p[2] - w.centre[2]) > 20000 or not w.here(p):
                 return None
             return {'Uuid': c, 'Name': m.get('Name') or c[:8], 'Pos': tuple(p)}
         return None

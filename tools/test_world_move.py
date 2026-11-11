@@ -445,6 +445,25 @@ class Cache(Base):
         self.assertEqual(W.square_order(2)[1], [])
 
 
+class InTheLevel(Base):
+    """A member stands in the level's own ground only outside every WoW map's place. The level's AI grid spans the
+    whole level, so its bounds must not decide: with them every companion got no ground of its own."""
+    def test_here_is_this_maps_place(self):
+        (self.tmp / 'world-status.json').write_text(json.dumps({'RunId': 'r1', 'LevelBounds': [-16000, -16000, 16000, 16000]}))
+        self.assertTrue(self.w.here((-78.8, 1079.5, 8249.2)))        # Northshire
+        self.assertFalse(self.w.here((762.5, 6308.6, -9449.4)))      # Shadowglen: Kalimdor's floor, another world
+        self.assertFalse(self.w.here((-15840.0, 0.0, -15840.0)))     # the level's start square
+        self.assertFalse(self.w.here((15700.0, -20.0, 0.0)))         # the parked pool
+
+    def test_a_companion_in_wows_world_has_ground_and_a_place_in_the_party(self):
+        (self.tmp / 'world-status.json').write_text(json.dumps({'RunId': 'r1', 'LevelBounds': [-16000, -16000, 16000, 16000]}))
+        (self.tmp / 'party.json').write_text(json.dumps({'RunId': 'r1', 'Members': [
+            {'Uuid': 'hero-1', 'Name': 'Tav', 'Hero': True, 'Pos': [-74.8, 1080.7, 8273.3]},
+            {'Uuid': 'sh', 'Name': 'Shadowheart', 'Pos': [-78.8, 1079.5, 8249.2]}]}))
+        members = self.w.read_members((-74.8, 1080.7, 8273.3))
+        self.assertEqual(sorted(w.name for w, _, _ in members), ['Shadowheart', 'Tav'])
+
+
 class FarSight(Base):
     """Far Sight follows the player's control on its own thread, whatever the ground's round waits for (0.1.3013.60: a
     round building two movement tiles for 68 s held the F2 to Astarion 699 m off until after the F1 back)."""
@@ -486,7 +505,8 @@ class FarSight(Base):
         self.assertEqual((self.sent()['Seq'], self.sent()['On']), (2, False))
 
     def test_a_member_in_the_level_gets_none(self):
-        (self.tmp / 'world-status.json').write_text(json.dumps({'RunId': 'r1', 'LevelBounds': [-800, -500, 300, 100]}))
+        # On the level's own start square, outside every WoW map's place (wow_places.py).
+        self.party((-15840.0, 0.0, -15840.0))
         self.control(self.AST)
         self.sight.step()
         self.assertIsNone(self.sent())
