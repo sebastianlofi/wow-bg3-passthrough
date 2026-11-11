@@ -153,6 +153,7 @@ static void wlit_put(float* out, int on, const float* eye, const float* fwd, con
             const float tr = fminf(amb3[0] + sun[3], 1.0f), tb = fminf(amb3[2] + sun[5], 1.0f);
             float k = (tb - tr) / fmaxf(tb, 1e-3f) * 2.0f;
             out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4] = (k < 0.0f ? 0.0f : k > 1.0f ? 1.0f : k) * 0.5f;
+            out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4 + 1] = g_cc.wdzdbg;
         }
         out[2] = (float)nb;
         out[3] = nb > 0 ? 1.0f : 0.0f;  // a room's lobes: the outdoor law's point lights do not apply

@@ -149,6 +149,13 @@ void main() {
             N = nn > 1e-20 ? N / sqrt(nn) : vec3(0.0, 0.0, -1.0);
             if (dot(N, P) > 0.0) N = -N;
         }
+        // Compose word wdzdbg=1 (a test view): a pixel of BG3's by the eye depth read for it: red its depth over 20 m,
+        // green 1 where that depth is none (0), blue the facing's part toward the eye.
+        if (tb.TAB[LX + 4 + 8 * 4 + 1] > 0.5) {
+            vec3 dbg = vec3(clamp(z / 20.0, 0.0, 1.0), z < 0.01 ? 1.0 : 0.0, clamp(-N.z, 0.0, 1.0));
+            o = vec4(inv3(dbg) / ex, 0.0);
+            return;
+        }
         float shape = 1.0 + AMB_SHAPE * dot(N, vec3(tb.TAB[LX], tb.TAB[LX + 1], tb.TAB[LX + 2]));
         // WoW's light sum for a unit: the ambient, and its three nearest point lights within their range (after the
         // table in its buffer: count, share, then place in this view, range, colour a light).
