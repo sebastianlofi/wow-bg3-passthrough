@@ -191,6 +191,9 @@ local YD = 0.9144
 -- are the teleport and turn thresholds; LiveLeadMs moves the server copy's target on by that much
 -- more of the mob's motion (the time until the client applies a replicated server change).
 M.Live, M.LiveMove, M.LiveTurnDeg, M.LiveLeadMs = true, 0.25, 4, 0
+-- Metres a stand-in may stand over or under its creature before the grid's floor there is taken for another's
+-- (see follow: the placement without the snap).
+M.LiveHeight = 2.5
 -- Help for a friendly NPC (see the header): metres round the victim; 0 turns a kind off.
 M.GuardRadius, M.HelpRadius = 30.0, 10.0
 -- Base movement of every stand-in, percent of its template's (scale step; 100 leaves it).
@@ -979,9 +982,32 @@ function M.Start(runId)
                 -- BG3 runs a stand-in in its combat: checked every tick, a fight can start any time.
                 if q(Osi.IsInCombat, m.Uuid) ~= 1 and q(Osi.IsDead, m.Uuid) ~= 1 then
                     local at = pos(m.Uuid)
-                    if at and hdist(at, p) > M.LiveMove then
-                        pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, 1)
-                        M.LiveStats.Teleports = M.LiveStats.Teleports + 1
+                    if at then
+                        -- A stand-in stands where its creature stands, at its height. BG3's snap puts a
+                        -- character on the walk grid's floor in that column, and the grid has no tile where
+                        -- no walker goes: behind a counter, on a mine's floor under a road while the party is
+                        -- above, in a city under a mountain seen from its roof. The snap then took another
+                        -- layer in the column (Stormwind's auctioneers 35 m under their hall on the buried
+                        -- terrain, Moonbrook's miners on the street over their mine, Ironforge's guards on the
+                        -- peak: 6 of 50, 10 of 37, 12 of 38 stand-ins), out of reach of every click and
+                        -- path, or standing unseen beside the party. Such a stand-in is placed without the
+                        -- snap, onto WoW's own face there, which BG3's rays find (measured: all of those
+                        -- stood at their creatures and stayed). One that sinks again has nothing of WoW's
+                        -- under it, a creature in the air: it goes back to the snap for good, after a fall of
+                        -- M.LiveHeight at most.
+                        local dy = at[2] - p[2]
+                        if m.NoSnap and dy < -M.LiveHeight then
+                            m.NoSnap, m.Air = nil, true
+                            M.LiveStats.Air = (M.LiveStats.Air or 0) + 1
+                            pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, 1)
+                        elseif not m.Air and not m.NoSnap and math.abs(dy) > M.LiveHeight then
+                            m.NoSnap = true
+                            M.LiveStats.NoSnap = (M.LiveStats.NoSnap or 0) + 1
+                            pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, 0)
+                        elseif hdist(at, p) > M.LiveMove or (m.NoSnap and dy > M.LiveHeight) then
+                            pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, m.NoSnap and 0 or 1)
+                            M.LiveStats.Teleports = M.LiveStats.Teleports + 1
+                        end
                     end
                     local f = m.FaceCheck == nil and forward(m.Uuid)
                     local turnDue = (m.LiveDir == nil or angle(m.LiveDir, dir) > math.rad(M.LiveTurnDeg))

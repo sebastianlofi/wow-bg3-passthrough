@@ -904,19 +904,19 @@ impl Mirror {
         }
         out
     }
-    /// A mob's horizontal distance to the nearest party member within 20 yd of its height (none:
-    /// infinite).
+    /// A mob's horizontal distance to the nearest party member (no member: infinite). For the order only.
     fn party_dist(&self, anchors: &[Point], p: Point) -> f64 {
         anchors
             .iter()
-            .filter(|a| (p.2 - a.2).abs() < 20.)
             .map(|a| hdist(p, *a))
             .fold(f64::INFINITY, f64::min)
     }
     /// The mobs to mirror: the running fight's, then every other creature WoW has loaded round the
     /// party (the feed: WoW's visible set), attackable or friendly, nearest to a member first (the
-    /// order `Mirrors.lua` spawns them in). No range or count of ours: what WoW shows has a stand-in.
-    /// Only a mob whose height is far from every member's (`party_dist`: another storey) is left out.
+    /// order `Mirrors.lua` spawns them in). No range, height or count of ours: what WoW shows has a
+    /// stand-in. (A mob more than 20 yd over or under every member was left out, a rest of the days
+    /// of a 45 yd range and one small floor: on a hillside or a roof WoW showed creatures that BG3 could
+    /// not click, aim at or see. Westfall, Moonbrook: 3 of 38.)
     pub fn wanted(&self, fight: &[String], now: u64) -> Vec<&WowUnit> {
         let anchors = self.anchors();
         if anchors.is_empty() {

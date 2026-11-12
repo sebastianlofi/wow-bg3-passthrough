@@ -609,8 +609,8 @@ fn mobs_round_every_party_member_are_mirrored_at_any_distance_wow_lists() {
     use wow_bg3_link::mirror::parse_members;
     let mut m = mirror();
     let hero = m.hero().unwrap().pos;
-    // A companion 600 yd north of the hero and 40 yd higher (no member stands at that height yet),
-    // with a mob 10 yd from it and one 90 yd from it (WoW's visibility reaches 100 yd).
+    // A companion 600 yd north of the hero and 40 yd higher, with a mob 10 yd from it and one 90 yd
+    // from it (WoW's visibility reaches 100 yd).
     let far = (hero.0 + 600.0, hero.1, hero.2 + 40.0);
     let text = format!(
         "{MOBS}mob f130000000099001 299 5 1 {} {} {} 0.0 50 50 0 Far Wolf\nmob f130000000099002 299 5 1 {} {} {} 0.0 50 50 0 Edge Wolf\n",
@@ -628,9 +628,17 @@ fn mobs_round_every_party_member_are_mirrored_at_any_distance_wow_lists() {
             .map(|u| u.guid.clone())
             .collect::<Vec<_>>()
     };
+    // Listed is mirrored, whatever its height against the members': WoW has it loaded for someone.
+    assert!(wanted(&m).contains(&"f130000000099001".to_string()));
+    let mut high = m.hero().unwrap().clone();
+    high.guid = "f1300000000990aa".into();
+    high.pos.0 += 30.0;
+    high.pos.2 += 26.0;
+    high.hp = 50;
+    m.mobs.mobs.push(high);
     assert!(
-        !wanted(&m).contains(&"f130000000099001".to_string()),
-        "no member there yet"
+        wanted(&m).contains(&"f1300000000990aa".to_string()),
+        "a creature 26 yd up the hill beside the hero has its stand-in"
     );
     m.members = parse_members(&serde_json::json!({"Format": 1, "Members": [
         {"Uuid": "hero-uuid", "Hero": true, "Wow": [hero.0, hero.1, hero.2]},
