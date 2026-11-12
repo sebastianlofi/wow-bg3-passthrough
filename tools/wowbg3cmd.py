@@ -784,6 +784,9 @@ def dock_panel(ctx):
         if not at:
             continue
         for s in wow_docks.other(r, i):
+            # Only a crossing that can be made: no offer to a stop where no place to stand is found.
+            if not dock_stand(r, r['Stops'].index(s)):
+                continue
             docks.append({'Key': dock_key(r, s), 'Name': dock_name(r, s), 'Kind': vessel(r), 'Wow': [round(v, 2) for v in at[:3]]})
     atomic_write(ctx.link / 'dock-panel.json', json.dumps({'Map': here_map, 'Docks': docks}))
 

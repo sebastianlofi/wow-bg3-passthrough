@@ -95,7 +95,8 @@ This is the first public version. What we know is missing or rough:
 - Ships and zeppelins are drawn by WoW and cannot be boarded: your dream guardian stands at each dock and takes the
   party to the dock at the other end (a BG3 dialog: "Travel to <place>?"). Proven on a ship (Menethil Harbor to
   Auberdine) and a zeppelin (Durotar to Tirisfal Glades), with the guardian standing at the far dock for the way
-  back; the other six routes are untested. The place is named by the
+  back; the other six routes are untested. The ferry between Feathermoon Stronghold and the Forgotten Coast is not offered: no place to stand is found at the
+  Forgotten Coast end. The place is named by the
   server's area at the pier, which for some piers is the water beside the town ("The Long Wash, Darkshore" is
   Auberdine's pier). The dialog has no staged camera: the two stand as they stood. The guardian is drawn like a party
   member, so it takes a few seconds to appear the first time. `/wowbg3 cross` is a test command now.

@@ -175,6 +175,11 @@ def test_the_guardians_panel_and_its_yes():
             raise AssertionError('a vessel that does not stop here took the party')
         except w.CmdError as e:
             assert 'does not stop here' in str(e)
+        # A far end with no place to stand is not offered (the crossing would be refused).
+        w._DOCKS['stand'][(295, 1)] = None
+        w.dock_panel(ctx)
+        assert json.loads((link / 'dock-panel.json').read_text())['Docks'] == []
+        del w._DOCKS['stand'][(295, 1)]
         # Away from every dock the panel is empty: the guardian leaves.
         struct.pack_into('<3f', raw, 72, -3000.0, -560.0, 6.0)
         (link / 'camera.bin').write_bytes(bytes(raw))
