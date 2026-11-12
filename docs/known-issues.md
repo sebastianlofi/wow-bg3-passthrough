@@ -26,6 +26,10 @@ This is the first public version. What we know is missing or rough:
 
 ## Picture
 
+- Two of BG3's video options have to stay at their defaults for now: Anti-Aliasing on TAA and FidelityFX
+  Sharpening on. The mod puts WoW's own colours back into the picture at those two steps of BG3's, so with either
+  one off (or with another anti-aliasing mode) the distant ground turns pale, WoW's fog is lost behind the trees and
+  tree tops go black with bright edges. Other video options were not tried one by one.
 - WoW's world is shown in WoW's own colours. BG3's spell glow no longer spills onto WoW ground that the effect
   itself does not cover.
 - BG3's characters are shaded as WoW shades its own: as a whole, when the ground they stand on is in a tree's or a
