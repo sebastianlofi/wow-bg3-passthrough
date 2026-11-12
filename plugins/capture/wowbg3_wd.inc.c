@@ -126,13 +126,17 @@ static void wd_restore(DeviceData* d, VkCommandBuffer cb) {
 
 // The second draw: WoW's collision ground, tested against WoW's depth just written. Where it passes, the ground is what WoW shows, so
 // only those pixels get the "receives decals" byte and the ground's own normal. WoW's models and leaves stay out of BG3's decals.
+// Its fragment stage (wowbg3_wdm.frag) reads WoW's depth for the pixel as the first draw does, so the pipeline has that draw's
+// layout and uses the set and the constants it left bound: a triangle far in front of what WoW shows (a wall its see-through
+// opening cut away) marks nothing, where the depth test alone let it overwrite a character's normal and material.
 #include "wowbg3_wdt_spv.h"
+#include "wowbg3_wdm_spv.h"
 static VkPipeline g_wd_tri; static VkRenderPass g_wd_tri_for;
 static VkPipeline wd_tri(DeviceData* d, VkRenderPass rp) {
     if (g_wd_tri && g_wd_tri_for == rp) return g_wd_tri;
     VkShaderModule vs, fs;
     VkShaderModuleCreateInfo mv = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_wdt_vert, wowbg3_wdt_vert};
-    VkShaderModuleCreateInfo mf = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_ground_frag, wowbg3_ground_frag};
+    VkShaderModuleCreateInfo mf = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_wdm_frag, wowbg3_wdm_frag};
     if (d->CreateShaderModule(d->device, &mv, NULL, &vs) != VK_SUCCESS || d->CreateShaderModule(d->device, &mf, NULL, &fs) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main", NULL},
@@ -156,10 +160,10 @@ static VkPipeline wd_tri(DeviceData* d, VkRenderPass rp) {
                              VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                              VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 9, dyn};
-    VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, &dss, &cbs, &dy, g_gr.layout, rp, 0, VK_NULL_HANDLE, -1};
+    VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, &dss, &cbs, &dy, g_wd.layout, rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_wd_tri) != VK_SUCCESS) return VK_NULL_HANDLE;
     g_wd_tri_for = rp;
-    logf_("wdepth: ground mark ready");
+    logf_("wdepth: ground mark ready (a triangle marks only at WoW's own depth)");
     return g_wd_tri;
 }
 static void wd_mark(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkBuffer vbuf, VkBuffer recb, VkDeviceSize recoff, uint32_t verts) {
