@@ -77,8 +77,6 @@ function Probe.Start(context)
         if not okWf then Ext.Log.Print("WOW-BG3 worldflag: " .. tostring(errWf)) end
         -- BG3's own 3D screens (respec, level-up, mirror) shown as BG3 draws them.
         local okRs, errRs = pcall(function() Ext.Require("RenderScreen.lua").Start(report.RunId) end)
-        -- The world's turn in turn-based mode outside combat (TurnHold.lua releases WoW's creatures then).
-        pcall(function() Ext.Require("TurnHold.lua").StartClient(report.RunId) end)
         if not okRs then Ext.Log.Print("WOW-BG3 render screen: " .. tostring(errRs)) end
         local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").StartClient() end)
         if not okMl then Ext.Log.Print("WOW-BG3 move loading: " .. tostring(errMl)) end
