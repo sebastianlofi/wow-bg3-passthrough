@@ -39,12 +39,16 @@
 -- The world's turn (a playtest report: the environment's turn came and nothing in WoW moved): BG3
 -- pauses the world only while the party takes its turns; once every member in turn-based mode has
 -- ended its turn, the turn order shows the environment's turn and the rest of the world runs for that
--- round. Force Turn-Based raises no TurnStarted events, so the client tells it from the party's view
--- models (M.StartClient): someone in turn-based mode and nobody's turn (IsCurrentTurn) for
--- M.WorldTicks checks in a row is the world's turn. It writes wow-bg3/link/ftbturn.txt, "<seq> world" or
--- "<seq> party", on a change; while it says world this file releases the hold (Hold false) and holds
--- again when the party's turn comes back. A companion can be in the mode without the hero, so the client
--- goes by link/ftbparty.txt, this file's word on whether any member is ("1" or "0").
+-- round (six seconds). Force Turn-Based raises no TurnStarted events, but each member's own TurnBased
+-- component says it: IsActiveCombatTurn is true while its turn is open and false through the environment's
+-- turn (measured on the server: true on entering the mode, false from End Turn for 180 ticks, true again).
+-- So with members in the mode and none of them active for M.WorldChecks passes it is the world's turn: the
+-- hold is released, and taken again when a turn opens. wow-bg3/link/ftbturn.txt ("<seq> world" or
+-- "<seq> party") and link/ftbparty.txt ("1" while any member is in the mode) say so to anyone checking.
+-- Before, the client told the turn from the hotbar's view models, found by walking BG3's whole UI tree every
+-- second tick while the mode was on (5 to 9 ms a walk). BG3 rebuilds that tree when the mode is left, on
+-- another thread, and crashed under the walk in the extender's UI binding (l_type_name; twice in ten exits
+-- in the harness). Nothing here reads the UI now.
 local M = {}
 local Hero = Ext.Require("Hero.lua")
 local Session = Ext.Require("Session.lua")
@@ -231,7 +235,7 @@ function M.Start(runId)
         Ext.Utils.Print("WOW-BG3 turnhold: released (" .. why .. ")")
     end
 
-    -- Whether any member is in the mode, for the client half (see the header).
+    -- Whether any member is in the mode (see the header).
     local partyWord
     local function sayParty(on)
         local word = on and "1" or "0"
@@ -244,13 +248,24 @@ function M.Start(runId)
     -- A new Lua session (game start or a load): nothing held from before.
     write({})
     sayParty(false)
-    -- The world's turn (see the header): the client's word, written in this session.
-    local turnSeen = Ext.IO.LoadFile("wow-bg3/link/ftbturn.txt")
-    local function worldTurn()
-        local raw = Ext.IO.LoadFile("wow-bg3/link/ftbturn.txt")
-        if raw == turnSeen then return false end -- nothing written since the load
-        turnSeen = nil
-        return raw ~= nil and raw:match("^%d+ world") ~= nil
+    -- The world's turn (see the header): no member in the mode has its turn open, M.WorldChecks passes in a row.
+    local quiet, turnWord, turnSeq = 0, nil, 0
+    local function sayTurn(word)
+        if word ~= turnWord then
+            turnWord, turnSeq = word, turnSeq + 1
+            Ext.IO.SaveFile("wow-bg3/link/ftbturn.txt", string.format("%d %s\n", turnSeq, word))
+        end
+    end
+    local function worldTurn(members)
+        for _, m in ipairs(members) do
+            local e = q(Ext.Entity.Get, m.Uuid)
+            if e and q(function() return e.TurnBased.IsActiveCombatTurn end) == true then
+                quiet = 0
+                return false
+            end
+        end
+        quiet = quiet + 1
+        return quiet >= M.WorldChecks
     end
 
     Ext.Events.Tick:Subscribe(function()
@@ -282,14 +297,18 @@ function M.Start(runId)
             end
             sayParty(#members > 0)
             if #members == 0 then
+                quiet = 0
+                sayTurn("party")
                 release(M.On and "nobody in turn-based mode out of combat" or "off")
                 return
             end
-            if worldTurn() then
+            if worldTurn(members) then
+                sayTurn("world")
                 if held then stats.WorldTurns = (stats.WorldTurns or 0) + 1 end
                 release("the world's turn")
                 return
             end
+            sayTurn("party")
             local bg3, census = bg3Frozen(members)
             stats.Bg3 = census
             local guids, loaded = heldGuids(bg3, members)
@@ -315,50 +334,6 @@ function M.Start(runId)
     end)
 end
 
--- The client half (see the header): the party's turn or the world's, from the view models.
-M.WorldTicks = 3 -- checks (every 2 ticks)
-function M.StartClient(runId)
-    local Probe = Ext.Require("ActionProbe.lua")
-    local ticks, quiet, said, seq = 0, 0, nil, 0
-    -- BG3's UI is read only in a running game and only while a member is in turn-based mode (the
-    -- server half's word): reading the view models every tick through the splash screen crashed BG3 in
-    -- the Script Extender's UI bridge (harness).
-    local function memberInFtb()
-        return Ext.IO.LoadFile("wow-bg3/link/ftbparty.txt") == "1"
-    end
-    Ext.Events.Tick:Subscribe(function()
-        ticks = ticks + 1
-        if ticks % 2 ~= 0 then return end
-        if Ext.Utils.GetGameState() ~= "Running" then return end
-        local okH, inFtb = pcall(memberInFtb)
-        if not (okH and inFtb) then
-            quiet = 0
-            if said ~= "party" and said ~= nil then
-                said = "party"; seq = seq + 1
-                Ext.IO.SaveFile("wow-bg3/link/ftbturn.txt", string.format("%d party\n", seq))
-            end
-            return
-        end
-        local ok, ftb, turn = pcall(function()
-            local list = Probe.FindUnique("HotBar", "HotBar").DataContext.CurrentPlayer.AssignedCharacters
-            local inFtb, anyTurn = false, false
-            for i = 1, 16 do
-                local c = list[i]
-                if c == nil then break end
-                if tostring(c.CharacterMode) == "InFTB" then inFtb = true end
-                if c.IsCurrentTurn == true then anyTurn = true end
-            end
-            return inFtb, anyTurn
-        end)
-        if not ok then return end
-        quiet = (ftb and not turn) and quiet + 1 or 0
-        local now = (ftb and quiet >= M.WorldTicks) and "world" or "party"
-        if now ~= said then
-            said = now
-            seq = seq + 1
-            Ext.IO.SaveFile("wow-bg3/link/ftbturn.txt", string.format("%d %s\n", seq, now))
-        end
-    end)
-end
+M.WorldChecks = 2 -- passes of the server's check (every M.Every ticks) with no member's turn open
 
 return M
