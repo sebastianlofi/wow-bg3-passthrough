@@ -767,7 +767,7 @@ static struct {
     VkDescriptorPool pool; VkDescriptorSet mset[FOG_SETS], cset[FOG_SETS]; uint32_t mring, cring;
     struct { uint64_t img; VkImageView view; VkFramebuffer fb; uint32_t w, h; } t[8];
     uint64_t masks, cuts, refused;
-    uint64_t cmp_img, cmp_at;  // the composite's image, and the present at which its effects pass was last copied before and after
+    uint64_t cmp_img, cmp_at, mask_at;  // the composite's image, the present at which its effects pass was last copied before and after, and of the last mask
 } g_blm;
 static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {
     if (g_blm.wfed.img) return g_blm.w == w && g_blm.h == h;
@@ -908,9 +908,41 @@ static void bl_run(DeviceData* d, VkCommandBuffer cb, int slot, VkImageLayout la
 // of a character aiming, an ability's area, a spell's wisps and glow). The image is copied before and after the pass, in
 // the pass's own command buffer, so the two copies are in order whatever BG3's threads record first; wdpost compares
 // them (wowbg3_post.frag).
+static void late_fold(DeviceData* d, VkCommandBuffer cb);  // after g_ovl (g_fbt_m held)
 static __thread VkCommandBuffer t_late_cb; static __thread uint64_t t_late_img; static __thread int32_t t_late_fin;
+// Research (word wdlatelog): every pass on the scene depth and one full-size B10G11R11 target, whether it is taken as BG3's
+// effects pass, and the draws of the attack preview's figure (ghost_recipe) with the pass they fall in.
+static __thread VkCommandBuffer t_lp_cb; static __thread uint64_t t_lp_img; static __thread int t_lp_taken; static __thread uint32_t t_lp_ghosts;
+static uint64_t g_lp_present, g_lp_n, g_lp_said;
+static void late_log_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint8_t* load, int taken) {
+    t_lp_cb = VK_NULL_HANDLE;
+    if (!g_cc.wdlatelog || !g_role.depth) return;
+    int depth = 0; uint64_t img = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (imgs[k] == g_role.depth) { depth = 1; continue; }
+        ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
+        if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32) img = imgs[k];
+    }
+    if (!depth || !img) return;
+    const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    uint64_t k = __atomic_load_n(&g_lp_present, __ATOMIC_RELAXED) == pr ? __atomic_add_fetch(&g_lp_n, 1, __ATOMIC_RELAXED) : (__atomic_store_n(&g_lp_present, pr, __ATOMIC_RELAXED), __atomic_store_n(&g_lp_n, 1, __ATOMIC_RELAXED), 1);
+    t_lp_cb = cb; t_lp_img = img; t_lp_taken = taken; t_lp_ghosts = 0;
+    if (__atomic_add_fetch(&g_lp_said, 1, __ATOMIC_RELAXED) % 97 < 12)
+        logf_("wdlatelog: present %llu pass %llu on %llx (%u attachments, load %d) composite's image %llx: %s", (unsigned long long)pr, (unsigned long long)k,
+              (unsigned long long)img, n, n ? (int)load[n - 1] : -1, (unsigned long long)g_blm.cmp_img, taken ? "taken as the effects pass" : "not taken");
+}
+static void late_log_draw(VkCommandBuffer cb) {
+    if (!g_cc.wdlatelog || t_bind_cb != cb || !t_pipe || !g_rec) return;
+    RecInfo* ri = TABLE_FIND(g_rec, REC_CAP, t_pipe, 0);
+    if (!ri || !ri->r || !ghost_recipe(ri->r)) return;
+    static uint64_t n;
+    if (t_lp_cb == cb) t_lp_ghosts++;
+    if (n++ % 53 < 6) logf_("wdlatelog: the attack preview's figure drawn at present %llu in %s (image %llx, %s)", (unsigned long long)__atomic_load_n(&g_req.presents, __ATOMIC_RELAXED),
+                            t_lp_cb == cb ? "a scene pass" : "no scene pass seen", t_lp_cb == cb ? (unsigned long long)t_lp_img : 0ull, t_lp_cb == cb && t_lp_taken ? "the effects pass" : "not the effects pass");
+}
 static void late_pass_begin(DeviceData* d, VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint8_t* load, const int32_t* ini, const int32_t* fin) {
     t_late_cb = VK_NULL_HANDLE;
+    late_log_pass(cb, n, imgs, load, 0);
     if (!d || !g_cc.wdpost || !g_blm.ready || !g_blm.cmp0.img || !g_blm.cmp_img || !d->CmdCopyImage || !g_role.depth) return;
     int depth = 0, at = -1;
     for (uint32_t k = 0; k < n; k++) {
@@ -919,12 +951,17 @@ static void late_pass_begin(DeviceData* d, VkCommandBuffer cb, uint32_t n, const
         else return;
     }
     if (!depth || at < 0 || load[at] != VK_ATTACHMENT_LOAD_OP_LOAD || ini[at] < 0 || fin[at] < 0) return;
+    if (t_lp_cb == cb) t_lp_taken = 1;
     ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[at], 0);
     if (!i || i->fmt != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || i->w != g_blm.w || i->hgt != g_blm.h) return;
     sf_copy(d, cb, (VkImage)imgs[at], (VkImageLayout)ini[at], &g_blm.cmp0, g_blm.w, g_blm.h);  // called with the trace lock held: no other lock here
     t_late_cb = cb; t_late_img = imgs[at]; t_late_fin = fin[at];
 }
 static void late_pass_end(DeviceData* d, VkCommandBuffer cb) {
+    if (t_lp_cb == cb) {
+        if (t_lp_ghosts) { static uint64_t n; if (n++ % 31 < 6) logf_("wdlatelog: a pass on %llx with %u draws of the attack preview's figure ended (%s)", (unsigned long long)t_lp_img, t_lp_ghosts, t_lp_taken ? "taken as the effects pass" : "not taken"); }
+        t_lp_cb = VK_NULL_HANDLE;
+    }
     if (t_late_cb != cb) return;
     t_late_cb = VK_NULL_HANDLE;
     if (!d) return;
@@ -932,6 +969,7 @@ static void late_pass_end(DeviceData* d, VkCommandBuffer cb) {
     if (g_blm.cmp1.img && t_late_img == g_blm.cmp_img) {
         sf_copy(d, cb, (VkImage)t_late_img, (VkImageLayout)t_late_fin, &g_blm.cmp1, g_blm.w, g_blm.h);
         __atomic_store_n(&g_blm.cmp_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+        late_fold(d, cb);
     }
     pthread_mutex_unlock(&g_fbt_m);
 }
@@ -964,6 +1002,7 @@ static void fb_bmask(DeviceData* d, VkCommandBuffer cb) {
     uint32_t pc[4] = {g_cc.fxcal ? 1u : 0u, 0, 0, 0};
     bl_run(d, cb, slot, (VkImageLayout)t_blm_lay, g_blm.mp, g_blm.ml, set, pc);
     g_blm.cmp_img = t_blm_img;  // the composite's image: BG3's effects pass draws into it next (late_pass_begin)
+    __atomic_store_n(&g_blm.mask_at, __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED), __ATOMIC_RELAXED);  // late reset at this composite (late_fold)
     if (g_blm.masks++ % 600 == 0) logf_("wdbloom: %llu masks, %llu cuts, %llu refused", (unsigned long long)g_blm.masks, (unsigned long long)g_blm.cuts, (unsigned long long)g_blm.refused);
 }
 // After BG3's bloom prefilter: 0 where its source pixels hold pure WoW.
@@ -1182,7 +1221,8 @@ static int ovl_make(DeviceData* d) {
         {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 4, b};
     if (d->CreateDescriptorSetLayout(d->device, &dci, NULL, &g_ovl.dsl) != VK_SUCCESS) return 0;
-    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_ovl.dsl, 0, NULL};
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};  // mode: 0 after an overlay pass, 1 after an effects pass (wowbg3_ovl.comp)
+    VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_ovl.dsl, 1, &pcr};
     if (d->CreatePipelineLayout(d->device, &lci, NULL, &g_ovl.layout) != VK_SUCCESS) return 0;
     VkShaderModule m; VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_ovl_comp, wowbg3_ovl_comp};
     if (d->CreateShaderModule(d->device, &mci, NULL, &m) != VK_SUCCESS) return 0;
@@ -1228,6 +1268,7 @@ static void fb_ovl(DeviceData* d, VkCommandBuffer cb) {
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ovl.pipe);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ovl.layout, 0, 1, &set, 0, NULL);
+    { const uint32_t mode = 0; d->CmdPushConstants(cb, g_ovl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &mode); }
     d->CmdDispatch(cb, (g_blm.w + 7) / 8, (g_blm.h + 7) / 8, 1);
     sf_barrier(d, cb, (VkImage)t_ovl_out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, lay, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -1239,6 +1280,40 @@ static void fb_ovl(DeviceData* d, VkCommandBuffer cb) {
     }
     if (g_ovl.runs++ % 1800 == 0) logf_("wdpost: %llu overlay passes of BG3's followed, %llu refused", (unsigned long long)g_ovl.runs, (unsigned long long)g_ovl.refused);
     pthread_mutex_unlock(&g_fbt_m);
+}
+// At the end of each of BG3's effects passes on the composite's image (late_pass_end, g_fbt_m held): what that pass drew over
+// WoW's ground (its copy before, cmp0, and after, cmp1) folded into late (wowbg3_ovl.comp, mode 1), in the pass's own command
+// buffer, so the passes of a frame add up in queue order whatever thread recorded each. Only after this frame's mask
+// (fb_bmask resets late at the composite): a fold onto an older frame's late would carry it over.
+static void late_fold(DeviceData* d, VkCommandBuffer cb) {
+    if (!g_cc.wdpostcas || !g_blm.late.img || !g_blm.cmp0.view || !g_blm.cmp1.view || !g_pst.ready || !ovl_make(d)) return;
+    const uint64_t pres = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    if (pres - __atomic_load_n(&g_blm.mask_at, __ATOMIC_RELAXED) > 1) { g_ovl.refused++; return; }
+    VkDescriptorSet set = g_ovl.set[g_ovl.ring++ % FOG_SETS];
+    VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL}, i3 = {VK_NULL_HANDLE, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo i1 = {g_pst.smp, g_blm.cmp0.view, VK_IMAGE_LAYOUT_GENERAL}, i2 = {g_pst.smp, g_blm.cmp1.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[4] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i1, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 2, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i2, NULL, NULL},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i3, NULL, NULL}};
+    d->UpdateDescriptorSets(d->device, 4, wr, 0, NULL);
+    // The mask's and the last fold's writes (fragment and compute) before this fold reads and writes late; the copies are
+    // made available by sf_copy's own barriers.
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ovl.pipe);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_ovl.layout, 0, 1, &set, 0, NULL);
+    { const uint32_t mode = 1; d->CmdPushConstants(cb, g_ovl.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &mode); }
+    d->CmdDispatch(cb, (g_blm.w + 7) / 8, (g_blm.h + 7) / 8, 1);
+    VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
+    // BG3's compute state as it was, where it had one in this command buffer.
+    if (t_cbind_cb == cb && t_cpipe) {
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
+        for (uint32_t s = 0; s < 8 && t_clayout; s++)
+            if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+    }
+    { static uint64_t n; if (n++ % 1800 == 0) logf_("wdpost: %llu of BG3's effects passes folded into what it drew over WoW's ground", (unsigned long long)n); }
 }
 // patch46: BG3 destroyed img (g_fbt_m held): wdpost's view of it and wdbloom's.
 static void post_forget_image(DeviceData* d, uint64_t img) {

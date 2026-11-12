@@ -416,6 +416,7 @@ static void ground_bind(VkCommandBuffer cb);
 static void ground_view_seen(void);
 static void ground_end(DeviceData* d, VkCommandBuffer cb);
 static void late_pass_begin(DeviceData* d, VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint8_t* load, const int32_t* ini, const int32_t* fin);  // wowbg3_fxbg.inc.c
+static void late_log_draw(VkCommandBuffer cb);
 static void shade_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const uint32_t* layers, const int32_t* fin, uint32_t w, uint32_t h);  // wowbg3_shade.inc.c
 static void shade_view(VkCommandBuffer cb);
 static void shade_end(DeviceData* d, VkCommandBuffer cb);
@@ -1064,7 +1065,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd; float wdexp, wdocc, wdevref, wdshade, wdzdbg; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd, wdlatelog; float wdexp, wdocc, wdevref, wdshade, wdzdbg; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     float wdamb; int wdwfog, wdwlit;
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
@@ -1217,6 +1218,7 @@ static void compose_config(void) {
     g_cc.wdtable = has_word(line, "wdtable");  // research: WoW's pixels only through the feed's table, never their own colour after BG3's display transform
     g_cc.wdpostcas = has_word(line, "wdpostcas");
     g_cc.wdpostdbg = has_word(line, "wdpostdbg");
+    g_cc.wdlatelog = has_word(line, "wdlatelog");  // research: BG3's effects passes and the attack preview's figure (wowbg3_fxbg.inc.c)
     g_cc.wdpcdbg = has_word(line, "wdpcdbg");  // wdpostcas shows the mask's classes as colours
     { const char* oc = strstr(line, "wdocc="); g_cc.wdocc = oc ? strtof(oc + 6, NULL) : 1.0f; if (!(g_cc.wdocc >= 0.0f && g_cc.wdocc <= 1.0f)) g_cc.wdocc = 1.0f; }
     { const char* fd = strstr(line, "wdfogdbg="); g_cc.wdfogdbg = fd ? atoi(fd + 9) : 0; }
@@ -3197,6 +3199,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(VkCommandBuffer cb, uint3
     if (!d) return;
     if (t_tavd_cb == cb && t_ib_cb == cb) tavd_note(cb, t_ib, fin);
     t_fxc_glow = 0;
+    late_log_draw(cb);
     if (tav_hidden_draw(cb) && !fxc_figure_extra(cb) && !(g_cc.fxdrop && t_fxl_cb == cb)) {
         if (g_fxw_frames > 0) fxw_draw(cb, 'X', n, i, fi, vo, fin, 'H');
         return;
