@@ -7,7 +7,7 @@
 -- WoW's maps (tools/wow_lift_platforms.py). For every lift with a floor to ride near a party member this module
 -- takes the smallest platform the floor fits in, puts it where WoW's car is, and repeats the car's moves: benilla
 -- says where each lift is and where the keyframe span it is on ends, with the time left (link/wowlifts.bin, benilla
--- 0135), and a span is one straight move at one speed, which is exactly what PlatformMoveTo makes. WoW keeps the
+-- 0139), and a span is one straight move at one speed, which is exactly what PlatformMoveTo makes. WoW keeps the
 -- timetable: nothing here calls or holds a car.
 --
 -- Reads: link/wowlifts.bin (WBL1, seq, count, count x (guid u64, entry u32, flags u32 (1 moving), period ms, cycle
@@ -22,7 +22,7 @@
 -- floor, kept moving at a known speed: how far BG3 moved it is how much of BG3's time passed there). The clock goes to
 -- benilla every tick (link/liftclock.bin: WLC1, seq, count, count x (guid u64, cycle ms u32, rate u32: 1000 while
 -- BG3's time runs there, 0 while it stands), seq), which draws the car and carries WoW's own character by it
--- (benilla 0136). A car far from the party has no platform and keeps WoW's own clock.
+-- (benilla 0140). A car far from the party has no platform and keeps WoW's own clock.
 --
 -- The platforms' floors go to the plugin every tick too (link/liftfloors.bin: WLF1, seq, count, count x (x, y, z,
 -- radius), seq): BG3 asks its rays where a character stands and what a click points at, and a car is in none of

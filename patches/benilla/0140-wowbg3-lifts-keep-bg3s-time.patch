@@ -6,7 +6,7 @@ diff --git a/crates/benilla-app/src/wowbg3_lifts.rs b/crates/benilla-app/src/wow
  //! period ms u32, cycle ms u32, WoW x y z now f32, WoW x y z of the span's end f32, ms to it
  //! u32), seq again. Written whole (a temporary file renamed over it).
 +//!
-+//! Patch 0136: a car near BG3's party keeps BG3's time. In turn-based mode BG3 holds its platforms and
++//! Patch 0140: a car near BG3's party keeps BG3's time. In turn-based mode BG3 holds its platforms and
 +//! moves them on the environment's turn only, so the mod runs each such car's clock itself (from how
 +//! far BG3 moved the platform) and sends it every tick: `link/liftclock.bin`, `WLC1`, seq u32, count
 +//! u32, count x (guid u64, cycle ms u32, rate u32: 1000 while BG3's time runs there, 0 while it
@@ -24,7 +24,7 @@ diff --git a/crates/benilla-app/src/wowbg3_lifts.rs b/crates/benilla-app/src/wow
      frames: u64,
  }
  
-+/// BG3's clock for the lifts near its party (patch 0136).
++/// BG3's clock for the lifts near its party (patch 0140).
 +#[derive(Resource)]
 +struct LiftClock {
 +    path: PathBuf,

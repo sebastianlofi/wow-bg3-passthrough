@@ -316,7 +316,7 @@ def slope_faces(section, rec, minx, minz, spots, ring=1.0, step=1.0):
 
 
 def read_live(raw):
-    """benilla's link/wowlifts.bin (patch 0135): WBL1, seq, count, count x (guid u64, entry u32, flags u32 (1 moving),
+    """benilla's link/wowlifts.bin (patch 0139): WBL1, seq, count, count x (guid u64, entry u32, flags u32 (1 moving),
     period ms, cycle ms, WoW xyz now, WoW xyz of the end of the span it is on, ms to that end), seq again.
     [{Guid, Entry, Moving, Period, Cycle, Pos, To, ToMs}], or None for a file that is not whole."""
     if len(raw) < 16 or raw[:4] != b'WBL1':

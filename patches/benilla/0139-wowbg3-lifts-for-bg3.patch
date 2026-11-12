@@ -5,7 +5,7 @@ diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
  mod wowbg3_fx;
  mod wowbg3_fx_render;
  mod wowbg3_keys;
-+// WOW-BG3 patch 0135: WoW's lifts for BG3's side of a ride.
++// WOW-BG3 patch 0139: WoW's lifts for BG3's side of a ride.
 +mod wowbg3_lifts;
  mod wowbg3_lead;
  mod wowbg3_offscreen;
@@ -17,7 +17,7 @@ diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transp
  /// (`Map::SendInitTransports`, `Map.cpp:1719`), so a lift is always on the viewer's map. At login
  /// `CurrentMap` is still the startup seed when lifts arm, so a stamped map would hide them.
  struct Lift {
-+    /// WOW-BG3 (patch 0135): the template entry, for `wowlifts.bin`.
++    /// WOW-BG3 (patch 0139): the template entry, for `wowlifts.bin`.
 +    entry: u32,
      frames: Arc<Vec<ElevatorKeyframe>>,
      period_ms: u32,
@@ -26,7 +26,7 @@ diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transp
          }
      }
  
-+    /// WOW-BG3 (patch 0135): a lift as BG3's side of a ride needs it this frame (`wowbg3_lifts`):
++    /// WOW-BG3 (patch 0139): a lift as BG3's side of a ride needs it this frame (`wowbg3_lifts`):
 +    /// where the car is, and the end of the keyframe span it is on with the time left to it. A
 +    /// span is one straight move at one speed (or a rest), so BG3's own platform can make the
 +    /// same move. `None` for a boat or a zeppelin.
@@ -56,7 +56,7 @@ diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transp
      }
  }
  
-+/// WOW-BG3 (patch 0135): one lift this frame, in raw WoW coordinates ([`Transport::lift_now`]).
++/// WOW-BG3 (patch 0139): one lift this frame, in raw WoW coordinates ([`Transport::lift_now`]).
 +pub(crate) struct LiftNow {
 +    pub(crate) entry: u32,
 +    pub(crate) period_ms: u32,
@@ -84,7 +84,7 @@ diff --git a/crates/benilla-app/src/transport.rs b/crates/benilla-app/src/transp
  
      #[test]
 +    fn a_lift_says_where_its_span_ends() {
-+        // Rest 1 s at the spawn, 2 s up 10 yd, rest 1 s (patch 0135).
++        // Rest 1 s at the spawn, 2 s up 10 yd, rest 1 s (patch 0139).
 +        let frames = Arc::new(vec![
 +            ElevatorKeyframe { time_ms: 0, pos: [0.0; 3] },
 +            ElevatorKeyframe { time_ms: 1000, pos: [0.0; 3] },
@@ -133,7 +133,7 @@ diff --git a/crates/benilla-app/src/wowbg3.rs b/crates/benilla-app/src/wowbg3.rs
          crate::wowbg3_cursors::build(app, PathBuf::from(&dir));
          // Patch 0041: a server teleport in world mode moves BG3's character.
          crate::wowbg3_teleport::build(app, PathBuf::from(&dir));
-+        // Patch 0135: WoW's lifts for BG3's side of a ride.
++        // Patch 0139: WoW's lifts for BG3's side of a ride.
 +        crate::wowbg3_lifts::build(app, PathBuf::from(&dir));
          // Patch 0050: party bots' WoW bodies hidden, placed on their BG3 figures.
          crate::wowbg3_party::build(app, PathBuf::from(&dir));
@@ -143,7 +143,7 @@ new file mode 100644
 --- /dev/null
 +++ b/crates/benilla-app/src/wowbg3_lifts.rs
 @@ -0,0 +1,96 @@
-+//! WOW-BG3 (local fork, patch 0135): WoW's lifts for BG3's side of a ride.
++//! WOW-BG3 (local fork, patch 0139): WoW's lifts for BG3's side of a ride.
 +//!
 +//! A lift (an elevator, a tram car: game object type 11) moves on the client's own clock along
 +//! `TransportAnimation.dbc` (`transport`). BG3 carries its characters on a platform of its own that

@@ -302,7 +302,7 @@ class Carve(unittest.TestCase):
 
 
 class Live(unittest.TestCase):
-    """benilla's wowlifts.bin (patch 0135), as crates/benilla-app/src/wowbg3_lifts.rs writes it."""
+    """benilla's wowlifts.bin (patch 0139), as crates/benilla-app/src/wowbg3_lifts.rs writes it."""
     def record(self):
         return struct.pack('<Q4I6fI', 0xF12000500A900001, 20649, 1, 16667, 5000, 1.0, 2.0, 3.0, 1.0, 2.0, 40.0, 250)
 
