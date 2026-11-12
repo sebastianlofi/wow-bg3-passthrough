@@ -57,7 +57,7 @@ This is the first public version. What we know is missing or rough:
   WoW's deck; where a car's floor lies above the ground beside it (the tram's deck, 0.7 m over the station floor)
   the last two metres of ground slope up to it, also while the car is away; the other lifts of the world (Thousand
   Needles, Gnomeregan, Blackrock and so on) use the same code and are untested; a real fight aboard is untested
-  (turn-based mode without one is). Open: BG3 crashed twice as Undercity's car left (a fight aboard with the old
+  (turn-based mode without one is; no hostile creature comes within reach of a lift in the test world). Open: BG3 crashed twice as Undercity's car left (a fight aboard with the old
   catch-up orders; a chained companion aboard), in BG3's own behaviour scripts, cause not found; it has not come
   back in more than twenty later rounds with a companion. A companion added (`add`) while the hero stands on a
   car lands beside the platform's hold and may not be carried. Zeppelins and boats are not ridden: a ship turns,
@@ -93,10 +93,11 @@ This is the first public version. What we know is missing or rough:
   stack.
 
 - Ships and zeppelins are drawn by WoW and cannot be boarded: your dream guardian stands at each dock and takes the
-  party to the dock at the other end (a BG3 dialog: "Travel to <place>?"). Proven on a ship (Menethil Harbor to
-  Auberdine) and a zeppelin (Durotar to Tirisfal Glades), with the guardian standing at the far dock for the way
-  back; the other six routes are untested. The ferry between Feathermoon Stronghold and the Forgotten Coast is not offered: no place to stand is found at the
-  Forgotten Coast end. The place is named by the
+  party to the dock at the other end (a BG3 dialog: "Travel to <place>?"). Crossed by real clicks, one way each, with the guardian standing at the far dock for the way back: the ships
+  Menethil Harbor to Auberdine and to Theramore, Auberdine to Rut'theran Village, Ratchet to Booty Bay, and the
+  zeppelins Durotar to Tirisfal Glades, Tirisfal Glades to Grom'gol and Grom'gol to Durotar. The ferry between
+  Feathermoon Stronghold and the Forgotten Coast is not offered: no place to stand is found at the Forgotten Coast
+  end. The party arrives on the guardian's own spot and BG3 moves the two a step apart. The place is named by the
   server's area at the pier, which for some piers is the water beside the town ("The Long Wash, Darkshore" is
   Auberdine's pier). The dialog has no staged camera: the two stand as they stood. The guardian is drawn like a party
   member, so it takes a few seconds to appear the first time. `/wowbg3 cross` is a test command now.
