@@ -54,6 +54,15 @@
 -- WoW orientation (radians), flags u32 (1 dead, 2 moving) from the stand-in's client Transform
 -- (what BG3 draws), then seq again (torn-read check). fight.txt's actor lines stay the fallback.
 local M = {}
+
+-- Whether an enemy's 0 HP is its death, by the server's record of its stand-in (mirror-status.json: Dead is BG3's
+-- IsDead): true when the record says dead or BG3's server has no such stand-in any more (false); false while
+-- BG3 has it alive; nil while there is no word (the record unread): no reading then, never a guess at a death.
+function M.ZeroIsDeath(record)
+    if record == nil then return nil end
+    if record == false then return true end
+    return record.Dead == true
+end
 local N = Ext.Require("WowNative.lua")
 local ArenaMath = Ext.Require("Arena.lua")
 local Link = Ext.Require("Link.lua")
@@ -509,12 +518,12 @@ local function newBackend(actors, void, runId, session)
     -- at full HP 53 m off; both fell out of the roster), so then the server's word: mirror-status.json.
     -- Listed nowhere (world mode): the stand-in is gone from BG3, HP 0 (max and position may be nil).
     -- nil: nothing to go on just now (the hero, or the file unreadable); never a guess at a death.
+    -- An enemy read here at 0 HP is not dead by that alone: BG3 brings some back at once (a zombie's Undead
+    -- Fortitude: read 1, 0 and 1 again within 0.3 s; the 0 went to WoW as the kill and WoW's zombie died while
+    -- BG3's fought on). The kill is BG3's own word, the server's record of the stand-in (M.ZeroIsDeath).
     local serverStatus, serverStatusAt, unread = nil, nil, {}
-    local function memberReading(id, uuid)
-        local hp, max = health(uuid)
-        local p = positionOf(uuid)
-        if hp and p then return hp, max, p end
-        if id == "hero" or not inWorld or not guids[id] then return nil end
+    -- The server's record of an enemy's stand-in: the record; false when BG3's server lists none; nil unread.
+    local function serverRecord(id, uuid)
         if serverStatusAt ~= ticks then serverStatus, serverStatusAt = mirrorStatus(), ticks end
         local st = serverStatus
         if not (st and type(st.Mobs) == "table") then return nil end
@@ -522,6 +531,21 @@ local function newBackend(actors, void, runId, session)
         if not (type(m) == "table" and m.Uuid == uuid) then
             m = type(st.FightSpawned) == "table" and st.FightSpawned[uuid] or nil
         end
+        return type(m) == "table" and m or false
+    end
+    local function memberReading(id, uuid)
+        local hp, max = health(uuid)
+        local p = positionOf(uuid)
+        if hp and p then
+            if hp <= 0 and id ~= "hero" and inWorld and guids[id] and not M.ZeroIsDeath(serverRecord(id, uuid)) then
+                return nil
+            end
+            return hp, max, p
+        end
+        if id == "hero" or not inWorld or not guids[id] then return nil end
+        local m = serverRecord(id, uuid)
+        if m == nil then return nil end
+        m = m or nil
         if not unread[id] then
             unread[id] = true
             Ext.Utils.Print("WOW-BG3 roster: " .. id .. " " .. tostring(uuid) .. " reads nothing here (HP "
@@ -535,6 +559,7 @@ local function newBackend(actors, void, runId, session)
         if m.Dead == true then return 0, maxHp, at end
         local now = tonumber(m.Hp)
         if not (now and maxHp) then return nil end
+        if now <= 0 then return nil end -- at 0 HP and alive by BG3's word: no kill (see serverRecord)
         return math.floor(now), maxHp, at
     end
     -- Whether BG3 has this enemy standing; one with no reading just now counts as last reported.
