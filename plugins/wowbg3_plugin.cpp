@@ -1599,8 +1599,8 @@ bool pick_ignores(PickFilter const& f, glm::vec3 const& p, int kind, glm::vec3 c
     return over || (f.Cut && in_see_cut(f, p));
 }
 
-bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
-                 std::uint32_t kinds = kKindAll, PickFilter const& pick = PickFilter{}) {
+bool wow_closest_tris(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
+                      std::uint32_t kinds, PickFilter const& pick) {
     if (r.Tris.empty() || !segment_touches(r, a, b)) return false;
     const glm::vec3 d = b - a;
     thread_local std::vector<std::uint32_t> mark;
@@ -1668,6 +1668,85 @@ bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, flo
         }
     }
     return best <= 1.0f;
+}
+
+// The floors of WoW's lift cars: round, level, wherever BG3's platform under the car is now (Lifts.lua writes
+// link/liftfloors.bin every tick: WLF1, seq, count, count x (x, y, z, radius), seq). A car is a game object, in no
+// static face, and BG3 asks its rays where a character stands and what a click points at: without a floor there a
+// click on a car went through to what lies under it, and a character on a platform that BG3 holds in mid-shaft (turn-
+// based mode) was put on the shaft's floor far below by the client (harness, Undercity). Kind 4 (a floor WoW draws
+// nothing at), so the camera's clearance does not see them. No file for half a second: no floors.
+constexpr int kLiftFloorsMax = 16;
+struct LiftFloors {
+    std::atomic<int> N{0};
+    std::atomic<float> F[kLiftFloorsMax][4];
+    std::atomic<double> Checked{-1e9}, Fresh{-1e9};
+    std::atomic<std::uint32_t> Seq{0};
+    std::atomic_flag Busy = ATOMIC_FLAG_INIT;
+};
+LiftFloors g_lift_floors;
+
+void lift_floors_read(double now) {
+    LiftFloors& f = g_lift_floors;
+    if (now - f.Checked.load(std::memory_order_relaxed) < 0.008 || f.Busy.test_and_set(std::memory_order_acquire)) return;
+    f.Checked.store(now, std::memory_order_relaxed);
+    unsigned char raw[16 + 16 * kLiftFloorsMax];
+    ssize_t got = -1;
+    const std::string path = io_dir() + "link/liftfloors.bin";
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+        got = ::pread(fd, raw, sizeof(raw), 0);
+        ::close(fd);
+    }
+    std::uint32_t seq = 0, n = 0, seq2 = 0;
+    if (got >= 16 && std::memcmp(raw, "WLF1", 4) == 0) {
+        std::memcpy(&seq, raw + 4, 4);
+        std::memcpy(&n, raw + 8, 4);
+        if (n <= (std::uint32_t)kLiftFloorsMax && got == (ssize_t)(16 + 16 * n)) std::memcpy(&seq2, raw + 12 + 16 * n, 4);
+        if (seq != 0 && seq == seq2 && seq != f.Seq.load(std::memory_order_relaxed)) {
+            float v[kLiftFloorsMax][4];
+            std::memcpy(v, raw + 12, 16 * n);
+            bool fine = true;
+            for (std::uint32_t i = 0; i < n; ++i) {
+                for (float x : v[i]) fine = fine && std::isfinite(x);
+            }
+            if (fine) {
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    for (int k = 0; k < 4; ++k) f.F[i][k].store(v[i][k], std::memory_order_relaxed);
+                }
+                f.N.store((int)n, std::memory_order_release);
+                f.Seq.store(seq, std::memory_order_relaxed);
+                f.Fresh.store(now, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (now - f.Fresh.load(std::memory_order_relaxed) > 0.5) f.N.store(0, std::memory_order_release);
+    f.Busy.clear(std::memory_order_release);
+}
+
+bool wow_closest(ArenaRays const& r, glm::vec3 const& a, glm::vec3 const& b, float& best, glm::vec3& normal,
+                 std::uint32_t kinds = kKindAll, PickFilter const& pick = PickFilter{}) {
+    bool hit = wow_closest_tris(r, a, b, best, normal, kinds, pick);
+    if (r.Tris.empty() || ((kinds >> 4) & 1u) == 0) return hit;
+    const float dy = b.y - a.y;
+    if (fabsf(dy) < 1e-6f) return hit;
+    lift_floors_read(mono_seconds());
+    LiftFloors& f = g_lift_floors;
+    const int n = f.N.load(std::memory_order_acquire);
+    if (n <= 0) return hit;
+    if (!hit) best = 2.0f;
+    for (int i = 0; i < n && i < kLiftFloorsMax; ++i) {
+        const float t = (f.F[i][1].load(std::memory_order_relaxed) - a.y) / dy;
+        if (t <= 1e-5f || t > 1.0f || t >= best) continue;
+        const float x = a.x + (b.x - a.x) * t - f.F[i][0].load(std::memory_order_relaxed);
+        const float z = a.z + (b.z - a.z) * t - f.F[i][2].load(std::memory_order_relaxed);
+        const float radius = f.F[i][3].load(std::memory_order_relaxed);
+        if (x * x + z * z > radius * radius) continue;
+        best = t;
+        normal = glm::vec3(0.0f, dy < 0.0f ? 1.0f : -1.0f, 0.0f);
+        hit = true;
+    }
+    return hit;
 }
 
 bool wants_wow(ArenaRays const& r, bg3se::PhysicsType type, bg3se::PhysicsGroupFlags in, bg3se::PhysicsGroupFlags ex) {

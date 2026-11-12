@@ -27,7 +27,6 @@ answers with the client's own rule (benilla-formats `elevators.rs`, the 1.12 cli
 Nothing here moves anything: it is the timetable the BG3 side needs to move its platform in step with
 WoW's car.
 """
-import math
 import struct
 import sys
 from pathlib import Path
@@ -280,26 +279,6 @@ def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.
                         struct.pack_into('<f', out, k + o, up)
                 cut += 1
     return (bytes(out) if out is not None else section), cut
-
-
-DECK_SIDES = 24
-DECK_OVER = 0.02   # the deck's face lies this far over the platform's tiles: a point on it is over them, not under
-
-
-def deck_faces(spots):
-    """A resting car's floor as faces, for BG3's rays: [9 floats] per triangle, a disc of the platform's radius at
-    each stop. A car is a game object, not in WoW's static collision, so a ray through it went on to whatever lies
-    under it; and BG3 sends a walker to the highest floor at or under the point named (harness: sent onto the tram
-    car from the station, 0.8 m under its deck, she went down the ramp to the track bed under the car; named 0.7 m
-    over the deck she walked onto it). With the deck there a click on the car is a point on the car."""
-    out = []
-    for bx, by, bz, radius in spots:
-        y = by + DECK_OVER
-        rim = [(bx + radius * math.cos(2 * math.pi * i / DECK_SIDES), y, bz + radius * math.sin(2 * math.pi * i / DECK_SIDES))
-               for i in range(DECK_SIDES)]
-        for i in range(DECK_SIDES):
-            out.append((bx, y, bz) + rim[(i + 1) % DECK_SIDES] + rim[i])      # wound to face up
-    return out
 
 
 def slope_faces(section, rec, minx, minz, spots, ring=1.0, step=1.0):

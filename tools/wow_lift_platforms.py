@@ -7,7 +7,7 @@ platform's floor is baked into its level, and a car's size is only known from th
 level keeps a few round floors of several sizes, EACH of every size, parked off every WoW map's place. While the
 game runs the mod takes the smallest one a car's floor fits in (mod Lifts.lua; the table there is lua()).
 
-  specs()        the platform levels' specs (wowbg3_level.build)
+  specs()        the platform levels' specs (wowbg3_level.build): the clock's first, then the floors'
   instances()    what the level places: [{Root, MapKey, Name, Pos}] (a level spec's "LevelTemplates")
   pick(radius)   the floor radius for a car's (metres), or None when no platform is that large
   lua()          the same family as Lifts.lua's table
@@ -34,6 +34,14 @@ MARGIN = 1.0
 PARK = (-15700.0, -60.0, -15500.0)
 STEP = 40.0
 FLOOR_SHAPE = '1645d06c-0a6f-4656-9fc7-0dc8e174e655'   # a stock BG3 shape (by id) the platform's grid belongs to
+# Clocks: platforms with no floor at all. In turn-based mode BG3 holds a platform near a character who is in the mode
+# and moves it on the environment's turn only, six seconds' worth a round (stock, measured: the Emerald Grove's
+# elevator and the creche's floating bed; a platform 32 m from the party runs on in real time). A car has to keep
+# BG3's time, at rest too, and none of the extender's clocks does (Ext.Utils.GameTime runs on through the mode). So
+# a clock platform beside each car near the party is kept moving at a known speed, and how far BG3 moved it says how
+# much of BG3's time passed there (mod Lifts.lua).
+CLOCKS = 6
+CLOCK = 'WOWBG3_Lift_Clock'
 
 
 def name(radius):
@@ -52,8 +60,23 @@ def park(radius, i):
     return (PARK[0] + STEP * i, PARK[1], PARK[2] + STEP * RADII.index(radius))
 
 
+def clock_key(i):
+    return wowbg3_level.uid(LEVEL, 'lift', CLOCK, i)
+
+
+def clock_park(i):
+    return (PARK[0] + STEP * i, PARK[1], PARK[2] + STEP * (len(RADII) + 1))
+
+
+def clock_spec():
+    return {'Name': CLOCK, 'DisplayName': 'Azeroth', 'Platform': True, 'Root': wowbg3_level.uid(CLOCK, 'root'),
+            'Bounds': [-9, -100, -9, 9, 100, 9],
+            'Scenery': [{'Template': FLOOR_SHAPE, 'Name': CLOCK + '_Floor', 'Pos': [0.0, -40.0, 0.0]}],
+            'Subgrids': [{'X': -1.0, 'Y': 0, 'Z': -1.0, 'W': 4, 'H': 4, 'Kind': 'blank', 'Owner': 0}]}
+
+
 def specs():
-    out = []
+    out = [clock_spec()]
     for r in RADII:
         n = int(-(-(2 * r + 1) // 1)) * 2          # tiles a side: the disc and half a metre round it
         half = n * 0.25
@@ -66,7 +89,9 @@ def specs():
 
 def instances():
     return [{'Root': root(r), 'MapKey': key(r, i), 'Name': '%s_%03d' % (name(r), i), 'Pos': list(park(r, i))}
-            for r in RADII for i in range(EACH)]
+            for r in RADII for i in range(EACH)] + [
+        {'Root': wowbg3_level.uid(CLOCK, 'root'), 'MapKey': clock_key(i), 'Name': '%s_%03d' % (CLOCK, i), 'Pos': list(clock_park(i))}
+        for i in range(CLOCKS)]
 
 
 def pick(radius):
@@ -77,7 +102,9 @@ def lua():
     rows = ['    {Radius = %s, Park = {%s}, Keys = {%s}},' % (
         ('%g' % r), ', '.join('{%g, %g, %g}' % park(r, i) for i in range(EACH)), ', '.join('"%s"' % key(r, i) for i in range(EACH)))
         for r in RADII]
-    return 'M.MARGIN = %g\nM.PLATFORMS = {\n%s\n}' % (MARGIN, '\n'.join(rows))
+    clocks = 'M.CLOCKS = {Park = {%s}, Keys = {%s}}' % (
+        ', '.join('{%g, %g, %g}' % clock_park(i) for i in range(CLOCKS)), ', '.join('"%s"' % clock_key(i) for i in range(CLOCKS)))
+    return 'M.MARGIN = %g\nM.PLATFORMS = {\n%s\n}\n%s' % (MARGIN, '\n'.join(rows), clocks)
 
 
 if __name__ == '__main__':

@@ -843,10 +843,10 @@ class World:
                 spots.append((math.floor(b[0] * 2 + 0.5) / 2, b[1], math.floor(b[2] * 2 + 0.5) / 2, r))
         if not spots:
             return
-        # A resting car's floor and the slope up to it as faces too (wow_lifts.deck_faces, slope_faces; the slope from
-        # the tiles as they were cut): the square's one triangle set holds its storeys' as well. Floors WoW draws
-        # nothing at (kind 4).
-        faces = wow_lifts.deck_faces(spots) + wow_lifts.slope_faces(cell['tiles'], 5, minx, minz, spots)
+        # The slope up to a car's floor as faces too (wow_lifts.slope_faces, from the tiles as they were cut): the
+        # square's one triangle set holds its storeys' as well. Floors WoW draws nothing at (kind 4). The car's own
+        # floor is no fixed face: it is where BG3's platform is (the plugin's lift floors, from Lifts.lua).
+        faces = wow_lifts.slope_faces(cell['tiles'], 5, minx, minz, spots)
         for st in cell.get('storeys') or []:
             faces += wow_lifts.slope_faces(st['floors'], 5, st['min'][0], st['min'][1], spots)
         if faces:

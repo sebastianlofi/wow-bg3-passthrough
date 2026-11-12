@@ -1,0 +1,165 @@
+diff --git a/crates/benilla-app/src/wowbg3_lifts.rs b/crates/benilla-app/src/wowbg3_lifts.rs
+--- a/crates/benilla-app/src/wowbg3_lifts.rs
++++ b/crates/benilla-app/src/wowbg3_lifts.rs
+@@ -9,8 +9,18 @@
+ //! `wowlifts.bin`: `WBL1`, seq u32, count u32, count x (guid u64, entry u32, flags u32 (1 moving),
+ //! period ms u32, cycle ms u32, WoW x y z now f32, WoW x y z of the span's end f32, ms to it
+ //! u32), seq again. Written whole (a temporary file renamed over it).
++//!
++//! Patch 0136: a car near BG3's party keeps BG3's time. In turn-based mode BG3 holds its platforms and
++//! moves them on the environment's turn only, so the mod runs each such car's clock itself (from how
++//! far BG3 moved the platform) and sends it every tick: `link/liftclock.bin`, `WLC1`, seq u32, count
++//! u32, count x (guid u64, cycle ms u32, rate u32: 1000 while BG3's time runs there, 0 while it
++//! stands), seq again. A lift named there is drawn, and carries the player, by that clock; between
++//! two records it runs on at the rate given. A lift not named (far from the party, or BG3 not
++//! writing for a second) goes on by itself from where it is.
+ 
++use std::collections::HashMap;
+ use std::path::PathBuf;
++use std::time::Instant;
+ 
+ use bevy::prelude::*;
+ 
+@@ -24,9 +34,29 @@
+     frames: u64,
+ }
+ 
++/// BG3's clock for the lifts near its party (patch 0136).
++#[derive(Resource)]
++struct LiftClock {
++    path: PathBuf,
++    seq: u32,
++    at: Option<Instant>,
++    rows: HashMap<u64, (u32, u32)>,
++    kept: u64,
++}
++
+ pub(crate) fn build(app: &mut App, dir: PathBuf) {
+     app.insert_resource(LiftsOut { path: dir.join("wowlifts.bin"), seq: 0, frames: 0 })
+-        .add_systems(Update, write_lifts.after(benilla_world::schedule::WorldStage::Input));
++        .insert_resource(LiftClock {
++            path: dir.join("liftclock.bin"),
++            seq: 0,
++            at: None,
++            rows: HashMap::new(),
++            kept: 0,
++        })
++        .add_systems(
++            Update,
++            (keep_bg3s_time, write_lifts).chain().after(benilla_world::schedule::WorldStage::Input),
++        );
+     info!("wowbg3 lifts: WoW's lifts go to wowlifts.bin every frame");
+ }
+ 
+@@ -43,6 +73,72 @@
+     out.extend_from_slice(&l.to_ms.to_le_bytes());
+ }
+ 
++/// `liftclock.bin` whole: its seq and rows (guid, cycle ms, rate), or `None` for a file caught
++/// between two writes.
++fn parse_clock(raw: &[u8]) -> Option<(u32, Vec<(u64, u32, u32)>)> {
++    if raw.len() < 16 || &raw[0..4] != b"WLC1" {
++        return None;
++    }
++    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
++    let (seq, n) = (u32_at(4), u32_at(8) as usize);
++    if n > 4096 || raw.len() != 16 + 16 * n || u32_at(12 + 16 * n) != seq {
++        return None;
++    }
++    let rows = (0..n)
++        .map(|i| {
++            let o = 12 + 16 * i;
++            (u64::from_le_bytes(raw[o..o + 8].try_into().unwrap()), u32_at(o + 8), u32_at(o + 12))
++        })
++        .collect();
++    Some((seq, rows))
++}
++
++/// Where a lift is in its cycle `age_ms` after BG3 said `cycle` at `rate` (0 to 1000): it runs on at
++/// that rate for a tenth of a second at most (BG3 writes thirty times a second).
++fn kept_cycle(cycle: u32, rate: u32, age_ms: u64, period: u32) -> u32 {
++    let on = age_ms.min(100) * u64::from(rate.min(1000)) / 1000;
++    ((u64::from(cycle) + on) % u64::from(period.max(1))) as u32
++}
++
++fn keep_bg3s_time(
++    mut clock: ResMut<LiftClock>,
++    mut lifts: Query<(&Guid, &Transport, &mut TransportAnchor)>,
++) {
++    let now = Instant::now();
++    if let Some((seq, rows)) = std::fs::read(&clock.path).ok().and_then(|raw| parse_clock(&raw)) {
++        if seq != clock.seq {
++            clock.seq = seq;
++            clock.at = Some(now);
++            clock.rows = rows.into_iter().map(|(guid, cycle, rate)| (guid, (cycle, rate))).collect();
++        }
++    }
++    let Some(at) = clock.at else {
++        return;
++    };
++    let age = now.duration_since(at).as_millis() as u64;
++    if age > 1000 {
++        return;
++    }
++    let mut n = 0u64;
++    for (guid, transport, mut anchor) in &mut lifts {
++        let Some(&(cycle, rate)) = clock.rows.get(&guid.0) else {
++            continue;
++        };
++        if transport.lift_now(&anchor).is_none() {
++            continue;
++        }
++        anchor.progress_ms = kept_cycle(cycle, rate, age, transport.period_ms());
++        anchor.at = now;
++        n += 1;
++    }
++    if n > 0 {
++        clock.kept += 1;
++        if clock.kept % 3000 == 1 {
++            info!("wowbg3 lifts: {n} lifts keep BG3's time ({} frames so far)", clock.kept);
++        }
++    }
++}
++
+ fn write_lifts(mut out: ResMut<LiftsOut>, lifts: Query<(&Guid, &Transport, &TransportAnchor)>) {
+     let mut body = Vec::new();
+     let mut n = 0u32;
+@@ -74,6 +170,38 @@
+     use super::*;
+ 
+     #[test]
++    fn bg3s_clock_file_is_read_whole_or_not_at_all() {
++        let mut raw = b"WLC1".to_vec();
++        raw.extend_from_slice(&7u32.to_le_bytes());
++        raw.extend_from_slice(&2u32.to_le_bytes());
++        for (guid, cycle, rate) in [(0xF120_0050_AF00_AF65u64, 5964u32, 1000u32), (7, 16666, 0)] {
++            raw.extend_from_slice(&guid.to_le_bytes());
++            raw.extend_from_slice(&cycle.to_le_bytes());
++            raw.extend_from_slice(&rate.to_le_bytes());
++        }
++        raw.extend_from_slice(&7u32.to_le_bytes());
++        let (seq, rows) = parse_clock(&raw).unwrap();
++        assert_eq!(seq, 7);
++        assert_eq!(rows, vec![(0xF120_0050_AF00_AF65, 5964, 1000), (7, 16666, 0)]);
++        let n = raw.len();
++        raw[n - 4] = 8; // the two seqs differ: caught between two writes
++        assert!(parse_clock(&raw).is_none());
++        assert!(parse_clock(b"nope").is_none());
++    }
++
++    #[test]
++    fn a_held_lift_stands_and_a_running_one_runs_on_between_records() {
++        // BG3 holds the platform (turn-based mode): the car stands however old the record is.
++        assert_eq!(kept_cycle(5000, 0, 0, 16667), 5000);
++        assert_eq!(kept_cycle(5000, 0, 90, 16667), 5000);
++        // BG3's time runs: the car runs on between two records, a tenth of a second at most.
++        assert_eq!(kept_cycle(5000, 1000, 20, 16667), 5020);
++        assert_eq!(kept_cycle(5000, 1000, 700, 16667), 5100);
++        // Over the cycle's end.
++        assert_eq!(kept_cycle(16660, 1000, 20, 16667), 13);
++    }
++
++    #[test]
+     fn a_record_is_52_bytes_in_the_documented_order() {
+         let l = LiftNow {
+             entry: 20649,

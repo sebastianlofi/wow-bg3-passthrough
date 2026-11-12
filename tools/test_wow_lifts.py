@@ -290,18 +290,6 @@ class Carve(unittest.TestCase):
         self.assertEqual(L.slope_faces(self.section(5, 962.6), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)]), [])
         self.assertEqual(L.slope_faces(self.section(5, 960.0), 5, 0.0, 0.0, [(32.0, 962.3, 32.0, 4.0)]), [])
 
-    def test_a_resting_cars_floor_is_a_face(self):
-        faces = L.deck_faces([(32.0, 962.3, 32.0, 4.0), (10.0, 950.0, 10.0, 6.0)])
-        self.assertEqual(len(faces), 2 * L.DECK_SIDES)
-        area = 0.0
-        for f in faces[:L.DECK_SIDES]:
-            u, v = [f[3 + k] - f[k] for k in range(3)], [f[6 + k] - f[k] for k in range(3)]
-            up = u[2] * v[0] - u[0] * v[2]
-            self.assertGreater(up, 0)                                            # looks up
-            area += up / 2
-            self.assertTrue(all(abs(f[k] - (962.3 + L.DECK_OVER)) < 1e-4 for k in (1, 4, 7)))   # just over the platform's tiles
-        self.assertLess(abs(area - 3.14159 * 16) / 50.3, 0.02)                   # the platform's disc
-
     def test_another_floor_in_the_same_column_stays(self):
         s, n = L.carve(self.section(5, 990.0), 5, 0.0, 0.0, [(32.0, 962.0, 32.0, 4.0)])
         self.assertEqual(n, 0)

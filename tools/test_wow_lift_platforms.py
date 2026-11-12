@@ -32,9 +32,26 @@ class Family(unittest.TestCase):
 
     def test_every_platform_has_its_own_ids(self):
         inst = LP.instances()
-        self.assertEqual(len(inst), len(LP.RADII) * LP.EACH)
+        self.assertEqual(len(inst), len(LP.RADII) * LP.EACH + LP.CLOCKS)
         self.assertEqual(len({i['MapKey'] for i in inst}), len(inst))
         self.assertEqual({i['Root'] for i in inst}, {s['Root'] for s in LP.specs()})
+
+    def test_a_clock_has_no_floor(self):
+        spec = LP.clock_spec()
+        sg = spec['Subgrids'][0]
+        raw = wowbg3_level.tiles(sg['W'], sg['H'], sg['Kind'], None)
+        self.assertTrue(all(struct.unpack_from('<Q', raw, k * 16)[0] == 0x8005 for k in range(sg['W'] * sg['H'])))
+        b = P.bounds()
+        boxes = [P.box(m) for m in P.places()]
+        for i in range(LP.CLOCKS):
+            x, y, z = LP.clock_park(i)
+            self.assertTrue(b[0] < x - 3 and x + 3 < b[3] and b[1] < y and y < b[4] and b[2] < z - 3 and z + 3 < b[5])
+            for box in boxes:
+                self.assertTrue(x + 3 < box[0] or x - 3 > box[3] or y + 1 < box[1] or y - 1 > box[4] or z + 3 < box[2] or z - 3 > box[5])
+            for r in LP.RADII:
+                for k in range(LP.EACH):
+                    q = LP.park(r, k)
+                    self.assertGreater(((x - q[0]) ** 2 + (z - q[2]) ** 2) ** 0.5, r + 5.0)
 
     def test_parked_inside_the_level_and_off_every_wow_map(self):
         b = P.bounds()
@@ -55,7 +72,7 @@ class Family(unittest.TestCase):
                 self.assertGreater(((p[0] - q[0]) ** 2 + (p[2] - q[2]) ** 2) ** 0.5, r1 + r2 + 2.0)
 
     def test_a_floor_is_a_disc_of_its_radius(self):
-        for spec in LP.specs():
+        for spec in LP.specs()[1:]:
             sg = spec['Subgrids'][0]
             raw = wowbg3_level.tiles(sg['W'], sg['H'], sg['Kind'], sg['Radius'])
             states = [struct.unpack_from('<Q', raw, k * 16)[0] for k in range(sg['W'] * sg['H'])]
@@ -82,14 +99,14 @@ class Family(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             wowbg3_level.build(spec, d)
             text = (Path(d) / 'LevelTemplates/_merged.lsx').read_text()
-            self.assertEqual(text.count('"LevelTemplate"'), len(LP.RADII) * LP.EACH)
+            self.assertEqual(text.count('"LevelTemplate"'), len(LP.RADII) * LP.EACH + LP.CLOCKS)
         for s in LP.specs():
             with tempfile.TemporaryDirectory() as d:
                 wowbg3_level.build(s, d)
                 flag = [line for line in (Path(d) / 'meta.lsx').read_text().splitlines() if 'IsPlatformLevel' in line][0]
                 self.assertIn('value="True"', flag)
                 self.assertFalse((Path(d) / 'Triggers').exists())
-        self.assertEqual(wowbg3_level.root_templates_lsx(LP.specs()).count('"SubLevelName"'), len(LP.RADII))
+        self.assertEqual(wowbg3_level.root_templates_lsx(LP.specs()).count('"SubLevelName"'), len(LP.RADII) + 1)
 
 
 class ModTable(unittest.TestCase):
@@ -150,6 +167,39 @@ class Driver(unittest.TestCase):
             return M.Order(l, {0, 1000 + 10, 0}, {0, 1000, 0}, 0)
         end""")(self.M)
         self.assertAlmostEqual(order.Speed, 40.0, places=3)
+
+    def test_a_moving_cars_clock_is_read_from_its_platform(self):
+        f = self.L.eval('function(M, e, left, v) return M.CycleOnSpan(e, left, v) end')
+        # Sent 80 m at 25 m/s to arrive at cycle 7000: 20 m still to go is 800 ms before that.
+        self.assertAlmostEqual(f(self.M, 7000, 20.0, 25.0), 6200.0, places=3)
+        self.assertEqual(f(self.M, 7000, 0.01, 25.0), 7000)          # arrived
+        self.assertEqual(f(self.M, 7000, 20.0, 0.0), 7000)
+
+    def test_a_resting_cars_clock_is_read_from_the_clock_platform(self):
+        f = self.L.eval('function(M, a, b, most) return M.Flow(a, b, most) end')
+        self.assertAlmostEqual(f(self.M, 960.0, 960.0 - self.M.CLOCK_SPEED / 30, 200), 1000 / 30, places=3)   # one tick of BG3's time
+        self.assertEqual(f(self.M, 960.0, 960.0, 200), 0)            # BG3 holds it: no time passed
+        self.assertEqual(f(self.M, 960.0, 950.0, 180), 180)          # brought from elsewhere: no reading
+
+    def test_the_clock_file_for_benilla(self):
+        t = self.L.eval('function(M) return {string.byte(M.Pack(9, {{Guid = "f1200050af00af65", Cycle = 5964.7, Rate = 1000}, '
+                        '{Guid = "0000000000000007", Cycle = 16666, Rate = 0}}), 1, -1)} end')(self.M)
+        raw = bytes(t[i] for i in range(1, len(t) + 1))
+        self.assertEqual(raw[:4], b'WLC1')
+        self.assertEqual(struct.unpack_from('<II', raw, 4), (9, 2))
+        self.assertEqual(struct.unpack_from('<QII', raw, 12), (0xF1200050AF00AF65, 5964, 1000))
+        self.assertEqual(struct.unpack_from('<QII', raw, 28), (7, 16666, 0))
+        self.assertEqual(struct.unpack_from('<I', raw, 44), (9,))
+        self.assertEqual(len(raw), 48)
+
+    def test_the_floors_file_for_the_plugin(self):
+        t = self.L.eval('function(M) return {string.byte(M.Floors(4, {{220.0, 962.25, -1412.0, 9.0}}), 1, -1)} end')(self.M)
+        raw = bytes(t[i] for i in range(1, len(t) + 1))
+        self.assertEqual(raw[:4], b'WLF1')
+        self.assertEqual(struct.unpack_from('<II', raw, 4), (4, 1))
+        self.assertEqual(struct.unpack_from('<4f', raw, 12), (220.0, 962.25, -1412.0, 9.0))
+        self.assertEqual(struct.unpack_from('<I', raw, 28), (4,))
+        self.assertEqual(len(raw), 32)
 
     def test_size(self):
         size = self.L.eval('function(M, r) return M.Size(r) end')
