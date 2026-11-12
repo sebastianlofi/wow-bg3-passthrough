@@ -8,7 +8,7 @@
   "llvm_commit": "392dfff97d29b59d77e5cac6d4b6ef2585fe7117",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "297e2625812de1c5ba3cdfaa8a78be56223aa942007d9106924756a41608f8e1",
+  "library_sha256": "4125af4d50652e8b525b6d63b935149e1c1d2e37943235e94637a63f41e2e344",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -219,7 +219,7 @@
       ]
     }
   ],
-  "previous_library_sha256": "11e57e940f2fe3991b15e7c92dff18b0c2aee086fff697cf6e758e786333bb16",
+  "previous_library_sha256": "297e2625812de1c5ba3cdfaa8a78be56223aa942007d9106924756a41608f8e1",
   "retired_patches": [
     {
       "file": "patches/0003-wow-arena-hooks.patch",
