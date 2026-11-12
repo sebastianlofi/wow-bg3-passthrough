@@ -360,8 +360,7 @@ static volatile int g_tav_hide;
 static __thread VkCommandBuffer t_any_cb, t_blc_cb, t_blm_cb;
 static __thread uint64_t t_any_img0, t_blc_img, t_blm_img, t_blm_b1;
 static __thread int32_t t_any_fin0, t_blc_lay, t_blm_lay, t_blm_b1lay;
-static uint64_t g_blv_alb, g_blv_surf, g_blv_z, g_blv_nrm; static int32_t g_blv_lalb, g_blv_lsurf, g_blv_lz, g_blv_lnrm;
-static uint64_t g_gb_nrm;  // BG3's G-buffer normal image (ground_pass); g_blv_nrm: the view BG3 itself reads it through (any of its passes)  // BG3's G-buffer albedo and surface views (bare_draw, this frame)
+static uint64_t g_gb_nrm;  // BG3's G-buffer normal image (ground_pass); read through a view of the plugin's own (gbv_view, wowbg3_fxbg.inc.c)
 static volatile int g_fxl_frames;  // effects research log (see fxl_pass)
 static volatile int g_fxw_frames;  // draw decisions research log (request "fxwhy<N>", see fxw_draw)
 static volatile int g_sight_lines;  // BG3's sight overlay research log (request "sight<N>", see sight_note)
@@ -2536,13 +2535,6 @@ static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(VkDevice device, ui
                                        x->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
                 set_slot((uint64_t)x->dstSet, x->dstBinding, x->descriptorType, (uint64_t)x->pImageInfo[k].imageView, 0, 0,
                          (uint64_t)x->pImageInfo[k].sampler, (int32_t)x->pImageInfo[k].imageLayout);
-            // BG3's own view of its G-buffer normal, as one of its passes reads it (the pass wdbare follows does not
-            // bind it): the feed reads the facing of BG3's pixels through it.
-            if (g_gb_nrm && x->pImageInfo && (x->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || x->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) &&
-                x->pImageInfo[k].imageView && view_image((uint64_t)x->pImageInfo[k].imageView) == g_gb_nrm && g_blv_nrm != (uint64_t)x->pImageInfo[k].imageView) {
-                g_blv_nrm = (uint64_t)x->pImageInfo[k].imageView; g_blv_lnrm = (int32_t)x->pImageInfo[k].imageLayout;
-                static int said; if (said++ < 4) logf_("wdwlit: BG3 reads its G-buffer normal %llx through view %llx (layout %d)", (unsigned long long)g_gb_nrm, (unsigned long long)g_blv_nrm, g_blv_lnrm);
-            }
         }
     }
     for (uint32_t i = 0; i < nc; i++) {  // copies carry slots between sets
