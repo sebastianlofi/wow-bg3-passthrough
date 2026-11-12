@@ -281,6 +281,26 @@ S
 pids="$(grep 'get server_pid' "$t/out9" | awk '{print $4}' | tr '\n' ' ')"
 [[ "$pids" =~ ^0\ [1-9][0-9]*\ $ ]] && grep -q "start session" "$t/out9" && grep -q "left the menu (StartLoading)" "$t/out9" \
     && pass "start = session: not started in the menu, started when the client left it" || bad "start = session: $pids"
+
+# 10 (0.4.1): modsettings.lsx names the mod, but the mod's scripts say BG3 did not load its module (setting
+# "module" 0: the file changed after BG3 had read it). Nothing starts; when BG3 has the module, the child starts.
+mv "$data/logs" "$t/oldlogs/run9" 2>/dev/null
+"$host" "$plugin" > "$t/out10" 2>&1 <<S
+state Menu
+frame
+set module 0
+state StartLoading
+frame
+sleep 2
+get server_pid
+set module 1
+sleep 2
+get server_pid
+exit
+S
+pids="$(grep 'get server_pid' "$t/out10" | awk '{print $4}' | tr '\n' ' ')"
+[[ "$pids" =~ ^0\ [1-9][0-9]*\ $ ]] && grep -q "did not load WOW-BG3's module" "$t/out10" \
+    && pass "module 0: no child though modsettings.lsx enables the mod; started once BG3 has the module" || bad "module setting: $pids"
 cp "$t/launcher.conf.orig" "$t/WOW-BG3/launcher.conf"
 
 # 3: a bg3le without patch 0003: loads, says so, never holds

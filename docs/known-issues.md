@@ -16,6 +16,12 @@ This is the first public version. What we know is missing or rough:
 - WoW item icons, the item table and the quest cursors are made in the background of that first session, a
   minute or two in; until then a WoW item shows its BG3 base's icon. No restart is needed.
 
+- BG3 keeps its list of enabled mods in Steam Cloud, one list for every machine of a Steam account, and it
+  turns a mod off by itself when a save made without it is loaded (Continue included). So WOW-BG3 can be off
+  in a BG3 you start although you never turned it off. In such a BG3 the mod does nothing: New Game is BG3's
+  own, and a WOW-BG3 save asks in BG3's Mod Verification box; tick WoW-BG3 Passthrough there and it loads as
+  usual. To have it on for a New Game, enable it in BG3's Mod Manager and start BG3 again.
+
 ## Picture
 
 - WoW's world is shown in WoW's own colours. BG3's spell glow no longer spills onto WoW ground that the effect

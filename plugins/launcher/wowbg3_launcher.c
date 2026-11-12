@@ -41,6 +41,11 @@
 //   <child>_pid   read only: the child's pid, 0 when not running
 //   holding    read only: 1 while the loading screen is held
 //   mod_enabled   read only: WOW-BG3's UUID is enabled in modsettings.lsx
+//   module     -1 the mod's scripts have not said, 0 BG3 did not load WOW-BG3's module in this session, 1 it did
+//              (Module.lua, from BG3's own module list). modsettings.lsx is a file: BG3 reads it once at its
+//              start, and it can change afterwards (Steam Cloud put another machine's copy in place 4 s after
+//              BG3 started), so the file alone said "enabled" in a BG3 that ran without the mod. With 0 the
+//              mod counts as not enabled: no child starts, no loading screen is held.
 //   pak        read only: 0 no pak known, 1 copied this start, 2 already in Mods, 3 Mods unwritable
 //   hold       1: hold the loading screen (default), 0: never        (kept across starts)
 //   hold_timeout  seconds before a hold gives up (default 120)          (kept across starts)
@@ -73,7 +78,7 @@
 
 #include "bg3le_plugin.h"
 
-#define LAUNCHER_VERSION "0.4.0"
+#define LAUNCHER_VERSION "0.4.1"
 #define MOD_UUID "a97c1258-37c3-434c-9309-c982f6cea252"
 #define MAX_CHILDREN 8
 #define MAX_ARGS 48
@@ -121,7 +126,7 @@ static char g_shm[PATH_MAX];     // WOWBG3_SHM (frames, Tav's geometry): a tmpfs
 static char g_capture[PATH_MAX]; // WOWBG3_CAPTURE_DIR: the render plugin's compose words and log
 
 // ---- settings (ints Lua reads and writes) ----
-static int s_world = -1, s_ready = 0, s_holding = 0, s_mod_enabled = 0, s_pak = 0;
+static int s_world = -1, s_ready = 0, s_holding = 0, s_mod_enabled = 0, s_pak = 0, s_module = -1;
 static int s_hold = 1, s_hold_timeout = 120;
 // Where the loading screen is held: 0 automatic (4 where bg3le can hold it, else 1), 1 the queued
 // StopLoading (patch 0003: measured, BG3's server waits in Sync meanwhile), 2 the queued
@@ -633,9 +638,9 @@ static void write_status(const char* why) {
     FILE* f = fopen(tmp, "w");
     if (!f) return;
     fprintf(f, "{\"Version\": \"%s\", \"Format\": 1, \"Why\": \"%s\", \"Home\": \"%s\", \"Data\": \"%s\", "
-               "\"ModEnabled\": %d, \"Pak\": %d, \"World\": %d, \"Ready\": %d, \"Holding\": %d, "
+               "\"ModEnabled\": %d, \"Module\": %d, \"Pak\": %d, \"World\": %d, \"Ready\": %d, \"Holding\": %d, "
                "\"Gate\": %d, \"HoldAt\": %d, \"Children\": [",
-            LAUNCHER_VERSION, why, g_home, g_data, s_mod_enabled, s_pak, s_world, s_ready, s_holding,
+            LAUNCHER_VERSION, why, g_home, g_data, s_mod_enabled, s_module, s_pak, s_world, s_ready, s_holding,
             g_gate_on, g_hold_mode);
     for (int i = 0; i < g_nchild; i++) {
         child_t* c = &g_child[i];
@@ -657,14 +662,16 @@ static double g_start_wall = 0;
 // BG3's client has left its main menu for a load since this BG3 started (on_frame), or its game state cannot
 // be read (then "session" children start as "enabled" ones did). Set on the frame thread, read here.
 static atomic_int s_session_started;
+// The mod is in this BG3: its settings file names it and BG3's own module list does not say otherwise.
+static int mod_active(void) { return s_mod_enabled && s_module != 0; }
 static int desired(child_t* c) {
     if (c->done || s_stop_all) return 0;
     if (c->want == 0) return 0;
     if (c->want == 1) return 1;
     switch (c->start) {
         case START_ALWAYS: return 1;
-        case START_ENABLED: return s_mod_enabled;
-        case START_SESSION: return s_mod_enabled && atomic_load(&s_session_started);
+        case START_ENABLED: return mod_active();
+        case START_SESSION: return mod_active() && atomic_load(&s_session_started);
         default: return 0;
     }
 }
@@ -706,6 +713,13 @@ static void* supervisor(void* unused) {
                     s_mod_enabled = en;
                     changed = 1;
                 }
+            }
+            static int said_module = -1;
+            if (s_module != said_module) {
+                said_module = s_module;
+                if (s_module == 0) LOG("BG3 did not load WOW-BG3's module in this session (the mod's scripts say so): the mod counts as not enabled");
+                else if (s_module == 1) LOG("BG3 loaded WOW-BG3's module");
+                changed = 1;
             }
         }
         for (int i = 0; i < g_nchild; i++) {
@@ -954,7 +968,7 @@ static int gate(void* user, const char* from, const char* to) {
     // WorldFlag says (server, at SessionLoaded) or 15 s pass.
     if (!s_hold) why = "hold off";
     else if (s_world == 0) why = "vanilla game";
-    else if (s_world == -1 && !s_mod_enabled) why = "WOW-BG3 not enabled";
+    else if (s_world == -1 && !mod_active()) why = s_mod_enabled ? "BG3 did not load WOW-BG3's module" : "WOW-BG3 not enabled";
     else if (s_world == -1 && waited > (g_hold_mode == 4 ? 5 : 15)) why = "the mod never said whether this is a world-mode game";
     else if (s_ready) why = "ready";
     else if (g_hold_gave_up) why = "gave up earlier this session";
@@ -1114,6 +1128,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
     rc |= host->add_setting(self, "ready", BG3LE_SETTING_INT, &s_ready, 0, 1);
     rc |= host->add_setting(self, "holding", BG3LE_SETTING_INT, &s_holding, 0, 0);
     rc |= host->add_setting(self, "mod_enabled", BG3LE_SETTING_INT, &s_mod_enabled, 0, 0);
+    rc |= host->add_setting(self, "module", BG3LE_SETTING_INT, &s_module, -1, 1);
     rc |= host->add_setting(self, "pak", BG3LE_SETTING_INT, &s_pak, 0, 0);
     rc |= host->add_setting(self, "hold", BG3LE_SETTING_INT, &s_hold, 0, 1);
     rc |= host->add_setting(self, "hold_timeout", BG3LE_SETTING_INT, &s_hold_timeout, 5, 3600);
@@ -1128,6 +1143,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
     s_ready = 0;
     s_holding = 0;
     s_hold_at = 0;
+    s_module = -1;
     s_mod_enabled = en;
     s_pak = pak;
     for (int i = 0; i < g_nchild; i++) {
