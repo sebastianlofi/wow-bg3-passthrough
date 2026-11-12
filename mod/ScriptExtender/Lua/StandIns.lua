@@ -316,6 +316,7 @@ function M.Start(runId)
                 local made = Osi.CreateAt(template, p[1], p[2], p[3], 1, 0, "")
                 local uuid = assert(uuidOf(made), "CreateAt returned no character: " .. tostring(made))
                 created[uuid] = true
+                Ext.Require("Scaling.lua").Without(uuid) -- passives of BG3's template a stand-in does without
                 if type(c.Guid) == "string" then
                     WOWBG3FightSpawned = WOWBG3FightSpawned or {}
                     WOWBG3FightSpawned[uuid] = c.Guid

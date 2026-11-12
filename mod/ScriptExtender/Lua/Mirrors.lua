@@ -746,6 +746,7 @@ function M.Start(runId)
             end
         end
         local uuid = assert(uuidOf(made), "CreateAt returned no character: " .. tostring(made))
+        Scaling.Without(uuid) -- passives of BG3's template a stand-in does without (Undead Fortitude)
         -- Its health from the start: the template's own max HP at the WoW fraction, set in this
         -- tick (BG3 applies it when it fills Health, the next tick; healthDue checks).
         local frac = wowFraction(mob)
