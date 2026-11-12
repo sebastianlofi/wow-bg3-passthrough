@@ -205,6 +205,18 @@
           "after_sha256": "2b239078bdd9e1ef86b3131cab14a93249ca8cfad2f0462eb5bde8ea590624a6"
         }
       ]
+    },
+    {
+      "file": "patches/0011-wowbg3-build-in-version-line.patch",
+      "sha256": "2ded4914aef15d40136da3225f85e5426370cba3616d34277dd24629503972d1",
+      "purpose": "The extender's line under the main menu in the original Script Extender's wording, naming bg3le and the WOW-BG3 build",
+      "targets": [
+        {
+          "path": "src/game_state.cpp",
+          "before_sha256": "b99f7538403c6a5ab5f164e16d4b6fb8cf0286e8125ca09e9215d852bcf7bb47",
+          "after_sha256": "91a9182b9d104f326056f5fa0d9d1cf59061203cee351995ececeee5b71fad6b"
+        }
+      ]
     }
   ],
   "previous_library_sha256": "11e57e940f2fe3991b15e7c92dff18b0c2aee086fff697cf6e758e786333bb16",

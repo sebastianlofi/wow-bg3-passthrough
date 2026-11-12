@@ -21,6 +21,8 @@ This is the first public version. What we know is missing or rough:
   in a BG3 you start although you never turned it off. In such a BG3 the mod does nothing: New Game is BG3's
   own, and a WOW-BG3 save asks in BG3's Mod Verification box; tick WoW-BG3 Passthrough there and it loads as
   usual. To have it on for a New Game, enable it in BG3's Mod Manager and start BG3 again.
+  When the mod is on, the last line under BG3's main menu reads "WOW-BG3 0.1.0 (build ...)"; without that line
+  it is off.
 
 ## Picture
 

@@ -93,18 +93,43 @@ def config_json(native_plugins) -> bytes:
     return (json.dumps(src, indent=2) + "\n").encode("utf-8")
 
 
-def pak_files(version: str, native_plugins):
+VERSION_LUA = "Version.lua"  # written here, never a file of the source tree
+
+
+def build_id(files, release=()) -> str:
+    """Eight hex digits that name one build: from every file of the pak (name and content) and, for a whole release,
+    every other file it holds (`release`: [(path in the release, sha256)]). The same sources give the same id."""
+    h = hashlib.sha256()
+    for name, data in sorted(files):
+        h.update(b"pak\0" + name.encode() + b"\0" + hashlib.sha256(data).hexdigest().encode() + b"\n")
+    for name, digest in sorted(release):
+        h.update(b"file\0" + str(name).encode() + b"\0" + digest.encode() + b"\n")
+    return h.hexdigest()[:8]
+
+
+def version_lua(version: str, build: str) -> bytes:
+    """What MenuLine.lua shows under BG3's main menu: "WOW-BG3 <version> (build <build>)"."""
+    return ('-- Written by release/build-release.py: this release and this build of it.\n'
+            'return {Version = "%s", Build = "%s"}\n' % (version, build)).encode()
+
+
+def pak_files(version: str, native_plugins, release=()):
+    """`release`: the other files of the release this pak belongs to ([(path, sha256)]), for the build id; a pak
+    made alone (a test pak) gets the id of its own files."""
     files = [(f"Mods/{FOLDER}/meta.lsx", meta_lsx(FOLDER, version)),
              (f"Mods/{FOLDER}/ScriptExtender/Config.json", config_json(native_plugins))]
     lua = sorted((MOD_SRC / "ScriptExtender/Lua").glob("*.lua"))
     if not lua:
         raise SystemExit("no Lua in " + str(MOD_SRC))
+    if any(p.name == VERSION_LUA for p in lua):
+        raise SystemExit(f"{VERSION_LUA} is written by the release builder: take it out of {MOD_SRC}")
     for p in lua:
         files.append((f"Mods/{FOLDER}/ScriptExtender/Lua/{p.name}", p.read_bytes()))
     # The stats of our own spells: never an empty file (an empty stats .txt hangs BG3's load).
     for p in sorted((MOD_SRC / f"Public/{FOLDER}/Stats/Generated/Data").glob("*.txt")):
         files.append((f"Public/{FOLDER}/Stats/Generated/Data/{p.name}", p.read_bytes()))
     files += level_files()
+    files.append((f"Mods/{FOLDER}/ScriptExtender/Lua/{VERSION_LUA}", version_lua(version, build_id(files, release))))
     return files
 
 
@@ -237,7 +262,6 @@ def main():
     # The launcher loads first (name order), then wowbg3.so and the render plugin.
     plugins.sort()
 
-    lspk.write(str(dist / "WOW-BG3.pak"), pak_files(a.version, plugins))
     shutil.copy2(HERE / "launcher.conf.in", folder / "launcher.conf")
     shutil.copy2(HERE / "settings.conf", folder / "settings.conf")
     # The render plugin's colour table (a displayed colour to the light BG3 shows it as, measured once against BG3's
@@ -385,7 +409,14 @@ def main():
         shutil.move(str(dist), str(out / f"{name}.incomplete"))
         raise SystemExit("missing: " + "; ".join(missing) + f" (moved to {name}.incomplete)")
 
-    lines = [f"WOW-BG3 {a.version}  mod UUID {UUID}"]
+    # The pak last: its Version.lua carries the build id, made from every other file of the release.
+    rest = [(str(p.relative_to(dist)), sha256(p)) for p in sorted(dist.rglob("*")) if p.is_file()]
+    pak = pak_files(a.version, plugins, rest)
+    lspk.write(str(dist / "WOW-BG3.pak"), pak)
+    build = re.search(rb'Build = "([0-9a-f]{8})"', dict(pak)[f"Mods/{FOLDER}/ScriptExtender/Lua/{VERSION_LUA}"]).group(1).decode()
+    print(f"WOW-BG3 {a.version} (build {build})")
+
+    lines = [f"WOW-BG3 {a.version}  mod UUID {UUID}", f"BUILD {build}"]
     lines += [f"MISSING {m}" for m in missing]
     if bg3le_note:
         lines.append(bg3le_note)

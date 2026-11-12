@@ -22,12 +22,11 @@ def test_both_start_up_scripts_start_everything_through_the_check():
     for name, context in (('BootstrapClient.lua', 'client'), ('BootstrapServer.lua', 'server')):
         c = code(name)
         assert c.lstrip().startswith('Ext.Require("Module.lua").Start("%s", function()' % context), name
-        # every other file is asked for inside that one call: nothing at the file's own level
-        depth = 0
-        for line in c.splitlines():
-            if 'Ext.Require(' in line and 'Module.lua' not in line:
-                assert depth > 0, '%s asks for a file outside the check: %s' % (name, line.strip())
-            depth += len(re.findall(r'\bfunction\b', line)) - len(re.findall(r'\bend\b', line))
+        # the file is that one call and nothing else: every line between its first and its closing "end)" is indented
+        lines = [l for l in c.splitlines() if l.strip()]
+        assert lines[-1] == 'end)', '%s must end with the call\'s own "end)"' % name
+        for line in lines[1:-1]:
+            assert line.startswith('    '), '%s has a line outside the check: %s' % (name, line.strip())
 
 
 def test_the_check_reads_bg3s_own_module_list_and_not_the_settings_file():
