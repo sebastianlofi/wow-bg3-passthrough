@@ -182,7 +182,7 @@ static void wd_mask_copy(DeviceData* d, VkCommandBuffer cb, uint64_t serial, uin
     pthread_mutex_lock(&g_sf.m);
     VkImage z = g_sf.s[serial % SF_SLOTS].z.img;
     if (!g_wd_mask.img || g_wd_mw != w || g_wd_mh != h) {
-        if (g_wd_mask.img) sf_img_free(d, &g_wd_mask);
+        if (g_wd_mask.img) fb_retire(&g_wd_mask);  // the scene changed size: freed once the GPU is past it
         if (!sf_img_make(d, &g_wd_mask, VK_FORMAT_R32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { pthread_mutex_unlock(&g_sf.m); return; }
         g_wd_mw = w; g_wd_mh = h; g_wd_minit = 0;
     }

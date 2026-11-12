@@ -867,11 +867,11 @@ static uint64_t fxc_texkey(uint64_t view) {
             __atomic_add_fetch(&g_scene_reads, 1, __ATOMIC_RELAXED);
             return 2;
         }
-        if (i->fmt == VK_FORMAT_R32_SFLOAT && i->w == g_role.ew && i->hgt == g_role.eh) return 4;  // BG3's linear view depth
+        if (i->fmt == VK_FORMAT_R32_SFLOAT && i->w == SCENE_W && i->hgt == SCENE_H) return 4;  // BG3's linear view depth
         // BG3's G-buffer normal (R16G16, the view-space normal encoded; projected decals read it).
-        if (i->fmt == VK_FORMAT_R16G16_SFLOAT && i->w == g_role.ew && i->hgt == g_role.eh) return 6;
+        if (i->fmt == VK_FORMAT_R16G16_SFLOAT && i->w == SCENE_W && i->hgt == SCENE_H) return 6;
         // BG3's froxel light grid (B10G11R11 at froxel size; its shaders read value * 32 as light).
-        if (i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (i->w != g_role.ew || i->hgt != g_role.eh)) return 5;
+        if (i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && (i->w != SCENE_W || i->hgt != SCENE_H)) return 5;
         ImgInfo* pt = t_pass_target ? TABLE_FIND(g_img, IMG_CAP, t_pass_target, 0) : NULL;
         if (pt && i->fmt == pt->fmt && i->w == pt->w && i->hgt == pt->hgt) __atomic_add_fetch(&g_scene_missed, 1, __ATOMIC_RELAXED);
         // Render targets the effects read (soft particles, fog volumes): logged once each, for mapping.

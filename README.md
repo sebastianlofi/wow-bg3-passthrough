@@ -240,10 +240,6 @@ step. In short:
    option. It still runs your other Script Extender mods; `--uninstall` undoes it.
 5. Start BG3, enable WoW-BG3 Passthrough in the mod manager, start a New Game.
 
-Leave two of BG3's video options at their defaults: Anti-Aliasing on TAA and FidelityFX Sharpening on. WoW's
-colours are put back into the picture at those two steps of BG3's; with either one off, WoW's world shows washed
-out and wrong in the distance ([known issues](docs/known-issues.md)).
-
 The first start takes a few minutes and needs the internet once: the local WoW server builds its data
 from your WoW files and downloads its world database (about 48 MB, from vmangos' public sources; this
 mod ships no game data). The mobs' abilities are made from that database, so the first time, BG3 stays

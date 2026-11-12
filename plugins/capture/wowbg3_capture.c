@@ -885,7 +885,13 @@ static struct {
     uint64_t hud[8]; uint32_t nhud;  // RGBA8+S8 targets seen (a final pass sampling two prefers these)
     uint64_t logged[4]; uint32_t nlogged;  // UI targets already logged (BG3 alternates two at times)
     uint64_t switches;             // main UI changes, for the log
-} g_role = {0, 0, -1, -1, {{0, 0}}, 0, {0}, 0, 0, 0, 0, 0, 0, {0}, 0, {0}, 0, 0};
+    // BG3's scene size: its G-buffer pass's (scene_seen). The screen's (ew, eh) unless BG3 upscales: with FSR 1.0 or 2.2
+    // it renders its scene smaller and scales it up before its display transform. Every pass of the scene (depth, G-buffer,
+    // lighting, composite, effects) is at this size, the UI and the final picture at the screen's. 0: not seen yet.
+    uint32_t sw, sh;
+} g_role = {0, 0, -1, -1, {{0, 0}}, 0, {0}, 0, 0, 0, 0, 0, 0, {0}, 0, {0}, 0, 0, 0, 0};
+#define SCENE_W (g_role.sw ? g_role.sw : g_role.ew)
+#define SCENE_H (g_role.sh ? g_role.sh : g_role.eh)
 static __thread VkCommandBuffer t_ui_cb;
 static __thread uint64_t t_ui_img;
 static __thread uint32_t t_ui_draws;
@@ -924,17 +930,19 @@ static void role_reset_cb(VkCommandBuffer cb) {
 // A pass begins on `cb` with attachment images `imgs` (final layouts `fin`, -1 unknown). g_trace_lock held.
 static void role_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin) {
     if (!g_role.ew) return;
-    uint32_t colors = 0, stencil = 0;
+    uint32_t colors = 0, scolors = 0, stencil = 0;
     uint64_t depth = 0, ui = 0; int32_t dfin = -1, ufin = -1;
     VkFormat df = 0, uf = 0;
     int sc = 0;
     for (uint32_t k = 0; k < n; k++) {
         ImgInfo* i = imgs[k] ? TABLE_FIND(g_img, IMG_CAP, imgs[k], 0) : NULL;
         if (!i) { if (imgs[k] && is_swapchain_image(imgs[k])) sc = 1; continue; }
-        if (i->w != g_role.ew || i->hgt != g_role.eh) continue;
-        if (i->fmt == VK_FORMAT_S8_UINT) stencil++;
-        else if (is_depth_format(i->fmt)) { depth = imgs[k]; dfin = fin[k]; df = i->fmt; }
-        else { colors++; if (is_ui_color(i->fmt)) { ui = imgs[k]; ufin = fin[k]; uf = i->fmt; } }
+        // The scene's depth and G-buffer at the scene's size; the UI's target and its stencil at the screen's.
+        const int scene = i->w == SCENE_W && i->hgt == SCENE_H, screen = i->w == g_role.ew && i->hgt == g_role.eh;
+        if (!scene && !screen) continue;
+        if (i->fmt == VK_FORMAT_S8_UINT) { if (screen) stencil++; }
+        else if (is_depth_format(i->fmt)) { if (scene) { depth = imgs[k]; dfin = fin[k]; df = i->fmt; } }
+        else { if (scene) colors++; if (screen) { scolors++; if (is_ui_color(i->fmt)) { ui = imgs[k]; ufin = fin[k]; uf = i->fmt; } } }
     }
     t_sc_cb = sc ? cb : VK_NULL_HANDLE;
     if (depth && colors >= 3) pace_gbuffer(cb);
@@ -944,7 +952,7 @@ static void role_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, cons
         g_role.depth = depth; g_role.dfmt = df; g_role.dlayout = -1;
         char s[96]; img_desc(s, sizeof s, depth); logf_("roles: scene depth %s", s);
     }
-    if (stencil && colors == 1 && ui) { t_ui_cb = cb; t_ui_img = ui; t_ui_draws = 0; if (!g_role.ufmt) g_role.ufmt = uf; }
+    if (stencil && scolors == 1 && ui) { t_ui_cb = cb; t_ui_img = ui; t_ui_draws = 0; if (!g_role.ufmt) g_role.ufmt = uf; }
     for (uint32_t k = 0; k < n; k++) if (fin[k] >= 0) role_set_layout(cb, imgs[k], fin[k]);
     (void)dfin; (void)ufin;
 }
@@ -1327,7 +1335,7 @@ static void fx_pass(DeviceData* d, VkCommandBuffer cb, uint64_t fb, uint32_t n, 
         ImgInfo* i = imgs[k] ? TABLE_FIND(g_img, IMG_CAP, imgs[k], 0) : NULL;
         if (!i) return;
         colors++;
-        if (fx_format(i->fmt) && i->w == g_role.ew && i->hgt == g_role.eh) at = (int)k;
+        if (fx_format(i->fmt) && i->w == SCENE_W && i->hgt == SCENE_H) at = (int)k;
     }
     if (!depth || colors != 1 || at < 0 || load[at] != VK_ATTACHMENT_LOAD_OP_LOAD) return;
     t_fx_cb = cb; t_fx_fb = fb; t_fx_img = imgs[at]; t_fx_draws = 0; t_fx_final = fin[at]; t_fx_copy = 0;
@@ -1527,7 +1535,7 @@ static void put_pixel_from_wow(uint8_t* bgra, const uint8_t* wow, uint32_t code)
 // BG3's command buffers start copying into them from the next frame).
 static int fx_create(DeviceData* d) {
     if (!d->GetImageMemoryRequirements || !d->BindImageMemory) return 0;
-    g_fx.w = g_role.ew; g_fx.h = g_role.eh;
+    g_fx.w = SCENE_W; g_fx.h = SCENE_H;
     for (int k = 0; k < 2; k++) {
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, g_fx.fmt,
             {g_fx.w, g_fx.h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
@@ -2056,7 +2064,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_BeginCommandBuffer(VkCommandBuffer c
             for (uint32_t k = 0; f && k < f->n && k < 8; k++) {
                 uint64_t img = view_image(f->views[k]);
                 ImgInfo* ii = img ? TABLE_FIND(g_img, IMG_CAP, img, 0) : NULL;
-                if (!ii || ii->w != g_role.ew || ii->hgt != g_role.eh || ii->fmt == VK_FORMAT_S8_UINT) continue;
+                if (!ii || ii->w != SCENE_W || ii->hgt != SCENE_H || ii->fmt == VK_FORMAT_S8_UINT) continue;
                 if (is_depth_format(ii->fmt)) depth++;
                 else colors++;
             }
@@ -2619,6 +2627,8 @@ static void wdx_dispatch_pre(VkCommandBuffer cb);
 static void wdx_dispatch_after(DeviceData* d, VkCommandBuffer cb);  // patch60
 static void wdx_readers(VkCommandBuffer cb, int compute);
 static void post_cas(DeviceData* d, VkCommandBuffer cb);
+static void post_dt(DeviceData* d, VkCommandBuffer cb);
+static void fb_retire_sweep(DeviceData* d);
 static void fxc_copy(uint64_t src, uint64_t dst);
 static void fb_copy_hook(DeviceData* d, VkCommandBuffer cb, uint64_t s, uint64_t t, VkImageLayout sl);
 static void fog_draw(VkCommandBuffer cb);
@@ -2639,8 +2649,8 @@ static void fxl_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const
         if (!i) return;
         colors++;
         if (load[k] != VK_ATTACHMENT_LOAD_OP_LOAD) loaded = 0;
-        if (fx_format(i->fmt) && i->w == g_role.ew && i->hgt == g_role.eh) at = (int)k;
-        if (colors == 1 && i->fmt == VK_FORMAT_R16G16_SFLOAT && i->w == g_role.ew && i->hgt == g_role.eh) gbuf = 1;
+        if (fx_format(i->fmt) && i->w == SCENE_W && i->hgt == SCENE_H) at = (int)k;
+        if (colors == 1 && i->fmt == VK_FORMAT_R16G16_SFLOAT && i->w == SCENE_W && i->hgt == SCENE_H) gbuf = 1;
     }
     // BG3's deferred decal pass: the scene depth and four G-buffer targets (R16G16
     // normal first, then RGBA8), all loaded; the G-buffer pass itself clears five.
@@ -2906,6 +2916,29 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPushConstants(VkCommandBuffer cb, VkP
     d->CmdPushConstants(cb, lay, st, off, size, v);
 }
 
+// BG3's G-buffer pass, at whatever size: its scene depth and five colour targets, the first the R16G16 normal. Its size is
+// the scene's (g_role.sw, sh); it is the screen's unless BG3 upscales (FSR), when it is smaller.
+static void scene_seen(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, const VkRenderPassAttachmentBeginInfo* il, uint32_t w, uint32_t h) {
+    (void)cb; (void)rp;
+    if (w == SCENE_W && h == SCENE_H) return;
+    trace_lock_timed();
+    FbInfo* f = TABLE_FIND(g_fb, FB_CAP, (uint64_t)fb, 0);
+    uint32_t n = il ? (il->attachmentCount > 8 ? 8 : il->attachmentCount) : (f ? f->n : 0);
+    int depth = 0, colors = 0, normal = 0, same = 1;
+    for (uint32_t k = 0; k < n; k++) {
+        uint64_t im = view_image(il ? (uint64_t)il->pAttachments[k] : f->views[k]);
+        ImgInfo* i = im ? TABLE_FIND(g_img, IMG_CAP, im, 0) : NULL;
+        if (!i) continue;
+        if (i->w != w || i->hgt != h) same = 0;
+        if (is_depth_format(i->fmt)) depth = 1;
+        else { if (!colors && i->fmt == VK_FORMAT_R16G16_SFLOAT) normal = 1; colors++; }
+    }
+    pthread_mutex_unlock(&g_trace_lock);
+    if (depth && normal && colors >= 4 && same && w >= 64 && h >= 64 && w <= g_role.ew && h <= g_role.eh) {
+        logf_("roles: BG3's scene is %ux%u (the screen %ux%u)%s", w, h, g_role.ew, g_role.eh, w < g_role.ew ? ": BG3 upscales it" : "");
+        g_role.sw = w; g_role.sh = h;
+    }
+}
 static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, const VkRenderPassAttachmentBeginInfo* il,
                        uint32_t w, uint32_t h) {
     t_void_cb = VK_NULL_HANDLE;
@@ -2946,7 +2979,9 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         t_any_fin0 = (p0 && p0->n) ? p0->final[0] : -1;
         pthread_mutex_unlock(&g_trace_lock);
     }
-    if (g_cc.on && g_img && w == g_role.ew && h == g_role.eh) {
+    if (g_img) scene_seen(cb, rp, fb, il, w, h);
+    const int scene_pass = w == SCENE_W && h == SCENE_H;
+    if (g_cc.on && g_img && (scene_pass || (w == g_role.ew && h == g_role.eh))) {
         trace_lock_timed();
         RpInfo* p = TABLE_FIND(g_rp, RP_CAP, (uint64_t)rp, 0);
         FbInfo* f = TABLE_FIND(g_fb, FB_CAP, (uint64_t)fb, 0);
@@ -3258,7 +3293,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(VkCommandBuffer cb, uint32_t
     d->CmdDispatch(cb, x, y, z);
     wdx_dispatch_after(d, cb);
     if (g_cc.wdeyelog) wd_eye_after(d, cb);
-    if (g_cc.wdpostcas) post_cas(d, cb);
+    if (g_cc.wdpostcas) { post_dt(d, cb); post_cas(d, cb); }  // after BG3's display transform; after its CAS where that runs
 }
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o) {
     DeviceData* d = device_for(cb);
@@ -4088,6 +4123,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
         ground_present();
         shade_present();
         amb_present();
+        fb_retire_sweep(d);
         surf_present();
         pv_present(q);
         t_fxc = now_ns() - t;

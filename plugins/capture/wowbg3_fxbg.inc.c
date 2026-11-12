@@ -46,6 +46,42 @@ static VkImageView gbv_view(DeviceData* d, uint64_t img) {  // takes g_fbt_m
     pthread_mutex_unlock(&g_fbt_m);
     return v;
 }
+// Images of the plugin's own that BG3's scene size has outgrown (a resolution changed, upscaling switched on or off): freed
+// once the GPU is past every command buffer that could still use them (FB_RETIRE presents later), never at once.
+#define FB_RETIRE 8
+static struct { SfImg i; VkFramebuffer fb; VkImageView view; uint64_t at; } g_retire[32];
+static pthread_mutex_t g_retire_m = PTHREAD_MUTEX_INITIALIZER;
+static void fb_retire(SfImg* i) {
+    if (!i->img) return;
+    pthread_mutex_lock(&g_retire_m);
+    int k = -1;
+    for (int j = 0; j < 32 && k < 0; j++) if (!g_retire[j].i.img && !g_retire[j].fb && !g_retire[j].view) k = j;
+    if (k >= 0) { g_retire[k].i = *i; g_retire[k].fb = VK_NULL_HANDLE; g_retire[k].view = VK_NULL_HANDLE; g_retire[k].at = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED); }
+    else logf_("fxbg: no room to retire an image: it is kept (a leak, not a fault)");
+    pthread_mutex_unlock(&g_retire_m);
+    memset(i, 0, sizeof *i);
+}
+// A framebuffer and a view of an image of BG3's (both may be null), the same way.
+static void fb_retire_fb(VkFramebuffer fb, VkImageView view) {
+    if (!fb && !view) return;
+    pthread_mutex_lock(&g_retire_m);
+    int k = -1;
+    for (int j = 0; j < 32 && k < 0; j++) if (!g_retire[j].i.img && !g_retire[j].fb && !g_retire[j].view) k = j;
+    if (k >= 0) { memset(&g_retire[k], 0, sizeof g_retire[k]); g_retire[k].fb = fb; g_retire[k].view = view; g_retire[k].at = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED); }
+    pthread_mutex_unlock(&g_retire_m);
+}
+static void fb_retire_sweep(DeviceData* d) {  // at a present
+    const uint64_t pr = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_retire_m);
+    for (int j = 0; j < 32; j++) {
+        if (!(g_retire[j].i.img || g_retire[j].fb || g_retire[j].view) || pr - g_retire[j].at <= FB_RETIRE) continue;
+        if (g_retire[j].i.img) sf_img_free(d, &g_retire[j].i);
+        if (g_retire[j].fb && d->DestroyFramebuffer) d->DestroyFramebuffer(d->device, g_retire[j].fb, NULL);
+        if (g_retire[j].view && d->DestroyImageView) d->DestroyImageView(d->device, g_retire[j].view, NULL);
+        memset(&g_retire[j], 0, sizeof g_retire[j]);
+    }
+    pthread_mutex_unlock(&g_retire_m);
+}
 static uint8_t g_fb_dead[FB_IMGS + 4];   // patch36 (fbstale): slot whose image BG3 destroyed, view kept
 static uint64_t g_fb_stale[2], g_fb_dead_n;  // draws through a dead slot: feed, wdbare; destroys seen
 static void fb_stale_note(int bare, int slot) {
@@ -469,6 +505,11 @@ static int fb_make(DeviceData* d) {
 
 // wdfog: the composite's own atmosphere inputs, read from BG3's bound sets at its draw (recording thread).
 #define FOG_FS 0x54fb164bcf9f7fe8ull
+// The same composite with Subsurface Scattering off (BG3's lowest quality preset turns it off): another permutation of the
+// shader, the same inputs (set 1: depth, forward target, the two lighting buffers). Not known before, the plugin made none of
+// its classes under it, and WoW's pixels were classed by a frame long gone (2026-11-12, every video option).
+#define FOG_FS_NOSSS 0xc05e629d82e8426aull
+static int composite_fs(uint64_t k) { return k == FOG_FS || k == FOG_FS_NOSSS; }
 #define BARE_FS 0x11129c8f138629e1ull  // BG3's last pass on its lighting buffer (second skin-diffusion pass), which renders into it
 #define TAA_FS 0x415d66f480407a17ull  // BG3's TAA resolve (wdpost)
 #define CLD_FS 0x2ae2e7a50880c0bbull  // BG3's clouds, composited into its forward target after the sky pass
@@ -532,7 +573,8 @@ static int fog_make(DeviceData* d) {
 
 // The S/T image (RGBA16F at the target's size: BG3's in-scatter, its transmittance) and the fog pass that writes it.
 static int fog_st(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {
-    if (g_fog.st.img) return g_fog.stw == w && g_fog.sth == h;
+    if (g_fog.st.img && g_fog.stw == w && g_fog.sth == h) return 1;
+    if (g_fog.st.img) { fb_retire(&g_fog.st); g_fog.stfail = 0; }  // BG3's scene changed size (bl_imgs)
     if (g_fog.stfail) return 0;
     g_fog.stfail = 1;
     if (!sf_img_make(d, &g_fog.st, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
@@ -780,7 +822,16 @@ static struct {
     uint64_t cmp_img, cmp_at, mask_at;  // the composite's image, the present at which its effects pass was last copied before and after, and of the last mask
 } g_blm;
 static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {
-    if (g_blm.wfed.img) return g_blm.w == w && g_blm.h == h;
+    if (g_blm.wfed.img && g_blm.w == w && g_blm.h == h) return 1;
+    if (g_blm.wfed.img) {
+        // BG3's scene changed size (the resolution, or upscaling: FSR renders the scene smaller than the screen). The images
+        // a pixel of the scene are made again at the new size; until then every feed was refused and the scene kept BG3's
+        // placeholder (with FSR 1.0 a black figure, WoW's colours a frame behind).
+        logf_("wdbloom: BG3's scene is %ux%u now (was %ux%u): the plugin's images a pixel made again", w, h, g_blm.w, g_blm.h);
+        SfImg* old[6] = {&g_blm.wfed, &g_blm.nob, &g_blm.wdsp, &g_blm.cmp0, &g_blm.cmp1, &g_blm.late};
+        for (int i = 0; i < 6; i++) fb_retire(old[i]);
+        g_blm.fail = 0; g_blm.cmp_img = 0;
+    }
     if (g_blm.fail) return 0;
     g_blm.fail = 1;
     if (!sf_img_make(d, &g_blm.wfed, VK_FORMAT_R32G32B32A32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
@@ -1038,14 +1089,17 @@ static struct {
     struct { uint64_t img; SfImg s; uint32_t w, h; int init; uint64_t at; } sn[2];  // per fed image (the feed runs on each full-size target BG3 clears with depth)
     uint64_t fwd_img;  // the image the composite reads as its forward target
     uint64_t alb, surf, fwd; int32_t lalb, lsurf, lfwd;  // BG3's own views of its albedo, surface and forward target, newest
-    int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe; VkSampler smp;
+    int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe, pipe_mask; VkSampler smp;
     VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring;
-    struct { uint64_t img; VkImageView view; VkFramebuffer fb; } t[4];
-    uint64_t passes, refused, snaps, nocomp, noalb;
+    struct { uint64_t img; VkImageView view; VkFramebuffer fb; } t[8];
+    uint64_t passes, refused, snaps, nocomp, noalb, fins;
 } g_pst;
 static __thread struct { uint64_t out, in; int32_t lout, lin; } t_pst;
 // BG3's overlay passes between its TAA and its display transform, there only while something is aimed or highlighted:
 // each reads the scene and writes it again with its overlay (an ability's area on the ground, an outline).
+// BG3's exposure pass (the meter's EV applied to this frame's composite, after its effects passes): there under every
+// anti-aliasing mode. wdpost's classes are made at its end (fb_post_fin); TAA, where it runs, comes after it.
+#define EXP_FS 0xe7a0be45256eff51ull  // t_pfin_*: wowbg3_surf.inc.c
 #define OVL_FS_A 0xf9ac3c52a928d4f4ull
 #define OVL_FS_B 0x4571b5640092d8cbull
 static __thread uint64_t t_ovl_in, t_ovl_out; static __thread int32_t t_ovl_lin, t_ovl_lout;
@@ -1064,9 +1118,11 @@ static void post_watch(VkCommandBuffer cb, Recipe* r) {
                 if (im && im == g_gb_surf) { g_pst.surf = si->slot[b].res; g_pst.lsurf = si->slot[b].layout; }
             }
         }
-    } else if (key == FOG_FS) {
+    } else if (composite_fs(key)) {
         SetInfo* s1 = set_find(t_set[1]);
         if (s1 && s1->slot[1].res) { g_pst.fwd = s1->slot[1].res; g_pst.lfwd = s1->slot[1].layout; g_pst.fwd_img = view_image(s1->slot[1].res); }
+    } else if (key == EXP_FS) {
+        t_pfin_cb = cb; t_pfin_img = t_pass_img0; t_pfin_lay = t_pass_fin0;
     } else if (key == OVL_FS_A || key == OVL_FS_B) {
         // One of BG3's overlay passes: its scene input (the bound image of the scene's kind and size) and its target.
         t_ovl_cb = VK_NULL_HANDLE;
@@ -1128,6 +1184,9 @@ static int post_make(DeviceData* d) {
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_pst.layout, g_fbg.rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_pst.pipe) != VK_SUCCESS) return 0;
+    // The same pass writing no colour: the classes alone, at the end of BG3's exposure pass (fb_post_fin).
+    cbs1.colorWriteMask = 0;
+    if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_pst.pipe_mask) != VK_SUCCESS) return 0;
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * FOG_SETS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, FOG_SETS, 2, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_pst.pool) != VK_SUCCESS) return 0;
@@ -1139,37 +1198,46 @@ static int post_make(DeviceData* d) {
     logf_("wdpost: ready");
     return 1;
 }
-static void fb_post_l(DeviceData* d, VkCommandBuffer cb);
+static void fb_post_run(DeviceData* d, VkCommandBuffer cb, uint64_t out, int32_t lout, uint64_t in, int32_t lin, int fin);
+// At the end of BG3's TAA pass: TAA's input over its output at WoW's pixels, and the classes.
 static void fb_post(DeviceData* d, VkCommandBuffer cb) {
     if (!g_cc.wdpost || !g_fbg.ready || !post_make(d)) return;
-    pthread_mutex_lock(&g_fbt_m); fb_post_l(d, cb); pthread_mutex_unlock(&g_fbt_m);
+    pthread_mutex_lock(&g_fbt_m); fb_post_run(d, cb, t_pst.out, t_pst.lout, t_pst.in, t_pst.lin, 0); pthread_mutex_unlock(&g_fbt_m);
 }
-static void fb_post_l(DeviceData* d, VkCommandBuffer cb) {
-    ImgInfo* ii = TABLE_FIND(g_img, IMG_CAP, t_pst.out, 0);
+// At the end of BG3's exposure pass, under every anti-aliasing mode: the classes alone (no colour written), so wdpostcas
+// has them whether or not a TAA pass follows (with Anti-Aliasing on None or SMAA there is none, and the classes were
+// never made: every WoW pixel showed BG3's display transform of the fed value). With TAA the TAA's own run makes the
+// same classes again from these (wowbg3_post.frag is the same on a second run).
+static void fb_post_fin(DeviceData* d, VkCommandBuffer cb) {
+    if (!g_cc.wdpost || !g_fbg.ready || !g_blm.wfed.view || !post_make(d)) return;
+    pthread_mutex_lock(&g_fbt_m); fb_post_run(d, cb, t_pfin_img, t_pfin_lay, (uint64_t)g_blm.wfed.view, VK_IMAGE_LAYOUT_GENERAL, 1); pthread_mutex_unlock(&g_fbt_m);
+}
+static void fb_post_run(DeviceData* d, VkCommandBuffer cb, uint64_t out, int32_t lout, uint64_t in, int32_t lin, int fin) {
+    ImgInfo* ii = TABLE_FIND(g_img, IMG_CAP, out, 0);
     // patch46: the pure-WoW mask wdbloom's pass made at this frame's composite (same size as the TAA output)
-    if (!g_blm.ready || !g_blm.nob.img || !ii || t_pst.lout < 0 || !t_pst.in || ii->w != g_blm.w || ii->hgt != g_blm.h) {
+    if (!g_blm.ready || !g_blm.nob.img || !ii || lout < 0 || !in || ii->w != g_blm.w || ii->hgt != g_blm.h || ii->fmt != VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
         if (g_pst.refused++ % 600 == 0) logf_("wdpost: refused %llu (mask %d target %d input %d, mask %ux%u)", (unsigned long long)g_pst.refused,
-            g_blm.nob.img != VK_NULL_HANDLE, ii != NULL, t_pst.in != 0, g_blm.w, g_blm.h);
+            g_blm.nob.img != VK_NULL_HANDLE, ii != NULL, in != 0, g_blm.w, g_blm.h);
         return;
     }
     int slot = -1;
-    for (int i = 0; i < 4 && slot < 0; i++) if (g_pst.t[i].img == t_pst.out) slot = i;
+    for (int i = 0; i < 8 && slot < 0; i++) if (g_pst.t[i].img == out) slot = i;
     if (slot < 0) {
-        for (int i = 0; i < 4 && slot < 0; i++) if (!g_pst.t[i].img) slot = i;
+        for (int i = 0; i < 8 && slot < 0; i++) if (!g_pst.t[i].img) slot = i;
         if (slot < 0) { g_pst.refused++; return; }
-        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, (VkImage)t_pst.out, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+        VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, (VkImage)out, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B10G11R11_UFLOAT_PACK32,
             {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         if (d->CreateImageView(d->device, &vci, NULL, &g_pst.t[slot].view) != VK_SUCCESS) return;
         VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_fbg.rp, 1, &g_pst.t[slot].view, ii->w, ii->hgt, 1};
         if (d->CreateFramebuffer(d->device, &fci, NULL, &g_pst.t[slot].fb) != VK_SUCCESS) return;
-        g_pst.t[slot].img = t_pst.out;
-        logf_("wdpost: TAA output %llx %ux%u layout %d, input view %llx layout %d, forward view %llx (image %llx) layout %d, albedo %d, surface %d", (unsigned long long)t_pst.out, ii->w, ii->hgt, (int)t_pst.lout,
-              (unsigned long long)t_pst.in, (int)t_pst.lin, (unsigned long long)g_pst.fwd, (unsigned long long)g_pst.fwd_img, (int)g_pst.lfwd, (int)g_pst.lalb, (int)g_pst.lsurf);
+        g_pst.t[slot].img = out;
+        logf_("wdpost: %s %llx %ux%u layout %d, input view %llx layout %d, forward view %llx (image %llx) layout %d, albedo %d, surface %d", fin ? "the exposure pass's output (classes alone)" : "TAA output", (unsigned long long)out, ii->w, ii->hgt, (int)lout,
+              (unsigned long long)in, (int)lin, (unsigned long long)g_pst.fwd, (unsigned long long)g_pst.fwd_img, (int)g_pst.lfwd, (int)g_pst.lalb, (int)g_pst.lsurf);
     }
     VkDescriptorSet set = g_pst.set[g_pst.ring++ % FOG_SETS];
     VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL};  // patch46: binding 0 is the mask, 5 TAA's input; 1-4 unused
     VkDescriptorImageInfo im[5];
-    for (int j = 0; j < 5; j++) im[j] = (VkDescriptorImageInfo){g_pst.smp, (VkImageView)t_pst.in, (VkImageLayout)t_pst.lin};
+    for (int j = 0; j < 5; j++) im[j] = (VkDescriptorImageInfo){g_pst.smp, (VkImageView)in, (VkImageLayout)lin};
     im[0] = (VkDescriptorImageInfo){g_pst.smp, g_blm.wfed.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 1: what the feed wrote
     if (g_pst.fwd) im[1] = (VkDescriptorImageInfo){g_pst.smp, (VkImageView)g_pst.fwd, (VkImageLayout)g_pst.lfwd};  // binding 2: BG3's forward target after its effects pass
     sf_barrier(d, cb, g_blm.wfed.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -1188,12 +1256,12 @@ static void fb_post_l(DeviceData* d, VkCommandBuffer cb) {
     for (uint32_t k = 0; k < 5; k++) wr[1 + k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1 + k, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &im[k], NULL, NULL};
     wr[6] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL};
     d->UpdateDescriptorSets(d->device, 7, wr, 0, NULL);
-    VkImageLayout lay = (VkImageLayout)t_pst.lout;
-    sf_barrier(d, cb, (VkImage)t_pst.out, lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+    VkImageLayout lay = (VkImageLayout)lout;
+    sf_barrier(d, cb, (VkImage)out, lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, g_fbg.rp, g_pst.t[slot].fb, {{0, 0}, {ii->w, ii->hgt}}, 0, NULL};
     d->CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pst.pipe);
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fin ? g_pst.pipe_mask : g_pst.pipe);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pst.layout, 0, 1, &set, 0, NULL);
     { uint32_t dbg = (g_cc.wdpostdbg ? 1u : 0u) | (g_cc.wdtable || !g_pst.fwd ? 2u : 0u) | (cmp_ok ? 4u : 0u); d->CmdPushConstants(cb, g_pst.layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &dbg); }
     VkViewport vp = {0, 0, (float)ii->w, (float)ii->hgt, 0, 1};
@@ -1214,9 +1282,10 @@ static void fb_post_l(DeviceData* d, VkCommandBuffer cb) {
         if (t_vs_have & 1) d->CmdSetViewport(cb, 0, 1, &t_vs_vp);
         if (t_vs_have & 2) d->CmdSetScissor(cb, 0, 1, &t_vs_sc);
     }
-    sf_barrier(d, cb, (VkImage)t_pst.out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, lay, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    sf_barrier(d, cb, (VkImage)out, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, lay, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-    if (g_pst.passes++ % 600 == 0) logf_("wdpost: %llu passes, %llu refused (on wdbloom's mask)", (unsigned long long)g_pst.passes, (unsigned long long)g_pst.refused);
+    if (fin) { if (g_pst.fins++ % 600 == 0) logf_("wdpost: %llu class passes at BG3's exposure pass", (unsigned long long)g_pst.fins); }
+    else if (g_pst.passes++ % 600 == 0) logf_("wdpost: %llu passes, %llu refused (on wdbloom's mask)", (unsigned long long)g_pst.passes, (unsigned long long)g_pst.refused);
 }
 
 // wdpost, the overlay passes: after one of them, what it changed at a pure pixel joins what BG3's effects pass drew there
@@ -1327,7 +1396,7 @@ static void late_fold(DeviceData* d, VkCommandBuffer cb) {
 }
 // patch46: BG3 destroyed img (g_fbt_m held): wdpost's view of it and wdbloom's.
 static void post_forget_image(DeviceData* d, uint64_t img) {
-    for (int i = 0; i < 4; i++) if (g_pst.t[i].img == img) {
+    for (int i = 0; i < 8; i++) if (g_pst.t[i].img == img) {
         if (g_pst.t[i].fb && d->DestroyFramebuffer) d->DestroyFramebuffer(d->device, g_pst.t[i].fb, NULL);
         if (g_pst.t[i].view && d->DestroyImageView) d->DestroyImageView(d->device, g_pst.t[i].view, NULL);
         g_pst.t[i].img = 0; g_pst.t[i].view = VK_NULL_HANDLE; g_pst.t[i].fb = VK_NULL_HANDLE;
@@ -1344,10 +1413,14 @@ static void post_forget_image(DeviceData* d, uint64_t img) {
         logf_("wdbloom: BG3 destroyed its image %llx: our view of it forgotten", (unsigned long long)img);
     }
 }
-// wdpostcas (patch 32): after BG3's CAS (compute e2ffaef8), its input over its output at wdpost's pixels.
+// wdpostcas (patch 32): after BG3's CAS (compute e2ffaef8), its input over its output at the pixels that show WoW's own colour
+// (wowbg3_postcas.comp mode 1; the colours themselves were put on its input right after the display transform, post_dt).
 #define CAS_CS 0xe2ffaef855eba087ull
 static struct { int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe; VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring;
-                uint64_t runs, refused; } g_pcas;
+                uint64_t runs, refused, dts, dtrefused; SfImg dtc; uint32_t dtw, dth; int dtfail; VkSampler lsmp; } g_pcas;
+// BG3's display transform: a compute pass from its HDR scene to the A2B10G10R10 image the UI is put over, there under
+// every video option. With FidelityFX Sharpening on, BG3's CAS (CAS_CS) reads that image and writes another.
+#define DT_CS 0x35d9685ac5afcece
 static int pcas_make(DeviceData* d) {
     if (g_pcas.ready) return 1;
     if (g_pcas.failed) return 0;
@@ -1357,7 +1430,10 @@ static int pcas_make(DeviceData* d) {
     b[6] = (VkDescriptorSetLayoutBinding){6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 7, b};
     if (d->CreateDescriptorSetLayout(d->device, &dci, NULL, &g_pcas.dsl) != VK_SUCCESS) return 0;
-    VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};  // wdpcdbg
+    VkSamplerCreateInfo lsi = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0, VK_FALSE, 1, VK_FALSE, VK_COMPARE_OP_ALWAYS, 0, 0, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE};
+    if (d->CreateSampler(d->device, &lsi, NULL, &g_pcas.lsmp) != VK_SUCCESS) return 0;  // WoW's colour between the scene's pixels (upscaling)
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};  // wdpcdbg, and the mode (wowbg3_postcas.comp)
     VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_pcas.dsl, 1, &pcr};
     if (d->CreatePipelineLayout(d->device, &lci, NULL, &g_pcas.layout) != VK_SUCCESS) return 0;
     VkShaderModule m; VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_postcas_comp, wowbg3_postcas_comp};
@@ -1395,7 +1471,7 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
     }
     uint64_t oimg = view_image(si->slot[2].res);
     ImgInfo* ii = oimg ? TABLE_FIND(g_img, IMG_CAP, oimg, 0) : NULL;
-    if (!ii || ii->w != g_blm.w || ii->hgt != g_blm.h) { g_pcas.refused++; return; }
+    if (!ii || ii->w < g_blm.w || ii->hgt < g_blm.h) { g_pcas.refused++; return; }  // the screen's size: the scene's or larger
     if (g_pcas.runs == 0) logf_("wdpostcas: CAS input view %llx layout %d, output view %llx (image %llx f%d %ux%u) layout %d", (unsigned long long)si->slot[1].res, (int)si->slot[1].layout,
         (unsigned long long)si->slot[2].res, (unsigned long long)oimg, (int)ii->fmt, ii->w, ii->hgt, (int)si->slot[2].layout);
     VkDescriptorSet set = g_pcas.set[g_pcas.ring++ % FOG_SETS];
@@ -1403,6 +1479,7 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
     VkDescriptorImageInfo im[5];
     for (int j = 0; j < 5; j++) im[j] = (VkDescriptorImageInfo){g_pst.smp, (VkImageView)si->slot[1].res, (VkImageLayout)si->slot[1].layout};
     im[0] = (VkDescriptorImageInfo){g_pst.smp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 1: WoW's own colour per pixel
+    im[1] = (VkDescriptorImageInfo){g_pcas.lsmp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 2: the same, filtered
     im[2] = (VkDescriptorImageInfo){g_pst.smp, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 3: what BG3 drew over a pure pixel after its composite
     VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, (VkImageView)si->slot[2].res, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr[7] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL}};
@@ -1413,7 +1490,7 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pcas.pipe);
     d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pcas.layout, 0, 1, &set, 0, NULL);
-    { uint32_t dbg = g_cc.wdpcdbg ? 1u : 0u; d->CmdPushConstants(cb, g_pcas.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &dbg); }
+    { uint32_t pcv[2] = {g_cc.wdpcdbg ? 1u : 0u, 1u}; d->CmdPushConstants(cb, g_pcas.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pcv); }  // mode 1: CAS's input back over WoW's pixels
     d->CmdDispatch(cb, (ii->w + 7) / 8, (ii->hgt + 7) / 8, 1);
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
@@ -1422,6 +1499,71 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
     for (uint32_t s = 0; s < 8; s++)
         if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
     if (g_pcas.runs++ % 600 == 0) logf_("wdpostcas: %llu runs, %llu refused", (unsigned long long)g_pcas.runs, (unsigned long long)g_pcas.refused);
+}
+// Right after BG3's display transform (DT_CS), whatever follows: WoW's own colour over its output at WoW's pixels, with
+// what BG3 drew over them, WoW's fog on BG3's pixels and the figures' edges (wowbg3_postcas.comp, mode 0). Its output is
+// the storage image of A2B10G10R10 at the scene's size it binds; a copy of it is the shader's input, as CAS's input was.
+// This used to run only after BG3's CAS, so with FidelityFX Sharpening off it never ran.
+static void post_dt_l(DeviceData* d, VkCommandBuffer cb);
+static void post_dt(DeviceData* d, VkCommandBuffer cb) {
+    if (t_cbind_cb != cb || !t_cpipe || !g_cpipe) return;
+    CPipeInfo* p = TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0);
+    if (!p || p->spv != DT_CS) return;
+    if (!g_cc.wdpost || g_cc.wdpostdbg || !g_fbg.ready || !pcas_make(d) || !g_pst.ready) return;
+    pthread_mutex_lock(&g_fbt_m); post_dt_l(d, cb); pthread_mutex_unlock(&g_fbt_m);
+}
+static void post_dt_l(DeviceData* d, VkCommandBuffer cb) {
+    uint64_t outv = 0; ImgInfo* oi = NULL;
+    for (uint32_t s = 0; s < 8 && !outv; s++) {
+        SetInfo* si = t_cset[s] ? set_find(t_cset[s]) : NULL;
+        for (uint32_t b = 0; si && b < DESC_SLOTS && !outv; b++) {
+            if (si->slot[b].type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !si->slot[b].res) continue;
+            uint64_t im = view_image(si->slot[b].res);
+            ImgInfo* ii = im ? TABLE_FIND(g_img, IMG_CAP, im, 0) : NULL;
+            // At the screen's size, which is the scene's or, with upscaling, larger (wowbg3_postcas.comp maps between them).
+            if (ii && ii->fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && ii->w >= g_blm.w && ii->hgt >= g_blm.h) { outv = si->slot[b].res; oi = ii; }
+        }
+    }
+    if (!outv || !g_blm.ready || !g_blm.nob.img || !t_clayout) {
+        if (g_pcas.dtrefused++ % 600 == 0) logf_("wdpostcas: the display transform's output not found or the mask not ready (%llu times; output %d mask %d)", (unsigned long long)g_pcas.dtrefused, outv != 0, g_blm.nob.img != VK_NULL_HANDLE);
+        return;
+    }
+    if (!g_pcas.dtc.img || g_pcas.dtw != oi->w || g_pcas.dth != oi->hgt) {
+        if (g_pcas.dtfail) return;
+        if (g_pcas.dtc.img) fb_retire(&g_pcas.dtc);
+        if (!sf_img_make(d, &g_pcas.dtc, VK_FORMAT_A2B10G10R10_UNORM_PACK32, oi->w, oi->hgt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { g_pcas.dtfail = 1; logf_("wdpostcas: no copy image for the display transform's output"); return; }
+        g_pcas.dtw = oi->w; g_pcas.dth = oi->hgt;
+        logf_("wdpostcas: after BG3's display transform, on its output %llx (image %llx, %ux%u)", (unsigned long long)outv, (unsigned long long)oi->h, oi->w, oi->hgt);
+    }
+    // The transform wrote its output as a storage image (layout GENERAL): its writes, then the copy.
+    VkMemoryBarrier mb0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb0, 0, NULL, 0, NULL);
+    sf_copy(d, cb, (VkImage)oi->h, VK_IMAGE_LAYOUT_GENERAL, &g_pcas.dtc, oi->w, oi->hgt);
+    VkDescriptorSet set = g_pcas.set[g_pcas.ring++ % FOG_SETS];
+    VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo im[5];
+    for (int j = 0; j < 5; j++) im[j] = (VkDescriptorImageInfo){g_pst.smp, g_pcas.dtc.view, VK_IMAGE_LAYOUT_GENERAL};
+    im[0] = (VkDescriptorImageInfo){g_pst.smp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
+    im[1] = (VkDescriptorImageInfo){g_pcas.lsmp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
+    im[2] = (VkDescriptorImageInfo){g_pst.smp, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, (VkImageView)outv, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[7] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL}};
+    for (uint32_t j = 0; j < 5; j++) wr[1 + j] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1 + j, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &im[j], NULL, NULL};
+    wr[6] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL};
+    d->UpdateDescriptorSets(d->device, 7, wr, 0, NULL);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pcas.pipe);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_pcas.layout, 0, 1, &set, 0, NULL);
+    { uint32_t pcv[2] = {g_cc.wdpcdbg ? 1u : 0u, 0u}; d->CmdPushConstants(cb, g_pcas.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pcv); }
+    d->CmdDispatch(cb, (oi->w + 7) / 8, (oi->hgt + 7) / 8, 1);
+    VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
+    // BG3's compute state as it was.
+    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
+    for (uint32_t s = 0; s < 8; s++)
+        if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+    if (g_pcas.dts++ % 600 == 0) logf_("wdpostcas: %llu runs after BG3's display transform, %llu refused", (unsigned long long)g_pcas.dts, (unsigned long long)g_pcas.dtrefused);
 }
 // Dynamic offset of binding b of set s as BG3 bound it (dynamic offsets go in binding order).
 static uint64_t fog_dyn(const SetInfo* si, uint32_t s, uint32_t b) {
@@ -1437,7 +1579,7 @@ static void fog_draw(VkCommandBuffer cb) {
     RecInfo* ri = TABLE_FIND(g_rec, REC_CAP, t_pipe, 0);
     Recipe* r = ri ? ri->r : NULL;
     int is = 0;
-    for (uint32_t s = 0; r && s < r->nstages; s++) if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) is = r->st[s].key == FOG_FS ? 1 : r->st[s].key == CLD_FS ? 2 : is;
+    for (uint32_t s = 0; r && s < r->nstages; s++) if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) is = composite_fs(r->st[s].key) ? 1 : r->st[s].key == CLD_FS ? 2 : is;
     if (g_cc.wdpost) post_watch(cb, r);
     if (g_cc.wdbare) for (uint32_t s = 0; r && s < r->nstages; s++) if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT && r->st[s].key == BARE_FS) { bare_draw(cb); return; }
     if ((g_cc.wdbloom || g_cc.wdpost) && is == 1) {  // patch28: after the composite, the pure WoW pixels (patch46: also for wdpost)

@@ -329,6 +329,8 @@ static int sf_init(DeviceData* d, VkFormat alb_fmt, int32_t alb_lay) {
     return 1;
 }
 
+static void fb_retire(SfImg* i);  // wowbg3_fxbg.inc.c: freed once the GPU is past it
+static void fb_retire_fb(VkFramebuffer fb, VkImageView view);
 // The compositor's 1x1 stand-ins for frames without surfaces (g_sf.m held). 1: there.
 static int sf_dummies(DeviceData* d) {
     if (g_sf.dummy[3].view) return 1;
@@ -346,10 +348,9 @@ static int sf_dummies(DeviceData* d) {
 // The slot's images at this size (g_sf.m held; a resize leaks the old ones to in-flight work).
 static int sf_slot_images(DeviceData* d, SfSlot* s, uint32_t w, uint32_t h) {
     if (s->z.img && s->w == w && s->hgt == h) return 1;
-    if (s->z.img) {  // a resize: everything that used them is long done by the time BG3 resizes
-        sf_img_free(d, &s->z); sf_img_free(d, &s->a0);
-        if (s->fb && d->DestroyFramebuffer) d->DestroyFramebuffer(d->device, s->fb, NULL);
-        if (s->alb_view && d->DestroyImageView) d->DestroyImageView(d->device, s->alb_view, NULL);
+    if (s->z.img) {  // a resize (BG3's scene changed size: upscaling on or off, a resolution): retired, freed once the GPU is past them
+        fb_retire(&s->z); fb_retire(&s->a0);
+        fb_retire_fb(s->fb, s->alb_view);
         s->fb = VK_NULL_HANDLE; s->alb_view = VK_NULL_HANDLE; s->fb_img = 0;
     }
     const VkImageUsageFlags st = VK_IMAGE_USAGE_STORAGE_BIT;
@@ -366,7 +367,9 @@ static int sf_slot_images(DeviceData* d, SfSlot* s, uint32_t w, uint32_t h) {
 // A copy slot's images at this size (g_sf.m held).
 static int sf_copy_images(DeviceData* d, SfCopy* c, uint32_t w, uint32_t h) {
     if (c->a1.img && c->w == w && c->hgt == h) return 1;
-    sf_img_free(d, &c->a1); sf_img_free(d, &c->h);
+    // A new size (BG3's scene changed size: a resolution, upscaling on or off): the old images may still be in command
+    // buffers BG3 has not finished, so they are retired, not freed here.
+    fb_retire(&c->a1); fb_retire(&c->h);
     const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!sf_img_make(d, &c->a1, VK_FORMAT_R8G8B8A8_UNORM, w, h, u) || !sf_img_make(d, &c->h, VK_FORMAT_R32_UINT, w, h, u)) {
         sf_img_free(d, &c->a1); sf_img_free(d, &c->h);
@@ -585,6 +588,8 @@ static __thread VkCommandBuffer t_pass_cb, t_fog_cb, t_cld_cb;  // wdfog: the fu
 static __thread uint64_t t_pass_imgs[8]; static __thread int32_t t_pass_fins[8];
 static void fb_bare(DeviceData* d, VkCommandBuffer cb);
 static void fb_post(DeviceData* d, VkCommandBuffer cb);
+static void fb_post_fin(DeviceData* d, VkCommandBuffer cb);  // wdpost's classes at BG3's exposure pass
+static __thread VkCommandBuffer t_pfin_cb; static __thread uint64_t t_pfin_img; static __thread int32_t t_pfin_lay;
 static __thread VkCommandBuffer t_post_cb;
 static void fb_bmask(DeviceData* d, VkCommandBuffer cb);
 static void fb_bcut(DeviceData* d, VkCommandBuffer cb);
@@ -619,7 +624,7 @@ static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs
             if (imgs[k] == g_role.depth || !imgs[k]) continue;
             colors++;
             ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
-            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh && load[k] == VK_ATTACHMENT_LOAD_OP_CLEAR) at = (int)k;
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == SCENE_W && i->hgt == SCENE_H && load[k] == VK_ATTACHMENT_LOAD_OP_CLEAR) at = (int)k;
         }
         if (colors == 1 && at >= 0) { t_fbg_cb = cb; t_fbg_img = imgs[at]; t_fbg_lay = fin[at]; }
     }
@@ -629,7 +634,7 @@ static void surf_pass_begin(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs
             if (imgs[k] == g_role.depth || !imgs[k]) continue;
             colors++;
             ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, imgs[k], 0);
-            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == SCENE_W && i->hgt == SCENE_H
                 && load[k] == VK_ATTACHMENT_LOAD_OP_LOAD && ini[k] > 0)
                 at = (int)k;
         }
@@ -678,6 +683,7 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     if (t_fog_cb == cb) { t_fog_cb = VK_NULL_HANDLE; fb_fog(d, cb); }
     if (t_cld_cb == cb) { t_cld_cb = VK_NULL_HANDLE; fb_clr(d, cb); }
     if (t_bare_cb == cb) { t_bare_cb = VK_NULL_HANDLE; fb_bare(d, cb); }
+    if (t_pfin_cb == cb) { t_pfin_cb = VK_NULL_HANDLE; fb_post_fin(d, cb); }
     if (t_post_cb == cb) { t_post_cb = VK_NULL_HANDLE; fb_post(d, cb); }
     if (t_blm_cb == cb) { t_blm_cb = VK_NULL_HANDLE; fb_bmask(d, cb); }
     if (t_blc_cb == cb) { t_blc_cb = VK_NULL_HANDLE; fb_bcut(d, cb); }
@@ -697,7 +703,7 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
             if (t_sf_img[k] == g_role.depth || !t_sf_img[k]) continue;
             colors++;
             ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, t_sf_img[k], 0);
-            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == g_role.ew && i->hgt == g_role.eh) at = (int)k;
+            if (i && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && i->w == SCENE_W && i->hgt == SCENE_H) at = (int)k;
         }
         pthread_mutex_unlock(&g_trace_lock);
         if (colors == 1 && at >= 0) t_sf_fwd = 1;
@@ -712,19 +718,25 @@ static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
     for (uint32_t k = 0; k < t_sf_n && !src; k++) {
         if (t_sf_fwd) {
             ImgInfo* i = TABLE_FIND(g_img, IMG_CAP, t_sf_img[k], 0);
-            if (i && i->fmt == want && i->w == g_role.ew && i->hgt == g_role.eh) { src = (VkImage)t_sf_img[k]; lay = t_sf_fin[k]; }
+            if (i && i->fmt == want && i->w == SCENE_W && i->hgt == SCENE_H) { src = (VkImage)t_sf_img[k]; lay = t_sf_fin[k]; }
         } else if (t_sf_img[k] == g_sf.alb_img) {
             src = (VkImage)t_sf_img[k]; lay = t_sf_fin[k];
         }
     }
     pthread_mutex_unlock(&g_trace_lock);
     if (!src || lay <= 0) return;
+    // The copy is the source image's own size: the scene's size remembered from the last G-buffer pass can be another
+    // while BG3 rebuilds its targets at a new size, and a copy past the image's edge lost the GPU (a crash in BG3 when
+    // FSR 2.2 was switched off, 2026-11-12).
+    uint32_t w = 0, h = 0;
+    pthread_mutex_lock(&g_trace_lock);
+    { ImgInfo* si = TABLE_FIND(g_img, IMG_CAP, (uint64_t)src, 0); if (si) { w = si->w; h = si->hgt; } }
+    pthread_mutex_unlock(&g_trace_lock);
     pthread_mutex_lock(&g_sf.m);
     // the copy slot of the present count this frame is recorded at (its frame: surf_submit_cb)
     const uint64_t key = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     const int ci = (int)(key % SF_COPIES);
     SfCopy* c = &g_sf.c[ci];
-    uint32_t w = g_role.ew, h = g_role.eh;
     if (!g_sf.d || !w || !sf_copy_images(g_sf.d, c, w, h)) { pthread_mutex_unlock(&g_sf.m); return; }
     if (c->key != key) { c->key = key; c->dec_serial = c->fwd_serial = 0; }
     SfImg* dst = t_sf_fwd ? &c->h : &c->a1;
@@ -757,7 +769,8 @@ static void sf_scene_copy(VkCommandBuffer cb, uint64_t img, int32_t lay) {
     const uint64_t key = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     const int ci = (int)(key % SF_COPIES);
     SfCopy* c = &g_sf.c[ci];
-    uint32_t w = g_role.ew, h = g_role.eh;
+    uint32_t w = 0, h = 0;  // the source image's own size (surf_pass_end)
+    { ImgInfo* si = g_img ? TABLE_FIND(g_img, IMG_CAP, img, 0) : NULL; if (si) { w = si->w; h = si->hgt; } }
     if (!g_sf.d || !w || !sf_copy_images(g_sf.d, c, w, h)) { pthread_mutex_unlock(&g_sf.m); return; }
     if (c->key != key) { c->key = key; c->dec_serial = c->fwd_serial = 0; }
     g_sf.copies[g_sf.copies_next % 32].cb = (uint64_t)(uintptr_t)cb;

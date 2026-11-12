@@ -1,4 +1,7 @@
-// WOW-BG3 capture layer (wdpostcas, wowbg3_fxbg.inc.c): after BG3's CAS sharpening, where the pixel is pure WoW ground
+// WOW-BG3 capture layer (wdpostcas, wowbg3_fxbg.inc.c): mode 0 right after BG3's display transform (compute 35d9685a, there
+// under every video option; cin is a copy of its output, cout the output), mode 1 after BG3's CAS when it runs (below).
+// It used to run only after BG3's CAS sharpening, so with FidelityFX Sharpening off WoW's own colours never came back.
+// Where the pixel is pure WoW ground
 // (patch46: wdbloom's mask from the composite, as wdpost) and BG3 drew nothing over it after the feed (the mask says 2,
 // wowbg3_post.frag), WoW's own displayed colour of that pixel over CAS's output.
 // BG3's display transform takes a bright saturated colour towards white, so no value fed before it comes out as WoW's
@@ -8,17 +11,41 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;
 layout(set = 0, binding = 1) uniform sampler2D wdsp;                    // WoW's own colour per pixel (the feed), a 1 where written
+layout(set = 0, binding = 2) uniform sampler2D wdspl;                   // the same, through a filtering sampler
 layout(set = 0, binding = 3) uniform sampler2D late;                    // BG3's late addition over a pure pixel: its share of BG3's pixel a channel, a 1 (wowbg3_post.frag)
-layout(set = 0, binding = 5) uniform sampler2D cin;                     // CAS's input (the display transform's output)
-layout(rgb10_a2, set = 0, binding = 6) uniform image2D cout;  // CAS's output (read for BG3's own pixels under WoW's fog)
-layout(push_constant) uniform PC { uint dbg; } pc;  // word wdpcdbg: the mask's classes as colours
+layout(set = 0, binding = 5) uniform sampler2D cin;                     // the display transform's output (mode 0: a copy of it; mode 1: CAS's input)
+layout(rgb10_a2, set = 0, binding = 6) uniform image2D cout;  // mode 0: the display transform's output; mode 1: CAS's output
+layout(push_constant) uniform PC { uint dbg; uint mode; } pc;  // dbg: word wdpcdbg, the mask's classes as colours; mode below
+// The scene's pixel under a pixel of the screen: the same one, or with upscaling (FSR renders the scene smaller than the
+// screen and BG3 scales it up before its display transform) the one it was scaled from. nob, wdsp and late are the scene's.
+ivec2 msz, osz;
+ivec2 m(ivec2 p) { return min((p * msz) / osz, msz - 1); }
+// WoW's own colour for a pixel of the screen: the scene's pixel's, filtered between the scene's pixels where they all are
+// WoW's own (alpha 1), so an upscaled WoW ground is not in blocks.
+vec4 wow_at(ivec2 p) {
+    vec4 wn = texelFetch(wdsp, m(p), 0);
+    if (msz == osz || !(wn.a > 0.5 && wn.a < 1.5)) return wn;
+    vec4 wl = textureLod(wdspl, (vec2(p) + 0.5) / vec2(osz), 0.0);
+    return abs(wl.a - 1.0) < 0.002 ? vec4(wl.rgb, 1.0) : wn;
+}
 void main() {
-    ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz;
+    msz = imageSize(nob); osz = imageSize(cout); sz = osz;
     if (q.x >= sz.x || q.y >= sz.y) return;
-    float n = imageLoad(nob, q).r;
-    vec4 w = texelFetch(wdsp, q, 0);
+    float n = imageLoad(nob, m(q)).r;
+    vec4 w = wow_at(q);
+    // Mode 1, after BG3's CAS (FidelityFX Sharpening on): everything below already ran on the display transform's output,
+    // which is CAS's input; CAS sharpened all of it. Where the pixel is WoW's own colour (with what BG3 drew over it)
+    // CAS's input goes back over its output: WoW's picture is not sharpened a second time (CAS over-sharpens it).
+    // BG3's own pixels keep BG3's sharpening.
+    if (pc.mode == 1u) {
+        float v1 = -n - 1.0;
+        bool wow = ((n > 1.5 || (n > 0.35 && n < 0.45)) && w.a > 0.5) || (n < 0.0 && w.a > 0.5 && floor(v1) / 255.0 < 0.98);
+        if (wow || (pc.dbg != 0u && (n > 0.25 || n < 0.0))) imageStore(cout, q, vec4(texelFetch(cin, q, 0).rgb, 1.0));
+        return;
+    }
     if (pc.dbg != 0u) {  // pure and untouched: WoW's colour; pure at the composite only: blue; under an addition: red its share, green its gain
-        vec4 l = texelFetch(late, q, 0);
+        vec4 l = texelFetch(late, m(q), 0);
         if ((n > 1.5 || (n > 0.35 && n < 0.45)) && l.a > 0.5) imageStore(cout, q, vec4(1.0, 0.0, 1.0, 1.0));
         else if (n > 1.5) imageStore(cout, q, vec4(w.rgb, 1.0));
         else if (n > 0.5) imageStore(cout, q, vec4(0.0, 0.0, 1.0, 1.0));
@@ -44,14 +71,14 @@ void main() {
         vec3 pg = vec3(0.0), wg = vec3(0.0); vec2 dir = vec2(0.0); float k = 0.0;
         for (int i = 0; i < 4; i++) {
             ivec2 r = clamp(q + D[i], ivec2(0), sz - 1);
-            vec4 wr = texelFetch(wdsp, r, 0);
-            float nr = imageLoad(nob, r).r;
+            vec4 wr = wow_at(r);
+            float nr = imageLoad(nob, m(r)).r;
             if ((nr > 1.5 || (nr > 0.35 && nr < 0.45)) && wr.a > 0.5 && wr.a < 1.5) { pg += texelFetch(cin, r, 0).rgb; wg += wr.rgb; dir += vec2(D[i]); k += 1.0; }
         }
         if (k > 0.5 && k < 3.5) {
             pg /= k; wg /= k;
             ivec2 in2 = clamp(q - ivec2(round(normalize(dir + vec2(1e-4)) * 2.0)), ivec2(0), sz - 1);
-            float ni = imageLoad(nob, in2).r;
+            float ni = imageLoad(nob, m(in2)).r;
             if (!(ni > 0.25) && !(ni < 0.0)) {
                 vec3 fg = texelFetch(cin, in2, 0).rgb - pg, me = texelFetch(cin, q, 0).rgb - pg;
                 float ff = dot(fg, fg);
@@ -67,6 +94,6 @@ void main() {
     if (!((n > 1.5 || early) && w.a > 0.5)) { imageStore(cout, q, c); return; }
     // WoW's own colour, and over it what BG3 drew there after its composite: a glow adds its share of BG3's displayed
     // pixel, smoke takes its part of WoW's colour away.
-    vec4 l = texelFetch(late, q, 0);
+    vec4 l = texelFetch(late, m(q), 0);
     imageStore(cout, q, vec4(l.a > 0.5 ? clamp(mix(w.rgb * (1.0 + l.rgb), w.rgb + c.rgb * l.rgb, step(vec3(0.0), l.rgb)), vec3(0.0), vec3(1.0)) : w.rgb, 1.0));
 }

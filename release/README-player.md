@@ -22,8 +22,6 @@ playing it. Stop right away if you feel unwell.
   to build what the local WoW server needs, on your machine.
 - About 10 GB free disk space for the generated server data.
 - An internet connection for the first start only (a 48 MB download).
-- Two of BG3's video options at their defaults: Anti-Aliasing on TAA and FidelityFX Sharpening on.
-  With either one off, WoW's world shows washed out and wrong in the distance.
 
 Everything else is in this download: the Linux Script Extender (bg3le, with
 WOW-BG3's patches), the local WoW server, the WoW engine (benilla) and the tools.
