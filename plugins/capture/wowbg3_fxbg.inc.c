@@ -179,7 +179,7 @@ static void wlit_put(float* out, int on, int nrm, const float* eye, const float*
             f4[2] = (float)(p[0] * fwd[0] + p[1] * fwd[1] + p[2] * fwd[2]);
             f4[3] = 1.0f;
         }
-        t[0] = 0.0f; t[1] = g_cc.wdzdbg; t[2] = (float)fn; t[3] = 0.0f;
+        t[0] = 0.0f; t[1] = g_cc.wdzdbg; t[2] = (float)fn; t[3] = g_cc.wdfloorout;  // t[3]: the test dial wdfloorout
     }
     // The room's lobes (with the ambient, whatever wdwlit says): toward each light in the camera's view (right, up,
     // forward; BG3's axes are WoW's y, z, -x), then its colour.
@@ -244,6 +244,16 @@ static void wlit_put(float* out, int on, int nrm, const float* eye, const float*
                 k8++;
             }
             out[2] = (float)k8;
+            // Test dial wdbackfill=K: a fill toward the side away from the sun, K of the sun's diffuse, on every pixel of
+            // BG3's (the lobe's fourth number 0), under the outdoor law alone (out[3] stays 0).
+            if (g_cc.wdbackfill > 0.0f && k8 < FB_LOBE) {
+                float* o8 = out + 4 + FB_LIT * 8 + k8 * 8;
+                o8[0] = (float)-(w[0] * right[0] + w[1] * right[1] + w[2] * right[2]);
+                o8[1] = (float)-(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+                o8[2] = (float)-(w[0] * fwd[0] + w[1] * fwd[1] + w[2] * fwd[2]);
+                o8[3] = 0.0f; o8[4] = sun[3] * g_cc.wdbackfill; o8[5] = sun[4] * g_cc.wdbackfill; o8[6] = sun[5] * g_cc.wdbackfill; o8[7] = 0.0f;
+                out[2] = (float)(k8 + 1);
+            }
             { static uint64_t saidl; if (g_cc.wdlog && saidl++ % 1800 == 0) logf_("wdwlit: %d of %d figures in WoW's shade take the sun's share (first level %.2f, in view at %.2f %.2f %.2f m, lobe toward %.2f %.2f %.2f colour %.2f %.2f %.2f; eye %.1f %.1f %.1f, figure %.1f %.1f %.1f)", k8, n, n ? level[0] : 0.0f, out[4 + FB_LIT * 8 + FB_LOBE * 8 + 4], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 5], out[4 + FB_LIT * 8 + FB_LOBE * 8 + 6], out[4 + FB_LIT * 8], out[4 + FB_LIT * 8 + 1], out[4 + FB_LIT * 8 + 2], out[4 + FB_LIT * 8 + 4], out[4 + FB_LIT * 8 + 5], out[4 + FB_LIT * 8 + 6], eye[0], eye[1], eye[2], n ? at[0][0] : 0.0f, n ? at[0][1] : 0.0f, n ? at[0][2] : 0.0f); }
         }
     }

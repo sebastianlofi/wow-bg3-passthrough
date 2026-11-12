@@ -1065,7 +1065,7 @@ typedef struct {
     uint32_t n_solid_only, n_solid_skip;
     int fxhl;      // a figure's hover highlight captured instead of dropped with her (word "fxhl")
     int surf, surfdbg, surfpix;  // BG3's ground surfaces on WoW's ground (wowbg3_surf.inc.c)
-    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd, wdlatelog; float wdexp, wdocc, wdevref, wdshade, wdzdbg; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
+    int wdepth, wdfeed, wdlog, wdlock, wdgcam, wdeyelog, wdfog, wdfogdbg, wdfogst, wdlightlog, wdbare, wdbloomlog, wdbloom, wdjit, wdpost, wdpostcas, wdtable, wdpcdbg, noshade, fbstale, wdtime, wdpostdbg, wdexplog, wdexprd, wdlatelog; float wdexp, wdocc, wdevref, wdshade, wdzdbg, wdfloorout, wdbackfill; uint64_t wdskip; int fxbg, fxcal, fxbgmax, fxbgpass;  // BG3 draws its effects over WoW (wowbg3_fxbg.inc.c)
     float wdamb; int wdwfog, wdwlit;
     int fxdrop, fxkeep, fxbgfwd;  // fx-route prototypes: "fxdrop" capture all but a drop list; "fxkeep" the void drops by distance only
     int surfscene;  // ... their look taken from BG3's lit scene, not its pre-lighting layer (word "surfscene")
@@ -1233,6 +1233,12 @@ static void compose_config(void) {
     { const char* we = strstr(line, "wdexp="); g_cc.wdexp = we ? (float)atof(we + 6) : 0.0f; }
     { const char* wv = strstr(line, "wdevref="); g_cc.wdevref = wv ? strtof(wv + 8, NULL) : 0.0f; }  // patch61
     { const char* wv = strstr(line, "wdshade="); g_cc.wdshade = wv ? strtof(wv + 8, NULL) : 0.0f; }  // a test dial
+    // Test dials for the look of a figure's side turned from the sun where WoW's outdoor law gives it the ambient alone
+    // (a question for the maintainer, 2026-11-12; off unless given): wdfloorout=K a neutral floor of light on BG3's character
+    // pixels under the outdoor law as well (the room law has ROOM_FLOOR); wdbackfill=K a fill from the side away from
+    // the sun, K of the sun's diffuse, through the room lobes' shape (wowbg3_fxbg2.frag).
+    { const char* wv = strstr(line, "wdfloorout="); g_cc.wdfloorout = wv ? strtof(wv + 11, NULL) : 0.0f; }
+    { const char* wv = strstr(line, "wdbackfill="); g_cc.wdbackfill = wv ? strtof(wv + 11, NULL) : 0.0f; }
     { const char* wv = strstr(line, "wdzdbg="); g_cc.wdzdbg = wv ? strtof(wv + 7, NULL) : 0.0f; }  // a test view: BG3's pixels by the eye depth the feed reads for them  // a test dial: the sun's share for a figure in WoW's shade (0: the built-in one)
     { const char* wa = strstr(line, "wdamb="); g_cc.wdamb = wa ? strtof(wa + 6, NULL) : 0.0f; if (!(g_cc.wdamb >= 0.0f && g_cc.wdamb <= 4.0f)) g_cc.wdamb = 0.0f; }  // WoW's ambient on BG3's pixels
     if (g_cc.wdepth) { g_cc.fxbg = 1; g_cc.fxbgpass = 1; g_cc.fxbgfwd = 1; }

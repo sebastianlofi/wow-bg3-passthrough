@@ -234,6 +234,7 @@ void main() {
         if (tb.TAB[LT + 3] > 0.5) lit = night_soft(lit);
         else lit = mix(lit, vec3(dot(lit, vec3(0.299, 0.587, 0.114))), tb.TAB[LX + 4 + 8 * 4]);
         if (tb.TAB[LT + 3] > 0.5) lit = max(lit, vec3(ROOM_FLOOR * shape));
+        else if (tb.TAB[LX + 4 + 8 * 4 + 3] > 0.0) lit = max(lit, vec3(tb.TAB[LX + 4 + 8 * 4 + 3] * shape));  // test dial wdfloorout
         o = vec4(max(inv3(tex * min(lit, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex, 0.0);
         return;
     }
