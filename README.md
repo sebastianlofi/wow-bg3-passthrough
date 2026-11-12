@@ -300,7 +300,8 @@ What works is listed above; this is what does not, or has not been tried:
   the hero, and fights far from the hero.
 - **Zeppelins and boats** do not carry the party: a ship turns as it sails, and BG3's moving platforms never turn
   (also not on a curved path). The guardian at the dock takes the party across. Crossed so far in testing:
-  Menethil Harbor to Auberdine; the other seven routes use the same code.
+  the ship from Menethil Harbor to Auberdine and the zeppelin from Durotar to Tirisfal Glades; the other six routes
+  use the same code.
 - **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
   Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
   says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and
