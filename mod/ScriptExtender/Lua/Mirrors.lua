@@ -720,6 +720,7 @@ function M.Start(runId)
     -- a max (HpInit: ticks after the spawn, HP, max): not at the WoW fraction (HpDue) yet, it is set
     -- again there (HpInit[4] "set again"; not seen in the harness).
     local function healthDue(m)
+        Scaling.Without(m.Uuid) -- again once BG3 has filled the character in (see Scaling.lua)
         local h = hp(m.Uuid)
         if not (h and type(h[2]) == "number" and h[2] > 0) then
             if ticks - m.Born > 90 then m.HpWait, m.HpInit = nil, "no Health after 90 ticks" end

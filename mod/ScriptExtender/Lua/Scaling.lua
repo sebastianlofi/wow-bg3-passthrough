@@ -152,11 +152,16 @@ function M.Fixed()
     local Progression = Ext.Require("Progression.lua")
     return {Cap = Progression.CURVE and Progression.CURVE.Cap or 18, Difficulty = M.Difficulty()}
 end
--- Passives BG3's templates carry that a stand-in is made without. Undead Fortitude (BG3's zombies: at 0 HP a
--- saving throw puts them back to 1) is off for now, by the maintainer's word (2026-11-12): a WoW zombie dies at 0.
+-- What BG3's templates carry that a stand-in is made without. Undead Fortitude (BG3's zombies: at 0 HP a saving
+-- throw puts them back to 1) is off for now, by the maintainer's word (2026-11-12): a WoW zombie dies at 0. BG3 gives
+-- it as the status UNDEAD_FORTITUDE, which carries the passive (measured: RemovePassive alone leaves it; with the
+-- status removed the passive is gone a moment later and stays gone).
+M.WithoutStatuses = {"UNDEAD_FORTITUDE"}
 M.WithoutPassives = {"UndeadFortitude"}
--- Server: takes them off a stand-in just made (Mirrors.lua, StandIns.lua).
+-- Server: takes them off a stand-in. Called when it is made and again when its health is first set, a tick or
+-- more later (Mirrors.lua, StandIns.lua): BG3 may lay a template's statuses on after the character exists.
 function M.Without(uuid)
+    for _, status in ipairs(M.WithoutStatuses) do pcall(Osi.RemoveStatus, uuid, status) end
     for _, passive in ipairs(M.WithoutPassives) do pcall(Osi.RemovePassive, uuid, passive) end
 end
 

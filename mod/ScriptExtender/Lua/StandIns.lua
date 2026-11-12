@@ -571,6 +571,7 @@ function M.Start(runId)
                 return {Event = c.Event}
             elseif c.Action == "Scale" then
                 local uuid = live(c.Target)
+                Ext.Require("Scaling.lua").Without(uuid) -- again once BG3 has filled the character in
                 local h = Ext.Entity.Get(uuid).Health
                 local before = {h.Hp, h.MaxHp}
                 -- A mob that joined a fight with no mirror (LinkLive.lua), with `scaling` on: the rules Mirrors.lua uses.
