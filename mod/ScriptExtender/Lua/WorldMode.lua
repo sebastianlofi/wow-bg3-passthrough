@@ -133,12 +133,15 @@ function M.Start(runId)
     -- spirit companion, a raised dead: eoc::summon::IsSummon whose summoner is a drawn figure; its Owner
     -- is the summon itself for Find Familiar's cat (harness); a playtest report: the pet had no model, as
     -- nothing drew it).
-    local partyAt, partyList = -1000, {}
+    local partyAt, partyList, guide = -1000, {}, nil
     local function figures()
         local hero = Hero.Uuid()
         if not hero then return {} end
         if ticks - partyAt >= 15 then
             partyAt = ticks
+            -- The guardian at a dock (DockGuide.lua): BG3's character as well, so WoW draws it as it draws them.
+            local okG, g = pcall(function() return Ext.Require("DockGuide.lua").Client(runId) end)
+            guide = okG and g or nil
             local pj = readJson("party.json")
             partyList = {}
             if pj and pj.RunId == runId and type(pj.Members) == "table" then
@@ -158,7 +161,10 @@ function M.Start(runId)
                 anchors[#anchors + 1] = {t[1], t[2], t[3]}
             end
         end)
-        for _, u in ipairs(partyList) do
+        local stand = {}
+        for _, u in ipairs(partyList) do stand[#stand + 1] = u end
+        if guide then stand[#stand + 1] = guide end
+        for _, u in ipairs(stand) do
             if u ~= hero and #out < 8 then
                 local ok, p = pcall(function() local t = Ext.Entity.Get(u).Transform.Transform.Translate; return {t[1], t[2], t[3]} end)
                 local near = false

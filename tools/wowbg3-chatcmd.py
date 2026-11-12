@@ -31,6 +31,7 @@ import wowbg3cmd as W  # noqa: E402
 KEEP_LINES = 400
 STALE = 30
 PANEL_EVERY = 60  # s
+DOCKS_EVERY = 2   # s: the docks near WoW's character, for the guardian (a file read once the routes are known)
 
 
 def log(*a):
@@ -114,7 +115,8 @@ def is_move(text):
     return verb == 'tp' or (verb == 'waypoint' and rest[:1] == ['go']) or (verb == 'cross' and rest[:1] != ['list'])
 
 
-def handle(replies, seq, who, text, refused=None):
+def handle(replies, seq, who, text, refused=None, debug=None):
+    """debug: True for a line this helper wrote itself (the guardian's "yes" runs the test command cross)."""
     first = [True]
 
     def out(line, error=False):
@@ -122,7 +124,7 @@ def handle(replies, seq, who, text, refused=None):
             if first[0]:
                 l, first[0] = 'WOW-BG3: ' + l, False
             replies.add(seq, '!' if error else '+', l)
-    ctx = W.Ctx(char=who or None, debug=debug_commands(), out=out, chat=True)
+    ctx = W.Ctx(char=who or None, debug=debug_commands() if debug is None else debug, out=out, chat=True)
     t0 = time.time()
     try:
         lock = LOCKS[kind_of(text)]
@@ -159,6 +161,18 @@ def panel_loop():
             time.sleep(5)
 
 
+def dock_loop():
+    """What the guardian at a dock offers (DockGuide.lua): the crossings from the docks near WoW's character."""
+    ctx = W.Ctx(debug=False, out=lambda *_: None, chat=True)
+    while True:
+        try:
+            with LOCKS['server']:
+                W.dock_panel(ctx)
+            time.sleep(DOCKS_EVERY)
+        except Exception:  # noqa: BLE001  the server or WoW's character not up yet
+            time.sleep(5)
+
+
 def stamp_of(path):
     try:
         st = path.stat()
@@ -183,10 +197,24 @@ def main():
     log('watching %s (test commands %s; server %s)' % (req, 'on' if debug_commands() else 'off',
                                                         os.environ.get('WOW_BG3_SERVER') or 'Docker test server'))
     threading.Thread(target=panel_loop, daemon=True).start()
+    threading.Thread(target=dock_loop, daemon=True).start()
     click = link / 'waypoint-click.json'  # a click in BG3's own panel (Waypoints.lua)
     last_click = stamp_of(click)
+    dock = link / 'dock-click.json'  # "Yes, take me to ..." said to the guardian at a dock (DockGuide.lua)
+    last_dock = stamp_of(dock)
     last = None
     while True:
+        stamp = stamp_of(dock)
+        if stamp and stamp != last_dock:
+            last_dock = stamp
+            try:
+                text = 'cross #%s' % json.loads(dock.read_text())['Key']
+                seq = int(time.time() * 10)
+                log('#%d %r from the guardian' % (seq, text))
+                said = lambda why, s=seq: W.atomic_write(link / 'dock-refused.json', json.dumps({'Seq': s, 'Text': why}))
+                threading.Thread(target=handle, args=(replies, seq, None, text, said, True), daemon=True).start()
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                log('dock click: %s' % e)
         stamp = stamp_of(click)
         if stamp and stamp != last_click:
             last_click = stamp

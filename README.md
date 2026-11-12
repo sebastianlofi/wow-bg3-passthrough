@@ -84,10 +84,12 @@ version is mostly complete.
   stands while a turn is open and moves on the environment's turn, six seconds' worth a round, in WoW's picture
   too; out of turn-based mode it keeps WoW's own timetable. Ridden so far: Undercity's lifts and the Deeprun Tram.
   Zeppelins and boats are not ridden (next point).
-- **Ships and zeppelins.** You cannot ride one: stand at its dock (the pier, or the zeppelin tower's platform) and
-  type `/wowbg3 cross` in WoW's chat, and the party goes to the dock at the vessel's other end, as it goes to a
-  waypoint. Where two vessels stop at one dock, `cross` names both and `cross NAME` takes one; `cross list` shows
-  every route. Not in a fight or at camp.
+- **Ships and zeppelins.** You cannot ride or board one (nothing of a vessel is ground for BG3's characters).
+  Your dream guardian waits at the dock instead: walk onto the pier or the zeppelin tower's platform and it stands
+  there. Talk to it and it asks, in BG3's own dialog, "Travel to <place>?"; "Yes, take me to <place>." moves the
+  party to the dock at the vessel's other end, as a waypoint does, and "Not now." leaves you where you are. It is
+  there whether the vessel is in or not. Where two vessels stop at one harbour, each pier has its own crossing and
+  the guardian stands at the one you are nearest. Not in a fight or at camp.
 - **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
   in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
   it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
@@ -297,7 +299,8 @@ What works is listed above; this is what does not, or has not been tried:
   when your hero travels to the other continent. Still to come: a member on another continent than
   the hero, and fights far from the hero.
 - **Zeppelins and boats** do not carry the party: a ship turns as it sails, and BG3's moving platforms never turn
-  (also not on a curved path). `/wowbg3 cross` at the dock takes the party across.
+  (also not on a curved path). The guardian at the dock takes the party across. Crossed so far in testing:
+  Menethil Harbor to Auberdine; the other seven routes use the same code.
 - **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
   Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
   says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and

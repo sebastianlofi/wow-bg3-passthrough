@@ -148,6 +148,11 @@ def level_files():
     import loca_write
     lsx, texts = loca_write.level_names([json.loads(p.read_text()) for p in sorted((HERE / "levels").glob("*.json"))])
     files.append((f"Mods/{FOLDER}/Localization/Levels.lsf", lsf_write.lsx_to_lsf(lsx.encode("utf-8"))))
+    # The dock guardian's dialog (tools/bg3_dialog.py, DockGuide.lua): the dialog, its bank entry, the flag its
+    # "yes" sets, and its three lines in the same text table.
+    import bg3_dialog
+    files += bg3_dialog.files(FOLDER)
+    texts.update(bg3_dialog.texts())
     files.append((f"Localization/English/{FOLDER}.loca", loca_write.loca(texts)))
     return files
 

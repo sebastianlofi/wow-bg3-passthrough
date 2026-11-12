@@ -26,7 +26,8 @@ TYPES = {'uint8': 1, 'int16': 2, 'uint16': 3, 'int32': 4, 'uint32': 5, 'float': 
          'ivec4': 10, 'fvec2': 11, 'fvec3': 12, 'fvec4': 13, 'mat2x2': 14, 'mat3x3': 15, 'mat3x4': 16, 'mat4x3': 17,
          'mat4x4': 18, 'bool': 19, 'string': 20, 'path': 21, 'FixedString': 22, 'LSString': 23, 'uint64': 24,
          'int64': 26, 'int8': 27, 'TranslatedString': 28, 'guid': 31}
-NUMBERS = {1: '<B', 2: '<h', 3: '<H', 4: '<i', 5: '<I', 6: '<f', 7: '<d', 24: '<Q', 26: '<q', 27: '<b'}
+# 32: BG3's newer 64-bit integer (a dialog bank's _OriginalFileVersion_), given by its number: type="32".
+NUMBERS = {1: '<B', 2: '<h', 3: '<H', 4: '<i', 5: '<I', 6: '<f', 7: '<d', 24: '<Q', 26: '<q', 27: '<b', 32: '<q'}
 VECTORS = {8: (2, 'i'), 9: (3, 'i'), 10: (4, 'i'), 11: (2, 'f'), 12: (3, 'f'), 13: (4, 'f'), 14: (4, 'f'), 15: (9, 'f'),
            16: (12, 'f'), 17: (12, 'f'), 18: (16, 'f')}
 BUCKETS = 0x200

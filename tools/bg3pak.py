@@ -81,10 +81,11 @@ def guid_str(b):
 
 
 class Node:
-    __slots__ = ('name', 'attrs', 'children', 'parent')
+    __slots__ = ('name', 'attrs', 'types', 'children', 'parent')
 
     def __init__(self, name):
-        self.name, self.attrs, self.children, self.parent = name, {}, [], None
+        # types: an attribute's LSF type number by its name (22 FixedString, 23 LSString, 31 guid, ...).
+        self.name, self.attrs, self.types, self.children, self.parent = name, {}, {}, [], None
 
     def find(self, name):
         return [c for c in self.children if c.name == name]
@@ -101,17 +102,10 @@ def read_lsf(data):
     version, engine = struct.unpack_from('<IQ', data, 4)
     o = 16
     if version >= 6:
-        fields = struct.unpack_from('<' + 'I' * 8, data, o)
-        o += 32
-        if version >= 7:
-            # Keys section sizes (LSF v7) come after strings.
-            sizes = list(fields)
-            extra = struct.unpack_from('<II', data, o)
-            o += 8
-            (su, sd, ku, kd, nu, nd, au, ad), (vu, vd) = sizes, extra
-        else:
-            su, sd, nu, nd, au, ad, vu, vd = fields
-            ku = kd = 0
+        # Five pairs of (uncompressed, on disk) sizes: strings, keys, nodes, attributes, values (v6 has the keys'
+        # pair too: BG3's flag files are v6 with it at 0).
+        su, sd, ku, kd, nu, nd, au, ad, vu, vd = struct.unpack_from('<' + 'I' * 10, data, o)
+        o += 40
         cflags, _, _, meta_format = struct.unpack_from('<BBHI', data, o)
         o += 8
     else:
@@ -128,11 +122,12 @@ def read_lsf(data):
             return raw
         return _decompress(raw, method, size, chunked)
 
+    # On disk: strings, nodes, attributes, values, then the keys (the header names the keys' sizes second).
     strings_raw = section(sd, su, False)
-    keys_raw = section(kd, ku, True) if version >= 7 else b''
     nodes_raw = section(nd, nu, True)
     attrs_raw = section(ad, au, True)
     values = section(vd, vu, True)
+    keys_raw = section(kd, ku, True)
     # Strings: hash buckets of (u16 length, bytes).
     names = []
     p = 0
@@ -205,11 +200,13 @@ def read_lsf(data):
             while a >= 0 and a < len(attrs):
                 an, t, ln, nxt, off = attrs[a]
                 out[i].attrs[an] = value(t, ln, off)
+                out[i].types[an] = t
                 a = nxt
     else:
         for an, t, ln, node, off in attrs:
             if 0 <= node < len(out):
                 out[node].attrs[an] = value(t, ln, off)
+                out[node].types[an] = t
     roots = [n for n in out if n.parent is None]
     return roots
 

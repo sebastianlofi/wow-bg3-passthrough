@@ -89,11 +89,15 @@ def test_the_command_is_wired():
     spec = importlib.util.spec_from_file_location('wowbg3cmd', ROOT / 'tools/wowbg3cmd.py')
     w = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(w)
-    assert 'cross' in w.VERBS and 'cross' not in w.TEST_ONLY
+    # A player crosses by the guardian at the dock (DockGuide.lua); the typed command is a test command.
+    assert 'cross' in w.VERBS and 'cross' in w.TEST_ONLY
     assert w.verb_of(['cross']) == ('cross', []) and w.verb_of(['cross', 'list']) == ('cross', ['list'])
-    assert any('/wowbg3 cross' in l for l in w.help_lines(False))
+    assert not any('/wowbg3 cross' in l for l in w.help_lines(False))
+    assert any('/wowbg3 cross' in l for l in w.help_lines(True))
     chat = (ROOT / 'tools/wowbg3-chatcmd.py').read_text()
     assert "verb == 'cross'" in chat
+    # The guardian's "yes" runs it by the crossing's key, with test commands on or off.
+    assert "'cross #%s' % json.loads(dock.read_text())['Key']" in chat and "(replies, seq, None, text, said, True)" in chat
     assert '"wow_docks.py"' in (ROOT / 'release/build-release.py').read_text()
 
 
@@ -133,3 +137,64 @@ def test_a_dock_is_named_by_its_area_and_zone():
         assert w.zone_at(1, 40.0, 0.0) == 'Kalimdor'                   # no map file there
     finally:
         importlib.reload(wow_docks)
+
+
+def test_the_guardians_panel_and_its_yes():
+    """dock-panel.json: the crossings from the docks near WoW's character, each with where to stand at this pier and
+    the far place's name; `cross #KEY` takes exactly that one."""
+    import json
+    spec = importlib.util.spec_from_file_location('wowbg3cmd', ROOT / 'tools/wowbg3cmd.py')
+    w = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(w)
+    link = Path(tempfile.mkdtemp())
+    raw = bytearray(96)
+    struct.pack_into('<3f', raw, 72, -3700.0, -560.0, 6.0)      # at the Wetlands pier
+    struct.pack_into('<I', raw, 84, 0)
+    (link / 'camera.bin').write_bytes(bytes(raw))
+    w.crossings = table
+    w.zone_at = lambda m, x, y: {0: 'Menethil Harbor, Wetlands', 1: 'Auberdine, Darkshore'}[m]
+    stood = []
+    landing = wow_docks.landing
+    wow_docks.landing = lambda m, x, y, z, **k: stood.append((m, x, y)) or (x + 3.0, y + 4.0, z + 6.0)
+    try:
+        ctx = w.Ctx(io=link, link=link, debug=True, out=lambda *_: None)
+        w.dock_panel(ctx)
+        w.dock_panel(ctx)
+        panel = json.loads((link / 'dock-panel.json').read_text())
+        assert panel['Map'] == 0 and len(panel['Docks']) == 1
+        assert len(stood) == 2      # this pier and the far one (for its name), each worked out once
+        d = panel['Docks'][0]
+        assert d['Key'] == '295:1' and d['Name'] == 'Auberdine, Darkshore' and d['Kind'] == 'ship'
+        assert d['Wow'] == [-3706.5, -571.1, 6.0]
+        went = []
+        w.tele = lambda ctx, args, at=None: went.append(at)
+        w.cross(ctx, ['#295:1'])
+        assert went[0][3] == 1 and 'Auberdine' in went[0][4]
+        try:
+            w.cross(ctx, ['#302:1'])
+            raise AssertionError('a vessel that does not stop here took the party')
+        except w.CmdError as e:
+            assert 'does not stop here' in str(e)
+        # Away from every dock the panel is empty: the guardian leaves.
+        struct.pack_into('<3f', raw, 72, -3000.0, -560.0, 6.0)
+        (link / 'camera.bin').write_bytes(bytes(raw))
+        w.dock_panel(ctx)
+        assert json.loads((link / 'dock-panel.json').read_text())['Docks'] == []
+    finally:
+        wow_docks.landing = landing
+
+
+def test_nothing_of_a_vessel_is_ground():
+    """Nobody boards a ship or a zeppelin: BG3's characters stand only on ground the bridge places, and nothing of a
+    vessel is in it. The static ground is the server's maps (terrain, buildings, the piers); the only moving game
+    objects given a floor are lifts (type 11), by the bridge's own query and by the client's patch; a vessel
+    (type 15) is in neither, and no ground is made from a route."""
+    bridge = (ROOT / 'tools/world_bridge.py').read_text()
+    assert 'where t.type = 11;' in bridge and 'type = 15' not in bridge and 'type=15' not in bridge
+    assert 'wow_docks' not in bridge and 'wow_docks' not in (ROOT / 'tools/wow_lifts.py').read_text()
+    patch = (ROOT / 'patches/benilla/0139-wowbg3-lifts-for-bg3.patch').read_text()
+    assert 'let Drive::Lift(l) = &self.drive else {\n+            return None;' in patch
+    assert '`None` for a boat or a zeppelin' in patch
+    # The guardian's Lua places a character at a pier, never a platform or a floor.
+    guide = (ROOT / 'mod/ScriptExtender/Lua/DockGuide.lua').read_text()
+    assert 'PlatformMoveTo' not in guide and 'liftfloors' not in guide

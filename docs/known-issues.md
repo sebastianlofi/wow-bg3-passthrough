@@ -61,7 +61,9 @@ This is the first public version. What we know is missing or rough:
   catch-up orders; a chained companion aboard), in BG3's own behaviour scripts, cause not found; it has not come
   back in more than twenty later rounds with a companion. A companion added (`add`) while the hero stands on a
   car lands beside the platform's hold and may not be carried. Zeppelins and boats are not ridden: a ship turns,
-  a BG3 platform never does, also on a curved path (measured in stock); `/wowbg3 cross` takes the party across.
+  a BG3 platform never does, also on a curved path (measured in stock); the guardian at the dock takes the party
+  across. A rider on a moving car takes no move order and casts nothing until it stops, and turn-based mode can be
+  turned on mid-ride: both are BG3's own rules for its platforms (the same in stock).
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass
@@ -90,8 +92,12 @@ This is the first public version. What we know is missing or rough:
 - Camp food: a save from before camp can hold stray single copies of food, and a rest can then take the whole
   stack.
 
-- Ships and zeppelins are drawn by WoW and cannot be boarded: `/wowbg3 cross` at a dock takes the party to the
-  dock at the other end instead.
+- Ships and zeppelins are drawn by WoW and cannot be boarded: your dream guardian stands at each dock and takes the
+  party to the dock at the other end (a BG3 dialog: "Travel to <place>?"). Proven on one route (Menethil Harbor to
+  Auberdine and its pier back); the zeppelin towers and the other ships are untested. The place is named by the
+  server's area at the pier, which for some piers is the water beside the town ("The Long Wash, Darkshore" is
+  Auberdine's pier). The dialog has no staged camera: the two stand as they stood. The guardian is drawn like a party
+  member, so it takes a few seconds to appear the first time. `/wowbg3 cross` is a test command now.
 
 ## Levels and progression
 

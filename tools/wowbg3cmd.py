@@ -13,7 +13,8 @@ One verb each, no domain word in front:
   wowbg3cmd.py xprate [N]       the server's XP rate (kill, elite kill, quest, exploration); no N: show
   wowbg3cmd.py learn SPELL | unlearn SPELL   give the hero a BG3 spell or take it back (test helper)
   wowbg3cmd.py waypoint [list] | waypoint go NAME   fast travel between known flight points (wow_waypoints.py)
-  wowbg3cmd.py cross [list | NAME]   at a ship's or zeppelin's dock: over to the dock at its other end (wow_docks.py)
+  wowbg3cmd.py cross [list | NAME]   test only: at a ship's or zeppelin's dock, over to the dock at its other end
+                                     (wow_docks.py). A player asks the guardian at the dock (DockGuide.lua).
   wowbg3cmd.py help
   --json on any party verb: the mod's whole answer
 
@@ -723,6 +724,70 @@ def waypoint(ctx, args):
 CROSS_USAGE = 'cross | cross NAME (where two vessels stop at one dock) | cross list'
 
 
+def vessel(r):
+    """What a route's vessel is. The server's own names for them are its makers' ("TEST Ship"): what it is says more."""
+    import wow_docks
+    return 'ship' if r['Stops'][0]['Z'] < wow_docks.SEA else 'zeppelin'
+
+
+def dock_key(r, s):
+    """A crossing's name between this helper and BG3's side: the vessel's taxi path and the stop it goes to."""
+    return '%d:%d' % (r['Path'], r['Stops'].index(s))
+
+
+def wow_here(ctx):
+    """(map, x, y) of WoW's character, as the client last wrote it (link/camera.bin)."""
+    try:
+        raw = open(ctx.link / 'camera.bin', 'rb').read()
+        x, y, _ = struct.unpack_from('<3f', raw, 72)
+        return struct.unpack_from('<I', raw, 84)[0], x, y
+    except (OSError, struct.error):
+        raise CmdError('cross: no WoW position yet (link/camera.bin)')
+
+
+_DOCKS = {'routes': None, 'stand': {}, 'name': {}}
+
+
+def dock_stand(r, i):
+    """Where a player stands at a route's stop (wow_docks.landing), worked out once; None where nothing is found."""
+    import wow_docks
+    if (r['Path'], i) not in _DOCKS['stand']:
+        s = r['Stops'][i]
+        _DOCKS['stand'][(r['Path'], i)] = wow_docks.landing(s['Map'], s['X'], s['Y'], s['Z'])
+    return _DOCKS['stand'][(r['Path'], i)]
+
+
+def dock_name(r, s):
+    """A stop's place as the server names it where a player stands at it: the pier ("Auberdine, Darkshore"), not
+    the water the vessel lies in beside it ("The Long Wash, Darkshore")."""
+    key = dock_key(r, s)
+    if key not in _DOCKS['name']:
+        at = dock_stand(r, r['Stops'].index(s))
+        _DOCKS['name'][key] = zone_at(s['Map'], at[0], at[1]) if at else zone_at(s['Map'], s['X'], s['Y'])
+    return _DOCKS['name'][key]
+
+
+def dock_panel(ctx):
+    """dock-panel.json for the guardian at a dock (DockGuide.lua): the crossings from the docks within reach of
+    WoW's character, each with the place a player stands at this end's pier and the place at the other end by the
+    server's own name. The routes, the standing places and the names never change: each is worked out once."""
+    import wow_docks
+    try:
+        here_map, x, y = wow_here(ctx)
+    except CmdError:
+        return
+    if _DOCKS['routes'] is None:
+        _DOCKS['routes'] = crossings()
+    docks = []
+    for r, i, _ in wow_docks.near(_DOCKS['routes'], here_map, x, y):
+        at = dock_stand(r, i)
+        if not at:
+            continue
+        for s in wow_docks.other(r, i):
+            docks.append({'Key': dock_key(r, s), 'Name': dock_name(r, s), 'Kind': vessel(r), 'Wow': [round(v, 2) for v in at[:3]]})
+    atomic_write(ctx.link / 'dock-panel.json', json.dumps({'Map': here_map, 'Docks': docks}))
+
+
 def crossings():
     """WoW's ships and zeppelins as routes between docks (wow_docks.py): the server's type 15 game objects and the
     client's taxi paths."""
@@ -749,29 +814,27 @@ def cross(ctx, args):
     """BG3 has no ship to ride in our level, so a crossing is a move: standing at a ship's or a zeppelin's dock,
     the party goes to the dock at the vessel's other end, as it does to a flight point."""
     import wow_docks
-
-    def kind(r):
-        # The server's own names for the vessels are its makers' ("TEST Ship"): what it is says more.
-        return 'ship' if r['Stops'][0]['Z'] < wow_docks.SEA else 'zeppelin'
+    kind = vessel
     if len(args) > 1 and args[0].lower() == 'list':
         raise Usage(CROSS_USAGE)
     routes = crossings()
     if args and args[0].lower() == 'list':
-        ctx.say('Ships and zeppelins (stand at a dock and type /wowbg3 cross):')
+        ctx.say('Ships and zeppelins (the guardian at a dock takes you across):')
         for r in routes:
-            ctx.say('  %s (%s)' % (' - '.join(zone_at(s['Map'], s['X'], s['Y']) for s in r['Stops']), kind(r)))
+            ctx.say('  %s (%s)' % (' - '.join(dock_name(r, s) for s in r['Stops']), kind(r)))
         return
-    try:
-        raw = open(ctx.link / 'camera.bin', 'rb').read()
-        x, y, _ = struct.unpack_from('<3f', raw, 72)
-        here_map = struct.unpack_from('<I', raw, 84)[0]
-    except (OSError, struct.error):
-        raise CmdError('cross: no WoW position yet (link/camera.bin)')
+    here_map, x, y = wow_here(ctx)
     ways = [(r, s) for r, i, _ in wow_docks.near(routes, here_map, x, y) for s in wow_docks.other(r, i)]
     if not ways:
         raise CmdError('cross: no ship or zeppelin stops within %d yards of you ("cross list" names them all)' % wow_docks.REACH)
-    names = ['%s (%s)' % (zone_at(s['Map'], s['X'], s['Y']), kind(r)) for r, s in ways]
-    if args:
+    names = ['%s (%s)' % (dock_name(r, s), kind(r)) for r, s in ways]
+    if args and args[0].startswith('#'):
+        # The guardian's "yes" (dock-click.json): the crossing by its key, never by a name that two might share.
+        pick = [k for k, (r, s) in enumerate(ways) if '#' + dock_key(r, s) == args[0]]
+        if len(pick) != 1:
+            raise CmdError('cross: that vessel does not stop here')
+        k = pick[0]
+    elif args:
         text = ' '.join(args).lower()
         pick = [k for k, n in enumerate(names) if text in n.lower()]
         if len(pick) != 1:
@@ -782,7 +845,7 @@ def cross(ctx, args):
     else:
         k = 0
     r, s = ways[k]
-    at = wow_docks.landing(s['Map'], s['X'], s['Y'], s['Z'])
+    at = dock_stand(r, r['Stops'].index(s))
     if not at:
         raise CmdError('cross: no place to stand found at the dock at %s' % zone_at(s['Map'], s['X'], s['Y']))
     try:
@@ -1002,7 +1065,8 @@ def learn(ctx, verb, args):
 # One verb each, no domain word in front and no second name for anything.
 VERBS = tuple(PARTY_ACTIONS) + tuple(LEARN_ACTIONS) + ('tp', 'where', 'find', 'faction', 'time', 'level', 'xprate',
                                                        'waypoint', 'cross', 'report')
-TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate') + tuple(LEARN_ACTIONS)
+# cross: a player crosses by the guardian at the dock (DockGuide.lua); the typed command is for tests.
+TEST_ONLY = ('tp', 'where', 'find', 'faction', 'time', 'refill', 'level', 'xprate', 'cross') + tuple(LEARN_ACTIONS)
 
 
 def verb_of(words):
@@ -1049,13 +1113,13 @@ def help_lines(debug):
     out += ['/wowbg3 ' + l for l in PARTY_HELP]
     if waypoints_on():
         out.append('/wowbg3 waypoint | waypoint go NAME - the flight points you have discovered; fast travel to one')
-    out.append('/wowbg3 cross - at a ship\'s or zeppelin\'s dock: go to the dock at its other end (cross list: every route)')
     out.append('/wowbg3 help - this list')
     if debug:
         out += ['test commands:',
                 '/wowbg3 refill - HP, spell slots, rage... back to full',
                 '/wowbg3 tp PLACE | tp ZONE X Y | tp X Y - move on the WoW map (X Y from 0 to 100)',
                 '/wowbg3 where | find TEXT - where you are; search places',
+                '/wowbg3 cross | cross NAME | cross list - at a ship\'s or zeppelin\'s dock: across without the guardian there',
                 '/wowbg3 faction horde | alliance | own - your WoW side (faction: what is set)',
                 '/wowbg3 report - one file with the logs, to send when something is wrong',
                 '/wowbg3 time day | night | dawn | dusk | HH:MM | now - hold the light, for recording (now: this device\'s time)',
