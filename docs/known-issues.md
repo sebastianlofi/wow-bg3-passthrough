@@ -48,17 +48,20 @@ This is the first public version. What we know is missing or rough:
   Every other instance goes the same way but is untested, and no boss has any hand-made rules. Inside, BG3 offers
   no camp and no Long Rest. A raid needs no raid group; WoW's level minimums, keys and attunements still apply.
 
-- Lifts and the Deeprun Tram carry the party on BG3's own moving platforms (one under each of WoW's cars, moved
-  as WoW's client moves the car). Ridden in the harness: Undercity's three lifts and the Deeprun Tram, with a
-  companion. Limits: a platform's floor is round and a little wider than the car's, so at a tram car's ends a
-  character can stand a step beside WoW's deck; where a car's floor lies above the ground beside it (the tram's
-  deck, 0.7 m over the station floor) the last two metres of ground slope up to it, also while the car is away;
-  the other lifts of the world (Thousand Needles, Gnomeregan, Blackrock and so on) use the same code and are
-  untested. Open: BG3 crashed twice as Undercity's car left with more than the hero involved (a fight aboard; a
-  chained companion aboard), which keeps lifts out of a release until it is found. In a fight BG3 itself holds a
-  platform still until the fight is over (stock does the same on its own elevators). A companion added while the
-  hero stands on a car is not carried. Zeppelins and boats are not ridden: a ship turns, BG3's platform move does
-  not.
+- Lifts and the Deeprun Tram carry the party on BG3's own moving platforms, one under each of WoW's cars near the
+  party. Such a car keeps BG3's time: in turn-based mode, in a fight or not, it stands while a turn is open and
+  moves on the environment's turn (six seconds' worth a round), in WoW's picture as well; a car far from the party
+  keeps WoW's own clock. Ridden in the harness: Undercity's lifts (up and down, with a companion, through
+  turn-based mode) and the Deeprun Tram (both ways, with a companion, a hold in the tunnel). Limits: a platform's
+  floor is round and a little wider than the car's, so at a tram car's ends a character can stand a step beside
+  WoW's deck; where a car's floor lies above the ground beside it (the tram's deck, 0.7 m over the station floor)
+  the last two metres of ground slope up to it, also while the car is away; the other lifts of the world (Thousand
+  Needles, Gnomeregan, Blackrock and so on) use the same code and are untested; a real fight aboard is untested
+  (turn-based mode without one is). Open: BG3 crashed twice as Undercity's car left (a fight aboard with the old
+  catch-up orders; a chained companion aboard), in BG3's own behaviour scripts, cause not found; it has not come
+  back in more than twenty later rounds with a companion. A companion added (`add`) while the hero stands on a
+  car lands beside the platform's hold and may not be carried. Zeppelins and boats are not ridden: a ship turns,
+  a BG3 platform never does, also on a curved path (measured in stock); `/wowbg3 cross` takes the party across.
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass
