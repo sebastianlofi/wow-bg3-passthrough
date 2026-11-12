@@ -39,6 +39,7 @@ class Fake(B.World):
         self.land((0.0, 0.0, 100.0))
         self.answers, self.sent = [], []
         self.storeys = {}  # square -> how many storeys its cut has
+        self.bare = set()  # squares with no face of WoW's
 
     def precut(self, squares):
         pass
@@ -46,8 +47,9 @@ class Fake(B.World):
     def cut(self, ij):
         if ij not in self.cells:
             n = self.storeys.get(ij, 0)
-            self.cells[ij] = {'ij': ij, 'min': self.cell_min(ij), 'base': 90.0, 'tiles': b'', 'section': b'new', 'tris': b'',
-                              'kinds': b'', 'storeys': [{'min': self.cell_min(ij + (k + 1,)), 'base': 95.0, 'section': b'up', 'tiles': 9,
+            self.cells[ij] = {'ij': ij, 'min': self.cell_min(ij), 'base': 90.0, 'tiles': b'', 'section': b'new',
+                              'tris': b'' if ij in self.bare else bytes(36), 'kinds': b'' if ij in self.bare else b'\0',
+                              'storeys': [{'min': self.cell_min(ij + (k + 1,)), 'base': 95.0, 'section': b'up', 'tiles': 9,
                                                          'floors': bytes(5 * B.TILES * B.TILES)} for k in range(n)] or None}
         return self.cells[ij]
 
@@ -60,6 +62,7 @@ class Fake(B.World):
 
     def write_triangles(self, squares):
         self.triangles = list(squares)
+        return super().write_triangles(squares)
 
 
 class Base(unittest.TestCase):
@@ -535,6 +538,139 @@ class CreatureGround(Base):
         old = time.time() - 60
         os.utime(self.tmp / 'link/feed/astarion.txt', (old, old))
         self.assertEqual(len(w.wanted([(hero, S, None)])), 16)  # a feed that stopped: its creatures are gone
+
+
+class NoFaces(Base):
+    """Squares with no face of WoW's (the tram's tunnel): there is no ray set to swap in, and none is asked for."""
+    def test_write_triangles_says_so(self):
+        w = self.w
+        w.bare = {(7, 7), (8, 7)}
+        self.assertFalse(w.write_triangles([(7, 7), (8, 7)]))
+        self.assertFalse((self.tmp / 'arena-triangles.bin').exists())
+        self.assertTrue(w.write_triangles([(7, 7), (0, 0)]))
+        self.assertEqual(len((self.tmp / 'arena-triangles.bin').read_bytes()), 36)
+        self.assertEqual(len((self.tmp / 'arena-triangles.kinds').read_bytes()), 1)
+
+    def test_a_stream_of_bare_squares_asks_for_no_rays(self):
+        w = self.w
+        hero = w.walker('hero-1', 'Tav')
+        w.placed, w.rays = {0: (0, 0)}, [(0, 0)]
+        w.cut((0, 0))
+        p = (w.centre[0] + B.CELL * 40.5, w.centre[1], w.centre[2] + B.CELL * 0.5)     # 2.5 km down the tunnel
+        w.bare = {(i, j) for i in range(30, 50) for j in range(-10, 10)}
+        hero.pos = p
+        members = [(hero, p, False)]
+        w.members = members
+        with mock.patch.object(B, 'tav', lambda *_: (None, p)), mock.patch.object(w, 'read_members', lambda _p: members), \
+                mock.patch.object(w, 'fall_alarm', lambda *_: None), mock.patch.object(w, 'publish_party', lambda: None), \
+                mock.patch.object(w, 'follow_zones', lambda _m: None):
+            w.follow()
+        streams = [f for a, f in w.sent if a == 'Stream']
+        self.assertTrue(streams and streams[-1]['Cells'])
+        self.assertIs(streams[-1]['Rays'], False)
+
+
+class Zones(Base):
+    """A lift takes a member to the other side of the terrain without a move: its squares are cut again for there."""
+    def setUp(self):
+        super().setUp()
+        w = self.w                                   # the terrain is at 100 yd; the session came over it
+        w.placed = {0: (0, 0), 1: (1, 0)}
+        for ij in w.placed.values():
+            w.cut(ij)['under'] = False
+        self.hero = w.walker('hero-1', 'Tav')
+
+    def at(self, z):
+        p = self.w.to_bg3((5.0, 5.0, z))
+        self.hero.pos = p
+        return [(self.hero, p, False)]
+
+    def test_down_a_shaft_her_squares_are_cut_again(self):
+        w = self.w
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR - 1.0))
+        self.assertAlmostEqual(self.hero.at[2], 69.0)
+        self.assertTrue(w.below(self.hero.at))
+        self.assertEqual(w.restamp, {(0, 0), (1, 0)})
+        self.assertNotIn((0, 0), w.cells)            # cut again when next asked for
+        # Standing there: nothing more.
+        w.restamp.clear()
+        w.follow_zones(self.at(60.0))
+        self.assertEqual(w.restamp, set())
+        self.assertAlmostEqual(self.hero.at[2], 69.0)
+
+    def test_beside_a_lifts_shaft_her_side_stays(self):
+        w = self.w
+        with mock.patch.object(B, 'LIFT_STOPS', {0: [(8.0, 5.0, 60.0, 8.4)]}):
+            w.follow_zones(self.at(60.0))                 # on the car, 3 yd from its middle: no change yet
+            self.assertIsNone(self.hero.at)
+            self.assertEqual(w.restamp, set())
+            p = w.to_bg3((40.0, 5.0, 60.0))               # 32 yd on: past the shaft
+            self.hero.pos = p
+            w.follow_zones([(self.hero, p, False)])
+            self.assertTrue(w.below(self.hero.at))
+
+    def ground(self, ij, walk=1, floor=None):
+        """Square ij's tiles: all walkable (or not) at one floor, BG3 y."""
+        y = self.hero.pos[1] if floor is None else floor
+        self.w.cells[ij]['tiles'] = struct.pack('<Bf', walk, y) * (B.TILES * B.TILES)
+
+    def far(self, wx):
+        p = self.w.to_bg3((wx, 5.0, 60.0))
+        self.hero.pos = p
+        ij = (int((p[0] - self.w.centre[0]) // B.CELL), int((p[2] - self.w.centre[2]) // B.CELL))
+        self.w.placed[5] = ij
+        self.w.cut(ij)['under'] = True
+        return ij, [(self.hero, p, False)]
+
+    def test_under_the_terrain_her_point_follows_her_onto_far_ground(self):
+        w = self.w
+        w.follow_zones(self.at(60.0))                     # down a shaft: her point is here now
+        first = self.hero.at
+        w.restamp.clear()
+        ij, members = self.far(5.0 + B.ANCHOR_YD - 10.0)  # not far enough
+        self.ground(ij)
+        w.follow_zones(members)
+        self.assertEqual(self.hero.at, first)
+        ij, members = self.far(5.0 + B.ANCHOR_YD + 10.0)
+        self.ground(ij, walk=0)                           # on a car: no ground under her
+        w.follow_zones(members)
+        self.assertEqual(self.hero.at, first)
+        self.ground(ij, floor=self.hero.pos[1] + 36.0)    # ground 36 m over her head is not hers
+        w.follow_zones(members)
+        self.assertEqual(self.hero.at, first)
+        self.ground(ij)                                   # stepped off onto the far station
+        w.follow_zones(members)
+        self.assertAlmostEqual(self.hero.at[0], 5.0 + B.ANCHOR_YD + 10.0, places=3)
+        self.assertEqual(w.restamp, set())                # the same side of the terrain: nothing is cut again
+
+    def test_on_the_ground_nothing_changes(self):
+        self.w.follow_zones(self.at(100.0))
+        self.assertIsNone(self.hero.at)
+        self.assertEqual(self.w.restamp, set())
+
+    def test_back_up_with_five_yards_of_slack(self):
+        w = self.w
+        w.follow_zones(self.at(60.0))
+        w.restamp.clear()
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR + 3.0))     # just over the line: still under
+        self.assertTrue(w.below(self.hero.at))
+        w.follow_zones(self.at(100.0 - B.wow_arena.UNDER_CLEAR + 6.0))
+        self.assertFalse(w.below(self.hero.at))
+
+    def test_a_stale_square_is_placed_again_where_it_lies(self):
+        w = self.w
+        w.rays = [(0, 0), (1, 0)]
+        members = self.at(60.0)
+        w.follow_zones(members)
+        w.members = members
+        with mock.patch.object(B, 'tav', lambda *_: (None, self.hero.pos)), mock.patch.object(w, 'read_members', lambda _p: members), \
+                mock.patch.object(w, 'fall_alarm', lambda *_: None), mock.patch.object(w, 'publish_party', lambda: None), \
+                mock.patch.object(w, 'wanted', lambda _m: [(0, 0), (1, 0)]):
+            w.follow()
+        self.assertEqual(w.sent[-1][0], 'Stream')
+        self.assertEqual(sorted(c[0] for c in w.sent[-1][1]['Cells']), [0, 1])     # the same pool subgrids
+        self.assertEqual(w.placed, {0: (0, 0), 1: (1, 0)})
+        self.assertEqual(w.restamp, set())
 
 
 class InTheLevel(Base):

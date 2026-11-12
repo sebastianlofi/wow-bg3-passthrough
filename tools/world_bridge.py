@@ -371,6 +371,8 @@ FIXED_ORIGIN = (0.0, 0.0, 0.0)
 # floor above them, every other map on the third floor. The level's bounds hold them (release/levels).
 
 
+LIFT_CLEAR_YD = 12.0   # a member this near a lift's shaft (past its car's radius) keeps the side its squares are cut for
+ANCHOR_YD = 150.0      # under the terrain: a member standing this far from the point its squares are cut for takes a new one
 LIFT_STOPS = {}   # WoW map -> [(x, y, z, radius)] in WoW yards: where each lift car a character can ride rests, at its floor
 
 
@@ -380,6 +382,7 @@ def load_lifts(maps):
     (where each such car rests: its spawn in the server's table and its path in the client's TransportAnimation.dbc),
     for World.cut. Without the server's tables or the models there is no file and no lift carries anyone: the log says so."""
     try:
+        import wow_lift_platforms
         import wow_lifts
         import wow_vmap
         import wowsave
@@ -400,8 +403,10 @@ def load_lifts(maps):
             if sum(q * q for q in quat) < 0.5:
                 quat = (0.0, 0.0, 0.0, 1.0)
             d = decks[entry]
+            # The floor BG3 gives the car is a platform's: the smallest the car's own fits in (Lifts.lua takes the same).
+            radius = wow_lift_platforms.pick(d['Radius']) or d['Radius']
             for x, y, z in wow_lifts.stop_points(paths[entry], spawn, quat):
-                LIFT_STOPS.setdefault(m, []).append((x, y, z + d['Floor'] / YD, d['Radius'] / YD))
+                LIFT_STOPS.setdefault(m, []).append((x, y, z + d['Floor'] / YD, radius / YD))
         print('lifts: %d lift objects with a floor to ride (link/lifts.json), %d stops on %d maps' % (
             len(decks), sum(len(v) for v in LIFT_STOPS.values()), len(LIFT_STOPS)), flush=True)
     except Exception as e:  # noqa: BLE001  world mode runs without lifts
@@ -448,6 +453,17 @@ def node_of(centre, bx, bz):
     return (int(math.floor((bx - centre[0]) / CELL + 0.5)), int(math.floor((bz - centre[2]) / CELL + 0.5)))
 
 
+def lift_args(map_id, wx, wy):
+    """wow_arena.py's --lift for a square whose middle is WoW (wx, wy): where a lift's car rests within the
+    square's reach (LIFT_STOPS), so the cut holds the floors at both ends of its shaft. The same square, the same
+    arguments, whoever asks."""
+    out = []
+    for x, y, z, radius in sorted(LIFT_STOPS.get(map_id, ())):
+        if abs(x - wx) <= CELL / 2 / YD + radius + 10.0 and abs(y - wy) <= CELL / 2 / YD + radius + 10.0:
+            out += ['--lift', '%.2f' % x, '%.2f' % y, '%.2f' % z, '%.2f' % radius]
+    return out
+
+
 def cut_args(terrain, map_id, centre, origin, ij, at=None):
     """wow_arena.py's arguments (after the output folder) for square ij: the same ones, the same cut. `at`: the WoW
     point the session's hero landed on. Over the ground it changes nothing, so every such session cuts a square the
@@ -461,7 +477,7 @@ def cut_args(terrain, map_id, centre, origin, ij, at=None):
             '--models']  # WoW's collision models (wow_vmap.py): BG3's sight and casts see WoW's buildings, trees and fences
     if STOREYS and at and at[2] < terrain.height(at[0], at[1]) - wow_arena.UNDER_CLEAR:
         args += ['--under', str(at[0]), str(at[1]), str(at[2])]
-    return args
+    return args + lift_args(map_id, wx, wy)
 
 
 # Cuts made ahead (wow_waypoints.py prewarm): a square of a session whose origin is a flight point comes out the same
@@ -577,6 +593,7 @@ class World:
         self.centre, self.origin = centre_of(self.map), FIXED_ORIGIN   # this map's mapping: the same in every session
         self.at = None       # WoW point the session's hero lands on
         self.jumping = None  # (BG3 spot, WoW point) of a jump whose squares are being cut
+        self.restamp = set() # placed squares whose cut is for the other side of the terrain now (follow_zones)
         self.walkers = {}       # member uuid -> Walker (the hero's under its uuid, or 'hero' before hero.json)
         self.members = []       # [(Walker, (bx, by, bz), dead)] as last seen, nearest the camera first
         self.pinned = {}        # pool index -> until when it is not moved (something stood on it)
@@ -689,6 +706,7 @@ class World:
             self.cells[ij] = self.cells.pop(ij)  # newest last
             return self.cells[ij]
         cmd, out = self.cut_cmd(ij)
+        under = self.below(self.at_for(ij))
         self.cuts[0 if cmd else 1] += 1
         if ij in self.ready:
             self.ready.discard(ij)
@@ -721,7 +739,7 @@ class World:
         base = math.floor((min(floors) - 0.5) * 50) / 50
         assert max(floors) - base < 1300, 'a square spans more height than a subgrid holds'
         cell = {'ij': ij, 'min': (minx, minz), 'base': base, 'tiles': tiles, 'section': section, 'tris': tris,
-                'kinds': kinds, 'storey': None}
+                'kinds': kinds, 'storey': None, 'under': under}
         if STOREYS:
             meta = json.loads((out / 'arena.json').read_text())
             ups = meta.get('storey_levels') or []
@@ -769,6 +787,75 @@ class World:
             self.cells.pop(old)
         return cell
 
+    def below(self, at):
+        """Whether a WoW point lies under the terrain as cut_args means it: its squares are cut for that place's
+        own floors (--under), not for the ground."""
+        return bool(STOREYS and at and at[2] < self.terrain.height(at[0], at[1]) - wow_arena.UNDER_CLEAR)
+
+    def follow_zones(self, members):
+        """A member that came to the other side of the terrain without a move (a lift took it down into Undercity,
+        or up out of it): its squares are cut for where it is now. The placed squares cut for the other side are
+        cut again and placed again where they lie (restamp); five yards of slack keep a walker at the line from
+        flipping back and forth."""
+        for w, p, dead in members:
+            if dead or w.summon:
+                continue
+            x, y = self.wow_xy(p[0], p[2])
+            z = self.origin[2] + (p[1] - self.centre[1]) / YD
+            try:
+                th = self.terrain.height(x, y)
+            except Exception:  # noqa: BLE001  off the height maps: no side to change to
+                continue
+            was = self.below(w.at or self.at)
+            now = z < th - wow_arena.UNDER_CLEAR if not was else z < th - wow_arena.UNDER_CLEAR + 5.0
+            if now == was:
+                if now:
+                    self.anchor(w, p, (x, y, z))
+                continue
+            # Not on a lift or beside its shaft: the squares there hold the floors at both of its ends whichever side
+            # they were cut for (wow_arena.py --lift), and cutting them again as she arrived took the landing from
+            # under her (harness: she dropped from Undercity's upper stop to the lower). Once she has walked on.
+            if any((x - lx) ** 2 + (y - ly) ** 2 <= (radius + LIFT_CLEAR_YD) ** 2 for lx, ly, _, radius in LIFT_STOPS.get(self.map, ())):
+                continue
+            w.at = (x, y, z)
+            stale = 0
+            for k, ij in self.placed.items():
+                cell = self.cells.get(ij[:2])
+                if cell is not None and cell.get('under') != self.below(self.at_for(ij[:2])):
+                    self.restamp.add(ij)
+            for base in {ij[:2] for ij in self.restamp}:
+                if self.cells.pop(base, None) is not None:
+                    stale += 1
+            print('%s is %s the terrain now (WoW %.1f %.1f %.1f, terrain %.1f): %d placed squares are cut again' % (
+                w.name, 'under' if now else 'over', x, y, z, th, stale), flush=True)
+
+    def stands(self, p):
+        """Whether BG3 point p is on a walkable tile of a placed square (the ground's or a level's), within 1.5 m."""
+        f = self.floor_at(p[0], p[2])
+        if f and f[0] and abs(f[1] - p[1]) <= 1.5:
+            return True
+        i, j = int(math.floor((p[0] - self.centre[0]) / CELL)), int(math.floor((p[2] - self.centre[2]) / CELL))
+        for ij in ((i, j), (i - 1, j), (i, j - 1), (i - 1, j - 1)):     # a level lies a tile off its square
+            for st in (self.cells.get(ij) or {}).get('storeys') or ():
+                c, r = int((p[0] - st['min'][0]) // 0.5), int((p[2] - st['min'][1]) // 0.5)
+                if 0 <= c < TILES and 0 <= r < TILES and st['floors'][(r * TILES + c) * 5] & 1 \
+                        and abs(struct.unpack_from('<f', st['floors'], (r * TILES + c) * 5 + 1)[0] - p[1]) <= 1.5:
+                    return True
+        return False
+
+    def anchor(self, w, p, at):
+        """Under the terrain a square is cut for the floors joined to one WoW point (cut_args' `at`), found in the
+        movement tiles round that square: far from the point no floor is found, and the square comes without ground
+        (harness: the Deeprun Tram set the hero down 2500 yd from where she came in). So the point follows a member:
+        wherever she stands on ground ANCHOR_YD from it, that is her point from then on. Riding a car she stands on
+        no ground, and the squares at its stops hold their floors whatever point they are cut for (--lift)."""
+        old = w.at or self.at
+        if (at[0] - old[0]) ** 2 + (at[1] - old[1]) ** 2 < ANCHOR_YD ** 2 or not self.stands(p):
+            return
+        w.at = at
+        print('%s stands %.0f yd from the point her squares are cut for: they are cut for WoW %.1f %.1f %.1f from now on' % (
+            w.name, math.hypot(at[0] - old[0], at[1] - old[1]), *at), flush=True)
+
     def carve_lifts(self, cell):
         """Where a lift car rests WoW's own floor under it is the car's (wow_lifts.carve): those tiles are not ground
         in this square or its storeys, so a rider stands on the platform that carries the car's floor (Lifts.lua)."""
@@ -780,21 +867,31 @@ class World:
         spots = []
         for x, y, z, radius in stops:
             b = self.to_bg3((x, y, z))
-            r = radius * YD + 0.5
-            if minx - r - 1 <= b[0] <= minx + CELL + r + 1 and minz - r - 1 <= b[2] <= minz + CELL + r + 1:
-                spots.append((b[0], b[1], b[2], r))
+            r = radius * YD
+            if minx - r - 2 <= b[0] <= minx + CELL + r + 2 and minz - r - 2 <= b[2] <= minz + CELL + r + 2:
+                # Where the platform stands: on BG3's half-metre tile lattice (Lifts.lua ToBg3).
+                spots.append((math.floor(b[0] * 2 + 0.5) / 2, b[1], math.floor(b[2] * 2 + 0.5) / 2, r))
         if not spots:
             return
+        # The slope up to a car's floor as faces too (wow_lifts.slope_faces, from the tiles as they were cut): the
+        # square's one triangle set holds its storeys' as well. Floors WoW draws nothing at (kind 4). The car's own
+        # floor is no fixed face: it is where BG3's platform is (the plugin's lift floors, from Lifts.lua).
+        faces = wow_lifts.slope_faces(cell['tiles'], 5, minx, minz, spots)
+        for st in cell.get('storeys') or []:
+            faces += wow_lifts.slope_faces(st['floors'], 5, st['min'][0], st['min'][1], spots)
+        if faces:
+            cell['tris'] += b''.join(struct.pack('<9f', *f) for f in faces)
+            cell['kinds'] += bytes([4]) * len(faces)
         # A subgrid holds 1300 m over its base (the asserts in cut): a carved tile goes up, not past that.
         n = 0
         top = cell['base'] + 1290.0
-        cell['section'], k = wow_lifts.carve(cell['section'], len(cell['section']) // (TILES * TILES), minx, minz, spots, top=top)
+        cell['section'], k = wow_lifts.carve(cell['section'], len(cell['section']) // (TILES * TILES), minx, minz, spots, top=top, seam=SEAM_BITS)
         n += k
-        cell['tiles'], _ = wow_lifts.carve(cell['tiles'], 5, minx, minz, spots, top=top)
+        cell['tiles'], _ = wow_lifts.carve(cell['tiles'], 5, minx, minz, spots, top=top, seam=0)
         for st in cell.get('storeys') or []:
             sx, sz = st['min']
-            st['section'], k = wow_lifts.carve(st['section'], 5, sx, sz, spots, top=st['base'] + 1290.0)
-            st['floors'], _ = wow_lifts.carve(st['floors'], 5, sx, sz, spots, top=st['base'] + 1290.0)
+            st['section'], k = wow_lifts.carve(st['section'], 5, sx, sz, spots, top=st['base'] + 1290.0, seam=SEAM_BITS)
+            st['floors'], _ = wow_lifts.carve(st['floors'], 5, sx, sz, spots, top=st['base'] + 1290.0, seam=0)
             n += k
         if n:
             print('lifts: %d tiles under a resting car are not ground in square %s' % (n, cell['ij']), flush=True)
@@ -1016,9 +1113,15 @@ class World:
     def write_triangles(self, squares):
         # What each triangle is (terrain, wall, WMO, M2, flat floor), for the plugin's camera clearance;
         # it reads both files at the next Rays command and ignores kinds of another count.
+        # False: none of these squares has a face of WoW's (a tunnel the tram runs through has no floor to stand on, so
+        # nothing is cut there). There is then no set to swap in, and BG3 keeps the one it has.
         cells = [self.cut(ij) for ij in squares if len(ij) == 2]   # storeys bring no triangles of their own
+        tris = b''.join(c['tris'] for c in cells)
+        if not tris:
+            return False
         atomic_write(IO / 'arena-triangles.kinds', b''.join(c['kinds'] for c in cells))
-        atomic_write(IO / 'arena-triangles.bin', b''.join(c['tris'] for c in cells))
+        atomic_write(IO / 'arena-triangles.bin', tris)
+        return True
 
     def pool_files(self):
         """Where the plugin says the pool subgrids are, per side: {k: (i, j) or None}."""
@@ -1362,8 +1465,7 @@ class World:
                 raise RuntimeError('the pool has no free square for the new place')
             cells = self.cells_for(pairs)
             squares = [ij for ij in (self.rays or []) if ij not in need] + need
-            self.write_triangles(squares)
-            seq = self.command('Jump', Spot=list(S), Cells=cells, Rays=True)
+            seq = self.command('Jump', Spot=list(S), Cells=cells, Rays=self.write_triangles(squares))
             ok, err = self.wait_done(seq, 60)
             if not ok:
                 raise RuntimeError('Jump refused: %s' % err)
@@ -1442,10 +1544,34 @@ class World:
             if not dead:
                 self.fall_alarm(w, p[0], p[1], p[2])
         self.publish_party()
+        self.follow_zones(members)
         want = self.wanted(members)
         # At most 8 squares a round, in `want` order (the square under every member first): each new
         # square is a wow_arena.py cut (about a second), so a member far off waits no longer than that.
         pairs = self.moves(want)[:8]
+        # Squares cut for the other side of the terrain (follow_zones): the same pool subgrid, the same place,
+        # the tiles of the new cut. One no member wants any more, or a level the new cut has no more, is left
+        # to be reused.
+        if self.restamp:
+            self.restamp &= set(want)
+            now = time.time()
+            # A square with all its levels in one Stream: the plugin places them in one step, so no floor is missing
+            # between two of them. A square with a level that may not move now waits whole.
+            by_base = {}
+            for k, ij in sorted(self.placed.items()):
+                if ij in self.restamp:
+                    by_base.setdefault(ij[:2], []).append((k, ij))
+            for base, group in sorted(by_base.items()):
+                if len(pairs) + len(group) > 8 and pairs:
+                    break
+                if any(self.pinned.get(k, 0) >= now or any(k == q for q, _ in pairs) for k, _ in group):
+                    continue
+                cell = self.cut(base)
+                for k, ij in group:
+                    if len(ij) == 2 or len(cell.get('storeys') or ()) >= ij[2]:
+                        pairs.append((k, ij))
+                    else:
+                        self.restamp.discard(ij)
         # The WoW triangles go with the wanted squares and the placed ones near a member (KEEP_RAYS)
         # only (harness: with a pool of 84 the squares members left behind stay placed until they are
         # reused; their trails joined into one cluster over 1 km long and the plugin refused the rays).
@@ -1464,13 +1590,13 @@ class World:
         if not pairs and sorted(squares) == self.rays:
             return
         cells = self.cells_for(pairs)
-        self.write_triangles(squares)
-        seq = self.command('Stream', Cells=cells, Rays=True)
+        seq = self.command('Stream', Cells=cells, Rays=self.write_triangles(squares))
         ok, err = self.wait_done(seq, 45)
         if ok:
             self.rays = sorted(squares)
             for k, ij in pairs:
                 self.took(k, ij)
+                self.restamp.discard(ij)
         else:
             print('Stream refused:', err, flush=True)
             # A square with something on it (a fight's stand-in, a corpse, a surface) stays put for a

@@ -165,6 +165,9 @@ function Probe.Start(context)
         local okOwn, errOwn = pcall(function() Ext.Require("OwnLevel.lua").Start(report.RunId) end)
         local okIr, errIr = pcall(function() Ext.Require("InstanceRest.lua").Start(report.RunId) end)
         if not okIr then Ext.Log.Print("WOW-BG3 instance rest unavailable: " .. tostring(errIr)) end
+        -- WoW's lifts carry the party on BG3's own platforms.
+        local okLf, errLf = pcall(function() Ext.Require("Lifts.lua").Start(report.RunId) end)
+        if not okLf then Ext.Log.Print("WOW-BG3 lifts unavailable: " .. tostring(errLf)) end
         if not okOwn then Ext.Log.Print("WOW-BG3 own level: " .. tostring(errOwn)) end
     end
     save("bootstrap")

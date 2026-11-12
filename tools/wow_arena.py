@@ -4,7 +4,7 @@
 wow_arena.py OUT_DIR --wow X Y [--size 40] --bg3 X Y Z [--mirror 1|0] [--islands largest|border]
              [--maps DIR] [--mmaps DIR] [--models [all|wmo]] [--walls auto|all|none] [--vmaps DIR]
              [--margin 0.5] [--max-triangles 60000] [--map 0|1]
-             [--slope-limit 50] [--steep-polys keep|drop] [--storeys 1|0] [--under X Y Z]
+             [--slope-limit 50] [--steep-polys keep|drop] [--storeys 1|0] [--under X Y Z] [--lift X Y Z R]...
 
 Reads the test server's published movement maps (Detour tiles) and terrain heights for map MAP
 (0 Eastern Kingdoms, the default; 1 Kalimdor)
@@ -144,25 +144,49 @@ def detour_polys(path):
         polys.append(Poly(pts, flags, (str(path), i)))
     return polys
 
-def main_polys(polys, at=None):
-    """The polygons (their id()) in the largest set the movement map joins; with `at` (x, y, z), in the set of the
-    polygon nearest that point instead (empty if none lies over it). Joined as the movement map itself joins them:
-    Detour's neighbour links inside a tile and along the tiles' borders (wow_stand.joined), each polygon found by
-    the tile and index it was read from. (It was by the corners two polygons share, their heights rounded to a
-    whole yard: two tiles' copies of one border corner differ by hundredths, and at 13.51 and 13.49 they were two
-    corners. Auberdine and its pier, 323 polygons, hung on one such edge and were a piece of their own, so the cut
-    gave the pier no floor and whoever was moved onto it stood on the sea bed.)"""
+def poly_sets(polys):
+    """The set each polygon is in, as the movement map itself joins them: [label] in the polygons' order. Detour's
+    neighbour links inside a tile and along the tiles' borders (wow_stand.joined), each polygon found by the tile
+    and index it was read from. (It was by the corners two polygons share, their heights rounded to a whole yard:
+    two tiles' copies of one border corner differ by hundredths, and at 13.51 and 13.49 they were two corners.
+    Auberdine and its pier, 323 polygons, hung on one such edge and were a piece of their own, so the cut gave the
+    pier no floor and whoever was moved onto it stood on the sea bed.)"""
     import wow_stand
     find, _ = wow_stand.joined({t: wow_stand.read_tile(Path(t)) for t in {p.at[0] for p in polys}})
-    root = [find(p.at) for p in polys]
+    return [find(p.at) for p in polys]
+
+
+def main_polys(polys, at=None):
+    """The polygons (their id()) in the largest set the movement map joins (poly_sets); with `at`
+    (x, y, z), in the set of the polygon nearest that point instead (empty if none lies over it)."""
+    label = poly_sets(polys)
     size = {}
-    for r in root:
-        size[r] = size.get(r, 0) + 1
+    for k in label:
+        size[k] = size.get(k, 0) + 1
     big = max(size, key=size.get) if size else None
     if at:
         over = [(abs(poly_height(at[0], at[1], p) - at[2]), i) for i, p in enumerate(polys) if inside(at[0], at[1], p)]
-        big = root[min(over)[1]] if over else None
-    return {id(p) for p, r in zip(polys, root) if r == big}
+        big = label[min(over)[1]] if over else None
+    return {id(p) for i, p in enumerate(polys) if label[i] == big}
+
+
+def lift_polys(polys, lifts):
+    """The polygons (their id()) of every set that reaches a lift's stop: `lifts` [(x, y, z, radius)] in WoW yards,
+    z the car's floor where it rests. The movement map has no lifts, so the floors at a shaft's two ends are two
+    sets with no edge between them (Undercity's and the ruins over it); the car joins them. A set reaches a stop
+    when one of its corners lies within the car's radius and 3 yd of it, at the floor's height within 3 yd."""
+    if not lifts:
+        return set()
+    label = poly_sets(polys)
+    hit = set()
+    for i, p in enumerate(polys):
+        if label[i] in hit:
+            continue
+        for x, y, z, radius in lifts:
+            if any((q[0] - x) ** 2 + (q[1] - y) ** 2 <= (radius + 3.0) ** 2 and abs(q[2] - z) <= 3.0 for q in p):
+                hit.add(label[i])
+                break
+    return {id(p) for i, p in enumerate(polys) if label[i] in hit}
 
 
 class Poly(list):
@@ -472,6 +496,8 @@ def main():
     p.add_argument('--storey-levels', type=int, default=int(os.environ.get('WOW_BG3_STOREY_LEVELS') or 4))
     # A session under the terrain (Undercity, Ironforge): WoW point X Y Z of its origin. See UNDER_CLEAR.
     p.add_argument('--under', type=float, nargs=3, metavar=('X', 'Y', 'Z'))
+    # Where a lift's car rests near this square: WoW X Y, the car's floor Z, its radius (yd). See lift_polys.
+    p.add_argument('--lift', type=float, nargs=4, action='append', metavar=('X', 'Y', 'Z', 'R'))
     a = p.parse_args()
     assert 2 <= a.size <= 120
     sx = 1.0 if a.mirror else -1.0  # BG3 x = sx * WoW y
@@ -519,7 +545,8 @@ def main():
     col, terr, mesh, water, steep_poly = {}, {}, {}, {}, {}
     poly_hs = {}    # every polygon height in the tile's middle column but deep water's (storeys)
     # Under the terrain the storeys are the origin's own set of polygons: the ruins or the mountain over it are not.
-    under_set = main_polys(polys, a.under) if a.under else None
+    lift_set = lift_polys(polys, a.lift)
+    under_set = (main_polys(polys, a.under) | lift_set) if a.under else None
     for r, c in ring:
         x, y = to_wow(-half + (c + 0.5) * TILE, -half + (r + 0.5) * TILE)
         th = terrain.height(x, y)
@@ -555,6 +582,9 @@ def main():
         if a.under:
             zlo = min([zlo] + [h - 5.0 for hs in poly_hs.values() for h in hs])
             zhi = min(zhi, zlo + 390.0 / YD)
+        if a.lift:   # the floors at every stop of a lift here, whichever end the session came from
+            zlo = min([zlo] + [l[2] - 8.0 for l in a.lift])
+            zhi = min(max([zhi] + [l[2] + 8.0 for l in a.lift]), zlo + 390.0 / YD)
         wt, sizes = wow_vmap.VMap(a.vmaps, a.map).triangles(wx - reach_yd, wx + reach_yd, wy - reach_yd, wy + reach_yd,
                                                         zlo, zhi, m2=a.models == 'all', thickness=thick)
         surfaces = Surfaces(wt)
@@ -732,7 +762,7 @@ def main():
             if not any(rc not in seen and rc in col for rc in cand):
                 return seen
             if not main:
-                main.append(under_set if under_set is not None else main_polys(polys))
+                main.append(under_set if under_set is not None else main_polys(polys) | lift_set)
             start = []
             for rc in cand:
                 if rc not in seen and rc in col:

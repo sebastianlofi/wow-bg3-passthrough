@@ -15,7 +15,14 @@ answers with the client's own rule (benilla-formats `elevators.rs`, the 1.12 cli
   speed(span)                            yards a second on one span of a leg
   to_bg3(wow, centre, origin)            world mode's mapping (world_bridge.py World.to_bg3)
 
+  deck(model groups)                     a car's floor from its collision model: height, area, radius, box
+  models(VMAPS)  decks(templates, VMAPS, read_model)   every rideable lift's floor in metres, by template entry
+  stop_points(frames, spawn, quat)       where a car rests, in WoW
+  carve(section, rec, minx, minz, spots) a square's tiles without the static ground a car rests on
+  read_live(bytes)                       benilla's link/wowlifts.bin: every lift on the map this frame
+
   wow_lifts.py table DBC_DIR             every path: period, stops, legs, top speed
+  wow_lifts.py live FILE                 wowlifts.bin as text
 
 Nothing here moves anything: it is the timetable the BG3 side needs to move its platform in step with
 WoW's car.
@@ -133,7 +140,208 @@ def to_bg3(w, centre, origin):
     return (centre[0] + (w[1] - origin[1]) * YD, centre[1] + (w[2] - origin[2]) * YD, centre[2] - (w[0] - origin[0]) * YD)
 
 
+def deck(groups):
+    """A lift car's floor from its collision model (wow_vmap.read_model: [(lo, hi, verts, idx)], model space, WoW
+    axes, yards): the level where most of its upward-facing area lies (its top side, not its underside or a roof's). {Floor (z of it), Area (square yards),
+    Radius (the farthest floor point from the model's axis), Box (x0, y0, x1, y1)}, or None for a model with no
+    floor to stand on (a door, a plunger)."""
+    faces = []
+    for _, _, verts, idx in groups:
+        for i in range(0, len(idx), 3):
+            a, b, c = (verts[3 * k:3 * k + 3] for k in idx[i:i + 3])
+            u, v = [b[j] - a[j] for j in range(3)], [c[j] - a[j] for j in range(3)]
+            n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+            size = (n[0] ** 2 + n[1] ** 2 + n[2] ** 2) ** 0.5
+            # The server's collision models wind a face clockwise seen from its front: a floor's normal by this
+            # cross product points down. (Counting both ways took the underside of Undercity's car for its floor,
+            # 0.29 yd low: the static floor round the shaft then lay above the platform and BG3 stood the rider on
+            # that, harness.)
+            if size > 1e-9 and -n[2] / size > 0.94:
+                faces.append((size / 2.0, (a[2] + b[2] + c[2]) / 3.0, (a, b, c)))
+    if not faces:
+        return None
+    levels = {}
+    for area, z, _ in faces:
+        levels[round(z * 2)] = levels.get(round(z * 2), 0.0) + area
+    floor = max(levels, key=lambda k: levels[k]) / 2.0
+    on = [(area, z, tri) for area, z, tri in faces if abs(z - floor) <= 0.5]
+    area = sum(a for a, _, _ in on)
+    if area < 4.0:
+        return None
+    pts = [p for _, _, tri in on for p in tri]
+    return {'Floor': sum(a * z for a, z, _ in on) / area, 'Area': area,
+            'Radius': max((p[0] ** 2 + p[1] ** 2) ** 0.5 for p in pts),
+            'Box': (min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))}
+
+
+def models(vmaps):
+    """{display id: model file name} from the server's collision data (vmaps/temp_gameobject_models: display id,
+    name length, name, the model's bounds as six floats)."""
+    raw = (Path(vmaps) / 'temp_gameobject_models').read_bytes()
+    out, o = {}, 0
+    while o + 8 <= len(raw):
+        display, n = struct.unpack_from('<II', raw, o)
+        if o + 8 + n + 24 > len(raw):
+            break
+        out[display] = raw[o + 8:o + 8 + n].decode('utf-8', 'replace')
+        o += 8 + n + 24
+    return out
+
+
+def decks(templates, vmaps, read_model):
+    """{entry: {Radius, Floor}} in metres for the lifts a character can ride: `templates` [(entry, display id)]
+    of the server's type 11 game objects, each car's floor from its own collision model (deck). A model with no
+    floor (a door) or no file is left out."""
+    names, out, seen = models(vmaps), {}, {}
+    for entry, display in templates:
+        if display not in seen:
+            seen[display] = None
+            path = Path(vmaps) / (names.get(display, '') + '.vmo')
+            if display in names and path.is_file():
+                try:
+                    seen[display] = deck(read_model(path))
+                except (ValueError, struct.error, OSError):
+                    pass
+        d = seen[display]
+        if d:
+            out[int(entry)] = {'Radius': round(d['Radius'] * YD, 3), 'Floor': round(d['Floor'] * YD, 3)}
+    return out
+
+
+def stop_points(frames, spawn, quat):
+    """Where a car rests, in WoW: [(x, y, z)] of its stops (the spawn point plus each stop's turned offset)."""
+    out = []
+    for _, _, off in stops(frames):
+        r = turn(off, quat)
+        p = (spawn[0] + r[0], spawn[1] + r[1], spawn[2] + r[2])
+        if p not in out:
+            out.append(p)
+    return out
+
+
+AWAY_M = 300.0   # a tile under a resting car is moved this far up, out of BG3's reach from the car's floor
+RISE = 0.4       # the slope from the ground up to a resting car's floor: metres of height per metre (0.2 m a tile)
+
+
+def carve(section, rec, minx, minz, spots, reach=2.0, top=None, seam=12, ring=1.0, step=1.0):
+    """A square's tile records without the ground a lift car rests on, and with seams round it. Where a car stops,
+    WoW's own floor under it is the car's; BG3 stands a walker on the tile nearest its height, so with the static
+    tile left at its height (12 cm from the platform's in Undercity) the rider stood on that tile and stayed behind
+    when the car left (harness). `section`: n x n records of `rec` bytes, the first a flags byte (1 walkable, 4 and
+    8 a seam), then one float floor (rec 5) or two, low and high (rec 9), in BG3 m; (minx, minz) the square's
+    corner; `spots` [(x, y, z, radius)] in BG3 metres: the platform's place at the stop (x and z on the half
+    metre lattice, y its floor) and its floor's radius. Tiles within the radius whose floor lies within `reach` of
+    y lose the walkable bit and go AWAY_M up (not past `top`, the highest a tile of this section may lie; then
+    they only lose the bit). Walkable tiles in the `ring` metres beyond it, within `step` of the floor, get the
+    `seam` bits: BG3's path finder steps from one subgrid to another only on such tiles, and the platform's rim has
+    them too (wowbg3_level.py). The ring lies at the car's floor and the ground beyond it slopes to it (RISE): WoW walks up
+    the step onto a car (the Deeprun Tram's deck lies 0.7 m over its boarding ledge and the station floor) and BG3
+    walks no step of that height (harness: sent onto the car, the party took the ramp down to the track bed under
+    it). Everywhere else WoW's steps reach BG3 as slopes already, through the movement map's polygons; a car has
+    none. (bytes, how many taken away)."""
+    n = int(round((len(section) // rec) ** 0.5))
+    out, cut = None, 0
+    for bx, by, bz, radius in spots:
+        far = radius + ring + step / RISE
+        c0, c1 = int((bx - far - minx) // 0.5), int((bx + far - minx) // 0.5)
+        r0, r1 = int((bz - far - minz) // 0.5), int((bz + far - minz) // 0.5)
+        for r in range(max(r0, 0), min(r1, n - 1) + 1):
+            for c in range(max(c0, 0), min(c1, n - 1) + 1):
+                k = (r * n + c) * rec
+                x, z = minx + (c + 0.5) * 0.5, minz + (r + 0.5) * 0.5
+                d2 = (x - bx) ** 2 + (z - bz) ** 2
+                if d2 > far * far:
+                    continue
+                floor = struct.unpack_from('<f', section, k + 1)[0]
+                if d2 > radius * radius:
+                    if section[k] & 1 and abs(floor - by) <= step:
+                        d = d2 ** 0.5 - radius
+                        run = max(abs(floor - by) / RISE, 1e-6)      # the slope's length for this step
+                        if out is None and (seam or d < ring + run):
+                            out = bytearray(section)
+                        if seam and d <= ring:
+                            out[k] |= seam
+                        # The ring of seams lies at the car's floor (a step of 0.4 m there still stopped BG3's
+                        # path finder at the rim, harness); the slope begins beyond it.
+                        if d < ring + run:
+                            for o in range(1, rec, 4):
+                                h = struct.unpack_from('<f', section, k + o)[0]
+                                struct.pack_into('<f', out, k + o, by + (h - by) * max(0.0, d - ring) / run)
+                    continue
+                if abs(floor - by) > reach:
+                    continue
+                if out is None:
+                    out = bytearray(section)
+                out[k] &= 0xFE
+                up = floor + AWAY_M
+                if top is None or up <= top:
+                    for o in range(1, rec, 4):
+                        struct.pack_into('<f', out, k + o, up)
+                cut += 1
+    return (bytes(out) if out is not None else section), cut
+
+
+def slope_faces(section, rec, minx, minz, spots, ring=1.0, step=1.0):
+    """The same slope as faces, for BG3's rays: [9 floats] per triangle in BG3 metres, from a square's tile records
+    as they are before carve. BG3 stands a character at the height its rays find on WoW's own faces, and those
+    keep the step: led up to the car by the tiles' slope alone, the hero stayed 0.8 m under the Deeprun Tram's
+    deck, was never on the platform's tile and dropped into the trench under the car (harness). Two triangles a
+    tile, over every tile carve slopes and its ring; none where the car's floor lies under the ground beside it
+    (WoW's own face is the higher one there, and stepping down needs none)."""
+    n = int(round((len(section) // rec) ** 0.5))
+    out = []
+    for bx, by, bz, radius in spots:
+        far = radius + ring + step / RISE
+        c0, c1 = int((bx - far - minx) // 0.5), int((bx + far - minx) // 0.5)
+        r0, r1 = int((bz - far - minz) // 0.5), int((bz + far - minz) // 0.5)
+        for r in range(max(r0, 0), min(r1, n - 1) + 1):
+            for c in range(max(c0, 0), min(c1, n - 1) + 1):
+                k = (r * n + c) * rec
+                x, z = minx + (c + 0.5) * 0.5, minz + (r + 0.5) * 0.5
+                d = ((x - bx) ** 2 + (z - bz) ** 2) ** 0.5 - radius
+                floor = struct.unpack_from('<f', section, k + 1)[0]
+                if not section[k] & 1 or d <= 0 or by - floor > step or by - floor < 0.05:
+                    continue
+                run = (by - floor) / RISE
+                if d >= ring + run:
+                    continue
+                def at(px, pz):
+                    dc = ((px - bx) ** 2 + (pz - bz) ** 2) ** 0.5 - radius
+                    return (px, by + (floor - by) * min(1.0, max(0.0, dc - ring) / run), pz)
+                x0, z0 = minx + c * 0.5, minz + r * 0.5
+                p00, p10, p11, p01 = at(x0, z0), at(x0 + 0.5, z0), at(x0 + 0.5, z0 + 0.5), at(x0, z0 + 0.5)
+                out.append(p00 + p01 + p11)        # wound to face up
+                out.append(p00 + p11 + p10)
+    return out
+
+
+def read_live(raw):
+    """benilla's link/wowlifts.bin (patch 0135): WBL1, seq, count, count x (guid u64, entry u32, flags u32 (1 moving),
+    period ms, cycle ms, WoW xyz now, WoW xyz of the end of the span it is on, ms to that end), seq again.
+    [{Guid, Entry, Moving, Period, Cycle, Pos, To, ToMs}], or None for a file that is not whole."""
+    if len(raw) < 16 or raw[:4] != b'WBL1':
+        return None
+    seq, n = struct.unpack_from('<II', raw, 4)
+    if len(raw) != 16 + 52 * n or struct.unpack_from('<I', raw, 12 + 52 * n)[0] != seq:
+        return None
+    out = []
+    for i in range(n):
+        guid, entry, flags, period, cycle, x, y, z, tx, ty, tz, to_ms = struct.unpack_from('<Q4I6fI', raw, 12 + 52 * i)
+        out.append({'Guid': guid, 'Entry': entry, 'Moving': bool(flags & 1), 'Period': period, 'Cycle': cycle,
+                    'Pos': (x, y, z), 'To': (tx, ty, tz), 'ToMs': to_ms})
+    return out
+
+
 def main(argv):
+    if len(argv) == 3 and argv[1] == 'live':
+        lifts = read_live(Path(argv[2]).read_bytes())
+        if lifts is None:
+            print('not a whole wowlifts.bin')
+            return 1
+        for l in sorted(lifts, key=lambda l: l['Entry']):
+            print('%7d %016x  %s cycle %5d of %5d ms  at %9.1f %9.1f %7.1f  to %9.1f %9.1f %7.1f in %5d ms' % (
+                l['Entry'], l['Guid'], 'moving' if l['Moving'] else 'rests ', l['Cycle'], l['Period'], *l['Pos'], *l['To'], l['ToMs']))
+        return 0
     if len(argv) == 3 and argv[1] == 'table':
         for entry, frames in sorted(read_paths(argv[2]).items()):
             rests, journeys = stops(frames), legs(frames)
