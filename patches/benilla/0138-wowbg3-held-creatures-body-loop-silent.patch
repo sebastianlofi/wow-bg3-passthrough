@@ -1,0 +1,14 @@
+diff --git a/crates/benilla-app/src/sound/creature.rs b/crates/benilla-app/src/sound/creature.rs
+--- a/crates/benilla-app/src/sound/creature.rs
++++ b/crates/benilla-app/src/sound/creature.rs
+@@ -400,6 +400,10 @@
+         // `0x623800`'s gate: raw health (`0x623817`), absent read as 0 so a unit awaiting its
+         // snapshot stays silent, and `UNIT_DYNFLAG_DEAD` (`0x62381e`, re-evaluated at `0x60053c`).
+         let alive = store.0.unit_health().unwrap_or(0) > 0 && !store.0.unit_reads_dead();
++        // WOW-BG3 (patch 0138): a creature BG3's turn-based mode holds on its frame is silent, as BG3's own
++        // stopped characters are. The sounds its animations play stop with them (patch 0136); this loop (an
++        // elemental's rumble, a shredder's engine) runs on no animation and went on. Let go, it starts again.
++        let alive = alive && !crate::wowbg3_fight::turn_frozen(entity);
+         let desired = if alive { kit } else { 0 };
+         // Stop a superseded loop: death, or a mount swap that changed the row.
+         if let Some(&prev) = armed.get(&entity) {
