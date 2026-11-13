@@ -8,7 +8,7 @@
   "llvm_commit": "392dfff97d29b59d77e5cac6d4b6ef2585fe7117",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "4ff031c4a01ceb0a9131cbfd46a66ebf1808de9231266003cfaa75535e2ef258",
+  "library_sha256": "314739e732824ec80ac5e01dae4c0968cd728478d3c9aee7a681dc249ce75414",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -251,9 +251,26 @@
           "after_sha256": "558368991ad6bb5fc828f5118ccd1d8c0cc8edfd5ee0b275346414e4c7b5ec9c"
         }
       ]
+    },
+    {
+      "file": "patches/0014-ui-update-under-the-client-lock.patch",
+      "sha256": "8161572c9357d09cd050fb8bca7f5abd326cee8a3366be93faa09c0725f401ba",
+      "purpose": "The game's Noesis View::Update (run on its job workers) holds the client state's lock, so the client's Lua never reads Ext.UI's bare element pointers while the update frees elements",
+      "targets": [
+        {
+          "path": "src/lua_host.cpp",
+          "before_sha256": "89f22aae6bbb42ea34a5cbc2221c3a81bdff5239d69f8e0e332cf9d20a4a7d29",
+          "after_sha256": "452f4b8abda78ae4f17f6981e29baf28ad9b63fe44584ec01921fdbf18b2bb81"
+        },
+        {
+          "path": "src/noesis_ui.cpp",
+          "before_sha256": "c86652b359e47bbd254c53e0019069843e3ab2f2f43c05e630268630fc3ec809",
+          "after_sha256": "7a1f109935961837b02fd842d1fe3223bb3b78edf753c072b8497547fbb3333c"
+        }
+      ]
     }
   ],
-  "previous_library_sha256": "4125af4d50652e8b525b6d63b935149e1c1d2e37943235e94637a63f41e2e344",
+  "previous_library_sha256": "4ff031c4a01ceb0a9131cbfd46a66ebf1808de9231266003cfaa75535e2ef258",
   "retired_patches": [
     {
       "file": "patches/0003-wow-arena-hooks.patch",

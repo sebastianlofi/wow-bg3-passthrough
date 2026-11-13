@@ -1,0 +1,80 @@
+--- a/src/lua_host.cpp
++++ b/src/lua_host.cpp
+@@ -17101,6 +17101,19 @@
+ 
+ std::atomic<bool> g_client_ticks_itself{false};
+ 
++// The client state's lock, held by src/noesis_ui.cpp around the game's
++// Noesis View::Update: the game runs that update on its job workers while the
++// client's Lua reads the same element tree (Ext.UI hands out bare pointers),
++// so Lua could read an element the update was freeing. Recursive, as the
++// UI's routed events take it again from inside the update.
++extern "C" void bg3le_client_lock_hold(bool held) {
++    if (held) {
++        g_client_lock.lock();
++    } else {
++        g_client_lock.unlock();
++    }
++}
++
+ // Runs fn in the client Lua state now, from any thread, under the state's
+ // lock, as upstream's LuaClientPin does; false before the client ticks.
+ extern "C" bool bg3le_with_client_lua(void (*fn)(lua_State*, void*), void* user) {
+--- a/src/noesis_ui.cpp
++++ b/src/noesis_ui.cpp
+@@ -9,6 +9,7 @@
+ #include "noesis_ui.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <string>
+@@ -22,6 +23,7 @@
+                                        unsigned long long* from,
+                                        unsigned long long* to);
+ extern "C" std::size_t bg3le_noesis_resolve(void* (*find)(char const*));
++extern "C" void bg3le_client_lock_hold(bool held);
+ 
+ namespace bg3le {
+ namespace {
+@@ -65,13 +67,39 @@
+     }
+ }
+ 
++// The game runs View::Update on its job workers, and the client's Lua reads
++// the same element tree from the client's thread through Ext.UI's bare
++// pointers: measured 40 to 50 times a session, the two overlapped, and a walk
++// of the main menu read an element the update had just freed (signal 11 in
++// push_dependency). The update runs under the client state's lock, which the
++// client's Lua holds whenever it runs and which the UI's routed events already
++// take from inside the update; a long wait for it is logged.
++class UpdateHeld {
++public:
++    UpdateHeld() {
++        const auto from = std::chrono::steady_clock::now();
++        bg3le_client_lock_hold(true);
++        const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - from).count();
++        static std::atomic<int> logged{0};
++        if (waited >= 8000 && logged.fetch_add(1) < 20) {
++            logf("noesis: View::Update waited %.1f ms for the client's Lua", waited / 1000.0);
++        }
++    }
++    ~UpdateHeld() { bg3le_client_lock_hold(false); }
++    UpdateHeld(UpdateHeld const&) = delete;
++    UpdateHeld& operator=(UpdateHeld const&) = delete;
++};
++
+ std::uint64_t update_hook(void* view, double time) {
+     saw_view(view);
++    UpdateHeld held;
+     return g_update(view, time);
+ }
+ 
+ std::uint64_t update_thunk_hook(void* iview, double time) {
+     saw_view(static_cast<char*>(iview) - kIViewOffset);
++    UpdateHeld held;
+     return g_update_thunk(iview, time);
+ }
+ 
