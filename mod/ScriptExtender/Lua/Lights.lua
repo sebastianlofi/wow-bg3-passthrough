@@ -14,6 +14,7 @@
 -- Reach: WoW's falloff never ends, BG3's light does at its radius; WoW takes it up to one and a half times that.
 -- The file is written again every second while there are lights, so benilla drops them when the game stops writing.
 local M = {}
+local World = Ext.Require("WorldMode.lua")
 
 M.EVERY = 6            -- ticks: ten times a second
 M.REACH = 60           -- metres from the controlled character
@@ -63,7 +64,9 @@ function M.Start(runId)
         ticks = ticks + 1
         if ticks % M.EVERY ~= 3 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
-            local w = mapping()
+            -- Away at camp (World.IsActive: BG3's camp is BG3's) no light goes to WoW's world, which is not shown: walking
+            -- the camp level's every light cost 13 to 45 ms each time (INT_Main_A, 2026-11-13).
+            local w = World.IsActive() and mapping() or nil
             local lines = {}
             if w then
                 local host = Ext.Entity.GetAllEntitiesWithComponent("ClientControl")[1]

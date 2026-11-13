@@ -258,7 +258,21 @@ function M.Start(runId)
     -- record of the camp's position through the mapping is what sent the WoW body 3.3 km away.
     local camp = {Switch = Camp.On(), Seq = 0, In = false, Last = nil, Hold = nil}
     local CAMP_JUMP, CAMP_HOLD = Camp.JUMP, Camp.PENDING + 30
-    M.InCamp = function() return camp.In end
+    -- In a level of our own camp is another BG3 level (Camp.lua's startOwn: INT_Main_A), and no trip record is
+    -- published: the hero's level in hero.json (the server's, every 15 to 30 ticks) says it. Away from the
+    -- world-mode level BG3's camp is BG3's, and the modules that treat BG3 as WoW's view stand aside as for a trip
+    -- (Lights.lua sent the camp's lights to WoW's world, 13 to 45 ms every 6 ticks at INT_Main_A, 2026-11-13).
+    local away = {At = -1, Away = false}
+    local function awayOwn()
+        if not Hero.OWN then return false end
+        if ticks - away.At >= 15 or away.At < 0 then
+            away.At = ticks
+            local h = readJson("hero.json")
+            away.Away = type(h) == "table" and type(h.Region) == "string" and h.Region ~= Hero.REGION
+        end
+        return away.Away
+    end
+    M.InCamp = function() return camp.In or awayOwn() end
     M.CampState = camp
     local function campRead()
         local s = readJson("camp-state.json")

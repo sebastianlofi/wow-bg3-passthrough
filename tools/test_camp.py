@@ -147,6 +147,64 @@ class Trip(unittest.TestCase):
         self.assertFalse(self.state()['InCamp'])
 
 
+class OwnLevelRest(unittest.TestCase):
+    """Camp.lua in our own level: Long Rest pressed in the world is the trip, and BG3's End the Day runs at camp."""
+
+    def setUp(self):
+        self.L = L = runtime()
+        L.execute(r"""
+          files["wow-bg3/camp.json"] = '{"On": true}'
+          level, going, proc_calls, moved = "WOWBG3_Azeroth_A", false, {}, {}
+          Ext.Require = function(n) return {OWN = true, REGION = "WOWBG3_Azeroth_A",
+            Uuid = function() return "%s" end, Hopping = function() return false end} end
+          Ext.Plugins = {List = function() return {} end, Set = function() end}
+          local function db(get) return {Get = get, Delete = function() end} end
+          Osi.DB_CurrentLevel = db(function() return {{level}} end)
+          Osi.DB_Players = {Get = function(_, w) return {{w or "%s"}} end}
+          Osi.DB_OnlyOnce = setmetatable({Get = function() return {{1}} end}, {__call = function() end})
+          Osi.DB_Camp_Unlocked = {Get = function() return {{1}} end}
+          Osi.DB_Camp_NightMode = {Get = function() return {} end}
+          Osi.DB_CampNight = {Get = function() return {} end, Delete = function() end}
+          Osi.DB_LeaveCamp_ReturnPos = {Get = function() return {} end}
+          Osi.DB_GoingToCamp = setmetatable({Get = function() if going then return {{1}} end return {} end,
+            Delete = function() going = false end}, {__call = function() going = true end})
+          Osi.QRY_WaypointTeleport_PlayerBlocked = function() return false end
+          Osi.TeleportPartiesToLevelWithMovie = function(to) moved[#moved + 1] = to end
+          Osi.PROC_Camp_TryEnterNightMode = function(w) proc_calls[#proc_calls + 1] = w end
+          Osi.PROC_TeleportToFromCamp = function() end
+        """ % (HERO_ID, HERO))
+        L.execute((LUA / 'Camp.lua').read_text().replace('local M = {}', 'local M = {}; Camp = M', 1))
+        L.execute('Camp.Start("run")')
+
+    def test_long_rest_in_the_world_is_the_gather_and_end_the_day_runs_at_camp(self):
+        L = self.L
+        g = L.globals()
+        g.listeners['EndTheDayRequested'](HERO)
+        # The story sees a gather under way (DB_GoingToCamp before its rules): it asks the engine for nothing.
+        self.assertTrue(g.going)
+        self.assertEqual(g.moved[1], 'INT_Main_A')
+        self.assertEqual(len(g.proc_calls), 0)
+        g.level = 'INT_Main_A'
+        L.eval('tick(10)')
+        self.assertFalse(g.going)               # the marker goes as the party arrives
+        self.assertEqual(len(g.proc_calls), 0)  # not in camp yet
+        g.in_camp = True
+        L.eval('tick(10)')
+        self.assertEqual(list(g.proc_calls.values()), [HERO])  # BG3's own End the Day, once
+        L.eval('tick(50)')
+        self.assertEqual(len(g.proc_calls), 1)
+
+    def test_go_to_camp_asks_no_end_the_day(self):
+        L = self.L
+        g = L.globals()
+        g.listeners['TeleportToFromCamp'](HERO)
+        g.level = 'INT_Main_A'
+        g.in_camp = True
+        L.eval('tick(30)')
+        self.assertEqual(len(g.proc_calls), 0)
+        self.assertFalse(g.going)
+
+
 class Publish(unittest.TestCase):
     """WorldMode.lua publishTav: no record of camp's position ever reaches the WoW side."""
 

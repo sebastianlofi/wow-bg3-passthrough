@@ -121,13 +121,14 @@ local function startOwn(runId)
     -- No trip of the borrowed-level kind: world mode's client and the bridge read this file.
     Ext.IO.SaveFile("wow-bg3/camp-state.json", Ext.Json.Stringify({RunId = runId, Seq = 1, InCamp = false}))
     local function send(to, why)
-        if asked and ticks < asked.Until then return end
+        if asked and ticks < asked.Until then return false end
         asked = {To = to, Until = ticks + 600}
         for _, b in ipairs(M.BEATS) do
             if #(q(function() return Osi.DB_OnlyOnce:Get(b) end) or {1}) == 0 then Osi.DB_OnlyOnce(b) end
         end
         Ext.Utils.Print("WOW-BG3 camp: " .. why .. ": the party goes to " .. to)
         Osi.TeleportPartiesToLevelWithMovie(to, "", "")
+        return true
     end
     pcall(Ext.Osiris.RegisterListener, "TeleportToFromCamp", 1, "before", function(who)
         local ok, err = pcall(function()
@@ -153,13 +154,21 @@ local function startOwn(runId)
         end)
         if not ok then Ext.Utils.Print("WOW-BG3 camp: " .. tostring(err)) end
     end)
-    -- Long Rest pressed in our level (the story's End the Day gathers the party at camp first, and has no camp
-    -- here): the same trip. At camp the button is BG3's own again.
+    -- Long Rest pressed in our level: BG3 gathers the party at camp first and then asks "Do you want to end the
+    -- day?" there; here the gather is this trip. The press is marked as a gather under way before the story sees it
+    -- (DB_GoingToCamp(1): GLO_Camp's PROC_Camp_TryEnterNightMode takes such a press as handled), else the story
+    -- asked the engine for End the Day in the world at once, the level change took its unanswered prompt away and
+    -- the engine refused every later one (RequestEndTheDayFail: Long Rest at camp did nothing, 2026-11-13). Once the
+    -- hero stands in camp the story's own End the Day runs, as after BG3's gather.
+    local restFor = nil
     pcall(Ext.Osiris.RegisterListener, "EndTheDayRequested", 1, "before", function(who)
         local ok, err = pcall(function()
             if level() ~= Hero.REGION or #(q(function() return Osi.DB_Players:Get(who) end) or {}) == 0 then return end
             if q(Osi.QRY_WaypointTeleport_PlayerBlocked, who) then return end
-            send(M.LEVEL, "Long Rest")
+            if send(M.LEVEL, "Long Rest") then
+                Osi.DB_GoingToCamp(1)
+                restFor = who
+            end
         end)
         if not ok then Ext.Utils.Print("WOW-BG3 camp: " .. tostring(err)) end
     end)
@@ -201,6 +210,12 @@ local function startOwn(runId)
                 visit.In = true
                 M.State.Trips = M.State.Trips + 1
                 Ext.Utils.Print("WOW-BG3 camp: at camp (" .. M.LEVEL .. "), the WoW side waits")
+                if restFor then
+                    local who = restFor
+                    restFor = nil
+                    local okE = pcall(Osi.PROC_Camp_TryEnterNightMode, who)
+                    Ext.Utils.Print("WOW-BG3 camp: Long Rest: End the Day at camp " .. (okE and "asked" or "refused"))
+                end
             end
             if not visit.In and ticks >= visit.Next then
                 visit.Tries, visit.Next = visit.Tries + 1, ticks + M.ENTER_EVERY
