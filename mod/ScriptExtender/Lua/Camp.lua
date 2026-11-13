@@ -158,7 +158,7 @@ local function startOwn(runId)
     -- day?" there; here the gather is this trip. The press is marked as a gather under way before the story sees it
     -- (DB_GoingToCamp(1): GLO_Camp's PROC_Camp_TryEnterNightMode takes such a press as handled), else the story
     -- asked the engine for End the Day in the world at once, the level change took its unanswered prompt away and
-    -- the engine refused every later one (RequestEndTheDayFail: Long Rest at camp did nothing, 2026-11-13). Once the
+    -- the engine refused every later one (RequestEndTheDayFail: Long Rest at camp did nothing). Once the
     -- hero stands in camp the story's own End the Day runs, as after BG3's gather.
     local restFor = nil
     pcall(Ext.Osiris.RegisterListener, "EndTheDayRequested", 1, "before", function(who)

@@ -65,7 +65,7 @@ function M.Start(runId)
         if ticks % M.EVERY ~= 3 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
             -- Away at camp (World.IsActive: BG3's camp is BG3's) no light goes to WoW's world, which is not shown: walking
-            -- the camp level's every light cost 13 to 45 ms each time (INT_Main_A, 2026-11-13).
+            -- the camp level's every light cost 13 to 45 ms each time (INT_Main_A).
             local w = World.IsActive() and mapping() or nil
             local lines = {}
             if w then
