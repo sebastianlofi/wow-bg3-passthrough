@@ -752,19 +752,20 @@ function M.Start(runId)
             end
         end
         if state and state.Started then
-            if ticks % 3 == 0 then publishTav() end
+            local P = Ext.Require("LuaProf.lua").Section
+            if ticks % 3 == 0 then P("wm publishTav", publishTav) end
             if ticks % 3 == 1 and not M.InCamp() then
                 local ok, err = pcall(readErrand)
                 if not ok then lastExtra.ErrandError = tostring(err) end
             end
-            if not M.InCamp() then publishInput(false) end
+            if not M.InCamp() then P("wm publishInput", publishInput, false) end
             if ticks % 600 == 0 then writeStatus() end
             -- Tav's meshes and poses for WoW (TavPlan.lua), checked every TavPlan.Every ticks (since
             -- Every 10, was 30: a weapon drawn or an attachment of a cast reaches WoW
             -- sooner; a check costs TavPlan.LastMs, in world-status.json as TavMs).
             if ticks % TavPlan.Every == 7 % TavPlan.Every and not M.InCamp() then
                 -- The hero and the companions near her (one figure each).
-                local ok, n = TavPlan.Publish(figures(), state.Centre, state.WowOrigin)
+                local ok, n = P("wm TavPlan.Publish", TavPlan.Publish, figures(), state.Centre, state.WowOrigin)
                 lastExtra.TavMeshes = ok and n or ("error: " .. tostring(n))
                 lastExtra.TavMs, lastExtra.TavPlans = TavPlan.LastMs, TavPlan.Plans
             end
@@ -779,7 +780,7 @@ function M.Start(runId)
             if listDue and not M.InCamp() then
                 local okp, p = pcall(Probe.HostPosition)
                 if okp then
-                    local ok, n = pcall(TavPlan.PublishKeep, p, 60, figures())
+                    local ok, n = P("wm PublishKeep", pcall, TavPlan.PublishKeep, p, 60, figures())
                     lastExtra.Kept = ok and n or ("error: " .. tostring(n))
                 end
             end

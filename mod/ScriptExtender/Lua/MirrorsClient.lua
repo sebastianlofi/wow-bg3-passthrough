@@ -19,6 +19,9 @@
 -- frame is drawn: in the harness the client copy was then 0.05 to 0.37 m behind its model at the end
 -- of 17% of the frames while it walked. So the same placement is applied again right after that
 -- system's update (Ext.Entity.OnSystemPostUpdate, M.HookSystem): 0 of 174 frames over 0.05 m.
+-- Since then the placement is made there alone, once a frame (it was made in the tick and made again there: two
+-- passes over every stand-in's transform, 2 ms of BG3's frame on an i7-14700K with 50 stand-ins), and only written
+-- where the transform is not already the target (an idle mob's). The tick places only while the hook is not taken.
 -- Left alone: stand-ins in a BG3 combat or dead (BG3 runs them, LinkLive streams them to WoW), mobs
 -- a fight holds, and everything without a fresh record (the server's placement shows). Also a robbed
 -- NPC searching for the thief (mirror-status.json Searching, Mirrors.lua): BG3's crime reaction walks
@@ -38,9 +41,11 @@ local hookId
 
 function M.Start(runId)
     local ticks = 0
+    local placeDue = false -- a tick in world mode asked for this frame's placement (made in the hook when it is taken)
     local owned, ownedAt = {}, -1000 -- stand-in uuid -> {guid, skip}
     local recs, seq, recT = {}, nil, 0
     local last = {} -- uuid -> the position and rotation written last tick
+    local calm, phase, nextPhase, CALM = {}, {}, 0, 30 -- uuid -> placements that found it in place; its tick phase
     local stats = {Placed = 0, Overwritten = 0, OverMax = 0, Skipped = 0, Stale = 0, CostMs = 0, CostMax = 0, Ticks = 0}
     -- Which stand-ins exist and which BG3 runs (mirror-status.json, Mirrors.lua's).
     local function readOwned()
@@ -83,8 +88,9 @@ function M.Start(runId)
     end
     local function place()
         -- New stand-ins are placed within 5 ticks of Mirrors.lua reporting them.
-        if ticks - ownedAt >= 5 then ownedAt = ticks; readOwned() end
-        readLive()
+        local P = Ext.Require("LuaProf.lua").Section
+        if ticks - ownedAt >= 5 then ownedAt = ticks; P("mc readOwned", readOwned) end
+        P("mc readLive", readLive)
         if not seq then return end
         local age = Ext.Utils.MonotonicTime() - recT
         if age > FRESH_MS then
@@ -96,16 +102,23 @@ function M.Start(runId)
         local dt = math.max(-LEAD_MAX, math.min(LEAD_MAX, (age + M.LeadMs) / 1000))
         -- Stand-ins Mirrors.lua no longer lists are not placed again (nor after CharacterManager).
         for uuid in pairs(last) do if not owned[uuid] then last[uuid] = nil end end
+        for uuid in pairs(calm) do if not owned[uuid] then calm[uuid], phase[uuid] = nil, nil end end
         for uuid, o in pairs(owned) do
-            local r = recs[o.Guid]
+          local r = recs[o.Guid]
+          if not phase[uuid] then nextPhase = nextPhase + 1; phase[uuid] = nextPhase % 3 end
+          -- An idle mob (no velocity) whose stand-in has stood at its point for CALM placements: every third tick.
+          local still = r and r[5] == 0 and r[6] == 0 and r[7] == 0
+          if still and (calm[uuid] or 0) >= CALM and (ticks + phase[uuid]) % 3 ~= 0 then
+            stats.Rested = (stats.Rested or 0) + 1
+          else
             local e = r and not o.Skip and (r[8] & 1) == 0 and Ext.Entity.Get(uuid)
             if e and not busy(e) then
                 local b = World.ToBg3({r[1] + r[5] * dt, r[2] + r[6] * dt, r[3] + r[7] * dt})
                 local t = e.Transform.Transform
                 local l = last[uuid]
+                local c, cr = t.Translate, t.RotationQuat
                 if l then
                     -- Something else moved it since our last write (the server's teleport replicated).
-                    local c = t.Translate
                     local d = math.sqrt((c[1] - l[1]) ^ 2 + (c[3] - l[3]) ^ 2)
                     if d > 0.002 then
                         stats.Overwritten = stats.Overwritten + 1
@@ -115,14 +128,24 @@ function M.Start(runId)
                 -- WoW orientation o faces BG3's (sin o, -cos o); yaw a turns -z to (-sin a, -cos a): a = -o.
                 local a = -r[4]
                 local qy, qw = math.sin(a / 2), math.cos(a / 2)
-                t.Translate = {b[1], b[2], b[3]}
-                t.RotationQuat = {0.0, qy, 0.0, qw}
-                last[uuid] = {b[1], b[2], b[3], qy, qw}
-                stats.Placed = stats.Placed + 1
+                -- In place within 1 mm and 0.01 degree (BG3 keeps the transform in 32-bit floats: at 1 km a step is 0.06 mm).
+                if math.abs(c[1] - b[1]) + math.abs(c[2] - b[2]) + math.abs(c[3] - b[3]) > 1e-3
+                    or math.abs(cr[2] - qy) + math.abs(cr[4] - qw) + math.abs(cr[1]) + math.abs(cr[3]) > 2e-4 then
+                    t.Translate = {b[1], b[2], b[3]}
+                    t.RotationQuat = {0.0, qy, 0.0, qw}
+                    stats.Placed = stats.Placed + 1
+                    calm[uuid] = 0
+                else
+                    stats.Kept = (stats.Kept or 0) + 1
+                    calm[uuid] = still and (calm[uuid] or 0) + 1 or 0
+                end
+                if not l or l[1] ~= b[1] or l[2] ~= b[2] or l[3] ~= b[3] or l[4] ~= qy or l[5] ~= qw then last[uuid] = {b[1], b[2], b[3], qy, qw} end
             else
                 last[uuid] = nil
+                calm[uuid] = 0
                 stats.Skipped = stats.Skipped + 1
             end
+          end
         end
     end
     -- Robbed NPCs searching (see the header): where BG3 draws them, for benilla, while no fight streams.
@@ -153,25 +176,15 @@ function M.Start(runId)
             .. table.concat(parts) .. string.pack("<I4", WOWBG3SinSeq))
         stats.Searching = #parts
     end
-    local function reapply()
-        stats.Reapplied = (stats.Reapplied or 0) + 1
-        for uuid, b in pairs(last) do
-            local e = Ext.Entity.Get(uuid)
-            if e then
-                local t = e.Transform.Transform
-                local c, r = t.Translate, t.RotationQuat
-                if math.abs(c[1] - b[1]) + math.abs(c[3] - b[3]) > 0.002
-                    or math.abs(r[2] - b[4]) + math.abs(r[4] - b[5]) > 0.002 then
-                    stats.HookFixed = (stats.HookFixed or 0) + 1
-                    t.Translate = {b[1], b[2], b[3]}
-                    t.RotationQuat = {0.0, b[4], 0.0, b[5]}
-                end
-            end
-        end
-    end
     function M.Hook(system)
         if hookId then pcall(Ext.Entity.Unsubscribe, hookId) end
-        hookId = Ext.Entity.OnSystemPostUpdate(system, function() pcall(reapply) end)
+        hookId = Ext.Entity.OnSystemPostUpdate(system, function()
+            if not placeDue then return end
+            placeDue = false
+            stats.Reapplied = (stats.Reapplied or 0) + 1
+            local ok, err = Ext.Require("LuaProf.lua").Section("mc place (hook)", pcall, place)
+            if not ok then stats.Error = tostring(err) end
+        end)
         stats.Hook = system
         return hookId
     end
@@ -194,9 +207,14 @@ function M.Start(runId)
             stats.HookError = (not ok) and tostring(err) or nil
         end
         local t0 = Ext.Utils.MonotonicTime()
-        local ok, err = pcall(place)
-        if not ok then stats.Error = tostring(err) end
-        local okS, errS = pcall(publishSearch)
+        local P = Ext.Require("LuaProf.lua").Section
+        if hookId then
+            placeDue = true
+        else
+            local ok, err = P("mc place", pcall, place)
+            if not ok then stats.Error = tostring(err) end
+        end
+        local okS, errS = P("mc publishSearch", pcall, publishSearch)
         if not okS then stats.SearchError = tostring(errS) end
         local ms = Ext.Utils.MonotonicTime() - t0
         stats.Ticks = stats.Ticks + 1

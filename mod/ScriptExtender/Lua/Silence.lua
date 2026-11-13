@@ -8,7 +8,7 @@
 -- on the main object (Movement_Footstep, Dog_Crime_AD), the stand-in's own spell cast (CrSpell_Cast_Bite)
 -- and its whooshes on the hand objects.
 --
--- Every tick each stand-in's game objects are taken out of Wwise's mix with the plugin's op 150
+-- Each stand-in's game objects are taken out of Wwise's mix with the plugin's op 150
 -- (AK::SoundEngine::SetListeners with no listener: Wwise renders nothing they emit, whatever posts it),
 -- except the body object (Lua slot 4, C++ slot 3): BG3 plays an attacker's hit on the victim's body object
 -- (Tav's sword on a wolf: Weapon_Combat on the wolf's; a wolf's bite on Tav: Weapon_Combat and
@@ -20,6 +20,11 @@
 -- Without op 150 (an older plugin) the other objects get BG3's own GLO_Cinematics_MuteEntity instead
 -- (mutes BG3's world, cinematic and dialogue sounds on that object; not the action and spell sounds;
 -- BG3 posts it on every effect it ends).
+-- How often: every tick for a stand-in with a change (a new object, one gone, a death) and every third tick (each on
+-- its own phase) for one whose objects stayed as they were for 30 checks. Every tick for all was 1.5 ms of BG3's frame
+-- with 50 stand-ins (on an i7-14700K: late frames). BG3's component events cannot say when instead: a Sound
+-- component is made before its game object gets an id, and that id comes with no event (measured: 11 of 55 new ids
+-- had no create event in their tick). So a new object on a long-calm stand-in can sound for up to two ticks.
 -- Stand-ins: every mob Mirrors.lua lists (mirror-status.json, also the ones a fight adopted) and a fight's
 -- own spawns (LinkLive status.json Scaled, Uuid). Only in world mode. A game object BG3 registers anew
 -- (a respawn, sound activation) is taken the next tick. Status: wow-bg3/link/silence-status.json.
@@ -55,6 +60,8 @@ function M.Start(runId)
     local nativeAt = -1000
     local stats = {Standins = 0, Objects = 0, Muted = 0, Kept = 0, Fallback = 0, Errors = 0, Ticks = 0,
         CostMs = 0, CostMax = 0, Party = 0, DeadQuiet = 0}
+    local calm, phase, objs, nextPhase = {}, {}, {}, 0 -- uuid -> checks without a change; its tick phase; its objects
+    local CALM = 30
     local function readList()
         local out = {}
         local st = readJson(DIR .. "mirror-status.json")
@@ -112,13 +119,21 @@ function M.Start(runId)
         return nil
     end
     local function pass()
-        if ticks - listAt >= 5 then listAt = ticks; readList() end
+        if ticks - listAt >= 5 then listAt = ticks; Ext.Require("LuaProf.lua").Section("silence readList", readList) end
         if native == false and ticks - nativeAt > 600 then native = nil end
         local nStand, nObj = 0, 0
         local now = Ext.Utils.MonotonicTime()
-        for uuid in pairs(done) do if not standins[uuid] then done[uuid] = nil end end
+        for uuid in pairs(done) do if not standins[uuid] then done[uuid], calm[uuid], phase[uuid], objs[uuid] = nil, nil, nil, nil end end
         for uuid in pairs(deadAt) do if not standins[uuid] then deadAt[uuid] = nil end end
         for uuid in pairs(standins) do
+          -- A stand-in whose objects have stayed as they are for CALM checks is looked at every third tick (each on
+          -- its own phase); one with a change, a new object pending, a death, is looked at every tick.
+          if not phase[uuid] then nextPhase = nextPhase + 1; phase[uuid] = nextPhase % 3 end
+          if (calm[uuid] or 0) >= CALM and (ticks + phase[uuid]) % 3 ~= 0 then
+            nStand, nObj = nStand + 1, nObj + (objs[uuid] or 0)
+            stats.Rested = (stats.Rested or 0) + 1
+          else
+            local changed = false
             local e = Ext.Entity.Get(uuid)
             local okS, sk = pcall(function() return e and e.SkeletonSoundObjects end)
             -- Never the player's own characters (a stand-in has no party membership).
@@ -130,19 +145,25 @@ function M.Start(runId)
                 local d = done[uuid] or {}
                 done[uuid] = d
                 local okH, hp = pcall(function() return e.Health.Hp end)
+                local wasDead = deadAt[uuid] ~= nil
                 if okH and type(hp) == "number" and hp <= 0 then deadAt[uuid] = deadAt[uuid] or now else deadAt[uuid] = nil end
+                if (deadAt[uuid] ~= nil) ~= wasDead then changed = true end
+                local n0 = nObj
                 local quiet = deadAt[uuid] ~= nil and now - deadAt[uuid] >= M.DeadKeepMs
                 for i = 1, 9 do
                     local okE, se = pcall(function() return sk.SoundEntities[i] end)
                     local id = okE and se and soundId(se)
                     if not id then
+                        if d[i] ~= nil then changed = true end
                         d[i] = nil
                     else
                         nObj = nObj + 1
                         local rec = d[i]
                         local fresh = not rec or rec[1] ~= id
+                        if fresh then changed = true end
                         if i == M.KeepSlot and not quiet then
                             if fresh or rec[2] ~= "kept" then
+                                changed = true
                                 -- (alive again: the listeners its death took come back)
                                 if not fresh and rec[2] == "listeners" then pcall(op, id, 0) end
                                 if not fresh and rec[2] == "bg3-mute" then pcall(Ext.Audio.PostEvent, se, "GLO_Cinematics_UnMuteEntity") end
@@ -151,6 +172,7 @@ function M.Start(runId)
                                 stats.Kept = stats.Kept + 1
                             end
                         elseif fresh or rec[2] == "kept" then
+                            changed = true
                             local how = take(se, id)
                             if how then
                                 d[i] = {id, how}
@@ -159,7 +181,12 @@ function M.Start(runId)
                         end
                     end
                 end
+                objs[uuid] = nObj - n0
+                -- A dead one keeps every tick until its body object went (M.DeadKeepMs after HP 0).
+                local settling = deadAt[uuid] ~= nil and now - deadAt[uuid] < M.DeadKeepMs + 100
+                calm[uuid] = (changed or settling) and 0 or (calm[uuid] or 0) + 1
             end
+          end
         end
         stats.Standins, stats.Objects = nStand, nObj
     end

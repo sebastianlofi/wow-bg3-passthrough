@@ -186,6 +186,7 @@ local CAST_KEEP = 200
 -- once M.LiveMove metres off and turned once its wanted facing moved M.LiveTurnDeg (or BG3's turn has
 -- not reached it after FACE_CHECK ticks).
 local LIVE_FRESH_MS, LIVE_LEAD_MAX = 250, 0.2
+local QUIET_RECHECK = 30 -- server ticks (1 s): an idle stand-in's checks again though its WoW mob stayed put
 local YD = 0.9144
 -- Research knobs: Live false goes back to mirror.json's positions alone; LiveMove (m) and LiveTurnDeg
 -- are the teleport and turn thresholds; LiveLeadMs moves the server copy's target on by that much
@@ -943,6 +944,8 @@ function M.Start(runId)
     -- Every server tick: each idle stand-in where its WoW mob is now, facing its way.
     local function follow()
         M.LiveStats.Ticks = M.LiveStats.Ticks + 1
+        if (M.TickTeleports or 0) > (M.LiveStats.TeleportsMaxTick or 0) then M.LiveStats.TeleportsMaxTick = M.TickTeleports end
+        M.TickTeleports = 0
         if ticks - worldAt >= 30 then
             worldAt = ticks
             local w = readJson("world.json")
@@ -980,7 +983,16 @@ function M.Start(runId)
                 if not m.InFight and not m.Dead and q(Osi.IsInCombat, m.Uuid) ~= 1 then searchStep(m) end
                 p = nil
             end
-            if p and not m.InFight and not m.Dead and not forced[m.Uuid] then
+            -- An idle mob's point is the same every tick (no velocity): once a check found nothing to do, it is
+            -- checked again when its point or facing changes, or after QUIET_RECHECK ticks for what BG3 did to it.
+            -- (Every stand-in was asked IsInCombat, IsDead, its position and facing every tick: a third of the mod's
+            -- time on BG3's server thread with 50 stand-ins.)
+            local quiet = p and m.QuietP and ticks - m.QuietAt < QUIET_RECHECK and m.QuietP[1] == p[1] and m.QuietP[2] == p[2]
+                and m.QuietP[3] == p[3] and m.QuietD[1] == dir[1] and m.QuietD[2] == dir[2]
+            if quiet then M.LiveStats.Quiet = (M.LiveStats.Quiet or 0) + 1 end
+            if not quiet then m.QuietP = nil end
+            if p and not quiet and not m.InFight and not m.Dead and not forced[m.Uuid] then
+                local acted = M.LiveStats.Teleports + M.LiveStats.Turns + (M.LiveStats.NoSnap or 0) + (M.LiveStats.Air or 0)
                 -- BG3 runs a stand-in in its combat: checked every tick, a fight can start any time.
                 if q(Osi.IsInCombat, m.Uuid) ~= 1 and q(Osi.IsDead, m.Uuid) ~= 1 then
                     local at = pos(m.Uuid)
@@ -1007,7 +1019,8 @@ function M.Start(runId)
                             M.LiveStats.NoSnap = (M.LiveStats.NoSnap or 0) + 1
                             pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, 0)
                         elseif hdist(at, p) > M.LiveMove or (m.NoSnap and dy > M.LiveHeight) then
-                            pcall(Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, m.NoSnap and 0 or 1)
+                            Ext.Require("LuaProf.lua").Section("mirrors follow teleport", pcall, Osi.TeleportToPosition, m.Uuid, p[1], p[2] + 0.5, p[3], "", 0, 0, 0, 0, m.NoSnap and 0 or 1)
+                            M.TickTeleports = (M.TickTeleports or 0) + 1
                             M.LiveStats.Teleports = M.LiveStats.Teleports + 1
                         end
                     end
@@ -1021,6 +1034,9 @@ function M.Start(runId)
                     elseif m.FaceCheck then
                         checkFace(m)
                     end
+                end
+                if not m.FaceCheck and acted == M.LiveStats.Teleports + M.LiveStats.Turns + (M.LiveStats.NoSnap or 0) + (M.LiveStats.Air or 0) then
+                    m.QuietP, m.QuietD, m.QuietAt = p, dir, ticks
                 end
             end
         end
@@ -1355,25 +1371,33 @@ function M.Start(runId)
         end
     end
 
+    -- mirror-status.json: what other code reads of each stand-in, about three times a second. The diagnostics of each
+    -- (facing, spawn HP, outfit, name, ...) go to mirror-debug.json every 30th write (10 s): BG3's Lua JSON writer took
+    -- up to 13.6 ms for the whole 83 KB on BG3's server thread, a late frame every third of a second on a slower CPU.
+    local statusWrites = 0
     local function writeStatus()
-        local mobs = {}
+        statusWrites = statusWrites + 1
+        local withDebug = statusWrites % 30 == 1
+        local mobs, debugMobs = {}, withDebug and {} or nil
         for guid, m in pairs(mirrors) do
             local h = hp(m.Uuid) or {0, 0}
             if searching[m.Uuid] then searchDone(m, nil) end -- the time limit holds without WoW records too
             mobs[guid] = {Uuid = m.Uuid, Hp = h[1], MaxHp = h[2], InCombat = m.Combat == true, Dead = m.Dead == true,
                 HitByTav = hitByTav[m.Uuid] == true, Stage = m.Stage, Hostile = m.Hostile, Scale = m.Scale,
-                Friendly = m.Friendly, Guard = m.Guard, CrimeReady = friendlyAimed[m.Uuid] ~= nil,
-                Searching = searching[m.Uuid] ~= nil,
+                Friendly = m.Friendly, Guard = m.Guard, CrimeReady = friendlyAimed[m.Uuid] ~= nil, Searching = searching[m.Uuid] ~= nil,
                 -- A corpse someone carries (BG3's own pick-up): in an inventory, on no ground.
                 Carried = m.Dead == true and q(Osi.IsInInventory, m.Uuid) == 1,
-                FriendlyReset = m.FriendlyReset,
-                Provoked = provoked[m.Uuid] == true, LeftCombat = m.LeftCombat,
-                Named = m.Named, NameText = m.NameText, NameError = m.NameError, Aimed = aimed[m.Uuid] and ticks - aimed[m.Uuid] or nil,
-                SpawnHp = m.SpawnHp, SpawnFrac = m.SpawnFrac, HpInit = m.HpInit,
-                Outfit = m.Outfit, OutfitError = m.OutfitError,
-                HealsKept = m.HealsKept, ScaleHealSkipped = m.ScaleHealSkipped,
-                Pos = pos(m.Uuid), Yaw = yawOf(forward(m.Uuid)), WantYaw = m.Want and yawOf(m.Want.Dir) or nil,
-                Live = m.LiveAt ~= nil and ticks - m.LiveAt < 5, LiveYaw = m.LiveDir and yawOf(m.LiveDir) or nil}
+                Provoked = provoked[m.Uuid] == true, LeftCombat = m.LeftCombat, Named = m.Named, Pos = pos(m.Uuid)}
+            if debugMobs then
+                debugMobs[guid] = {Uuid = m.Uuid,
+                    FriendlyReset = m.FriendlyReset, NameText = m.NameText, NameError = m.NameError,
+                    Aimed = aimed[m.Uuid] and ticks - aimed[m.Uuid] or nil,
+                    SpawnHp = m.SpawnHp, SpawnFrac = m.SpawnFrac, HpInit = m.HpInit,
+                    Outfit = m.Outfit, OutfitError = m.OutfitError,
+                    HealsKept = m.HealsKept, ScaleHealSkipped = m.ScaleHealSkipped,
+                    Yaw = yawOf(forward(m.Uuid)), WantYaw = m.Want and yawOf(m.Want.Dir) or nil,
+                    Live = m.LiveAt ~= nil and ticks - m.LiveAt < 5, LiveYaw = m.LiveDir and yawOf(m.LiveDir) or nil}
+            end
         end
         local th = hp(Hero.Uuid()) or {0, 0}
         -- InCombat: the party's (the hero or a companion in a BG3 combat; the bridge pulls the mobs in
@@ -1385,7 +1409,7 @@ function M.Start(runId)
             -- world_bridge.py turns WoW's view onto its WoW character through Far Sight).
             Controlled = uuidOf(tostring(q(Osi.GetHostCharacter) or ""))}
         -- Diagnosis (casts refused in a fight): Tav's spell-cast and interrupt components.
-        if tav.InCombat then
+        if tav.InCombat and withDebug then
             tav.Busy = q(function()
                 local out = {}
                 for _, n in ipairs(host():GetAllComponentNames(false)) do
@@ -1414,7 +1438,14 @@ function M.Start(runId)
                     Dead = q(Osi.IsDead, uuid) == 1 or M.KnockedOut[uuid] == true}
             end
         end
-        Ext.IO.SaveFile(DIR .. "mirror-status.json", Ext.Json.Stringify({RunId = runId, Seq = lastSeen, Tick = ticks,
+        local P = Ext.Require("LuaProf.lua").Section
+        if debugMobs then
+            P("mirrors ws debug", function()
+                Ext.IO.SaveFile(DIR .. "mirror-debug.json", Ext.Json.Stringify({RunId = runId, Tick = ticks, Mobs = debugMobs},
+                    {Beautify = false}))
+            end)
+        end
+        local text = P("mirrors ws stringify", Ext.Json.Stringify, {RunId = runId, Seq = lastSeen, Tick = ticks,
             Session = session, FaceMode = M.FaceMode, FaceStats = M.FaceStats, Tav = tav, Mobs = mobs, Problems = problems,
             FightSpawned = fightSpawned,
             Strikes = M.Strikes or 0, LiveStats = M.LiveStats, Life = M.Life, HeroState = heroState,
@@ -1426,7 +1457,8 @@ function M.Start(runId)
                 local n = 0
                 for _, c in pairs(M.Churn) do if c > 1 then n = n + 1 end end
                 return n
-            end)()}))
+            end)()}, {Beautify = false})
+        P("mirrors ws save", Ext.IO.SaveFile, DIR .. "mirror-status.json", text)
     end
 
     Ext.Events.Tick:Subscribe(function()
@@ -1440,18 +1472,21 @@ function M.Start(runId)
             end
             return
         end
-        if next(attacking) then pcall(missedAttacks) end
+        local P = Ext.Require("LuaProf.lua").Section
+        if next(attacking) then P("mirrors missedAttacks", pcall, missedAttacks) end
         if next(mirrors) then
-            for _, m in pairs(mirrors) do
-                if m.HpWait then pcall(healthDue, m) else pcall(hpGuard, m) end
-            end
-            local okf, errf = pcall(follow)
+            P("mirrors hp", function()
+                for _, m in pairs(mirrors) do
+                    if m.HpWait then pcall(healthDue, m) else pcall(hpGuard, m) end
+                end
+            end)
+            local okf, errf = P("mirrors follow", pcall, follow)
             if not okf then note("follow: " .. tostring(errf)) end
         end
         if ticks % 10 ~= 0 then return end
-        local ok, err = pcall(step)
+        local ok, err = P("mirrors step", pcall, step)
         if not ok then note("step: " .. tostring(err)) end
-        pcall(writeStatus)
+        P("mirrors writeStatus", pcall, writeStatus)
     end)
 end
 return M

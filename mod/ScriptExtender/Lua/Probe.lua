@@ -64,6 +64,10 @@ function Probe.Start(context)
         end
     end
     if context == "client" then
+        if Ext._Internal.Getenv and Ext._Internal.Getenv("WOW_BG3_LUAPROF") == "1" then
+            local okLp, errLp = pcall(function() Ext.Require("LuaProf.lua").Install("client") end)
+            if not okLp then Ext.Log.Print("WOW-BG3 luaprof: " .. tostring(errLp)) end
+        end
         -- GUI overrides first: they must be in before BG3's GUI loads the files (WowUi.lua).
         local okUi, errUi = pcall(function() Ext.Require("WowUi.lua").Start(report.RunId) end)
         if not okUi then Ext.Log.Print("WOW-BG3 ui: " .. tostring(errUi)) end
@@ -113,6 +117,10 @@ function Probe.Start(context)
         if not okSi then Ext.Log.Print("WOW-BG3 silence: " .. tostring(errSi)) end
     end
     if context == "server" then
+        if Ext._Internal.Getenv and Ext._Internal.Getenv("WOW_BG3_LUAPROF") == "1" then
+            local okLp, errLp = pcall(function() Ext.Require("LuaProf.lua").Install("server") end)
+            if not okLp then Ext.Log.Print("WOW-BG3 luaprof: " .. tostring(errLp)) end
+        end
         local okMl, errMl = pcall(function() Ext.Require("MoveLoading.lua").StartServer() end)
         if not okMl then Ext.Log.Print("WOW-BG3 move fade: " .. tostring(errMl)) end
         -- New game straight into world mode: the nautiloid intro skipped with the
