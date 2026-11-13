@@ -113,6 +113,23 @@ def test_a_server_failure_of_an_earlier_bg3_does_not_count_for_this_one():
     assert coord.index('STARTED = time.time()') < coord.index('def server_state():')
 
 
+def test_nothing_shipped_matches_paths_by_the_old_io_folders_name():
+    """The minimap's picture is found by its path: matching "/wow-bg3/link/" (the old folder's name) found nothing once
+    the IO folder moved to Mods/WOW-BG3/data/io, and the minimap was empty."""
+    bad = []
+    for f in shipped():
+        for n, l in lines(f):
+            s = l.strip()
+            if s.startswith(('//', '#', '--', '*')):
+                continue
+            if re.search(r'["\']/wow-bg3/(link|gui|cursors)/', l):
+                bad.append('%s:%d %s' % (f, n, s))
+    assert not bad, bad
+    plugin = (ROOT / 'plugins/wowbg3_plugin.cpp').read_text()
+    # BG3's GUI hands the minimap's URI without the root's "/" ("home/<user>/..."): the match must drop it too.
+    assert 'io_dir() + "link/minimap/"' in plugin and "t.find_first_not_of('/')" in plugin
+
+
 if __name__ == '__main__':
     for name, fn in sorted(globals().items()):
         if name.startswith('test_'):

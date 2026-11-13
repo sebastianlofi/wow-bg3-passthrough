@@ -165,12 +165,8 @@ static int ground_view_record(GrRec* out) {
     DescSlot* sl = si ? &si->slot[2] : NULL;
     t_gr_src_res = sl ? sl->res : 0;
     t_gr_src_off = sl ? sl->off : 0;
-    if (sl && (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)) {
-        uint32_t at = 0;
-        for (uint32_t b = 0; b < 2; b++)
-            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
-        if (at < t_ndyn[0] && at < 8) t_gr_src_off += t_dyn[0][at];
-    }
+    const int at = sl ? set_dyn_at(t_set[0], si, 2) : -1;
+    if (at >= 0 && (uint32_t)at < t_ndyn[0] && at < 8) t_gr_src_off += t_dyn[0][at];
     return 1;
 }
 
@@ -194,12 +190,8 @@ static void ground_view_seen(void) {
     DescSlot* sl = &si->slot[2];
     if (!sl->res) return;
     uint64_t off = sl->off;
-    if (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-        uint32_t at = 0;
-        for (uint32_t b = 0; b < 2; b++)
-            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
-        if (at < t_ndyn[0] && at < 8) off += t_dyn[0][at];
-    }
+    const int at = set_dyn_at(t_set[0], si, 2);
+    if (at >= 0 && (uint32_t)at < t_ndyn[0] && at < 8) off += t_dyn[0][at];
     if (sl->res == t_gr_view_res && off == t_gr_view_off) return;
     t_gr_view_res = sl->res;
     t_gr_view_off = off;
@@ -430,9 +422,7 @@ static VkFramebuffer ground_fb(DeviceData* d, const uint64_t img[4], VkImageView
     for (int k = 0; k < 4; k++) {
         VkImageAspectFlags a = VK_IMAGE_ASPECT_COLOR_BIT;
         if (k == 0) {
-            a = VK_IMAGE_ASPECT_DEPTH_BIT;
-            if (g_gr.fmt[0] == VK_FORMAT_D32_SFLOAT_S8_UINT || g_gr.fmt[0] == VK_FORMAT_D24_UNORM_S8_UINT || g_gr.fmt[0] == VK_FORMAT_D16_UNORM_S8_UINT)
-                a |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            a = depth_layout_aspects(g_gr.fmt[0]);
         }
         VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, (VkImage)img[k], VK_IMAGE_VIEW_TYPE_2D, g_gr.fmt[k],
                                      {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
@@ -544,8 +534,7 @@ static void ground_inject(DeviceData* d, VkCommandBuffer cb) {
         d->CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 2 * qi);
     }
     if (preb) {
-        VkImageAspectFlags da = VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (fmt[0] == VK_FORMAT_D32_SFLOAT_S8_UINT) da |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        VkImageAspectFlags da = depth_layout_aspects(fmt[0]);
         barrier_aspect(d, cb, (VkImage)t_gr_img[0], da, (VkImageLayout)lay[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy rd = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {t_gr_w, t_gr_h, 1}};
         d->CmdCopyImageToBuffer(cb, (VkImage)t_gr_img[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, preb, 1, &rd);

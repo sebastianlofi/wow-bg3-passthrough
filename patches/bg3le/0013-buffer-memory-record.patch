@@ -1,0 +1,339 @@
+WOW-BG3 bg3le patch 0013: where the game's buffers live in host memory, and its descriptor sets' dynamic bindings, on every driver (on top of 0001-0012).
+
+A native plugin that reads the game's buffers on the CPU (WOW-BG3's render plugin: the per-view camera block, effect
+data) needs each buffer's memory, offset and the memory's mapping. An early plugin (patch 0005) starts at the game's
+first pipeline cache or swapchain, after the game made, bound and mapped its constant rings. bg3le is on the game's
+path from its first vkGetDeviceProcAddr, so it keeps the record: vkCreateBuffer, vkDestroyBuffer, vkBindBufferMemory(2),
+vkMapMemory, vkUnmapMemory and vkFreeMemory are answered with recorders (always on), and
+bg3le_vk_buffer_host(buffer, &size) gives a buffer's bytes while its memory is mapped over it. Before this the render
+plugin read RADV's own objects: no layout fitted on Nvidia's driver, and the world was not drawn there.
+The same for descriptor sets: vkCreateDescriptorSetLayout, vkAllocateDescriptorSets and their undoing are recorded, and
+bg3le_vk_set_dynamic(set, ...) gives a set's dynamic bindings (binding, descriptor count) in binding order: the plugin
+counted them from the slots it saw written, which missed the game's early sets and templates (7 offsets read as 5:
+BG3's state rebound with those lost the device on Nvidia).
+
+--- a/src/vulkan_forward.cpp
++++ b/src/vulkan_forward.cpp
+@@ -33,9 +33,14 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include <atomic>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
++#include <algorithm>
++#include <memory>
++#include <unordered_map>
++#include <vector>
+ #include <unordered_set>
+ 
+ #include "detour_interpose.h"
+@@ -355,3 +360,273 @@
+     }
+     return nullptr;
+ }
++
++// ---- WOW-BG3 patch 0013: where the game's buffers live in host memory, and its descriptor sets' dynamic bindings ----
++//
++// A native plugin that reads the game's buffers on the CPU (WOW-BG3's render plugin: the per-view camera block,
++// effect data) needs each buffer's memory, its offset in it and the memory's mapping. An early plugin starts at
++// the game's first pipeline cache or swapchain, after the game made, bound and mapped its constant rings, so it
++// never saw those calls; reading them back out of a driver's own objects works only on drivers whose layout is
++// known. bg3le is on the game's path from its first vkGetDeviceProcAddr, so it keeps the record itself, for every
++// driver: buffer -> (size, memory, offset), memory -> (mapping, offset, size). bg3le_vk_buffer_host answers.
++namespace {
++
++struct BufRec {
++    std::uint64_t memory = 0, offset = 0, size = 0;
++};
++struct MemRec {
++    char* ptr = nullptr;
++    std::uint64_t offset = 0, size = 0;
++};
++std::mutex g_rec_lock;
++std::unordered_map<std::uint64_t, BufRec>& rec_buffers() {
++    static std::unordered_map<std::uint64_t, BufRec> m;
++    return m;
++}
++std::unordered_map<std::uint64_t, MemRec>& rec_memory() {
++    static std::unordered_map<std::uint64_t, MemRec> m;
++    return m;
++}
++std::uint64_t h64(std::uint64_t v) { return v; }
++template <typename T>
++std::uint64_t h64(T* v) { return (std::uint64_t)(std::uintptr_t)v; }
++
++template <typename Fn>
++Fn rec_real(char const* name) {
++    if (void* next = ::dlsym(RTLD_NEXT, name)) return (Fn)next;
++    if (void* h = ::dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD)) {
++        if (void* found = ::dlsym(h, name)) return (Fn)found;
++    }
++    return nullptr;
++}
++
++}  // namespace
++
++extern "C" VkResult bg3le_rec_vkCreateBuffer(VkDevice dev, VkBufferCreateInfo const* info,
++                                             VkAllocationCallbacks const* alloc, VkBuffer* out) {
++    static const auto next = rec_real<PFN_vkCreateBuffer>("vkCreateBuffer");
++    const VkResult r = next(dev, info, alloc, out);
++    if (r == VK_SUCCESS && out != nullptr && info != nullptr) {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_buffers()[h64(*out)] = BufRec{0, 0, info->size};
++    }
++    return r;
++}
++
++extern "C" void bg3le_rec_vkDestroyBuffer(VkDevice dev, VkBuffer buffer, VkAllocationCallbacks const* alloc) {
++    static const auto next = rec_real<PFN_vkDestroyBuffer>("vkDestroyBuffer");
++    {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_buffers().erase(h64(buffer));
++    }
++    next(dev, buffer, alloc);
++}
++
++extern "C" VkResult bg3le_rec_vkBindBufferMemory(VkDevice dev, VkBuffer buffer, VkDeviceMemory memory,
++                                                 VkDeviceSize offset) {
++    static const auto next = rec_real<PFN_vkBindBufferMemory>("vkBindBufferMemory");
++    const VkResult r = next(dev, buffer, memory, offset);
++    if (r == VK_SUCCESS) {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        BufRec& b = rec_buffers()[h64(buffer)];
++        b.memory = h64(memory);
++        b.offset = offset;
++    }
++    return r;
++}
++
++extern "C" VkResult bg3le_rec_vkBindBufferMemory2(VkDevice dev, std::uint32_t n, VkBindBufferMemoryInfo const* infos) {
++    static const auto next = rec_real<PFN_vkBindBufferMemory2>("vkBindBufferMemory2");
++    const VkResult r = next(dev, n, infos);
++    if (r == VK_SUCCESS && infos != nullptr) {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        for (std::uint32_t i = 0; i < n; ++i) {
++            BufRec& b = rec_buffers()[h64(infos[i].buffer)];
++            b.memory = h64(infos[i].memory);
++            b.offset = infos[i].memoryOffset;
++        }
++    }
++    return r;
++}
++
++extern "C" VkResult bg3le_rec_vkMapMemory(VkDevice dev, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size,
++                                          VkMemoryMapFlags flags, void** data) {
++    static const auto next = rec_real<PFN_vkMapMemory>("vkMapMemory");
++    const VkResult r = next(dev, memory, offset, size, flags, data);
++    if (r == VK_SUCCESS && data != nullptr && *data != nullptr) {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_memory()[h64(memory)] = MemRec{(char*)*data, offset, size};
++    }
++    return r;
++}
++
++extern "C" void bg3le_rec_vkUnmapMemory(VkDevice dev, VkDeviceMemory memory) {
++    static const auto next = rec_real<PFN_vkUnmapMemory>("vkUnmapMemory");
++    {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_memory().erase(h64(memory));
++    }
++    next(dev, memory);
++}
++
++extern "C" void bg3le_rec_vkFreeMemory(VkDevice dev, VkDeviceMemory memory, VkAllocationCallbacks const* alloc) {
++    static const auto next = rec_real<PFN_vkFreeMemory>("vkFreeMemory");
++    {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_memory().erase(h64(memory));
++    }
++    next(dev, memory, alloc);
++}
++
++// Descriptor sets: which dynamic bindings each one has, from its layout (binding number and descriptor count, in
++// binding order: the order vkCmdBindDescriptorSets consumes dynamic offsets in). A plugin that started after the
++// game made its layouts and sets cannot count them from what it saw; bg3le_vk_set_dynamic answers.
++namespace {
++using DynList = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
++std::unordered_map<std::uint64_t, std::shared_ptr<const DynList>>& rec_layouts() {
++    static std::unordered_map<std::uint64_t, std::shared_ptr<const DynList>> m;
++    return m;
++}
++std::unordered_map<std::uint64_t, std::shared_ptr<const DynList>>& rec_sets() {
++    static std::unordered_map<std::uint64_t, std::shared_ptr<const DynList>> m;
++    return m;
++}
++std::unordered_map<std::uint64_t, std::vector<std::uint64_t>>& rec_pools() {
++    static std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> m;
++    return m;
++}
++}  // namespace
++
++extern "C" VkResult bg3le_rec_vkCreateDescriptorSetLayout(VkDevice dev, VkDescriptorSetLayoutCreateInfo const* info,
++                                                          VkAllocationCallbacks const* alloc, VkDescriptorSetLayout* out) {
++    static const auto next = rec_real<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout");
++    const VkResult r = next(dev, info, alloc, out);
++    if (r == VK_SUCCESS && out != nullptr && info != nullptr) {
++        auto list = std::make_shared<DynList>();
++        for (std::uint32_t i = 0; i < info->bindingCount && info->pBindings != nullptr; ++i) {
++            const VkDescriptorSetLayoutBinding& b = info->pBindings[i];
++            if ((b.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
++                 || b.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) && b.descriptorCount > 0) {
++                list->emplace_back(b.binding, b.descriptorCount);
++            }
++        }
++        std::sort(list->begin(), list->end());
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_layouts()[h64(*out)] = std::move(list);
++    }
++    return r;
++}
++
++extern "C" void bg3le_rec_vkDestroyDescriptorSetLayout(VkDevice dev, VkDescriptorSetLayout layout,
++                                                       VkAllocationCallbacks const* alloc) {
++    static const auto next = rec_real<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout");
++    {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        rec_layouts().erase(h64(layout));  // its sets keep their own copy of the list
++    }
++    next(dev, layout, alloc);
++}
++
++extern "C" VkResult bg3le_rec_vkAllocateDescriptorSets(VkDevice dev, VkDescriptorSetAllocateInfo const* info,
++                                                       VkDescriptorSet* sets) {
++    static const auto next = rec_real<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");
++    const VkResult r = next(dev, info, sets);
++    if (r == VK_SUCCESS && info != nullptr && sets != nullptr) {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        std::vector<std::uint64_t>& pool = rec_pools()[h64(info->descriptorPool)];
++        for (std::uint32_t i = 0; i < info->descriptorSetCount; ++i) {
++            auto l = rec_layouts().find(h64(info->pSetLayouts[i]));
++            rec_sets()[h64(sets[i])] = l != rec_layouts().end() ? l->second : nullptr;
++            pool.push_back(h64(sets[i]));
++        }
++    }
++    return r;
++}
++
++extern "C" VkResult bg3le_rec_vkFreeDescriptorSets(VkDevice dev, VkDescriptorPool pool, std::uint32_t n,
++                                                   VkDescriptorSet const* sets) {
++    static const auto next = rec_real<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets");
++    {
++        std::lock_guard<std::mutex> held(g_rec_lock);
++        for (std::uint32_t i = 0; i < n && sets != nullptr; ++i) rec_sets().erase(h64(sets[i]));
++    }
++    return next(dev, pool, n, sets);
++}
++
++namespace {
++void rec_pool_end(std::uint64_t pool, bool destroyed) {
++    std::lock_guard<std::mutex> held(g_rec_lock);
++    auto p = rec_pools().find(pool);
++    if (p == rec_pools().end()) return;
++    for (std::uint64_t set : p->second) rec_sets().erase(set);
++    if (destroyed) rec_pools().erase(p);
++    else p->second.clear();
++}
++}  // namespace
++
++extern "C" VkResult bg3le_rec_vkResetDescriptorPool(VkDevice dev, VkDescriptorPool pool, VkDescriptorPoolResetFlags flags) {
++    static const auto next = rec_real<PFN_vkResetDescriptorPool>("vkResetDescriptorPool");
++    rec_pool_end(h64(pool), false);
++    return next(dev, pool, flags);
++}
++
++extern "C" void bg3le_rec_vkDestroyDescriptorPool(VkDevice dev, VkDescriptorPool pool, VkAllocationCallbacks const* alloc) {
++    static const auto next = rec_real<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool");
++    rec_pool_end(h64(pool), true);
++    next(dev, pool, alloc);
++}
++
++// SET's dynamic bindings, in binding order: up to CAP (binding number, descriptor count) pairs into BINDING and COUNT.
++// Returns how many it has, or -1 when bg3le does not know the set (or its layout).
++extern "C" int bg3le_vk_set_dynamic(std::uint64_t set, std::uint32_t* binding, std::uint32_t* count, int cap) {
++    std::lock_guard<std::mutex> held(g_rec_lock);
++    auto s = rec_sets().find(set);
++    if (s == rec_sets().end() || !s->second) return -1;
++    const DynList& list = *s->second;
++    for (int i = 0; i < (int)list.size() && i < cap; ++i) {
++        if (binding != nullptr) binding[i] = list[i].first;
++        if (count != nullptr) count[i] = list[i].second;
++    }
++    return (int)list.size();
++}
++
++// The device-level names bg3le answers with a recorder (src/vulkan_memory.cpp asks), or null.
++extern "C" void* bg3le_vulkan_recorder(char const* name) {
++    static const struct {
++        char const* name;
++        void* fn;
++    } kRec[] = {
++        {"vkCreateBuffer", (void*)&bg3le_rec_vkCreateBuffer},
++        {"vkDestroyBuffer", (void*)&bg3le_rec_vkDestroyBuffer},
++        {"vkBindBufferMemory", (void*)&bg3le_rec_vkBindBufferMemory},
++        {"vkBindBufferMemory2", (void*)&bg3le_rec_vkBindBufferMemory2},
++        {"vkBindBufferMemory2KHR", (void*)&bg3le_rec_vkBindBufferMemory2},
++        {"vkMapMemory", (void*)&bg3le_rec_vkMapMemory},
++        {"vkUnmapMemory", (void*)&bg3le_rec_vkUnmapMemory},
++        {"vkFreeMemory", (void*)&bg3le_rec_vkFreeMemory},
++        {"vkCreateDescriptorSetLayout", (void*)&bg3le_rec_vkCreateDescriptorSetLayout},
++        {"vkDestroyDescriptorSetLayout", (void*)&bg3le_rec_vkDestroyDescriptorSetLayout},
++        {"vkAllocateDescriptorSets", (void*)&bg3le_rec_vkAllocateDescriptorSets},
++        {"vkFreeDescriptorSets", (void*)&bg3le_rec_vkFreeDescriptorSets},
++        {"vkResetDescriptorPool", (void*)&bg3le_rec_vkResetDescriptorPool},
++        {"vkDestroyDescriptorPool", (void*)&bg3le_rec_vkDestroyDescriptorPool},
++    };
++    if (name == nullptr) return nullptr;
++    for (auto const& e : kRec) {
++        if (std::strcmp(name, e.name) == 0) return e.fn;
++    }
++    return nullptr;
++}
++
++// A CPU pointer to BUFFER's first byte while its memory is mapped over the whole buffer, and its size; else null.
++extern "C" const std::uint8_t* bg3le_vk_buffer_host(std::uint64_t buffer, std::uint64_t* size) {
++    std::lock_guard<std::mutex> held(g_rec_lock);
++    auto b = rec_buffers().find(buffer);
++    if (b == rec_buffers().end() || b->second.memory == 0 || b->second.size == 0) return nullptr;
++    auto m = rec_memory().find(b->second.memory);
++    if (m == rec_memory().end() || m->second.ptr == nullptr || b->second.offset < m->second.offset) return nullptr;
++    const std::uint64_t at = b->second.offset - m->second.offset;
++    if (m->second.size != VK_WHOLE_SIZE && (at > m->second.size || b->second.size > m->second.size - at)) return nullptr;
++    if (size != nullptr) *size = b->second.size;
++    return (const std::uint8_t*)(m->second.ptr + at);
++}
+--- a/src/vulkan_memory.cpp
++++ b/src/vulkan_memory.cpp
+@@ -333,6 +333,9 @@
+ // memsteer.so, which has no overlay.
+ extern "C" void* bg3le_vulkan_forwarder(char const* name)
+     __attribute__((weak));
++// WOW-BG3 patch 0013: src/vulkan_forward.cpp's buffer and memory recorders, always on.
++extern "C" void* bg3le_vulkan_recorder(char const* name)
++    __attribute__((weak));
+ 
+ PFN_vkVoidFunction diverted(const char* name) {
+     if (name == nullptr) return nullptr;
+@@ -346,6 +349,12 @@
+         }
+     }
+ 
++    if (bg3le_vulkan_recorder != nullptr) {
++        if (void* fn = bg3le_vulkan_recorder(name)) {
++            return (PFN_vkVoidFunction)fn;
++        }
++    }
++
+     if (mode() == Mode::Off) return nullptr;
+     if (std::strcmp(name, "vkGetPhysicalDeviceMemoryProperties") == 0) {
+         return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties;
+@@ -374,7 +383,7 @@
+     // Ours whenever either feature is on: the device-level lookup is how both
+     // the steering and the overlay's forwarders are reached.
+     const bool wanted =
+-        mode() != Mode::Off
++        mode() != Mode::Off || bg3le_vulkan_recorder != nullptr
+         || (bg3le_vulkan_forwarder != nullptr
+             && bg3le_vulkan_forwarder("vkQueuePresentKHR") != nullptr);
+     if (name != nullptr && wanted

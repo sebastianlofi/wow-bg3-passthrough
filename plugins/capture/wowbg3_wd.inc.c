@@ -95,6 +95,22 @@ static int wd_draw(DeviceData* d, VkCommandBuffer cb, const GrRec* rec, uint32_t
     memcpy(f + 16, rec->fwd, 12); f[19] = 0; memcpy(f + 20, rec->right, 12); f[23] = 0; memcpy(f + 24, rec->up, 12); f[27] = 0;
     // The mat4's columns are vp's rows of four: the z and w rows across them.
     for (int c = 0; c < 4; c++) { f[28 + c] = rec->vp[c * 4 + 2]; f[32 + c] = rec->vp[c * 4 + 3]; }
+    {   // BG3's depth convention, measured from its own camera (camera-relative): the depth of points 1, 10 and 100 m ahead.
+        // Reverse-Z (near 1, far 0) is what the sky's placeholder and the depth test assume.
+        static int said;
+        if (said < 3) {
+            float dz[3];
+            const float dist[3] = {1.0f, 10.0f, 100.0f};
+            for (int i = 0; i < 3; i++) {
+                float p[3] = {rec->fwd[0] * dist[i], rec->fwd[1] * dist[i], rec->fwd[2] * dist[i]};
+                float zz = f[28] * p[0] + f[29] * p[1] + f[30] * p[2] + f[31], ww = f[32] * p[0] + f[33] * p[1] + f[34] * p[2] + f[35];
+                dz[i] = ww != 0.0f ? zz / ww : -1.0f;
+            }
+            logf_("wdepth: BG3's depth at 1, 10, 100 m ahead: %.7f %.7f %.7f (%s; depth format %d)", dz[0], dz[1], dz[2],
+                  dz[0] > dz[2] ? "reverse-Z: near is greater" : "forward Z: near is smaller", (int)g_gr.fmt[0]);
+            said++;
+        }
+    }
     float pc2[64];
     memcpy(pc2, f, 36 * sizeof(float));
     memcpy(pc2 + 36, eye, 12); pc2[39] = tx; memcpy(pc2 + 40, fwd, 12); pc2[43] = ty; memcpy(pc2 + 44, right, 12); pc2[47] = 0; memcpy(pc2 + 48, up, 12); pc2[51] = 0;
@@ -117,11 +133,7 @@ static int wd_draw(DeviceData* d, VkCommandBuffer cb, const GrRec* rec, uint32_t
 // BG3's descriptor sets back (this pass bound its own), as fb_feed does.
 static void wd_restore(DeviceData* d, VkCommandBuffer cb) {
     if (t_bind_cb != cb || !t_pipe) return;
-    RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
-    Recipe* rr = ri ? ri->r : NULL;
-    PlInfo* pl = (rr && g_pl && rr->layout) ? TABLE_FIND(g_pl, PL_CAP, rr->layout, 0) : NULL;
-    for (uint32_t k2 = 0; pl && k2 < pl->nsets && k2 < 8; k2++)
-        if (t_set[k2]) { VkDescriptorSet ds = (VkDescriptorSet)t_set[k2]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)rr->layout, k2, 1, &ds, t_ndyn[k2], t_dyn[k2]); }
+    binds_restore(d, cb, 0);  // BG3's descriptor binds exactly as it made them
 }
 
 // The second draw: WoW's collision ground, tested against WoW's depth just written. Where it passes, the ground is what WoW shows, so

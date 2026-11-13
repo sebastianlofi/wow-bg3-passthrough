@@ -152,7 +152,17 @@ static void sf_img_free(DeviceData* d, SfImg* i) {
     if (i->mem) d->FreeMemory(d->device, i->mem, NULL);
     memset(i, 0, sizeof *i);
 }
-static int sf_img_make(DeviceData* d, SfImg* i, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags usage) {
+// A Vulkan debug name on one of the plugin's objects ("wowbg3 <what>"), for validation's reports; nothing without a
+// debug layer.
+static void vk_name(DeviceData* d, VkObjectType type, uint64_t h, const char* what) {
+    if (!d->SetDebugUtilsObjectNameEXT || !h) return;
+    char n[96];
+    snprintf(n, sizeof n, "wowbg3 %s", what);
+    VkDebugUtilsObjectNameInfoEXT ni = {VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT, NULL, type, h, n};
+    d->SetDebugUtilsObjectNameEXT(d->device, &ni);
+}
+#define sf_img_make(d, i, f, w, h, u) sf_img_make_named(d, i, f, w, h, u, #i)
+static int sf_img_make_named(DeviceData* d, SfImg* i, VkFormat f, uint32_t w, uint32_t h, VkImageUsageFlags usage, const char* what) {
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_TILING_OPTIMAL, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (d->CreateImage(d->device, &ci, NULL, &i->img) != VK_SUCCESS) { i->img = VK_NULL_HANDLE; return 0; }
@@ -166,6 +176,8 @@ static int sf_img_make(DeviceData* d, SfImg* i, VkFormat f, uint32_t w, uint32_t
                                  {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
                                  {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (d->CreateImageView(d->device, &vci, NULL, &i->view) != VK_SUCCESS) { i->view = VK_NULL_HANDLE; sf_img_free(d, i); return 0; }
+    vk_name(d, VK_OBJECT_TYPE_IMAGE, (uint64_t)i->img, what);
+    vk_name(d, VK_OBJECT_TYPE_IMAGE_VIEW, (uint64_t)i->view, what);
     return 1;
 }
 static void sf_barrier(DeviceData* d, VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags ss,
@@ -678,7 +690,9 @@ static void sf_copy(DeviceData* d, VkCommandBuffer cb, VkImage src, VkImageLayou
 }
 // BG3 ended a pass (its EndRenderPass already recorded): after the surface decals, A1; after the
 // surface forward layers, H. Copies record no binding, so BG3's state is untouched.
+static void post_dtf(DeviceData* d, VkCommandBuffer cb);  // wowbg3_fxbg.inc.c: after BG3's fragment display transform
 static void surf_pass_end(DeviceData* d, VkCommandBuffer cb) {
+    post_dtf(d, cb);
     if (t_fbg_cb == cb) { t_fbg_cb = VK_NULL_HANDLE; fb_feed(d, cb, t_fbg_img, (VkImageLayout)t_fbg_lay); }
     if (t_fog_cb == cb) { t_fog_cb = VK_NULL_HANDLE; fb_fog(d, cb); }
     if (t_cld_cb == cb) { t_cld_cb = VK_NULL_HANDLE; fb_clr(d, cb); }

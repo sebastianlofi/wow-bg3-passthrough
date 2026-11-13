@@ -2,7 +2,9 @@
 local M = {}
 function M.Start(runId)
     local sequence, ticks = 0, 0
-    local function find(widget, name)
+    -- INDEX (optional): which of several nodes with this widget and name (BG3 keeps two copies of some dialogs, such as
+    -- ModVerification), 1 for the first met; without it the target must be the only one.
+    local function find(widget, name, index)
         local found, count = nil, 0
         local rows = {}
         local seen, visited = {}, 0
@@ -14,12 +16,16 @@ function M.Start(runId)
             if not ok then nodeName = nil end
             if node.Type == "ls.UIWidget" then owner = nodeName end
             rows[#rows + 1] = {Name = nodeName, Widget = owner, Type = node.Type}
-            if owner == widget and nodeName == name then found, count = node, count + 1 end
+            if owner == widget and nodeName == name then
+                count = count + 1
+                if index == nil or index == count then found = node end
+            end
             for i = 1, math.min(node.VisualChildrenCount or 0, 128) do walk(node:VisualChild(i), owner, depth + 1) end
         end
         walk(Ext.UI.GetRoot(), nil, 0)
         if name == "@tree" then return rows end
-        assert(count == 1, "Target must identify exactly one current menu node")
+        if index == nil then assert(count == 1, "Target must identify exactly one current menu node") end
+        assert(found ~= nil, "No such menu node (" .. tostring(count) .. " with this widget and name)")
         return found
     end
     Ext.Events.Tick:Subscribe(function()
@@ -34,7 +40,8 @@ function M.Start(runId)
         local result = {RunId = runId, Sequence = sequence, Action = command.Action}
         local ok, value = pcall(function()
             if command.Action == "Tree" then return find(nil, "@tree") end
-            local target = find(command.Widget, command.Name)
+            local index = math.type(command.Index) == "integer" and command.Index or nil
+            local target = find(command.Widget, command.Name, index)
             if command.Action == "Inspect" then
                 local props = {}
                 for key, prop in pairs(target:GetAllProperties()) do props[tostring(key)] = tostring(prop) end

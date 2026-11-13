@@ -213,6 +213,7 @@ typedef struct {
     PFN_vkDestroyBuffer DestroyBuffer;
     // trace
     PFN_vkCreateImage CreateImage;
+    PFN_vkSetDebugUtilsObjectNameEXT SetDebugUtilsObjectNameEXT;  // NULL unless a debug layer offers it
     PFN_vkCreateImageView CreateImageView;
     PFN_vkCreateFramebuffer CreateFramebuffer;
     PFN_vkCreateRenderPass CreateRenderPass;
@@ -903,7 +904,8 @@ static struct {
     // it renders its scene smaller and scales it up before its display transform. Every pass of the scene (depth, G-buffer,
     // lighting, composite, effects) is at this size, the UI and the final picture at the screen's. 0: not seen yet.
     uint32_t sw, sh;
-} g_role = {0, 0, -1, -1, {{0, 0}}, 0, {0}, 0, 0, 0, 0, 0, 0, {0}, 0, {0}, 0, 0, 0, 0};
+    uint64_t seen_at;  // 1 + the present at which the scene's G-buffer pass was last begun (scene_seen); 0: never
+} g_role = {0, 0, -1, -1, {{0, 0}}, 0, {0}, 0, 0, 0, 0, 0, 0, {0}, 0, {0}, 0, 0, 0, 0, 0};
 #define SCENE_W (g_role.sw ? g_role.sw : g_role.ew)
 #define SCENE_H (g_role.sh ? g_role.sh : g_role.eh)
 static __thread VkCommandBuffer t_ui_cb;
@@ -1461,6 +1463,14 @@ static void barrier_aspect(DeviceData* d, VkCommandBuffer cmd, VkImage img, VkIm
     d->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+// The aspects a layout change of a depth image takes: both of a depth-stencil image (without
+// separateDepthStencilLayouts a barrier must name them together). BG3's depth is D32S8 on AMD, D24S8 on Nvidia: a
+// barrier on the depth aspect alone of the latter lost the device there.
+static VkImageAspectFlags depth_layout_aspects(VkFormat f) {
+    return f == VK_FORMAT_D16_UNORM_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT
+               ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+               : VK_IMAGE_ASPECT_DEPTH_BIT;
+}
 static int depth_bytes(VkFormat f) {
     return (f == VK_FORMAT_D16_UNORM || f == VK_FORMAT_D16_UNORM_S8_UINT) ? 2 : 4;
 }
@@ -1661,10 +1671,10 @@ static VkSemaphore compose_frame(QueueData* q, SwapchainData* c, uint32_t index,
     barrier_aspect(d, cmd, img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy rc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}};
     d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_cr.buf[0], 1, &rc);
-    barrier_aspect(d, cmd, depth, VK_IMAGE_ASPECT_DEPTH_BIT, dlayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_aspect(d, cmd, depth, depth_layout_aspects(dfmt), dlayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy rd = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}};
     d->CmdCopyImageToBuffer(cmd, depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_cr.buf[1], 1, &rd);
-    barrier_aspect(d, cmd, depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dlayout);
+    barrier_aspect(d, cmd, depth, depth_layout_aspects(dfmt), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dlayout);
     if (ui) {
         barrier_aspect(d, cmd, ui, VK_IMAGE_ASPECT_COLOR_BIT, ulayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         d->CmdCopyImageToBuffer(cmd, ui, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_cr.buf[2], 1, &rc);
@@ -1809,6 +1819,7 @@ static void dump_image(QueueData* q, const VkPresentInfoKHR* info) {
     if (!found) { logf_("dump: image %u not known", g_dump.id); return; }
     int depth = is_depth_format(found->fmt);
     VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageAspectFlags lay_aspect = depth ? depth_layout_aspects(found->fmt) : aspect;  // the copy reads depth alone
     VkDeviceSize size = (VkDeviceSize)found->w * found->hgt * 8;
     Staging* st = staging_for(d, q->family, size);
     if (!st) return;
@@ -1816,10 +1827,10 @@ static void dump_image(QueueData* q, const VkPresentInfoKHR* info) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     d->BeginCommandBuffer(st->cmd, &bi);
     VkImage img = (VkImage)found->h;
-    barrier_aspect(d, st->cmd, img, aspect, (VkImageLayout)g_dump.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier_aspect(d, st->cmd, img, lay_aspect, (VkImageLayout)g_dump.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy r = {0, 0, 0, {aspect, 0, 0, 1}, {0, 0, 0}, {found->w, found->hgt, 1}};
     d->CmdCopyImageToBuffer(st->cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, st->buffer, 1, &r);
-    barrier_aspect(d, st->cmd, img, aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkImageLayout)g_dump.layout);
+    barrier_aspect(d, st->cmd, img, lay_aspect, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkImageLayout)g_dump.layout);
     d->EndCommandBuffer(st->cmd);
     (void)info;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &st->cmd, 0, NULL};
@@ -1958,6 +1969,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(VkDevice device, const V
         (copy.usage & VK_IMAGE_USAGE_SAMPLED_BIT) && copy.samples == VK_SAMPLE_COUNT_1_BIT &&
         copy.extent.width < 1600 && copy.extent.height < 1600)
         copy.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // BG3's 10-bit colour targets (its fragment display transform writes one: DT_FS): wdpostcas copies the output and
+    // puts WoW's colours back over it with a copy (wowbg3_fxbg.inc.c post_dtf).
+    if (copy.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && (copy.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && copy.samples == VK_SAMPLE_COUNT_1_BIT)
+        copy.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     info = &copy;
     VkResult r = d->CreateImage(device, info, alloc, out);
     if (r == VK_SUCCESS && trace_tables()) {
@@ -2162,8 +2177,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_UnmapMemory(VkDevice device, VkDeviceMem
 }
 // Buffers made before the render plugin: BG3 makes its constant rings at startup
 // (its per-view camera block among them), so the plugin never saw them bound or their memory mapped and
-// the ground injection found no camera ("unmapped"). The plugin reads them back from the driver
-// (g_buf_recover, wowbg3_render.c); the answers (also "not mapped") are kept here, apart from the tables
+// the ground injection found no camera ("unmapped"). The plugin asks bg3le, which records every buffer of the game
+// from its first call (g_buf_recover, wowbg3_render.c; bg3le patch 0013); the answers (also "not mapped") are kept here, apart from the tables
 // the hooks fill, under their own lock.
 static const uint8_t* (*g_buf_recover)(uint64_t buffer, uint64_t* size);
 typedef struct { uint64_t h; const uint8_t* ptr; uint64_t size; } RBufInfo;
@@ -2284,6 +2299,53 @@ static SetInfo* set_bound(uint64_t key) {
                   (unsigned long long)key, (unsigned long long)age);
     }
     return s;
+}
+// A set's dynamic offsets: how many it takes and where a binding's first one is. They follow its layout (each dynamic
+// binding, in binding order, takes one offset per descriptor), which bg3le records for every set the game makes
+// (WOW-BG3's bg3le patch 0013): BG3 makes its layouts, many sets and its update templates before the plugin starts,
+// so counting the dynamic slots the plugin saw written undercounted (7 offsets read as 5: on Nvidia's driver BG3's
+// state rebound with those lost the device; RADV let it pass). A set bg3le does not know falls back to that count.
+static int (*g_set_dyn)(uint64_t set, uint32_t* binding, uint32_t* count, int cap);
+static int g_set_dyn_tried;
+static uint64_t g_set_dyn_unknown;
+static int set_dyn_layout(uint64_t set, uint32_t* b, uint32_t* c, int cap) {
+    if (!__atomic_load_n(&g_set_dyn_tried, __ATOMIC_ACQUIRE)) {
+        g_set_dyn = (int (*)(uint64_t, uint32_t*, uint32_t*, int))dlsym(RTLD_DEFAULT, "bg3le_vk_set_dynamic");
+        logf_("sets: dynamic offsets from %s", g_set_dyn ? "bg3le's record of every set's layout (patch 0013)"
+                                                         : "the slots seen written (this bg3le keeps no layouts: patch 0013 missing)");
+        __atomic_store_n(&g_set_dyn_tried, 1, __ATOMIC_RELEASE);
+    }
+    int n = g_set_dyn && set ? g_set_dyn(set, b, c, cap) : -1;
+    if (n < 0 && set && g_set_dyn && __atomic_fetch_add(&g_set_dyn_unknown, 1, __ATOMIC_RELAXED) % 10000 == 0)
+        logf_("sets: set %llx not in bg3le's record (%llu so far): its dynamic offsets counted from the slots seen",
+              (unsigned long long)set, (unsigned long long)g_set_dyn_unknown + 1);
+    return n;
+}
+static int slot_dynamic(const SetInfo* si, uint32_t b) {
+    return si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
+// How many dynamic offsets SET takes.
+static uint32_t set_dyn_count(uint64_t set, const SetInfo* si) {
+    uint32_t b[16], c[16], total = 0;
+    int n = set_dyn_layout(set, b, c, 16);
+    if (n >= 0) { for (int i = 0; i < n && i < 16; i++) total += c[i]; return total; }
+    for (uint32_t k = 0; si && k < DESC_SLOTS; k++) total += (uint32_t)slot_dynamic(si, k);
+    return total;
+}
+// Where BINDING's first dynamic offset is among SET's, or -1 when it is not a dynamic binding.
+static int set_dyn_at(uint64_t set, const SetInfo* si, uint32_t binding) {
+    uint32_t b[16], c[16];
+    int n = set_dyn_layout(set, b, c, 16), at = 0;
+    if (n >= 0) {
+        for (int i = 0; i < n && i < 16; i++) {
+            if (b[i] == binding) return at;
+            at += (int)c[i];
+        }
+        return -1;
+    }
+    if (!si || binding >= DESC_SLOTS || !slot_dynamic(si, binding)) return -1;
+    for (uint32_t k = 0; k < binding; k++) at += slot_dynamic(si, k);
+    return at;
 }
 // Puts (key, s) into index t (g_fxl_lock held; no room check). 0 when t has no slot left.
 static int set_put(SetTab* t, uint64_t key, SetInfo* s) {
@@ -2879,6 +2941,51 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindVertexBuffers(VkCommandBuffer cb,
     for (uint32_t k = 0; k < n; k++) if (first + k < 8) { t_vb[first + k] = (uint64_t)b[k]; t_vbo[first + k] = o[k]; }
     d->CmdBindVertexBuffers(cb, first, n, b, o);
 }
+// BG3's descriptor binds in a command buffer, kept as it made them, to put its state back after the plugin draws in
+// it: for each set number the newest call that bound it (at most 8 calls), replayed in BG3's order. The layout, the
+// sets and every dynamic offset exactly as BG3 passed them, so nothing is rebuilt from what the plugin knows of
+// BG3's layouts (a rebuilt bind with too few dynamic offsets lost the device on Nvidia's driver).
+typedef struct { VkPipelineLayout lay; uint32_t first, n, nd; uint64_t seq; VkDescriptorSet sets[8]; uint32_t dyn[64]; } BindCall;
+typedef struct { VkCommandBuffer cb; uint64_t seq; BindCall call[8]; int of[8]; } BindLog;
+static __thread BindLog t_gbinds, t_cbinds;
+static void binds_note(BindLog* L, VkCommandBuffer cb, VkPipelineLayout lay, uint32_t first, uint32_t n,
+                       const VkDescriptorSet* sets, uint32_t nd, const uint32_t* dyn) {
+    if (L->cb != cb) { memset(L, 0, sizeof *L); L->cb = cb; for (int k = 0; k < 8; k++) L->of[k] = -1; }
+    if (!n || first >= 8 || n > 8 || first + n > 8 || nd > 64) {  // never seen from BG3; the replay then leaves this out
+        for (uint32_t k = first; k < first + n && k < 8; k++) L->of[k] = -1;
+        return;
+    }
+    int slot = -1;
+    for (int c = 0; c < 8 && slot < 0; c++) {  // a call no set number points at any more
+        int used = 0;
+        for (int k = 0; k < 8; k++) used |= L->of[k] == c;
+        if (!used) slot = c;
+    }
+    if (slot < 0) return;  // cannot happen: 8 set numbers, 8 calls
+    BindCall* c = &L->call[slot];
+    c->lay = lay; c->first = first; c->n = n; c->nd = nd; c->seq = ++L->seq;
+    memcpy(c->sets, sets, n * sizeof *sets);
+    if (nd) memcpy(c->dyn, dyn, nd * sizeof *dyn);
+    for (uint32_t k = first; k < first + n; k++) L->of[k] = slot;
+}
+// Replays BG3's binds of this command buffer (graphics or compute), oldest first.
+static void binds_restore(DeviceData* d, VkCommandBuffer cb, int compute) {
+    BindLog* L = compute ? &t_cbinds : &t_gbinds;
+    if (L->cb != cb) return;
+    int order[8], m = 0;
+    for (int c = 0; c < 8; c++) {
+        int used = 0;
+        for (int k = 0; k < 8; k++) used |= L->of[k] == c;
+        if (used) order[m++] = c;
+    }
+    for (int i = 1; i < m; i++)
+        for (int j = i; j > 0 && L->call[order[j]].seq < L->call[order[j - 1]].seq; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
+    for (int i = 0; i < m; i++) {
+        const BindCall* c = &L->call[order[i]];
+        d->CmdBindDescriptorSets(cb, compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS, c->lay, c->first, c->n,
+                                 c->sets, c->nd, c->nd ? c->dyn : NULL);
+    }
+}
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout lay,
                                                               uint32_t first, uint32_t n, const VkDescriptorSet* sets,
                                                               uint32_t nd, const uint32_t* dyn) {
@@ -2889,32 +2996,30 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(VkCommandBuffer cb
         t_clayout = (uint64_t)lay;
         uint32_t di = 0;
         for (uint32_t k = 0; k < n; k++) {
-            uint32_t s = first + k, nd_here = 0;
+            uint32_t s = first + k;
             if (s < 8) t_cset[s] = (uint64_t)sets[k];
             SetInfo* si = set_bound((uint64_t)sets[k]);
-            for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
-                if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-                    if (s < 8 && nd_here < 8 && di < nd) t_cdyn[s][nd_here] = dyn[di];
-                    nd_here++; di++;
-                }
+            const uint32_t nd_here = set_dyn_count((uint64_t)sets[k], si);
+            for (uint32_t j = 0; j < nd_here; j++, di++)
+                if (s < 8 && j < 8 && di < nd) t_cdyn[s][j] = dyn[di];
             if (s < 8) t_cndyn[s] = nd_here;
         }
+        binds_note(&t_cbinds, cb, lay, first, n, sets, nd, dyn);
     }
     if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
         if (t_bind_cb != cb) { t_bind_cb = cb; t_pipe = 0; memset(t_vb, 0, sizeof t_vb); memset(t_set, 0, sizeof t_set); }
         // Dynamic offsets are consumed in set order, binding order; kept per set in that order.
         uint32_t di = 0;
         for (uint32_t k = 0; k < n; k++) {
-            uint32_t s = first + k, nd_here = 0;
+            uint32_t s = first + k;
             if (s < 8) t_set[s] = (uint64_t)sets[k];
             SetInfo* si = set_bound((uint64_t)sets[k]);
-            for (uint32_t b = 0; si && b < DESC_SLOTS; b++)
-                if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-                    if (s < 8 && nd_here < 8 && di < nd) t_dyn[s][nd_here] = dyn[di];
-                    nd_here++; di++;
-                }
+            const uint32_t nd_here = set_dyn_count((uint64_t)sets[k], si);
+            for (uint32_t j = 0; j < nd_here; j++, di++)
+                if (s < 8 && j < 8 && di < nd) t_dyn[s][j] = dyn[di];
             if (s < 8) t_ndyn[s] = nd_here;
         }
+        binds_note(&t_gbinds, cb, lay, first, n, sets, nd, dyn);
         pace_bind(cb);
         ground_bind(cb);
         ground_view_seen();
@@ -2934,7 +3039,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPushConstants(VkCommandBuffer cb, VkP
 // the scene's (g_role.sw, sh); it is the screen's unless BG3 upscales (FSR), when it is smaller.
 static void scene_seen(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, const VkRenderPassAttachmentBeginInfo* il, uint32_t w, uint32_t h) {
     (void)cb; (void)rp;
-    if (w == SCENE_W && h == SCENE_H) return;
+    const uint64_t now = __atomic_load_n(&g_req.presents, __ATOMIC_RELAXED);
     trace_lock_timed();
     FbInfo* f = TABLE_FIND(g_fb, FB_CAP, (uint64_t)fb, 0);
     uint32_t n = il ? (il->attachmentCount > 8 ? 8 : il->attachmentCount) : (f ? f->n : 0);
@@ -2948,9 +3053,19 @@ static void scene_seen(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
         else { if (!colors && i->fmt == VK_FORMAT_R16G16_SFLOAT) normal = 1; colors++; }
     }
     pthread_mutex_unlock(&g_trace_lock);
-    if (depth && normal && colors >= 4 && same && w >= 64 && h >= 64 && w <= g_role.ew && h <= g_role.eh) {
+    // BG3 draws more than one deferred scene in a frame at times: the character preview of the inventory and the examine
+    // screens is a G-buffer pass of its own (700x690 beside a 2560x1080 world on Nvidia, 752x423 on AMD). While the scene
+    // is still drawn (a pass at its size this present or the last), a smaller one is such a preview and BG3's own picture;
+    // only when the scene's passes stop (a new resolution or upscaling) does a new size take over. Taken twice a frame,
+    // every image a pixel of the scene was made again twice a frame and the world's passes ran on the preview's images.
+    if (!(depth && normal && colors >= 4 && same && w >= 64 && h >= 64 && w <= g_role.ew && h <= g_role.eh)) return;
+    if (w == SCENE_W && h == SCENE_H) { __atomic_store_n(&g_role.seen_at, now + 1, __ATOMIC_RELAXED); return; }  // the scene's G-buffer pass
+    const uint64_t at = __atomic_load_n(&g_role.seen_at, __ATOMIC_RELAXED);
+    const int scene_drawn = at && now + 1 - at <= 1;
+    if (!scene_drawn || (uint64_t)w * h > (uint64_t)SCENE_W * SCENE_H) {
         logf_("roles: BG3's scene is %ux%u (the screen %ux%u)%s", w, h, g_role.ew, g_role.eh, w < g_role.ew ? ": BG3 upscales it" : "");
         g_role.sw = w; g_role.sh = h;
+        __atomic_store_n(&g_role.seen_at, now + 1, __ATOMIC_RELAXED);
     }
 }
 static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, const VkRenderPassAttachmentBeginInfo* il,
@@ -4197,6 +4312,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(VkQueue queue, const
     return r;
 }
 
+// BG3's picture size, for the WoW side (link/bg3size.txt, "W H"): benilla renders at it (patch 0143), so a resolution
+// or aspect ratio changed in BG3's options while playing is followed at once. Before, WoW kept the size it started
+// with and its picture was stretched over BG3's (lines, a wrong aspect).
+static void bg3_size_note(uint32_t w, uint32_t h) {
+    static uint32_t last_w, last_h;
+    if (!w || !h || (w == last_w && h == last_h)) return;
+    char path[600], tmp[620];
+    snprintf(path, sizeof path, "%s/bg3size.txt", link_dir());
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%u %u\n", w, h);
+    fclose(f);
+    if (rename(tmp, path) == 0) { last_w = w; last_h = h; logf_("BG3's picture is %ux%u: told the WoW side (%s)", w, h, path); }
+}
 static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                                const VkAllocationCallbacks* alloc, VkSwapchainKHR* out) {
     DeviceData* d = device_for(device);
@@ -4224,6 +4354,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(VkDevice device, 
         logf_("swapchain %ux%u format %d, %u images", c->extent.width, c->extent.height, (int)c->format, n);
     }
     pthread_mutex_unlock(&g_lock);
+    bg3_size_note(info->imageExtent.width, info->imageExtent.height);
     return r;
 }
 
@@ -4316,6 +4447,7 @@ static void device_fns(DeviceData* d, VkDevice dev, PFN_vkGetDeviceProcAddr gdpa
     DEV_FN(CreateSemaphore); DEV_FN(CreateBuffer); DEV_FN(GetBufferMemoryRequirements);
     DEV_FN(AllocateMemory); DEV_FN(BindBufferMemory); DEV_FN(MapMemory); DEV_FN(FreeMemory);
     DEV_FN(DestroyBuffer);
+    d->SetDebugUtilsObjectNameEXT = (PFN_vkSetDebugUtilsObjectNameEXT)gdpa(dev, "vkSetDebugUtilsObjectNameEXT");
     DEV_FN(CreateImage); DEV_FN(CreateImageView); DEV_FN(CreateFramebuffer); DEV_FN(CreateRenderPass);
     DEV_FN(CreateRenderPass2); DEV_FN(CmdBeginRenderPass); DEV_FN(CmdBeginRenderPass2);
     DEV_FN(CmdEndRenderPass); DEV_FN(CmdEndRenderPass2); DEV_FN(CmdBeginRendering); DEV_FN(CmdEndRendering);

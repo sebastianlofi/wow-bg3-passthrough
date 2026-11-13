@@ -98,14 +98,18 @@ static uint64_t g_jit_used, g_jit_missing, g_jit_dp[5]; static float g_jit_last[
 #define FB_LIT 8                       // WoW's point lights for BG3's pixels, after the table: a header of 4 floats, 8 a light
 #define FB_LOBE 8                      // WoW's room light for the hero's figure: its lobes, after the point lights, 8 floats each
 #define FB_TAIL (4 + FB_LIT * 8 + FB_LOBE * 8 + 4 + FB_LOBE * 4 + 4 + FB_LOBE * 4)  // then the world's up in the camera's view and 1 when BG3's G-buffer normal is bound; then, a lobe, the place in view and reach of the figure it is for; last, how far WoW's light outdoors is taken toward its own luminance (the night's softening), the test view, how many of the party's figures follow; then each figure's place in view (for a pixel BG3's image has no eye depth for)
+// The feed's descriptor sets: a ring, each draw taking the next and writing all of it. Two sets rewritten in place
+// were still in use by BG3's frames in flight (a set updated while a command buffer used it: Nvidia's driver lost
+// its state); 16 outlast the frames BG3 keeps in flight, as the fog's ring does.
+#define FBG_SETS 16
 static struct {
     int ready, failed;
     VkRenderPass rp; VkPipelineLayout layout; VkDescriptorSetLayout dsl; VkPipeline pipe;
-    VkDescriptorPool pool; VkDescriptorSet set[2]; VkBuffer setbuf[2];
+    VkDescriptorPool pool; VkDescriptorSet set[FBG_SETS]; uint32_t ring;
     struct { uint64_t img; VkImageView view; VkFramebuffer fb; } t[FB_IMGS];
     uint64_t fed_present, fed_img; uint64_t feeds, refused, nowow; uint64_t fedp[3], fedi[3], fogs;
     VkBuffer tbuf; VkDeviceMemory tmem; float* tmap; struct timespec tseen; int thave;
-    uint64_t ebuf[2], eoff[2]; int etype[2]; VkBuffer esetbuf[2][2];
+    uint64_t ebuf[2], eoff[2]; int etype[2];
     VkSampler asmp;
 } g_fbg;
 // WoW's ambient on BG3's own pixels (compose word "wdamb=K", K the share of WoW's ambient, 0 or absent: off).
@@ -445,7 +449,7 @@ static int fb_make(DeviceData* d) {
     VkRenderPassCreateInfo rci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &at, 1, &sp, 0, NULL};
     if (d->CreateRenderPass(d->device, &rci, NULL, &g_fbg.rp) != VK_SUCCESS) return 0;
     VkDescriptorSetLayoutBinding b[11] = {{10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
-        {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
@@ -479,11 +483,13 @@ static int fb_make(DeviceData* d) {
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_fbg.layout, g_fbg.rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_fbg.pipe) != VK_SUCCESS) return 0;
-    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6}};
-    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2, 4, ps};
+    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * FBG_SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2 * FBG_SETS},
+                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * FBG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * FBG_SETS}};
+    VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, FBG_SETS, 4, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_fbg.pool) != VK_SUCCESS) return 0;
-    VkDescriptorSetLayout l[2] = {g_fbg.dsl, g_fbg.dsl};
-    VkDescriptorSetAllocateInfo sai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_fbg.pool, 2, l};
+    VkDescriptorSetLayout l[FBG_SETS];
+    for (int k = 0; k < FBG_SETS; k++) l[k] = g_fbg.dsl;
+    VkDescriptorSetAllocateInfo sai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_fbg.pool, FBG_SETS, l};
     if (d->AllocateDescriptorSets(d->device, &sai, g_fbg.set) != VK_SUCCESS) return 0;
     VkBufferCreateInfo tci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (FB_TAB + FB_TAIL) * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     if (d->CreateBuffer(d->device, &tci, NULL, &g_fbg.tbuf) != VK_SUCCESS) return 0;
@@ -493,7 +499,7 @@ static int fb_make(DeviceData* d) {
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, (uint32_t)ty};
     if (ty < 0 || d->AllocateMemory(d->device, &mai, NULL, &g_fbg.tmem) != VK_SUCCESS || d->BindBufferMemory(d->device, g_fbg.tbuf, g_fbg.tmem, 0) != VK_SUCCESS) return 0;
     if (d->MapMemory(d->device, g_fbg.tmem, 0, VK_WHOLE_SIZE, 0, (void**)&g_fbg.tmap) != VK_SUCCESS) return 0;
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < FBG_SETS; k++) {
         VkDescriptorBufferInfo bi = {g_fbg.tbuf, 0, VK_WHOLE_SIZE};
         VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
         d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
@@ -526,7 +532,7 @@ static int fog_make(DeviceData* d) {
     g_fog.failed = 1;
     VkDescriptorSetLayoutBinding b[13] = {{10, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {11, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {12, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
-        {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {7, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
@@ -557,7 +563,7 @@ static int fog_make(DeviceData* d) {
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 3, dyn};
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_fog.layout, g_fbg.rp, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_fog.pipe) != VK_SUCCESS) return 0;
-    VkDescriptorPoolSize ps[6] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * FOG_SETS},
+    VkDescriptorPoolSize ps[6] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 2 * FOG_SETS},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, FOG_SETS}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 5 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_SAMPLER, FOG_SETS},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * FOG_SETS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, FOG_SETS, 6, ps};
@@ -796,11 +802,7 @@ static void fb_bare(DeviceData* d, VkCommandBuffer cb) {
     // BG3's state as it was (as fb_draw does): pipeline, sets, viewport and scissor.
     if (t_bind_cb == cb && t_pipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)t_pipe);
-        RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
-        Recipe* rr = ri ? ri->r : NULL;
-        PlInfo* pl = (rr && g_pl && rr->layout) ? TABLE_FIND(g_pl, PL_CAP, rr->layout, 0) : NULL;
-        for (uint32_t k2 = 0; pl && k2 < pl->nsets && k2 < 8; k2++)
-            if (t_set[k2]) { VkDescriptorSet ds = (VkDescriptorSet)t_set[k2]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)rr->layout, k2, 1, &ds, t_ndyn[k2], t_dyn[k2]); }
+        binds_restore(d, cb, 0);  // BG3's descriptor binds exactly as it made them
     }
     if (t_vs_cb == cb) {
         if (t_vs_have & 1) d->CmdSetViewport(cb, 0, 1, &t_vs_vp);
@@ -952,11 +954,7 @@ static void bl_run(DeviceData* d, VkCommandBuffer cb, int slot, VkImageLayout la
     // BG3's state as it was (as fb_bare does): pipeline, sets, viewport and scissor.
     if (t_bind_cb == cb && t_pipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)t_pipe);
-        RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
-        Recipe* rr = ri ? ri->r : NULL;
-        PlInfo* pli = (rr && g_pl && rr->layout) ? TABLE_FIND(g_pl, PL_CAP, rr->layout, 0) : NULL;
-        for (uint32_t k2 = 0; pli && k2 < pli->nsets && k2 < 8; k2++)
-            if (t_set[k2]) { VkDescriptorSet ds = (VkDescriptorSet)t_set[k2]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)rr->layout, k2, 1, &ds, t_ndyn[k2], t_dyn[k2]); }
+        binds_restore(d, cb, 0);  // BG3's descriptor binds exactly as it made them
     }
     if (t_vs_cb == cb) {
         if (t_vs_have & 1) d->CmdSetViewport(cb, 0, 1, &t_vs_vp);
@@ -1272,11 +1270,7 @@ static void fb_post_run(DeviceData* d, VkCommandBuffer cb, uint64_t out, int32_t
     d->CmdEndRenderPass(cb);
     if (t_bind_cb == cb && t_pipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)t_pipe);
-        RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
-        Recipe* rr = ri ? ri->r : NULL;
-        PlInfo* pl = (rr && g_pl && rr->layout) ? TABLE_FIND(g_pl, PL_CAP, rr->layout, 0) : NULL;
-        for (uint32_t k2 = 0; pl && k2 < pl->nsets && k2 < 8; k2++)
-            if (t_set[k2]) { VkDescriptorSet ds = (VkDescriptorSet)t_set[k2]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)rr->layout, k2, 1, &ds, t_ndyn[k2], t_dyn[k2]); }
+        binds_restore(d, cb, 0);  // BG3's descriptor binds exactly as it made them
     }
     if (t_vs_cb == cb) {
         if (t_vs_have & 1) d->CmdSetViewport(cb, 0, 1, &t_vs_vp);
@@ -1354,8 +1348,7 @@ static void fb_ovl(DeviceData* d, VkCommandBuffer cb) {
     // BG3's compute state as it was, where it had one in this command buffer.
     if (t_cbind_cb == cb && t_cpipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
-        for (uint32_t s = 0; s < 8 && t_clayout; s++)
-            if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+        binds_restore(d, cb, 1);  // BG3's compute binds exactly as it made them
     }
     if (g_ovl.runs++ % 1800 == 0) logf_("wdpost: %llu overlay passes of BG3's followed, %llu refused", (unsigned long long)g_ovl.runs, (unsigned long long)g_ovl.refused);
     pthread_mutex_unlock(&g_fbt_m);
@@ -1389,8 +1382,7 @@ static void late_fold(DeviceData* d, VkCommandBuffer cb) {
     // BG3's compute state as it was, where it had one in this command buffer.
     if (t_cbind_cb == cb && t_cpipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
-        for (uint32_t s = 0; s < 8 && t_clayout; s++)
-            if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+        binds_restore(d, cb, 1);  // BG3's compute binds exactly as it made them
     }
     { static uint64_t n; if (n++ % 1800 == 0) logf_("wdpost: %llu of BG3's effects passes folded into what it drew over WoW's ground", (unsigned long long)n); }
 }
@@ -1417,10 +1409,13 @@ static void post_forget_image(DeviceData* d, uint64_t img) {
 // (wowbg3_postcas.comp mode 1; the colours themselves were put on its input right after the display transform, post_dt).
 #define CAS_CS 0xe2ffaef855eba087ull
 static struct { int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe; VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring;
-                uint64_t runs, refused, dts, dtrefused; SfImg dtc; uint32_t dtw, dth; int dtfail; VkSampler lsmp; } g_pcas;
+                uint64_t runs, refused, dts, dtrefused; SfImg dtc, dto; uint32_t dtw, dth; int dtfail; VkSampler lsmp; uint64_t dtfs; } g_pcas;
 // BG3's display transform: a compute pass from its HDR scene to the A2B10G10R10 image the UI is put over, there under
 // every video option. With FidelityFX Sharpening on, BG3's CAS (CAS_CS) reads that image and writes another.
 #define DT_CS 0x35d9685ac5afcece
+// BG3's display transform as a fragment pass into its 10-bit image (seen on Nvidia's driver: no DT_CS there, and WoW's
+// colours never came back over BG3's grading and fog). Same input and output as DT_CS; wdpostcas follows either.
+#define DT_FS 0x732bda0d1dc3fc33
 static int pcas_make(DeviceData* d) {
     if (g_pcas.ready) return 1;
     if (g_pcas.failed) return 0;
@@ -1496,8 +1491,7 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
     // BG3's compute state as it was.
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
-    for (uint32_t s = 0; s < 8; s++)
-        if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+    binds_restore(d, cb, 1);  // BG3's compute binds exactly as it made them
     if (g_pcas.runs++ % 600 == 0) logf_("wdpostcas: %llu runs, %llu refused", (unsigned long long)g_pcas.runs, (unsigned long long)g_pcas.refused);
 }
 // Right after BG3's display transform (DT_CS), whatever follows: WoW's own colour over its output at WoW's pixels, with
@@ -1505,6 +1499,23 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
 // the storage image of A2B10G10R10 at the scene's size it binds; a copy of it is the shader's input, as CAS's input was.
 // This used to run only after BG3's CAS, so with FidelityFX Sharpening off it never ran.
 static void post_dt_l(DeviceData* d, VkCommandBuffer cb);
+static void post_dt_run(DeviceData* d, VkCommandBuffer cb, ImgInfo* oi, VkImageLayout lay, VkImageView outv, int frag);
+static __thread VkCommandBuffer t_dtf_cb;  // BG3's fragment display transform (DT_FS) drawn in the pass now open
+static __thread uint64_t t_dtf_img;
+static __thread int32_t t_dtf_lay;
+// After the pass BG3 drew its fragment display transform in (DT_FS): as post_dt for DT_CS.
+static void post_dtf(DeviceData* d, VkCommandBuffer cb) {
+    if (t_dtf_cb != cb) return;
+    t_dtf_cb = VK_NULL_HANDLE;
+    if (!g_cc.wdpost || g_cc.wdpostdbg || !g_fbg.ready || !pcas_make(d) || !g_pst.ready) return;
+    ImgInfo* oi = t_dtf_img ? TABLE_FIND(g_img, IMG_CAP, t_dtf_img, 0) : NULL;
+    if (!oi || oi->fmt != VK_FORMAT_A2B10G10R10_UNORM_PACK32 || !(oi->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(oi->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        if (g_pcas.dtrefused++ % 600 == 0) logf_("wdpostcas: BG3's fragment display transform's output %llx not usable (format %d usage %x; %llu times)",
+                                                 (unsigned long long)t_dtf_img, oi ? (int)oi->fmt : -1, oi ? (unsigned)oi->usage : 0u, (unsigned long long)g_pcas.dtrefused);
+        return;
+    }
+    pthread_mutex_lock(&g_fbt_m); post_dt_run(d, cb, oi, (VkImageLayout)t_dtf_lay, VK_NULL_HANDLE, 1); pthread_mutex_unlock(&g_fbt_m);
+}
 static void post_dt(DeviceData* d, VkCommandBuffer cb) {
     if (t_cbind_cb != cb || !t_cpipe || !g_cpipe) return;
     CPipeInfo* p = TABLE_FIND(g_cpipe, CPIPE_CAP, t_cpipe, 0);
@@ -1524,21 +1535,39 @@ static void post_dt_l(DeviceData* d, VkCommandBuffer cb) {
             if (ii && ii->fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && ii->w >= g_blm.w && ii->hgt >= g_blm.h) { outv = si->slot[b].res; oi = ii; }
         }
     }
-    if (!outv || !g_blm.ready || !g_blm.nob.img || !t_clayout) {
-        if (g_pcas.dtrefused++ % 600 == 0) logf_("wdpostcas: the display transform's output not found or the mask not ready (%llu times; output %d mask %d)", (unsigned long long)g_pcas.dtrefused, outv != 0, g_blm.nob.img != VK_NULL_HANDLE);
+    if (!outv || !t_clayout) {
+        if (g_pcas.dtrefused++ % 600 == 0) logf_("wdpostcas: the display transform's output not found (%llu times)", (unsigned long long)g_pcas.dtrefused);
         return;
     }
-    if (!g_pcas.dtc.img || g_pcas.dtw != oi->w || g_pcas.dth != oi->hgt) {
-        if (g_pcas.dtfail) return;
-        if (g_pcas.dtc.img) fb_retire(&g_pcas.dtc);
-        if (!sf_img_make(d, &g_pcas.dtc, VK_FORMAT_A2B10G10R10_UNORM_PACK32, oi->w, oi->hgt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { g_pcas.dtfail = 1; logf_("wdpostcas: no copy image for the display transform's output"); return; }
-        g_pcas.dtw = oi->w; g_pcas.dth = oi->hgt;
-        logf_("wdpostcas: after BG3's display transform, on its output %llx (image %llx, %ux%u)", (unsigned long long)outv, (unsigned long long)oi->h, oi->w, oi->hgt);
-    }
-    // The transform wrote its output as a storage image (layout GENERAL): its writes, then the copy.
+    // The transform wrote its output as a storage image (layout GENERAL): its writes before the copy.
     VkMemoryBarrier mb0 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb0, 0, NULL, 0, NULL);
-    sf_copy(d, cb, (VkImage)oi->h, VK_IMAGE_LAYOUT_GENERAL, &g_pcas.dtc, oi->w, oi->hgt);
+    post_dt_run(d, cb, oi, VK_IMAGE_LAYOUT_GENERAL, (VkImageView)outv, 0);
+}
+// wowbg3_postcas.comp mode 0 on the display transform's output OI (in layout LAY): a copy of it is the input; the output
+// is OUTV (DT_CS's storage view) or, for the fragment pass (FRAG), the plugin's own storage image, copied back over OI.
+static void post_dt_run(DeviceData* d, VkCommandBuffer cb, ImgInfo* oi, VkImageLayout lay, VkImageView outv, int frag) {
+    if (!g_blm.ready || !g_blm.nob.img) {
+        if (g_pcas.dtrefused++ % 600 == 0) logf_("wdpostcas: the mask not ready (%llu times)", (unsigned long long)g_pcas.dtrefused);
+        return;
+    }
+    if (!g_pcas.dtc.img || g_pcas.dtw != oi->w || g_pcas.dth != oi->hgt || (frag && !g_pcas.dto.img)) {
+        if (g_pcas.dtfail) return;
+        if (g_pcas.dtc.img) fb_retire(&g_pcas.dtc);
+        if (g_pcas.dto.img) fb_retire(&g_pcas.dto);
+        if (!sf_img_make(d, &g_pcas.dtc, VK_FORMAT_A2B10G10R10_UNORM_PACK32, oi->w, oi->hgt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { g_pcas.dtfail = 1; logf_("wdpostcas: no copy image for the display transform's output"); return; }
+        if (frag && !sf_img_make(d, &g_pcas.dto, VK_FORMAT_A2B10G10R10_UNORM_PACK32, oi->w, oi->hgt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { g_pcas.dtfail = 1; logf_("wdpostcas: no output image for the fragment display transform"); return; }
+        g_pcas.dtw = oi->w; g_pcas.dth = oi->hgt;
+        logf_("wdpostcas: after BG3's display transform (%s), on its output image %llx, %ux%u", frag ? "fragment pass" : "compute", (unsigned long long)oi->h, oi->w, oi->hgt);
+    }
+    if (g_pcas.dtfail) return;
+    sf_copy(d, cb, (VkImage)oi->h, lay, &g_pcas.dtc, oi->w, oi->hgt);
+    if (frag) {
+        // The shader writes only the pixels it changes; the rest must be BG3's own (its characters), so the output
+        // starts as BG3's image. (On the compute path the output is BG3's image itself.)
+        sf_copy(d, cb, (VkImage)oi->h, lay, &g_pcas.dto, oi->w, oi->hgt);
+        outv = g_pcas.dto.view;
+    }
     VkDescriptorSet set = g_pcas.set[g_pcas.ring++ % FOG_SETS];
     VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo im[5];
@@ -1559,20 +1588,27 @@ static void post_dt_l(DeviceData* d, VkCommandBuffer cb) {
     d->CmdDispatch(cb, (oi->w + 7) / 8, (oi->hgt + 7) / 8, 1);
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     d->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
-    // BG3's compute state as it was.
-    d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
-    for (uint32_t s = 0; s < 8; s++)
-        if (t_cset[s]) { VkDescriptorSet ds = (VkDescriptorSet)t_cset[s]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipelineLayout)t_clayout, s, 1, &ds, t_cndyn[s], t_cdyn[s]); }
+    if (frag) {  // the result over BG3's image, in its own layout again
+        sf_barrier(d, cb, g_pcas.dto.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        sf_barrier(d, cb, (VkImage)oi->h, lay, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageCopy rg = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {oi->w, oi->hgt, 1}};
+        d->CmdCopyImage(cb, g_pcas.dto.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkImage)oi->h, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+        sf_barrier(d, cb, (VkImage)oi->h, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, lay, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+    // BG3's compute state as it was, where it had one in this command buffer.
+    if (t_cbind_cb == cb && t_cpipe) {
+        d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, (VkPipeline)t_cpipe);
+        binds_restore(d, cb, 1);  // BG3's compute binds exactly as it made them
+    }
     if (g_pcas.dts++ % 600 == 0) logf_("wdpostcas: %llu runs after BG3's display transform, %llu refused", (unsigned long long)g_pcas.dts, (unsigned long long)g_pcas.dtrefused);
 }
 // Dynamic offset of binding b of set s as BG3 bound it (dynamic offsets go in binding order).
 static uint64_t fog_dyn(const SetInfo* si, uint32_t s, uint32_t b) {
-    uint8_t ty = si->slot[b].type;
-    if (ty != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && ty != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) return 0;
-    uint32_t idx = 0;
-    for (uint32_t k = 0; k < b; k++)
-        if (si->slot[k].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[k].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) idx++;
-    return (s < 8 && idx < t_ndyn[s] && idx < 8) ? t_dyn[s][idx] : 0;
+    const int idx = s < 8 ? set_dyn_at(t_set[s], si, b) : -1;  // from the set's layout (bg3le's record)
+    return (idx >= 0 && (uint32_t)idx < t_ndyn[s] && idx < 8) ? t_dyn[s][idx] : 0;
 }
 static void fog_draw(VkCommandBuffer cb) {
     if ((!g_cc.wdfog && !g_cc.wdbare && !g_cc.wdbloom && !g_cc.wdpost) || t_bind_cb != cb || !t_pipe || t_pass_cb != cb || !g_rec) return;
@@ -1581,6 +1617,8 @@ static void fog_draw(VkCommandBuffer cb) {
     int is = 0;
     for (uint32_t s = 0; r && s < r->nstages; s++) if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT) is = composite_fs(r->st[s].key) ? 1 : r->st[s].key == CLD_FS ? 2 : is;
     if (g_cc.wdpost) post_watch(cb, r);
+    for (uint32_t s = 0; r && s < r->nstages; s++)
+        if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT && r->st[s].key == DT_FS) { t_dtf_cb = cb; t_dtf_img = t_pass_img0; t_dtf_lay = t_pass_fin0; }
     if (g_cc.wdbare) for (uint32_t s = 0; r && s < r->nstages; s++) if (r->st[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT && r->st[s].key == BARE_FS) { bare_draw(cb); return; }
     if ((g_cc.wdbloom || g_cc.wdpost) && is == 1) {  // patch28: after the composite, the pure WoW pixels (patch46: also for wdpost)
         SetInfo* sb = set_find(t_set[1]);
@@ -1680,28 +1718,24 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     if (!g_fbg.ebuf[0] || !g_fbg.ebuf[1]) { g_fbg.refused++; return; }
     const int wdx_fix = mode == 0 && g_cc.wdevref > 0.0f && !g_cc.fxcal && g_wdx.cur_ok;  // patch61: binding 1 = BG3's newest eye state
     const uint64_t eb[2] = {wdx_fix ? (uint64_t)g_wdx.cur.buf : g_fbg.ebuf[0], g_fbg.ebuf[1]};
-    for (int e = 0; e < 2; e++) if (g_fbg.esetbuf[k][e] != (VkBuffer)eb[e]) {
+    const VkDescriptorSet fs = g_fbg.set[g_fbg.ring++ % FBG_SETS];  // this draw's set, written whole below
+    for (int e = 0; e < 2; e++) {
         VkDescriptorBufferInfo bi = {(VkBuffer)eb[e], 0, 16};
-        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], (uint32_t)e + 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &bi, NULL};
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, (uint32_t)e + 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &bi, NULL};
         d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
-        g_fbg.esetbuf[k][e] = (VkBuffer)eb[e];
     }
     {
-        static VkImageView seen[2];
         VkImageView mv = wd_mask_view();
         if (!mv) { g_fbg.refused++; return; }
-        if (seen[k] != mv) {
+        {
             VkDescriptorImageInfo ii2 = {VK_NULL_HANDLE, mv, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii2, NULL, NULL};
+            VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii2, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
-            seen[k] = mv;
         }
-        static VkImageView seen6[2];
-        if (seen6[k] != g_blm.wfed.view) {
+        {
             VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, g_blm.wfed.view, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr6 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL};
+            VkWriteDescriptorSet wr6 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr6, 0, NULL);
-            seen6[k] = g_blm.wfed.view;
         }
         // Binding 8: BG3's G-buffer albedo, for WoW's ambient on BG3's pixels; while BG3 has no G-buffer, an image of
         // our own, and no ambient.
@@ -1711,13 +1745,13 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
         const VkImageView av = gv_alb ? gv_alb : g_blm.wdsp.view;
         {
             VkDescriptorImageInfo i8 = {g_fbg.asmp, av, gv_alb ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr8 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i8, NULL, NULL};
+            VkWriteDescriptorSet wr8 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i8, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr8, 0, NULL);
         }
         const VkImageView zv = gv_z ? gv_z : g_blm.wdsp.view;  // binding 9: BG3's G-buffer fourth target (the test view wdzdbg=2 alone reads it: no depth is in it)
         {
             VkDescriptorImageInfo i9 = {g_fbg.asmp, zv, gv_z ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr9 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i9, NULL, NULL};
+            VkWriteDescriptorSet wr9 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i9, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr9, 0, NULL);
         }
         // Binding 10: BG3's G-buffer normal (R16G16): the facing WoW's light falls on, with the detail of BG3's own
@@ -1725,29 +1759,24 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
         // toward the eye).
         {
             VkDescriptorImageInfo i10 = {g_fbg.asmp, gv_nrm ? gv_nrm : g_blm.wdsp.view, gv_nrm ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr10 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i10, NULL, NULL};
+            VkWriteDescriptorSet wr10 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i10, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr10, 0, NULL);
         }
-        static VkImageView seen7[2];
-        if (seen7[k] != g_blm.wdsp.view) {
+        {
             VkDescriptorImageInfo i7 = {VK_NULL_HANDLE, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr7 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i7, NULL, NULL};
+            VkWriteDescriptorSet wr7 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i7, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr7, 0, NULL);
-            seen7[k] = g_blm.wdsp.view;
         }
-        static VkImageView seen5[2];
-        if (seen5[k] != g_fog.st.view) {
+        {
             VkDescriptorImageInfo i5 = {VK_NULL_HANDLE, g_fog.st.view, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i5, NULL, NULL};
+            VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i5, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
-            seen5[k] = g_fog.st.view;
         }
     }
-    if (g_fbg.setbuf[k] != wb) {
+    {
         VkDescriptorBufferInfo bi = {wb, 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fbg.set[k], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
+        VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
         d->UpdateDescriptorSets(d->device, 1, &wr, 0, NULL);
-        g_fbg.setbuf[k] = wb;
     }
     if (g_cc.wdlog && d->CmdCopyBuffer) {
         static GBuf rd; static uint64_t n;
@@ -1788,8 +1817,8 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 11, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &i11, NULL, NULL},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 12, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &i12, NULL, NULL},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &b0, NULL},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &b1, NULL},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &b2, NULL},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &b1, NULL},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &b2, NULL},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &b3, NULL},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i4, NULL, NULL},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fset, 5, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &i5, NULL, NULL},
@@ -1834,7 +1863,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     d->CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
     uint32_t eoffs[2] = {wdx_fix ? 0u : (uint32_t)g_fbg.eoff[0], (uint32_t)g_fbg.eoff[1]};
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? (tost ? g_fog.pipest : g_fog.pipe) : g_fbg.pipe);
-    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? g_fog.layout : g_fbg.layout, 0, 1, fog ? &fset : &g_fbg.set[k], 2, eoffs);
+    d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? g_fog.layout : g_fbg.layout, 0, 1, fog ? &fset : &fs, 2, eoffs);
     if (fog) { float k = (g_cc.fxcal || g_cc.wdfogdbg >= 2) ? 0.0f : 1.0f; float bc[4] = {k, k, k, 1.0f}; d->CmdSetBlendConstants(cb, bc); }
     VkViewport vp = {0, 0, (float)ii->w, (float)ii->hgt, 0, 1};
     VkRect2D sc = {{0, 0}, {ii->w, ii->hgt}};
@@ -1848,11 +1877,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     // BG3's state as it was, as ground_inject does, and its descriptor sets (this pass binds its own).
     if (t_bind_cb == cb && t_pipe) {
         d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipeline)t_pipe);
-        RecInfo* ri = g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
-        Recipe* rr = ri ? ri->r : NULL;
-        PlInfo* pl = (rr && g_pl && rr->layout) ? TABLE_FIND(g_pl, PL_CAP, rr->layout, 0) : NULL;
-        for (uint32_t k2 = 0; pl && k2 < pl->nsets && k2 < 8; k2++)
-            if (t_set[k2]) { VkDescriptorSet ds = (VkDescriptorSet)t_set[k2]; d->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, (VkPipelineLayout)rr->layout, k2, 1, &ds, t_ndyn[k2], t_dyn[k2]); }
+        binds_restore(d, cb, 0);  // BG3's descriptor binds exactly as it made them
     }
     if (t_vs_cb == cb) {
         if (t_vs_have & 1) d->CmdSetViewport(cb, 0, 1, &t_vs_vp);

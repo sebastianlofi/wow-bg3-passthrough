@@ -499,91 +499,30 @@ static void rpc_recover(VkRenderPass rp) {
         rlog("render pass %llx recovered from the driver (%u attachments, first format %d final %d); %llu so far",
              (unsigned long long)(uint64_t)rp, n, (int)f[0], fl[0], (unsigned long long)g_rpc.recovered);
 }
-// Buffers made before the plugin. BG3 makes its constant rings at startup, so the
-// layer never saw them bound or their memory mapped, and the ground injection found no camera in BG3's
-// per-view block ("ground: ... without BG3's camera ... unmapped"). RADV keeps what is needed, laid out by
-// Mesa version (vk_buffer {vk_object_base, create_flags, size +72, usage +80, ...}):
-//   Mesa 26.x: vk_buffer gains device_address +88; radv_buffer {vk, winsys bo +104, range}: a mapped
-//              buffer's bytes are at bo->cpu_map + (device_address - bo->va).
-//   Mesa 25.0: radv_buffer {vk, winsys bo +88, offset +96, bo_va +104 (= bo->va), range}: bytes at
-//              bo->cpu_map + offset (Ubuntu 25.04's driver, as Steam's runtime uses it: the 26.x read found no camera).
-// The bo {va +0, size +8, ..., cpu_map}. Which layout, and the bo's cpu_map, are checked on buffers the plugin
-// makes itself; until every sample fits, nothing is read (g_buf_recover stays unset).
-enum { BRC_ADDRESS, BRC_OFFSET };
-static struct { int ok, tries, kind; int o_size, o_da, o_bo, o_va, o_map, o_off, o_bova; uint64_t recovered, unmapped; } g_brc;
-static int brc_read(uint64_t h, int o_map, const uint8_t** p, uint64_t* size) {
-    uint64_t sz = 0, bo = 0, va = 0, map = 0, at = 0;
-    if (!rd((void*)(uintptr_t)(h + g_brc.o_size), &sz, 8) || !rd((void*)(uintptr_t)(h + g_brc.o_bo), &bo, 8)) return 0;
-    if (bo < 0x10000 || !rd((void*)(uintptr_t)(bo + g_brc.o_va), &va, 8) || !rd((void*)(uintptr_t)(bo + o_map), &map, 8)) return 0;
-    if (!sz || sz > (1ull << 32)) return 0;
-    if (g_brc.kind == BRC_ADDRESS) {
-        uint64_t da = 0;
-        if (!rd((void*)(uintptr_t)(h + g_brc.o_da), &da, 8) || da < va || da - va > (1ull << 34)) return 0;
-        at = da - va;
-    } else {
-        uint64_t bova = 0, bsz = 0;
-        if (!rd((void*)(uintptr_t)(h + g_brc.o_off), &at, 8) || !rd((void*)(uintptr_t)(h + g_brc.o_bova), &bova, 8) ||
-            !rd((void*)(uintptr_t)(bo + 8), &bsz, 8))
-            return 0;
-        if (bova != va || at > bsz || sz > bsz - at) return 0;
-    }
-    *size = sz;
-    *p = map ? (const uint8_t*)(uintptr_t)(map + at) : NULL;
-    return 1;
-}
+// Buffers made before the plugin. BG3 makes, binds and maps its constant rings at startup, before an early plugin
+// starts, so the layer never saw them and the ground injection found no camera in BG3's per-view block ("ground: ...
+// without BG3's camera ... unmapped"). bg3le keeps where every buffer of the game lives from its first call (WOW-BG3's
+// bg3le patch 0013: buffer -> memory and offset, memory -> mapping), on every driver: the plugin asks it. (Reading
+// the driver's own objects instead worked on RADV only: on Nvidia's driver no layout fitted and the world was undrawn.)
+static struct { int tried; uint64_t recovered, unmapped; } g_brc;
+static const uint8_t* (*g_bg3le_buffer_host)(uint64_t buffer, uint64_t* size);
 static const uint8_t* brc_recover(uint64_t buffer, uint64_t* size) {
-    const uint8_t* p = NULL;
-    if (!g_brc.ok || !brc_read(buffer, g_brc.o_map, &p, size)) return NULL;
+    const uint8_t* p = g_bg3le_buffer_host(buffer, size);
     if (!p) { g_brc.unmapped++; return NULL; }
     if (++g_brc.recovered <= 3 || g_brc.recovered % 100 == 0)
-        rlog("buffer %llx recovered from the driver (%llu bytes, mapped); %llu so far, %llu not mapped",
+        rlog("buffer %llx found in bg3le's record (%llu bytes, mapped); %llu so far, %llu not mapped",
              (unsigned long long)buffer, (unsigned long long)*size, (unsigned long long)g_brc.recovered, (unsigned long long)g_brc.unmapped);
     return p;
 }
 static void brc_calibrate(void) {
-    // BG3 maps its memory at startup, so the layer has no buffers of BG3's own to learn from: the plugin
-    // makes two small host-visible buffers of its own (gbuf_make: the driver's functions, BG3's device)
-    // and finds where RADV keeps what it needs on those.
-    static GBuf own[2];
-    static const struct { const char* mesa; int kind, o_bo, o_da, o_off, o_bova; } L[2] = {
-        {"26.x", BRC_ADDRESS, 104, 88, 0, 0},
-        {"25.0", BRC_OFFSET, 88, 0, 96, 104},
-    };
-    DeviceData* d = &g_devices[0];
-    if (!d->device) return;
-    g_brc.tries++;
-    for (int k = 0; k < 2; k++)
-        if (!own[k].buf && !gbuf_make(d, &own[k], 4096u << k, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1)) return;
-    if (!own[0].map || !own[1].map) return;
-    int which = -1;
-    for (int l = 0; l < 2 && !g_brc.ok; l++) {
-        g_brc.kind = L[l].kind; g_brc.o_size = 72; g_brc.o_bo = L[l].o_bo; g_brc.o_da = L[l].o_da;
-        g_brc.o_off = L[l].o_off; g_brc.o_bova = L[l].o_bova; g_brc.o_va = 0;
-        for (int o_map = 40; o_map <= 200 && !g_brc.ok; o_map += 8) {
-            int all = 1;
-            for (int k = 0; k < 2 && all; k++) {
-                const uint8_t* p = NULL;
-                uint64_t sz = 0;
-                all = brc_read((uint64_t)(uintptr_t)own[k].buf, o_map, &p, &sz) && p == (const uint8_t*)own[k].map && sz >= (4096u << k);
-            }
-            if (all) { g_brc.o_map = o_map; g_brc.ok = 1; which = l; }
-        }
-    }
-    if (g_brc.ok) {
-        if (L[which].kind == BRC_ADDRESS)
-            rlog("buffers made before the plugin: the driver's object read, Mesa %s layout (size +72, address +%d, bo +%d;"
-                 " bo va +0, cpu map +%d), checked on two buffers of the plugin's own", L[which].mesa, g_brc.o_da, g_brc.o_bo, g_brc.o_map);
-        else
-            rlog("buffers made before the plugin: the driver's object read, Mesa %s layout (size +72, bo +%d, offset +%d,"
-                 " bo va +%d; bo va +0, cpu map +%d), checked on two buffers of the plugin's own", L[which].mesa, g_brc.o_bo,
-                 g_brc.o_off, g_brc.o_bova, g_brc.o_map);
+    g_brc.tried = 1;
+    g_bg3le_buffer_host = (const uint8_t* (*)(uint64_t, uint64_t*))dlsym(RTLD_DEFAULT, "bg3le_vk_buffer_host");
+    if (g_bg3le_buffer_host) {
         g_buf_recover = brc_recover;
-    } else if (g_brc.tries <= 3) {
-        uint64_t q[16] = {0};
-        rd((void*)(uintptr_t)own[0].buf, q, sizeof q);
-        rlog("buffers made before the plugin: no layout fits (own buffer %p mapped at %p; object +64..: %llx %llx %llx %llx %llx %llx)",
-             (void*)own[0].buf, own[0].map, (unsigned long long)q[8], (unsigned long long)q[9], (unsigned long long)q[10],
-             (unsigned long long)q[11], (unsigned long long)q[12], (unsigned long long)q[13]);
+        rlog("buffers made before the plugin: bg3le's record of the game's buffers (patch 0013)");
+    } else {
+        rlog("buffers made before the plugin: this bg3le keeps no record of them (WOW-BG3's patch 0013 missing):"
+             " BG3's constant rings stay unread");
     }
 }
 // Shader modules made before the plugin. Mesa keeps the SPIR-V in
@@ -1064,7 +1003,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL hk_present(VkQueue q, const VkPresentInfoK
     VkResult r = layer_QueuePresentKHR(q, info);
     if (n == 1 || n % 3000 == 0) rlog("present #%lu through the plugin", n);
     if (!g_rpc.ok && g_img && n % 300 == 0 && g_rpc.tries < 40) rpc_calibrate();
-    if (!g_brc.ok && n % 300 == 150 && g_brc.tries < 40) brc_calibrate();
+    if (!g_brc.tried) brc_calibrate();
     if (n % 600 == 0) {
         rlog("render passes since the last line: %llu, %llu with something made before the plugin (render pass %llu,"
              " framebuffer %llu, view %llu, image %llu; swapchain images %llu)",

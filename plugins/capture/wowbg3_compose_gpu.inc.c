@@ -850,8 +850,7 @@ static int compose_gpu(QueueData* q, SwapchainData* c, uint32_t index, const VkP
     d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_gc.out.buf, 1, &rc);
     if (g_cc.fxbg) d->CmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_gc.dep.buf, 1, &rc);  // binding 1 holds BG3's final picture
     // Layout changes take both aspects of a depth-stencil image (without separateDepthStencilLayouts).
-    VkImageAspectFlags da = VK_IMAGE_ASPECT_DEPTH_BIT;
-    if (dfmt == VK_FORMAT_D32_SFLOAT_S8_UINT || dfmt == VK_FORMAT_D24_UNORM_S8_UINT || dfmt == VK_FORMAT_D16_UNORM_S8_UINT) da |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    VkImageAspectFlags da = depth_layout_aspects(dfmt);
     if (!pre && !g_cc.fxbg) {
         barrier_aspect(d, cmd, depth, da, dlayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy rd = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {W, H, 1}};

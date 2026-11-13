@@ -5535,7 +5535,7 @@ bool code_at(std::uintptr_t va, unsigned char const* code, std::size_t n) {
     return n <= sizeof(got) && safe_read((void const*)(g_api.LoadBias() + va), got, n) && std::memcmp(got, code, n) == 0;
 }
 
-// Our folder's file for this URI, or empty: a name ending in .dds right after ".../wow-bg3/link/minimap/"
+// Our folder's file for this URI, or empty: a name ending in .dds right after "<the mod's IO folder>/link/minimap/"
 // (BG3's GUI hands the provider the URI as the binding wrote it, perhaps with a pack prefix), then
 // optionally "?<anything>" (WowUi.lua makes each image's URI unique that way while benilla reuses
 // four files). The file is always io_dir()/link/minimap/<name>.
@@ -5558,17 +5558,32 @@ std::string uitex_path(void const* uri) {
     // item was an empty square in the bag, the trade and the loot windows (a playtest report), while the equipment
     // slots, drawn another way, had their pictures. BG3's GUI asks for an icon atlas by the atlas's id alone (its UUID
     // in the .lsx: tools/wow_icons.py ATLAS_UUID). WOW_BG3_UITEX_LOG=1 logs what the GUI asks for (research).
-    if (std::getenv("WOW_BG3_UITEX_LOG") != nullptr && g_uitex_all_logged.fetch_add(1) < 400) logf("wowbg3 ui textures: asked %.200s", s);
+    if (std::getenv("WOW_BG3_UITEX_LOG") != nullptr && (g_uitex_all_logged.fetch_add(1) < 400 || std::strstr(s, "minimap") != nullptr))
+        logf("wowbg3 ui textures: asked %.300s", s);
     static constexpr char kAtlas[] = "5d0c7e1a-9b34-4f6e-a2c8-71e3b6d4f905";
     if (std::strcmp(s, kAtlas) == 0) {
         if (g_uitex_atlas_logged.fetch_add(1) < 2) logf("wowbg3 ui textures: uri %.300s", s);
         return io_dir() + "gui/Icons_WowBg3.dds";
     }
-    static constexpr char kTail[] = "/wow-bg3/link/minimap/";
-    char const* at = std::strstr(s, kTail);
-    if (at == nullptr) return {};
+    // The mod's IO folder's link/minimap/ (WowUi.lua writes the URI from the same folder: WOWBG3_IO), compared after
+    // percent-decoding (the folder, BG3's "Larian Studios/Baldur's Gate 3/Mods", has spaces and an apostrophe). Matching the old folder's name ("/wow-bg3/link/minimap/") left the minimap without
+    // its picture once the IO folder moved.
+    // The folder without its leading slash: BG3's GUI hands "home/<user>/..." (it drops the root's "/").
+    static const std::string kTail = [] {
+        std::string t = io_dir() + "link/minimap/";
+        return t.substr(t.find_first_not_of('/'));
+    }();
+    std::string dec;
+    dec.reserve(std::strlen(s));
+    for (char const* c = s; *c != 0; ++c) {
+        auto hex = [](char h) { return h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1; };
+        if (*c == '%' && hex(c[1]) >= 0 && hex(c[2]) >= 0) { dec.push_back((char)(hex(c[1]) * 16 + hex(c[2]))); c += 2; }
+        else dec.push_back(*c);
+    }
+    const std::size_t pos = dec.find(kTail);
+    if (pos == std::string::npos) return {};
     if (g_uitex_logged.fetch_add(1) < 4) logf("wowbg3 ui textures: uri %.300s", s);
-    char const* name = at + sizeof(kTail) - 1;
+    char const* name = dec.c_str() + pos + kTail.size();
     char const* q = std::strchr(name, '?');
     const std::size_t n = q != nullptr ? (std::size_t)(q - name) : std::strlen(name);
     if (n < 5 || n > 64) return {};

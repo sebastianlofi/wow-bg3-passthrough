@@ -911,12 +911,8 @@ static const uint8_t* fxc_slot_cpu(uint32_t set, uint32_t binding, uint32_t need
     DescSlot* sl = &si->slot[binding];
     if (!sl->res) return NULL;
     uint64_t off = sl->off, left = 0;
-    if (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-        uint32_t at = 0;
-        for (uint32_t b = 0; b < binding; b++)
-            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
-        if (at < t_ndyn[set] && at < 8) off += t_dyn[set][at];
-    }
+    const int at = set_dyn_at(t_set[set], si, binding);
+    if (at >= 0 && (uint32_t)at < t_ndyn[set] && at < 8) off += t_dyn[set][at];
     const uint8_t* p = buf_cpu(sl->res, off, &left);
     return p && left >= need ? p : NULL;
 }
@@ -2219,12 +2215,8 @@ static const DescSlot* post_slot(const uint64_t* sets, uint32_t dyn[8][8], const
     if (!si || (!si->slot[binding].res && !si->slot[binding].samp)) return NULL;
     DescSlot* sl = &si->slot[binding];
     *off = sl->off;
-    if (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-        uint32_t at = 0;
-        for (uint32_t b = 0; b < binding; b++)
-            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
-        if (at < ndyn[set] && at < 8) *off += dyn[set][at];
-    }
+    const int at = dyn ? set_dyn_at(sets[set], si, binding) : -1;
+    if (at >= 0 && (uint32_t)at < ndyn[set] && at < 8) *off += dyn[set][at];
     return sl;
 }
 // Copies `n` mapped bytes of a uniform slot into `out`; 0 when not mapped.
@@ -3211,10 +3203,22 @@ static int void_skip(VkCommandBuffer cb, uint32_t fi, uint32_t count, uint32_t f
         if (hide_has(t_ib)) return 1;
         RecInfo* kri = t_bind_cb == cb && t_pipe && g_rec ? TABLE_FIND(g_rec, REC_CAP, t_pipe, 0) : NULL;
         Recipe* kr = kri ? kri->r : NULL;
+        static uint64_t norec, nall;
+        nall++;
+        if (!kr) norec++;
+        if (nall % 200000 == 1)
+            logf_("void: level draws judged %llu, kept for want of the pipeline's recipe %llu", (unsigned long long)nall, (unsigned long long)norec);
         if (!kr) return 0;
         float kat[3];
         int khow = fxc_place(kr, fi, kat, NULL);
         g_keep_how[khow + 1 >= 0 && khow + 1 < 6 ? khow + 1 : 5]++;
+        {   // How the level's draws were told apart (fxc_place: -1 too big, 0 unplaced, 1 object, 2 rows, 3 at the eye, 4 rows not mapped)
+            static uint64_t nlog;
+            if (++nlog % 200000 == 1)
+                logf_("void: draws by placement: too big %llu, unplaced %llu, object %llu, rows %llu, at eye %llu, rows unmapped %llu",
+                      (unsigned long long)g_keep_how[0], (unsigned long long)g_keep_how[1], (unsigned long long)g_keep_how[2],
+                      (unsigned long long)g_keep_how[3], (unsigned long long)g_keep_how[4], (unsigned long long)g_keep_how[5]);
+        }
         if (khow == -1) return 1;
         if (khow != 1 && khow != 2) return 0;
         const float* keye = (const float*)fxc_slot_cpu(0, 1, 112);

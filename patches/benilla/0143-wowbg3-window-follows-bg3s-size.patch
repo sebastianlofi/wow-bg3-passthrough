@@ -1,0 +1,78 @@
+WOW-BG3 benilla patch 0143: the offscreen window follows BG3's picture size (on top of 0001-0142).
+
+The window kept the size WOW_WIN gave it at start (BG3's settings file then). A resolution or aspect ratio changed in
+BG3's options while playing left WoW rendering at the old size, and the render plugin stretched it over BG3's picture
+(horizontal lines, a wrong aspect: seen on an Nvidia PC going from 1280x720 to 2560x1080). The render plugin writes
+BG3's swapchain size to $WOW_BG3_LINK_DIR/bg3size.txt ("W H") whenever BG3 makes one; follow_bg3_size reads it
+(at most every 250 ms, when its time changes) and sets the window's physical size; retarget makes the cameras' image
+of that size as for any resize.
+
+--- a/crates/benilla-app/src/wowbg3_offscreen.rs
++++ b/crates/benilla-app/src/wowbg3_offscreen.rs
+@@ -24,6 +24,9 @@
+ //! - SIGTERM (the launcher stopping it, BG3 closing) is a clean exit, as a window close was: the
+ //!   app's exit systems run (settings, WoW's saved variables) and the session closes, which logs the
+ //!   character out on the server ([`on_sigterm`]). A second SIGTERM kills at once.
++//! - The window follows BG3's picture size (WOW-BG3 patch 0143, [`follow_bg3_size`]): the render plugin writes it to
++//!   `$WOW_BG3_LINK_DIR/bg3size.txt` ("W H") whenever BG3 makes its swapchain, so a resolution or aspect ratio changed
++//!   in BG3's options while playing is the size WoW renders at from then on (it kept `WOW_WIN` before: stretched).
+ 
+ use std::collections::VecDeque;
+ use std::sync::atomic::{AtomicBool, Ordering};
+@@ -105,7 +108,8 @@
+             .insert_resource(IdleLimit { period: Duration::from_secs_f64(1.0 / idle_fps), last: None })
+             .insert_resource(ExitWith { pid: parent, next: Instant::now() })
+             .add_systems(PostUpdate, retarget.before(bevy::camera::CameraUpdateSystems))
+-            .add_systems(Update, exit_with)
++            .init_resource::<Bg3Size>()
++            .add_systems(Update, (exit_with, follow_bg3_size))
+             .add_systems(Last, idle_limit);
+     }
+ 
+@@ -159,6 +163,46 @@
+     }
+ }
+ 
++/// Patch 0143: when `bg3size.txt` was last read, and its time then.
++#[derive(Resource, Default)]
++struct Bg3Size {
++    next: Option<Instant>,
++    modified: Option<std::time::SystemTime>,
++}
++
++/// Patch 0143: the window takes BG3's picture size from `$WOW_BG3_LINK_DIR/bg3size.txt` ("W H", the render plugin's,
++/// written when BG3 makes its swapchain); [`retarget`] then makes the image the cameras draw into of that size.
++fn follow_bg3_size(mut state: ResMut<Bg3Size>, mut windows: Query<&mut Window, With<PrimaryWindow>>) {
++    let now = Instant::now();
++    if state.next.is_some_and(|n| now < n) {
++        return;
++    }
++    state.next = Some(now + Duration::from_millis(250));
++    let Some(dir) = std::env::var_os("WOW_BG3_LINK_DIR") else { return };
++    let path = std::path::PathBuf::from(dir).join("bg3size.txt");
++    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
++    if state.modified == Some(modified) {
++        return;
++    }
++    state.modified = Some(modified);
++    let Ok(text) = std::fs::read_to_string(&path) else { return };
++    let mut it = text.split_whitespace().filter_map(|v| v.parse::<u32>().ok());
++    let (Some(w), Some(h)) = (it.next(), it.next()) else { return };
++    if w == 0 || h == 0 || w > 16384 || h > 16384 {
++        return;
++    }
++    let Ok(mut window) = windows.single_mut() else { return };
++    if window.physical_width() == w && window.physical_height() == h {
++        return;
++    }
++    info!(
++        "wowbg3 offscreen: BG3's picture is {w}x{h}: the window follows (was {}x{})",
++        window.physical_width(),
++        window.physical_height()
++    );
++    window.resolution.set_physical_resolution(w, h);
++}
++
+ #[derive(Resource)]
+ struct IdleLimit {
+     period: Duration,

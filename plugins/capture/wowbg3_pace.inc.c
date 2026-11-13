@@ -98,12 +98,8 @@ static const uint8_t* pace_view_constants(uint32_t need) {
     DescSlot* sl = &si->slot[1];
     if (!sl->res) return NULL;
     uint64_t off = sl->off, left = 0;
-    if (sl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || sl->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
-        uint32_t at = 0;
-        for (uint32_t b = 0; b < 1; b++)
-            if (si->slot[b].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || si->slot[b].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) at++;
-        if (at < t_ndyn[0] && at < 8) off += t_dyn[0][at];
-    }
+    const int at = set_dyn_at(t_set[0], si, 1);
+    if (at >= 0 && (uint32_t)at < t_ndyn[0] && at < 8) off += t_dyn[0][at];
     const uint8_t* p = buf_cpu(sl->res, off, &left);
     return p && left >= need ? p : NULL;
 }

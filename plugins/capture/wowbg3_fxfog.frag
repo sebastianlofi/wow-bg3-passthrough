@@ -4,8 +4,10 @@
 // through a table measured from BG3's own output ("fxcal").
 #version 450
 layout(std430, set = 0, binding = 0) readonly buffer Wow { uint w[]; } wow;
-layout(std140, set = 0, binding = 1) uniform E0 { vec4 a; } e0;
-layout(std140, set = 0, binding = 2) uniform E1 { vec4 a; } e1;
+// BG3's exposure: its two buffers as its exposure pass binds them (storage buffers; as uniform buffers they broke
+// Nvidia's driver: no uniform usage, storage alignment), at their dynamic offsets.
+layout(std430, set = 0, binding = 1) readonly buffer E0 { vec4 a; } e0;
+layout(std430, set = 0, binding = 2) readonly buffer E1 { vec4 a; } e1;
 layout(push_constant) uniform PC {
     vec4 fN, rN, uN;     // frame N's axes; fN.w tan x, rN.w tan y, uN.w 1/W
     vec4 eK, fK, rK, uK; // K's eye minus N's eye (m), its axes; eK.w tan x, fK.w tan y, rK.w 1/H
