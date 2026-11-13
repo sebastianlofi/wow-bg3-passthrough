@@ -944,12 +944,12 @@ static void role_reset_cb(VkCommandBuffer cb) {
     pthread_mutex_unlock(&g_trace_lock);
 }
 // A pass begins on `cb` with attachment images `imgs` (final layouts `fin`, -1 unknown). g_trace_lock held.
-static void role_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin) {
+static void role_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, const int32_t* fin, const uint8_t* load) {
     if (!g_role.ew) return;
     uint32_t colors = 0, scolors = 0, stencil = 0;
     uint64_t depth = 0, ui = 0; int32_t dfin = -1, ufin = -1;
     VkFormat df = 0, uf = 0;
-    int sc = 0;
+    int sc = 0, fwd = 0;
     for (uint32_t k = 0; k < n; k++) {
         ImgInfo* i = imgs[k] ? TABLE_FIND(g_img, IMG_CAP, imgs[k], 0) : NULL;
         if (!i) { if (imgs[k] && is_swapchain_image(imgs[k])) sc = 1; continue; }
@@ -958,15 +958,24 @@ static void role_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, cons
         if (!scene && !screen) continue;
         if (i->fmt == VK_FORMAT_S8_UINT) { if (screen) stencil++; }
         else if (is_depth_format(i->fmt)) { if (scene) { depth = imgs[k]; dfin = fin[k]; df = i->fmt; } }
-        else { if (scene) colors++; if (screen) { scolors++; if (is_ui_color(i->fmt)) { ui = imgs[k]; ufin = fin[k]; uf = i->fmt; } } }
+        else {
+            if (scene) colors++;
+            if (scene && i->fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && load[k] == VK_ATTACHMENT_LOAD_OP_CLEAR) fwd++;
+            if (screen) { scolors++; if (is_ui_color(i->fmt)) { ui = imgs[k]; ufin = fin[k]; uf = i->fmt; } }
+        }
     }
     t_sc_cb = sc ? cb : VK_NULL_HANDLE;
     if (depth && colors >= 3) pace_gbuffer(cb);
     if (depth && colors >= 3) tavd_begin(cb);
     else if (t_tavd_cb == cb) tavd_flush_locked();
-    if (depth && colors >= 3 && g_role.depth != depth) {
+    // The scene depth is named by BG3's G-buffer pass and by its forward pass (the scene's B10G11R11 target cleared, on the
+    // scene depth), whichever is recorded first. BG3 records a frame's passes on several threads at once, and when it makes
+    // its targets again (each Shift press, an armed ability) the forward pass was at times recorded before the G-buffer pass:
+    // on the old depth's role, so that frame had no feed (a black world, then red ground while TAA forgot it; Nvidia).
+    if (depth && (colors >= 3 || (colors == 1 && fwd == 1)) && g_role.depth != depth) {
         g_role.depth = depth; g_role.dfmt = df; g_role.dlayout = -1;
-        char s[96]; img_desc(s, sizeof s, depth); logf_("roles: scene depth %s", s);
+        char s[96]; img_desc(s, sizeof s, depth);
+        logf_("roles: scene depth %s (named by its %s pass, present %llu)", s, colors >= 3 ? "G-buffer" : "forward", (unsigned long long)__atomic_load_n(&g_req.presents, __ATOMIC_RELAXED));
     }
     if (stencil && scolors == 1 && ui) { t_ui_cb = cb; t_ui_img = ui; t_ui_draws = 0; if (!g_role.ufmt) g_role.ufmt = uf; }
     for (uint32_t k = 0; k < n; k++) if (fin[k] >= 0) role_set_layout(cb, imgs[k], fin[k]);
@@ -3122,7 +3131,7 @@ static void begin_pass(VkCommandBuffer cb, VkRenderPass rp, VkFramebuffer fb, co
             ini[k] = p && k < p->n ? p->init[k] : -1;
             load[k] = p && k < p->n ? p->load[k] : 0xff;
         }
-        role_pass(cb, n, imgs, fin);
+        role_pass(cb, n, imgs, fin, load);
         ground_pass(cb, n, imgs, load, fin, w, h);
         surf_pass_begin(cb, n, imgs, ini, load, fin);
         late_pass_begin(device_for(cb), cb, n, imgs, load, ini, fin);

@@ -641,6 +641,63 @@ static struct {
 // either table go too, so a new image at a recycled handle gets its own. BG3 has finished every command that used
 // it (Vulkan's rule for destroying an image), and our draws are in BG3's command buffers.
 static void post_forget_image(DeviceData* d, uint64_t img);  // patch46 (after g_pst and g_blm)
+// BG3's G-buffer images go with the scene depth of the pass that drew them (g_gb_depth). BG3 records a frame's passes on
+// several threads, and when it makes its targets again (each Shift press) its forward pass was at times recorded before
+// that frame's G-buffer pass: the feed then read the previous G-buffer's images, alive but no longer drawn, whose memory
+// held something else by then (a red world for a frame, then red ground while TAA forgot it; Nvidia). Such a feed reads
+// the plugin's standby images (g_gbs) instead, and the G-buffer pass of its depth copies its targets into them when it
+// ends: BG3 submits that pass before its forward pass, so the copy is done before the read, whoever recorded first.
+static uint64_t g_gb_depth;
+static struct { SfImg nrm, alb, z; uint32_t w[3], h[3]; int fmt[3]; uint64_t want; uint64_t copies, races; } g_gbs;
+static __thread VkCommandBuffer t_gbs_cb; static __thread uint64_t t_gbs_src[3]; static __thread int32_t t_gbs_lay[3];
+static void gbs_named(VkCommandBuffer cb, uint64_t depth, const uint64_t* col, const int32_t* cfin, uint32_t nc) {
+    pthread_mutex_lock(&g_fbt_m);
+    g_gb_nrm = col[0]; g_gb_alb = col[1]; g_gb_surf = col[2]; g_gb_z = nc > 3 ? col[3] : 0; g_gb_depth = depth;
+    if (g_gbs.want && g_gbs.want == depth && nc > 3) {
+        g_gbs.want = 0; t_gbs_cb = cb;
+        t_gbs_src[0] = col[0]; t_gbs_src[1] = col[1]; t_gbs_src[2] = col[3];
+        t_gbs_lay[0] = cfin[0]; t_gbs_lay[1] = cfin[1]; t_gbs_lay[2] = cfin[3];
+    }
+    pthread_mutex_unlock(&g_fbt_m);
+}
+static void gbs_copy(DeviceData* d, VkCommandBuffer cb) {  // at the end of BG3's G-buffer pass, after WoW's ground went in (ground_end)
+    if (t_gbs_cb != cb) return;
+    t_gbs_cb = VK_NULL_HANDLE;
+    SfImg* dst[3] = {&g_gbs.nrm, &g_gbs.alb, &g_gbs.z};
+    for (int k = 0; k < 3; k++) {
+        ImgInfo* ii = TABLE_FIND(g_img, IMG_CAP, t_gbs_src[k], 0);
+        if (!ii || !dst[k]->img || t_gbs_lay[k] < 0 || g_gbs.w[k] != ii->w || g_gbs.h[k] != ii->hgt || g_gbs.fmt[k] != (int)ii->fmt) continue;
+        sf_copy(d, cb, (VkImage)t_gbs_src[k], (VkImageLayout)t_gbs_lay[k], dst[k], ii->w, ii->hgt);
+    }
+    if (g_gbs.copies++ % 50 == 0) logf_("gbuffer: %llu frames whose forward pass was recorded before their G-buffer pass: read through standby images", (unsigned long long)g_gbs.copies + 1);
+}
+// At a feed: views of BG3's G-buffer that belongs to this frame's scene depth, or of the standby images (layout GENERAL)
+// when that frame's G-buffer pass has not been recorded yet. Returns 1 for the standby images.
+static int gbs_views(DeviceData* d, VkImageView* alb, VkImageView* z, VkImageView* nrm) {
+    pthread_mutex_lock(&g_fbt_m);
+    const int race = g_role.depth && g_gb_depth && g_gb_depth != g_role.depth;
+    if (race) {
+        uint64_t like[3] = {g_gb_nrm, g_gb_alb, g_gb_z}; SfImg* sb[3] = {&g_gbs.nrm, &g_gbs.alb, &g_gbs.z};
+        int ok = 1;
+        for (int k = 0; k < 3; k++) {
+            ImgInfo* ii = like[k] ? TABLE_FIND(g_img, IMG_CAP, like[k], 0) : NULL;
+            if (!ii) { ok = 0; continue; }
+            if (sb[k]->img && (g_gbs.w[k] != ii->w || g_gbs.h[k] != ii->hgt || g_gbs.fmt[k] != (int)ii->fmt)) fb_retire(sb[k]);
+            if (!sb[k]->img) {
+                if (sf_img_make(d, sb[k], (VkFormat)ii->fmt, ii->w, ii->hgt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                    g_gbs.w[k] = ii->w; g_gbs.h[k] = ii->hgt; g_gbs.fmt[k] = (int)ii->fmt;
+                } else ok = 0;
+            }
+        }
+        g_gbs.want = g_role.depth; g_gbs.races++;
+        pthread_mutex_unlock(&g_fbt_m);
+        *nrm = ok ? g_gbs.nrm.view : VK_NULL_HANDLE; *alb = ok ? g_gbs.alb.view : VK_NULL_HANDLE; *z = ok ? g_gbs.z.view : VK_NULL_HANDLE;
+        return 1;
+    }
+    pthread_mutex_unlock(&g_fbt_m);
+    *alb = gbv_view(d, g_gb_alb); *z = gbv_view(d, g_gb_z); *nrm = gbv_view(d, g_gb_nrm);
+    return 0;
+}
 static void fb_forget_image(DeviceData* d, VkImage img) {
     if (!img || !d) return;
     static uint64_t forgot;
@@ -1713,7 +1770,8 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     fb_stale_note(0, slot);
     pthread_mutex_unlock(&g_fbt_m);
     // BG3's G-buffer as it is now (gbv_view): its albedo, its fourth target and its normal.
-    const VkImageView gv_alb = gbv_view(d, g_gb_alb), gv_z = gbv_view(d, g_gb_z), gv_nrm = gbv_view(d, g_gb_nrm);
+    VkImageView gv_alb, gv_z, gv_nrm;
+    const VkImageLayout gvl = gbs_views(d, &gv_alb, &gv_z, &gv_nrm) ? VK_IMAGE_LAYOUT_GENERAL : GBV_LAY;
     { static uint64_t none; if (!fog && !gv_alb && none++ % 600 == 0) logf_("gbuffer: a feed without BG3's albedo (%llu so far): no WoW ambient on BG3's pixels in that frame", (unsigned long long)none); }
     if (!g_fbg.ebuf[0] || !g_fbg.ebuf[1]) { g_fbg.refused++; return; }
     const int wdx_fix = mode == 0 && g_cc.wdevref > 0.0f && !g_cc.fxcal && g_wdx.cur_ok;  // patch61: binding 1 = BG3's newest eye state
@@ -1744,13 +1802,13 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
         // the ambient on its characters that way).
         const VkImageView av = gv_alb ? gv_alb : g_blm.wdsp.view;
         {
-            VkDescriptorImageInfo i8 = {g_fbg.asmp, av, gv_alb ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo i8 = {g_fbg.asmp, av, gv_alb ? gvl : VK_IMAGE_LAYOUT_GENERAL};
             VkWriteDescriptorSet wr8 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i8, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr8, 0, NULL);
         }
         const VkImageView zv = gv_z ? gv_z : g_blm.wdsp.view;  // binding 9: BG3's G-buffer fourth target (the test view wdzdbg=2 alone reads it: no depth is in it)
         {
-            VkDescriptorImageInfo i9 = {g_fbg.asmp, zv, gv_z ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo i9 = {g_fbg.asmp, zv, gv_z ? gvl : VK_IMAGE_LAYOUT_GENERAL};
             VkWriteDescriptorSet wr9 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 9, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i9, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr9, 0, NULL);
         }
@@ -1758,7 +1816,7 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
         // materials. While BG3 has no G-buffer, an image of our own (the table's tail says which, and the facing is
         // toward the eye).
         {
-            VkDescriptorImageInfo i10 = {g_fbg.asmp, gv_nrm ? gv_nrm : g_blm.wdsp.view, gv_nrm ? GBV_LAY : VK_IMAGE_LAYOUT_GENERAL};
+            VkDescriptorImageInfo i10 = {g_fbg.asmp, gv_nrm ? gv_nrm : g_blm.wdsp.view, gv_nrm ? gvl : VK_IMAGE_LAYOUT_GENERAL};
             VkWriteDescriptorSet wr10 = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, fs, 10, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i10, NULL, NULL};
             d->UpdateDescriptorSets(d->device, 1, &wr10, 0, NULL);
         }

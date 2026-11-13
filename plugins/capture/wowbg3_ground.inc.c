@@ -108,6 +108,8 @@ static void wd_mark(DeviceData* d, VkCommandBuffer cb, VkRenderPass rp, VkBuffer
 
 // The G-buffer pass being recorded on this thread: its command buffer, images, size; the frame's camera.
 static __thread VkCommandBuffer t_gr_cb;
+static void gbs_named(VkCommandBuffer cb, uint64_t depth, const uint64_t* col, const int32_t* cfin, uint32_t nc);  // wowbg3_fxbg.inc.c
+static void gbs_copy(DeviceData* d, VkCommandBuffer cb);
 static __thread uint64_t t_gr_img[4];
 static uint64_t g_gb_alb, g_gb_surf, g_gb_z;  // BG3's G-buffer albedo and surface images (wdbare) and its fourth colour target (RGBA8: not a depth; the eye depth is the lighting pass's R32F image, bare_draw)
 static __thread int32_t t_gr_lay[4];
@@ -288,7 +290,7 @@ static void ground_pass(VkCommandBuffer cb, uint32_t n, const uint64_t* imgs, co
     }
     t_gr_cb = cb;
     t_gr_img[0] = g_role.depth; t_gr_img[1] = col[0]; t_gr_img[2] = col[1]; t_gr_img[3] = col[2];
-    g_gb_nrm = col[0]; g_gb_alb = col[1]; g_gb_surf = col[2]; g_gb_z = col[3];  // read through the plugin's own views (gbv_view)
+    gbs_named(cb, g_role.depth, col, cfin, nc);  // g_gb_*: read through the plugin's own views (gbv_view)
     t_gr_lay[0] = dfin; t_gr_lay[1] = cfin[0]; t_gr_lay[2] = cfin[1]; t_gr_lay[3] = cfin[2];
     t_gr_w = w; t_gr_h = h;
     t_gr_cam = t_bind_cb == cb ? ground_view_record(&t_gr_rec) : 0;
@@ -580,6 +582,7 @@ static void ground_inject(DeviceData* d, VkCommandBuffer cb) {
 
 static void ground_end(DeviceData* d, VkCommandBuffer cb) {
     if (t_gr_cb == cb) ground_inject(d, cb);
+    gbs_copy(d, cb);  // after WoW's ground is in BG3's G-buffer, as a frame's feed reads it
 }
 
 // Submission order (from role_submit, g_trace_lock held): an injected frame becomes pending; the
