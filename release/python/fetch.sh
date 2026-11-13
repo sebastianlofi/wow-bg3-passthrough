@@ -12,6 +12,6 @@ curl -sSfL "https://github.com/astral-sh/python-build-standalone/releases/downlo
 grep " $NAME\$" SHA256SUMS | sha256sum -c -
 [ -d python ] && { mkdir -p "$WOWBG3_BUILD/old"; mv python "$WOWBG3_BUILD/old/python-$(date +%Y%m%d-%H%M%S)"; }
 tar xzf "$NAME"
-./python/bin/python3 -m pip install -q --no-cache-dir numpy==2.5.4 pillow==12.3.0 lz4 zstandard
+./python/bin/python3 -m pip install -q --no-cache-dir numpy==2.5.4 pillow==12.3.0 lz4==4.4.5 zstandard==0.25.0
 ./python/bin/python3 -c "import numpy, PIL, lz4, zstandard, sys; print(sys.version.split()[0], numpy.__version__, PIL.__version__)"
 du -sh python

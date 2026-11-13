@@ -1,0 +1,45 @@
+--- a/src/debug_server.cpp
++++ b/src/debug_server.cpp
+@@ -296,9 +296,28 @@
+ 
+ }  // namespace
+ 
+-void debug_server_start() {
++// A flag from ScriptExtenderSettings.json next to the game binary (src/console.cpp).
++extern "C" bool bg3le_settings_flag(char const* key, bool fallback);
++
++// Off unless asked for. The listener takes any connection from this machine without a password and runs the Lua it
++// is sent inside the game, and that Lua can open files: a port for whoever works on a mod, not one to leave open
++// on every player's machine at every start. On with BG3LE_DEBUG=1, with "EnableLuaDebugger": true in
++// ScriptExtenderSettings.json (the Windows extender's name for it), or when the console is asked for (CreateConsole,
++// BG3LE_CONSOLE=1: the console is a client of this listener). BG3LE_DEBUG=0 keeps it off whatever the settings say.
++bool debug_server_wanted() {
+     const char* opt = std::getenv("BG3LE_DEBUG");
+-    if (opt != nullptr && opt[0] == '0') return;
++    if (opt != nullptr && opt[0] != '\0') return opt[0] == '1';
++    const char* console = std::getenv("BG3LE_CONSOLE");
++    if (console != nullptr && console[0] == '1') return true;
++    return bg3le_settings_flag("EnableLuaDebugger", false) || bg3le_settings_flag("CreateConsole", false);
++}
++
++void debug_server_start() {
++    if (!debug_server_wanted()) {
++        logf("debug: the Lua debugger is off (BG3LE_DEBUG=1, or \"EnableLuaDebugger\": true in "
++             "ScriptExtenderSettings.json, turns it on)");
++        return;
++    }
+     bool expected = false;
+     if (!g_running.compare_exchange_strong(expected, true)) return;
+     std::thread(listener).detach();
+--- a/src/debug_server.h
++++ b/src/debug_server.h
+@@ -3,7 +3,8 @@
+ 
+ namespace bg3le {
+ 
+-// Starts the listener thread. No-op if already running or BG3LE_DEBUG=0.
++// Starts the listener thread when it is asked for: BG3LE_DEBUG=1, "EnableLuaDebugger" or "CreateConsole" in
++// ScriptExtenderSettings.json, or BG3LE_CONSOLE=1. No-op otherwise, with BG3LE_DEBUG=0, or if already running.
+ void debug_server_start();
+ 
+ // Runs queued evaluations. Must be called from the story thread; the socket

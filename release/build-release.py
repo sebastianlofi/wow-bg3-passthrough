@@ -205,6 +205,45 @@ def copy_tree(src: Path, dst: Path):
     shutil.copytree(src, dst, symlinks=False)
 
 
+# What of the packs a player's install never uses stays out of the release (a zip that carries a PAM module, Java
+# archives and three copies of python reads as bloat, or worse).
+# The server pack: its var/ and an older pack's sql/; of MariaDB, the Java archives of its CONNECT engine, its PAM
+# helper, the mroonga and groonga files, a build macro and test data. What mariadb-install-db reads stays (the
+# system, help, sys schema and test-db SQL, the error messages, the character sets).
+SERVER_OUT = ("var", "var.*", "sql", "*.jar", "pam_user_map.so", "user_map.conf", "mroonga", "groonga",
+              "groonga-normalizer-mysql", "aclocal", "mariadb_test_data_timezone.sql")
+# The python pack: _dbm links Berkeley DB (Sleepycat licence) and tcl9 is tkinter's, removed already; build helpers
+# (2to3, python3-config and its config folder), the turtle, numpy's tests and its Fortran tool; and libpython, which
+# nothing loads (bin/python3 has the interpreter linked in, and no extension module names the library).
+PYTHON_OUT = ("_dbm.cpython-*", "tcl9", "__pycache__", "2to3*", "python3*-config", "config-3.*-*", "turtle.py",
+              "tests", "f2py", "libpython3*.so*")
+
+
+def server_ignore(src):
+    """copytree's ignore for the server pack: SERVER_OUT by name, and mariadb/lib (libmariadb twice: its own client
+    programs have it linked in, and the copy mangosd and realmd load is the pack's lib/)."""
+    by_name = shutil.ignore_patterns(*SERVER_OUT)
+
+    def ignore(folder, names):
+        out = set(by_name(folder, names))
+        if Path(folder).name == "mariadb" and "lib" in names:
+            out.add("lib")
+        return out
+    return ignore
+
+
+def one_python(py: Path):
+    """No links in the release's python, and one interpreter, bin/python3 (the name launcher.conf and
+    wowbg3-server.sh call): a zip stores a link as another copy of its target, which made three pythons of 68 MB."""
+    exe = py / "bin/python3"
+    real = exe.resolve()
+    for p in sorted(py.rglob("*")):
+        if p.is_symlink():
+            p.unlink()
+    if real != exe and real.is_file():
+        real.rename(exe)
+
+
 # What a release must never carry: the server's database SQL (WoW's world, its texts), a table or seed made from
 # it, and the player's own files' products. Checked on the finished folder.
 GAME_DATA = (re.compile(r'\.sql(\.gz|\.7z|\.xz)?$', re.I), re.compile(r'(^|/)abilities[-_](seed|world)', re.I),
@@ -287,7 +326,7 @@ def main():
     # The portable server pack, with this tree's wowbg3-server.sh (run, WOWBG3_SERVER_VAR) and SQL download
     # (fetch-sql.py, sql.lock). An older pack's sql/ (vmangos' database) stays out.
     if a.server and (Path(a.server) / "wowbg3-server.sh").is_file():
-        shutil.copytree(a.server, folder / "server", symlinks=False, ignore=shutil.ignore_patterns("var", "var.*", "sql"))
+        shutil.copytree(a.server, folder / "server", symlinks=False, ignore=server_ignore(a.server))
         for f in ("wowbg3-server.sh", "fetch-sql.py", "sql.lock"):
             shutil.copy2(ROOT / "server" / f, folder / "server" / f)
         os.chmod(folder / "server/wowbg3-server.sh", 0o755)
@@ -347,9 +386,8 @@ def main():
     else:
         missing.append("bg3le (libbg3le.so)")
     if a.python and (Path(a.python) / "bin/python3").exists():
-        # Not shipped: _dbm links Berkeley DB (Sleepycat licence), tcl9 is tkinter's, removed already.
-        shutil.copytree(a.python, folder / "python", symlinks=True,
-                        ignore=shutil.ignore_patterns("_dbm.cpython-*", "tcl9", "__pycache__"))
+        shutil.copytree(a.python, folder / "python", symlinks=True, ignore=shutil.ignore_patterns(*PYTHON_OUT))
+        one_python(folder / "python")
     else:
         print("note: no --python: the runtime's python3 runs the tools; Tav stays untextured")
     if a.fastlz and Path(a.fastlz).is_file():
@@ -410,6 +448,11 @@ def main():
             t.add(d, arcname=f"{name}-sources/{arc}")
     if not a.sources:
         missing.append("upstream sources of the GPL/LGPL/MPL parts (--sources WOWBG3_BUILD/licences/sources)")
+
+    links = [str(p.relative_to(dist)) for p in sorted(dist.rglob("*")) if p.is_symlink()]
+    if links:  # the zip would hold each as a second copy of its target
+        shutil.move(str(dist), str(out / f"{name}.incomplete"))
+        raise SystemExit("links in the release: " + ", ".join(links[:20]) + f" (moved to {name}.incomplete)")
 
     bad = check_no_game_data(folder)
     if bad:

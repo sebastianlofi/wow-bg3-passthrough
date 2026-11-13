@@ -28,12 +28,17 @@ tmpx="$stage/mdb-unpack"; mkdir -p "$tmpx"
 tar xzf "$MARIADB_TAR" -C "$tmpx" --strip-components=1 \
     --wildcards '*/bin/mariadbd' '*/bin/mariadb' '*/bin/my_print_defaults' '*/bin/mariadb-dump' \
     '*/bin/resolveip' '*/scripts/mariadb-install-db' '*/share/*' '*/lib/libmariadb.so*' \
-    --exclude='*/share/man/*' --exclude='*/share/doc/*' --exclude='*/mysql-test/*'
+    --exclude='*/share/man/*' --exclude='*/share/doc/*' --exclude='*/mysql-test/*' \
+    --exclude='*.jar' --exclude='*/share/pam_user_map.so' --exclude='*/share/user_map.conf' --exclude='*/share/mroonga' \
+    --exclude='*/share/groonga' --exclude='*/share/groonga-normalizer-mysql' --exclude='*/share/aclocal' \
+    --exclude='*/share/mariadb_test_data_timezone.sql'
 mv "$tmpx"/bin "$tmpx"/scripts "$tmpx"/share "$tmpx"/lib "$dest/mariadb/"
 rmdir "$tmpx"
 # The bintar's programs carry their debug info (mariadbd ~300 MB); not needed to run.
 strip --strip-debug "$dest"/mariadb/bin/*
-cp -P "$dest"/mariadb/lib/libmariadb.so.3 "$dest/lib/"
+# libmariadb once, where mangosd and realmd load it (MariaDB's own client programs have it linked in).
+cp -L "$dest"/mariadb/lib/libmariadb.so.3 "$dest/lib/"
+rm -r "$dest/mariadb/lib"
 # Libraries from the SDK the programs link that a plain host or the sniper runtime may lack.
 docker run --rm --network none -v "$dest:/p:Z" "$SNIPER_SDK" bash -c '
   set -e

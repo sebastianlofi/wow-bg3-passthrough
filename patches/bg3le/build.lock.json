@@ -280,6 +280,23 @@
           "after_sha256": "9b5d8e3e35e3ca13f7eb05d11955dd3b1691cf59f6b08ba1f41bcf471cb5cef6"
         }
       ]
+    },
+    {
+      "file": "patches/0016-lua-debugger-off-unless-asked.patch",
+      "sha256": "a13a28a912bed7a9ce08add311362ae9e50c966b3ffe27be05b0375a2ff2c084",
+      "purpose": "The Lua debugger (127.0.0.1:9998, no password, runs the Lua it is sent) starts only when asked for: BG3LE_DEBUG=1, EnableLuaDebugger or CreateConsole in ScriptExtenderSettings.json, BG3LE_CONSOLE=1 (upstream started it at every start of the game)",
+      "targets": [
+        {
+          "path": "src/debug_server.cpp",
+          "before_sha256": "b7bbb0d2e0d062d3e0f8119f70687b2e8669ac95dd6f53cd067cc6f31bc8fe64",
+          "after_sha256": "e44bc3e0347cb623611bfce6a2cb9706e6f92e73022ad2cac96e10a0a16d20fa"
+        },
+        {
+          "path": "src/debug_server.h",
+          "before_sha256": "d63db876ce642ece12d85c9d6ad4100f6129791fbca1b0f41f18c0b52c44cb0c",
+          "after_sha256": "4ab7c22c1ed8f9a9f7effbb43cfe926294abf894ca2dc9d832843ca670814210"
+        }
+      ]
     }
   ],
   "previous_library_sha256": "314739e732824ec80ac5e01dae4c0968cd728478d3c9aee7a681dc249ce75414",

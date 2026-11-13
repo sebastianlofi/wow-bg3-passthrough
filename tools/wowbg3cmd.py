@@ -23,7 +23,7 @@ Where things are (each from the environment, else harness A's place on the PC):
   WOWBG3_LINK    the link folder benilla writes             (WOWBG3_IO/link)
   WOW_CHAR       the hero's WoW character                   (else the one online on a WOW-BG3 account)
   WOW_BG3_SERVER a portable server folder (harness B, the release), its var/ in WOWBG3_SERVER_VAR
-                 (else FOLDER/var); unset: the Docker test server (wow-bg3-mangosd-1, wow-bg3-database-1)
+                 (else FOLDER/var); unset: the developers' test server (devserver.py, source tree only)
 Python 3.9, standard library only (it runs in Steam's sniper runtime in the release).
 """
 import json
@@ -43,11 +43,6 @@ import wowserver  # noqa: E402
 ROOT = HERE.parent.parent  # the repo on the PC; WOW-BG3/tools in the release
 A_IO = (str(ROOT) + "/bg3/private/home/.local/share/Larian Studios/Baldur's Gate 3/"
         "Script Extender/wow-bg3")
-DOCKER_CONF = (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/config/mangosd.conf'
-DOCKER_CONF_INSIDE = '/opt/vmangos/config/mangosd.conf'
-DOCKER_DBC = (os.environ.get('WOWBG3_TEST_STACK') or '/opt/stacks/wow-bg3') + '/storage/mangosd/extracted-data/5875/dbc'
-DOCKER_DB = 'wow-bg3-database-1'
-DOCKER_WORLD = 'wow-bg3-mangosd-1'
 TEST_ACCOUNT = 'WOWBG3TEST'
 PLAYTHROUGH = re.compile(r'WB3P[A-Z0-9]{8}')  # one hidden WoW account per playthrough (wowaccount.py)
 XP_KEYS = r'Rate\.XP\.(Kill|Kill\.Elite|Quest|Explore)'  # also an ERE for grep
@@ -102,28 +97,26 @@ def sql(query, db=''):
     """One query, tab separated rows without a header."""
     p = server_dir()
     if p is None:
-        cmd = ['sudo', '-n', 'docker', 'exec', '-i', DOCKER_DB, 'sh', '-c',
-               'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -B %s' % db]
-        env = None
+        r = wowserver.dev().sql(query, db)
     else:
         v = server_var()
         sec = dict(l.split('=', 1) for l in (v / 'secrets.env').read_text().split() if '=' in l)
         cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % wowserver.db_socket(v), '-uroot', '-N', '-B'] + ([db] if db else [])
         env = dict(os.environ, LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_PWD=sec['ROOT_PASS'])
-    r = subprocess.run(cmd, input=query, capture_output=True, text=True, env=env)
+        r = subprocess.run(cmd, input=query, capture_output=True, text=True, env=env)
     if r.returncode:
         raise CmdError('database: %s' % (r.stderr.strip()[-200:] or r.returncode))
     return r.stdout
 
 
 def console(line, seconds=2.5):
-    """One line to mangosd's console (wowserver.py: Docker attach, or the portable server's pipe)."""
+    """One line to mangosd's console (wowserver.py: the portable server's pipe)."""
     return wowserver.console(line, seconds)
 
 
 def dbc_dir():
     v = server_var()
-    return str(v / 'data/5875/dbc') if v else DOCKER_DBC
+    return str(v / 'data/5875/dbc') if v else wowserver.dev().DBC
 
 
 def name_ok(name):
@@ -966,15 +959,13 @@ def level(ctx, args, wow_bg3_only=False):
 
 def xp_conf():
     v = server_var()
-    return v / 'etc/mangosd.conf' if v else Path(DOCKER_CONF)
+    return v / 'etc/mangosd.conf' if v else Path(wowserver.dev().CONF)
 
 
 def xp_seen():
     """The rate lines the server reads."""
     if server_dir() is None:
-        r = subprocess.run(['sudo', '-n', 'docker', 'exec', DOCKER_WORLD, 'grep', '-E', '^%s *=' % XP_KEYS, DOCKER_CONF_INSIDE],
-                           capture_output=True, text=True)
-        text = r.stdout
+        text = wowserver.dev().conf_lines('^%s *=' % XP_KEYS)
     else:
         text = xp_conf().read_text()
     return [m.group(0) for m in re.finditer(r'^%s *=.*$' % XP_KEYS, text, re.M)]
@@ -982,9 +973,9 @@ def xp_seen():
 
 def xp(ctx, args):
     """Kill, elite kill, quest and exploration XP times N, in the server's own config, then `reload config`
-    (no restart, nobody kicked). The Docker test server's file is a single-file bind mount: it is written in
-    place (same inode), a copy first to #recycle_bin/xprate-TIME/. The portable server's var/etc/mangosd.conf
-    is the player's own; its first state is kept once as mangosd.conf.before-xp."""
+    (no restart, nobody kicked). The server's var/etc/mangosd.conf is the player's own; its first state is kept
+    once as mangosd.conf.before-xp. (The developers' test server: devserver.py writes its file in place, a copy
+    first to #recycle_bin/xprate-TIME/.)"""
     if not args:
         ctx.say('server sees:')
         for line in xp_seen():
@@ -995,20 +986,20 @@ def xp(ctx, args):
         raise Usage('xprate N: a number, e.g. 20 or 1 (1 = normal); xprate: show')
     conf = xp_conf()
     if server_dir() is None:
-        old = subprocess.run(['sudo', '-n', 'cat', str(conf)], capture_output=True, text=True, check=True).stdout
+        old = wowserver.dev().conf_read()
         new = re.sub(r'^(%s) *=.*$' % XP_KEYS, lambda m: 'Rate.XP.%s = %s' % (m.group(2), n), old, flags=re.M)
         keep = ROOT / '#recycle_bin' / ('xprate-' + time.strftime('%Y%m%d-%H%M%S'))
         keep.mkdir(parents=True, exist_ok=True)
         (keep / 'mangosd.conf').write_text(old)
         (keep / 'mangosd.conf.new').write_text(new)
-        subprocess.run(['sudo', '-n', 'tee', str(conf)], input=new, capture_output=True, text=True, check=True)
+        wowserver.dev().conf_write(new)
     else:
         old = conf.read_text()
         new = re.sub(r'^(%s) *=.*$' % XP_KEYS, lambda m: 'Rate.XP.%s = %s' % (m.group(2), n), old, flags=re.M)
         first = conf.with_name('mangosd.conf.before-xp')
         if not first.exists():
             first.write_text(old)
-        with open(conf, 'r+') as fh:  # in place, as the Docker one
+        with open(conf, 'r+') as fh:  # in place
             fh.write(new)
             fh.truncate()
     seen = xp_seen()

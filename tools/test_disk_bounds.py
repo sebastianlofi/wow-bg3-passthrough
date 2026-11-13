@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """test_disk_bounds.py: what the mod keeps on a player's disk stays bounded. tavtex.py's prune_cache (bakes unused for
-a while, then the least recently used past the cap; detail maps no bake names) and crashreport.py's prune (the newest
-reports). The functions are lifted out of their files, so neither file's imports (numpy) are needed.
+a while, then the least recently used past the cap; detail maps no bake names), crashreport.py's prune (the newest
+reports) and wowsave.py's empty_bin (snapshots set aside, a month in the release). The functions are lifted out of
+their files, so neither file's imports (numpy) are needed.
 
   python3 tools/test_disk_bounds.py
 """
-import ast, os, re, tempfile, time, unittest
+import ast, datetime, os, re, shutil, tempfile, time, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -81,6 +82,37 @@ class Reports(unittest.TestCase):
         self.assertEqual(len([n for n in left if n.endswith('.zip')]), ns['KEEP'])
         self.assertIn('WOW-BG3-report-20260107.zip', left)
         self.assertIn('notes.txt', left)
+
+
+class SnapshotBin(unittest.TestCase):
+    def ns(self, root, days):
+        ns = lift(HERE / 'wowsave.py', {'empty_bin', 'BIN_DAYS'}, {'ROOT': root, 'datetime': datetime, 'shutil': shutil})
+        ns['BIN_DAYS'] = days
+        return ns
+
+    def fill(self):
+        root = Path(tempfile.mkdtemp())
+        day = lambda n: (datetime.date.today() - datetime.timedelta(days=n)).strftime('%Y%m%d')
+        names = ['wowsave-pruned-' + day(40), 'wowsave-rehomed-' + day(31), 'wowsave-pruned-' + day(30),
+                 'wowsave-pruned-' + day(0), 'xprate-' + day(90), 'wowsave-pruned-notadate']
+        for n in names:
+            (root / '#recycle_bin' / n).mkdir(parents=True)
+            (root / '#recycle_bin' / n / 'a.sql').write_text('x')
+        return root, names
+
+    def test_the_release_keeps_a_month(self):
+        root, names = self.fill()
+        gone = self.ns(root, 30)['empty_bin']()
+        self.assertEqual(sorted(gone), sorted(names[:2]))
+        self.assertEqual(sorted(p.name for p in (root / '#recycle_bin').iterdir()), sorted(names[2:]))
+
+    def test_the_source_tree_keeps_everything(self):
+        root, names = self.fill()
+        self.assertEqual(self.ns(root, None)['empty_bin'](), [])
+        self.assertEqual(len(list((root / '#recycle_bin').iterdir())), len(names))
+
+    def test_the_release_sets_it(self):
+        self.assertIn("sets['BIN_DAYS'] = 30", (HERE / 'relenv.py').read_text())
 
 
 if __name__ == '__main__':

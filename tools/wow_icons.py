@@ -48,7 +48,7 @@ def icon_key(name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cmd', choices=['build'])
-    ap.add_argument('--data', default=str(ROOT / 'client/SoloCraft 1.12.1/Data'))
+    ap.add_argument('--data', default=os.environ.get('WOW_DATA') or str(ROOT / 'client/Data'))
     ap.add_argument('--bg3', default='', help='not used any more (the atlas holds no BG3 icons); accepted for old callers')
     ap.add_argument('--out', default=str(IO / 'gui'))
     ap.add_argument('--items', default=str(IO / 'link/items.json'))

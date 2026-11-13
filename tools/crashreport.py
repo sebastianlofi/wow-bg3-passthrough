@@ -5,8 +5,8 @@
 
 lifecycle.py makes one when benilla dies, and `/wowbg3 report` makes one on demand. It holds the tails of the
 logs, benilla's crash reports, the kernel's GPU lines and GPU dump, and what the machine is. Your home folder
-reads as ~, your user name as USER, and a line that names a password, secret or token is blanked. Passwords
-files (account.env, secrets.env), saves and game files never go in.
+reads as ~, your user name as USER, the PC's name as HOST, and a line that names a password, secret or token is
+blanked. Passwords files (account.env, secrets.env), saves and game files never go in.
 """
 import getpass, glob, os, platform, re, subprocess, sys, time, zipfile
 from pathlib import Path
@@ -17,13 +17,27 @@ SECRET = re.compile(r'(?i)(pass(word)?|secret|token|api[_-]?key)\b\s*[=:]')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 
-def clean(text):
-    home, user = str(Path.home()), getpass.getuser()
+def whole(word):
+    """A pattern for `word` standing alone (not inside a longer name or number), or None for no word."""
+    return re.compile(r'(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])' % re.escape(word)) if word else None
+
+
+def clean(text, home=None, user=None, host=None):
+    """Colour codes out; a line naming a password cut there; the home folder as ~, the user name as USER and the
+    PC's name (with and without its domain) as HOST, each only where it stands alone."""
+    home = str(Path.home()) if home is None else home
+    user = getpass.getuser() if user is None else user
+    host = platform.node() if host is None else host
+    names = [(whole(host), 'HOST'), (whole(host.split('.')[0]), 'HOST'), (whole(user), 'USER')]
     lines = []
     for line in ANSI.sub('', text).splitlines():
         if SECRET.search(line):
             line = line[:SECRET.search(line).start()] + '[blanked]'
-        lines.append(line.replace(home, '~').replace(user, 'USER'))
+        line = line.replace(home, '~') if home else line
+        for pattern, name in names:
+            if pattern:
+                line = pattern.sub(name, line)
+        lines.append(line)
     return '\n'.join(lines) + '\n'
 
 
@@ -85,7 +99,7 @@ def make(reason='asked'):
                 notes.append('%s: %s' % (f, e))
         kernel = [line for line in run('dmesg', '-T').splitlines() if re.search(r'(?i)amdgpu|nouveau|nvidia|i915|xe |gpu|drm', line)]
         z.writestr('system/kernel-gpu.txt', clean('\n'.join(kernel[-400:])))
-        z.writestr('system/machine.txt', clean('\n'.join([platform.platform(), run('uname', '-a'), run('sh', '-c', 'cat /etc/os-release'),
+        z.writestr('system/machine.txt', clean('\n'.join([platform.platform(), run('uname', '-srvmo'), run('sh', '-c', 'cat /etc/os-release'),
                                                           run('sh', '-c', 'lspci | grep -iE "vga|3d"'), run('sh', '-c', 'vulkaninfo --summary')])))
         z.writestr('report.txt', 'reason: %s\ntime: %s\nnot kept:\n%s\n' % (reason, time.strftime('%c'), clean('\n'.join(notes))))
     prune(out)

@@ -17,6 +17,7 @@ Output is derived from Blizzard data: never commit it.
 """
 import argparse
 import io
+import os
 import struct
 import subprocess
 import sys
@@ -75,7 +76,7 @@ def read_blp(data_dir, vpath):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", default=str(ROOT / "client/SoloCraft 1.12.1/Data"))
+    p.add_argument("--data", default=os.environ.get("WOW_DATA") or str(ROOT / "client/Data"))
     p.add_argument("--out", default=str(SE / "cursors"))
     a = p.parse_args()
     out = Path(a.out)

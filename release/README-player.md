@@ -20,7 +20,8 @@ playing it. Stop right away if you feel unwell.
 - Your own World of Warcraft 1.12.1 client (build 5875, English).
   WOW-BG3 contains no Blizzard files. It reads your client's `Data/` folder
   to build what the local WoW server needs, on your machine.
-- About 15 GB free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it.
+- About 15 GB free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
+  (it grows as you explore).
 - An internet connection for the first start only (a 48 MB download).
 
 Everything else is in this download: the Linux Script Extender (bg3le, with
@@ -148,14 +149,47 @@ and to add new spells for those new levels. That is still to come.
 
 ## Remove
 
-Disable WOW-BG3 in the Mod Manager, then delete `Mods/WOW-BG3.pak` and
-`Mods/WOW-BG3/` (with it goes `data/`, the WoW server data and snapshots;
-keep a copy of it to come back later). World-mode saves need the mod to load properly.
+In this order:
+
+1. Disable WOW-BG3 in the Mod Manager and close BG3.
+2. Take the Script Extender out again (Steam closed), before you delete anything:
+
+   ```
+   python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py" --uninstall
+   ```
+
+   It removes bg3le from BG3's Steam launch options and deletes `~/.local/share/bg3le`.
+   The installer is inside `Mods/WOW-BG3/`, so this comes before step 3. Skip it only
+   if other mods of yours need bg3le.
+3. Delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (with it goes `data/`, the WoW
+   server data and snapshots; keep a copy of it to come back later).
+
+Left behind: `localconfig.vdf.bg3le-backup` beside Steam's `localconfig.vdf` (the copy
+made before the launch option was set; delete it if you like), and a folder in memory,
+`/dev/shm/wow-bg3-<your user id>`, gone at the next reboot. World-mode saves need the
+mod to load properly.
+
+## What it does on your PC
+
+- Everything the mod makes is in `Mods/WOW-BG3/data/`. Outside it: `~/.local/share/bg3le`
+  (the Script Extender), BG3's Steam launch option (every Steam account on this PC) with a
+  backup copy of Steam's file, and the folder in memory named above.
+- Network: one download at the first start (the world database, checked against
+  checksums that ship with the mod). Nothing is sent anywhere. The WoW server answers on
+  127.0.0.1 only; its database has no port. The Script Extender's Lua debugger
+  (127.0.0.1:9998 in stock bg3le) stays closed unless you turn it on with `BG3LE_DEBUG=1`.
+- The WoW server, its database and the WoW engine start with BG3 and stop with it.
+- The Script Extender loads only into BG3. As on Windows, it keeps Steam achievements on
+  with mods and clears BG3's own crash marker (`ModCrashSanityCheck`) at each start.
+- Disk: logs, textures and crash reports are capped; the ground data made from your WoW
+  files grows as you explore (about 1 GB after a few zones; expect several GB for the
+  whole world).
 
 ## When something goes wrong
 
-- The loading screen waits at most two minutes for the WoW side. If it gives
-  up, look at `Mods/WOW-BG3/data/logs/` and bg3le's newest log.
+- The loading screen waits two minutes for the WoW side, and up to fifteen more
+  while the first start is still building its data. If it gives up, look at
+  `Mods/WOW-BG3/data/logs/` and bg3le's newest log.
 - Report a bug with those logs and `launcher.json` from the `run` folder.
 - The WoW side runs where Steam runs BG3, with the Python that comes in
   `WOW-BG3/python/`. Nothing else to install.

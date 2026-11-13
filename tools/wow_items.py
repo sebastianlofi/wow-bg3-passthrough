@@ -36,9 +36,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 IO = ROOT / "bg3/private/home/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3"
-DATA = ROOT / 'client/SoloCraft 1.12.1/Data'
-DB_CMD = ['sudo', '-n', 'docker', 'exec', '-i', 'wow-bg3-database-1', 'sh', '-c',
-          'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --batch mangos']
+DATA = Path(os.environ.get('WOW_DATA') or ROOT / 'client/Data')  # the WoW client's Data folder; relenv.py sets it in the release
 COLS = ['entry', 'patch', 'class', 'subclass', 'name', 'display_id', 'quality', 'buy_price', 'buy_count', 'sell_price',
         'inventory_type', 'item_level', 'required_level', 'stackable', 'container_slots', 'delay',
         'dmg_min1', 'dmg_max1', 'dmg_type1', 'dmg_min2', 'dmg_max2', 'dmg_type2', 'armor', 'block',
@@ -624,7 +622,11 @@ def main():
     ap.add_argument('--db', default=None, help='shell command that runs SQL from stdin on the mangos database')
     ap.add_argument('--effects', action='store_true', help='map on-equip and on-use effects and random suffixes')
     args = ap.parse_args()
-    args.db = ['sh', '-c', args.db] if args.db else DB_CMD
+    if args.db:
+        args.db = ['sh', '-c', args.db]
+    else:  # the source tree's test server (devserver.py); the release always names its own
+        import wowserver
+        args.db = wowserver.dev().DB_CMD
     if args.cmd == 'build':
         build(args)
         return

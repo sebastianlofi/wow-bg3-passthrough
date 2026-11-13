@@ -81,7 +81,8 @@ def point(m, p):
             'SNAP': p['snap'], 'HERO': p['io'] / 'hero.json', 'MOVE': p['io'] / 'world-move.json',
             'MOVE_RESULT': p['io'] / 'world-move-result.json', 'DATA': p['wow'] / 'Data', 'SE': p['io']}
     if m.__name__ == 'wowsave':
-        sets['ROOT'] = p['data']   # its #recycle_bin (pruned snapshots) goes to the data folder
+        sets['ROOT'] = p['data']   # its #recycle_bin (pruned snapshots) goes to the data folder,
+        sets['BIN_DAYS'] = 30      # where a set-aside snapshot is kept a month, not for good
     for k, v in sets.items():
         if hasattr(m, k):
             setattr(m, k, v)

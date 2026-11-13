@@ -8,7 +8,8 @@ The release zip has its own README with the same steps; this page adds what is b
   under Proton). Tested on AMD graphics (Mesa RADV 25.0 and 26.2) and on Nvidia (RTX 4070 Ti, driver 595); Intel is untested.
 - Your own World of Warcraft 1.12.1 client, build 5875, English. WOW-BG3 never runs `WoW.exe`; it
   reads the client's `Data/` folder to build the local server's data and the textures it needs.
-- About 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it.
+- About 15 GB of free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
+  (the ground data made from your WoW files grows as you explore).
 - An internet connection for the first start only (a 48 MB download, see below).
 - Nothing else: the release brings the Linux Script Extender (bg3le with WOW-BG3's patches), the
   local WoW server (vmangos and MariaDB), the WoW engine (benilla), a Python for its tools and the
@@ -54,7 +55,9 @@ the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and not
 
 - When WOW-BG3 is enabled, its launcher plugin starts two programs next to BG3, inside Steam's
   runtime container: the local WoW server (`server/wowbg3-server.sh run`) and the coordinator
-  (`tools/wowbg3-coord.py`). Both stop when BG3 closes. Nothing listens outside your own machine.
+  (`tools/wowbg3-coord.py`). Both stop when BG3 closes. Nothing listens outside your own machine: the WoW server
+  answers on 127.0.0.1 only, its database has no port, and the Script Extender's Lua debugger (127.0.0.1:9998 in
+  stock bg3le) stays closed in WOW-BG3's build unless you turn it on (`BG3LE_DEBUG=1`).
 - The coordinator makes a local WoW account and, per BG3 playthrough, a hidden WoW character that
   matches your BG3 character's race and class. You never log in to anything.
 - Data lives in the mod's own folder, `Mods/WOW-BG3/data/` (nothing outside BG3's Mods folder): the server's data and database, the WoW side of your
@@ -75,14 +78,32 @@ them as well: when the server starts, it puts each saved WoW character back from
 
 ## Removing it
 
-Disable WoW-BG3 Passthrough in the mod manager, then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (its `data/`
-folder holds the server data and snapshots; keep a copy of it if you may come back). Run the Script Extender
-installer with `--uninstall` if you no longer want bg3le. World-mode saves need the mod to load
-properly.
+In this order:
+
+1. Disable WoW-BG3 Passthrough in the mod manager and close BG3.
+2. Take the Script Extender out, with Steam closed:
+
+   ```
+   python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py" --uninstall
+   ```
+
+   It removes bg3le from BG3's Steam launch options and deletes `~/.local/share/bg3le`. Do this before step 3: the
+   installer is inside `Mods/WOW-BG3/`. Skip it only if other mods of yours need bg3le; then install stock bg3le
+   again, since the library in `~/.local/share/bg3le` is WOW-BG3's build.
+3. Delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (its `data/` folder holds the server data and snapshots; keep a
+   copy of it if you may come back).
+
+Left behind: `localconfig.vdf.bg3le-backup` beside Steam's `localconfig.vdf` (the copy made before the launch
+option was set; delete it if you like) and `/dev/shm/wow-bg3-<your user id>`, gone at the next reboot. World-mode
+saves need the mod to load properly.
+
+If you deleted the folder first: BG3 still starts through bg3le. Remove the `bg3le-launch` part from BG3's launch
+options in Steam (Properties, General) and delete `~/.local/share/bg3le`.
 
 ## When something goes wrong
 
-- The loading screen waits at most a few minutes for the WoW side. If it gives up, look at
+- The loading screen waits two minutes for the WoW side, and up to fifteen more while the first start is still
+  building its data. If it gives up, look at
   `Mods/WOW-BG3/data/logs/` (`coord.log`, `server.log`, `benilla.log`) and bg3le's newest log
   in `~/.local/share/bg3le/logs/`.
 - When reporting a bug, attach those logs and `Mods/WOW-BG3/data/run/launcher.json`.

@@ -230,8 +230,8 @@ Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://gith
 step. In short:
 
 1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
-   about 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it
-   (the WoW server's data and caches).
+   about 15 GB of free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
+   (the WoW server's data and caches; they grow as you explore, see "What it puts on your PC").
 2. Put `WOW-BG3.pak` and the `WOW-BG3/` folder side by side into BG3's Mods folder
    (`~/.local/share/Larian Studios/Baldur's Gate 3/Mods`).
 3. Copy your WoW 1.12.1 client files into `Mods/WOW-BG3/WoW/` (so `Mods/WOW-BG3/WoW/Data/` exists).
@@ -292,23 +292,35 @@ makes every mob's Lightning Bolt (9532) a Fire Bolt. What came of it is in `logs
 Everything the mod makes lives in `Mods/WOW-BG3/` (its `data/` folder), with two exceptions the installer makes and
 `--uninstall` takes back out:
 
-- `~/.local/share/bg3le/`: the Linux Script Extender (its library, launch wrapper and logs; it keeps only its newest
-  logs).
-- BG3's Steam launch option, so Steam starts BG3 with the Script Extender. The installer asks before it stops Steam
-  to change it and keeps a copy of Steam's file as `localconfig.vdf.bg3le-backup`.
+- `~/.local/share/bg3le/`: the Linux Script Extender (its library, launch wrapper, a few small cache files and its
+  logs; it keeps only its newest ten logs).
+- BG3's Steam launch option, so Steam starts BG3 with the Script Extender: for every Steam account that has logged
+  in on this PC. The installer asks before it stops Steam to change it and keeps a copy of Steam's file beside it
+  as `localconfig.vdf.bg3le-backup`; `--uninstall` leaves that copy where it is.
+
+The Script Extender itself does two things in BG3 that are its own and not WOW-BG3's, as it does on Windows: it
+keeps Steam achievements on while mods are loaded, and at each start it removes the `ModCrashSanityCheck` folder
+BG3 leaves in its profile after a crash (BG3 would switch your mods off otherwise). `"EnableAchievements": false`
+in a `ScriptExtenderSettings.json` next to BG3's `bin/bg3` turns the first off.
 
 While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>` (about 50 to
 150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
 
 - **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
-  and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1); its database has
-  no network port at all.
+  and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1, ports 3744 and
+  8105); its database has no network port at all. Nothing else listens. The Script Extender has a Lua debugger for
+  mod authors (127.0.0.1:9998), which stock bg3le opens at every start; WOW-BG3's build keeps it closed unless you
+  ask for it (`BG3LE_DEBUG=1` in BG3's launch options, or `"EnableLuaDebugger": true` in
+  `ScriptExtenderSettings.json`), because it runs whatever Lua any program on your PC sends it.
 - **Processes.** The WoW server, its database and the WoW engine start with BG3 and stop with it, also when BG3
   crashes. The Script Extender loads only into BG3; other games and programs are untouched.
 - **Disk.** Logs are kept to two of each (a log over 16 MB starts afresh at BG3's next start, the older one kept
   as `.1`). The party's textures converted for WoW are kept up to 3 GB (the least recently used go first, and any
   unused for a month). Crash reports keep the newest five. A first start that was stopped part-way is cleaned up at
-  the next one.
+  the next one. The WoW side of a save BG3 has overwritten or deleted is kept a month (`data/#recycle_bin`), then
+  removed. What is made from your WoW files for the ground you walk (movement maps, ground and collision caches in
+  `data/server/data/mmaps` and `data/cache`) grows as you explore and stops at the size of WoW's world: about
+  1 GB after two days in a few zones. The whole world has not been measured; expect several GB.
 - **Your files.** Nothing is written into BG3's game folder or into your WoW files. The local server's generated
   passwords are readable by your user only.
 
@@ -429,10 +441,12 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   tested alone. Mods that change levels, XP, rests or the party size are the likeliest to clash.
 - **Your saves.** Saves made without WOW-BG3 stay plain BG3 games and stay loadable; back them up
   before you try a beta anyway.
-- **Uninstall.** Switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
-  installer with `--uninstall` to take the Script Extender back out of BG3's launch options, and
-  remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its `data/` folder; the memory
-  folder in `/dev/shm` goes at the next reboot).
+- **Uninstall.** In this order: switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at
+  once) and close BG3; run the installer with `--uninstall`, which takes the Script Extender back out of BG3's
+  launch options and removes `~/.local/share/bg3le/` (the installer is inside `Mods/WOW-BG3/`, so run it before
+  you delete that folder); then remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its
+  `data/` folder). What stays: the copy of Steam's file, `localconfig.vdf.bg3le-backup`, which you can delete, and
+  the memory folder in `/dev/shm`, which goes at the next reboot.
 - **When something goes wrong.** The logs are in `Mods/WOW-BG3/data/logs/` (the WoW side) and
   `~/.local/share/bg3le/logs/` (BG3's side). Please attach both to a bug report, with what you did
   just before.
@@ -446,8 +460,8 @@ time, for a crash or anything that looks wrong, type `/wowbg3 report` in chat.
 2. Open an [issue](https://github.com/sebastianlofi/wow-bg3-passthrough/issues), say what you were doing, and
    attach that one file.
 
-It holds the mod's logs, crash reports, your GPU's crash data and what your machine is. Your home folder and user
-name are masked, and lines naming a password or token are blanked. Your saves and game files are not in it. The
+It holds the mod's logs, crash reports, your GPU's crash data and what your machine is. Your home folder, your user
+name and your PC's name are masked, and lines naming a password or token are blanked. Your saves and game files are not in it. The
 logs do show your character's name and where it went, and the GPU data is raw, so open the zip first if you prefer.
 
 ## Credits

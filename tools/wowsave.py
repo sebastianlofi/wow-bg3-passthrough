@@ -7,7 +7,8 @@
                                          without NAMEs every character the snapshot holds
   wowsave.py index ID SAVE_DIR           note which BG3 save folder holds snapshot ID (ID.json)
   wowsave.py prune [--dry]               snapshots whose BG3 save folder is gone (or now holds a newer
-                                         snapshot) move to #recycle_bin/wowsave-pruned-YYYYMMDD/
+                                         snapshot) move to #recycle_bin/wowsave-pruned-YYYYMMDD/; in the release
+                                         such a folder is removed after 30 days (BIN_DAYS)
   wowsave.py list                        the snapshots, their characters and saves
   wowsave.py rehome                      every snapshot character the database lacks put back from its newest
                                          snapshot, on its own account (mangosd stopped: wowbg3-server.sh start
@@ -34,10 +35,14 @@ harness B's own server when WOW_BG3_SERVER names it (link/tools/wowserver.py, th
 import datetime, json, re, shutil, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import wowserver  # noqa: E402  (harness A's Docker test server, or B's own: WOW_BG3_SERVER)
+import wowserver  # noqa: E402  (the portable server WOW_BG3_SERVER names)
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
 SNAP = ROOT / 'server/private/snapshots'
+# What prune and rehome set aside (ROOT/#recycle_bin/wowsave-pruned-DATE, wowsave-rehomed-DATE) is kept this many days
+# and then removed. None in the source tree: nothing set aside there is ever removed. The release sets it
+# (relenv.py): its ROOT is the player's data folder, and a snapshot goes there at every save BG3 overwrites.
+BIN_DAYS = None
 DB = 'wow-bg3-database-1'
 BY_GUID = ['characters', 'character_account_data', 'character_action', 'character_aura',
            'character_battleground_data', 'character_forgotten_skills', 'character_gifts',
@@ -489,6 +494,26 @@ def index(sid, save_dir):
     print('snapshot %s is in save %s' % (sid, save_dir))
 
 
+def empty_bin(now=None):
+    """Our own dated folders in ROOT/#recycle_bin older than BIN_DAYS days go, by the date in their name; nothing
+    else there is touched. Returns the names removed."""
+    if not BIN_DAYS:
+        return []
+    today, gone = datetime.date.fromtimestamp(now or time.time()), []
+    for d in sorted((ROOT / '#recycle_bin').glob('wowsave-*')):
+        m = re.fullmatch(r'wowsave-(?:pruned|rehomed)-(\d{8})', d.name)
+        if not m or d.is_symlink() or not d.is_dir():
+            continue
+        try:
+            day = datetime.datetime.strptime(m.group(1), '%Y%m%d').date()
+        except ValueError:
+            continue
+        if (today - day).days > BIN_DAYS:
+            shutil.rmtree(str(d), ignore_errors=True)
+            gone.append(d.name)
+    return gone
+
+
 def prune(dry=False):
     """Snapshots whose save folder is gone, or whose folder holds a newer snapshot (BG3 reused it)."""
     metas = [read_meta(p.stem) | {'Id': p.stem} for p in sorted(SNAP.glob('*.sql'))]
@@ -512,6 +537,9 @@ def prune(dry=False):
                     if p.exists():
                         shutil.move(str(p), str(bin_ / p.name))
     print('pruned %d snapshot(s)%s: %s' % (len(gone), ' (dry run)' if dry else '', ' '.join(gone) or '-'))
+    old = [] if dry else empty_bin()
+    if old:
+        print('removed %d set-aside folder(s) older than %d days: %s' % (len(old), BIN_DAYS, ' '.join(old)))
 
 
 def main(a):

@@ -12,8 +12,8 @@ own XP bar (never a full level, so BG3's Level Up button is never opened by it).
   wowlevel.py once [NAME]         get, then write wow-bg3/wow-level.json (party.sh does this first)
   wowlevel.py watch [NAME] [S]    once every S seconds (default 10) while it runs; when the level
                                   changes, the party's bot characters follow it (bots below)
-  wowlevel.py set NAME N          test helper: GM console `character level NAME N` on the isolated
-                                  test server (any level 1 to 60, also down); WOW-BG3's own characters
+  wowlevel.py set NAME N          test helper: GM console `character level NAME N` on the local
+                                  server (any level 1 to 60, also down); WOW-BG3's own characters
                                   only (the default account or a playthrough account)
 
 NAME: the WoW character; default $WOW_CHAR, else the one online character on a WOW-BG3 account (the
@@ -23,10 +23,10 @@ Bots (watch): the bot characters of the other party members, wow-bg3/party-bots.
 not the hero's gets it through the server's verb (BOT_LEVEL below, world-console.py); until that
 verb exists the difference is only logged.
 """
-import json, os, re, select, socket, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import wowserver  # noqa: E402  (harness A's Docker test server, or B's own: WOW_BG3_SERVER; the harness notes)
+import wowserver  # noqa: E402  (the portable server WOW_BG3_SERVER names)
 
 ROOT = Path(__file__).resolve().parents[2]  # the development workspace; relenv.py sets it in the release
 IO = ROOT / "bg3/private/home/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3"
@@ -65,27 +65,8 @@ def default_name():
 
 
 def console(command):
-    """One GM console line on the isolated test server (its Docker attach stream, as world-console.py),
-    or on harness B's own server (WOW_BG3_SERVER, link/tools/wowserver.py)."""
-    if wowserver.portable():
-        return wowserver.console(command, 2.5)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.connect('/var/run/docker.sock')
-        s.sendall(('POST /v1.47/containers/%s/attach?stream=1&stdin=1&stdout=1&stderr=1 HTTP/1.1\r\n'
-                   'Host: localhost\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n' % CONSOLE).encode())
-        def recv(sec):
-            end, out = time.monotonic() + sec, []
-            while time.monotonic() < end:
-                if select.select([s], [], [], max(0, end - time.monotonic()))[0]:
-                    c = s.recv(65536)
-                    if not c:
-                        break
-                    out.append(c)
-            return b''.join(out).decode(errors='replace')
-        head = recv(1)
-        assert head.startswith('HTTP/1.1 101'), head[:200]
-        s.sendall((command + '\n').encode())
-        return recv(2.5)
+    """One GM console line on the WoW server (wowserver.py)."""
+    return wowserver.console(command, 2.5, CONSOLE)
 
 
 def get(name):
