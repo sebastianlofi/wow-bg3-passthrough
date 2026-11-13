@@ -5,8 +5,9 @@ profile, the Docker test server). In the release they ship unchanged in WOW-BG3/
 this module points them at the player's folders, from the environment the launcher plugin
 (wowbg3-launcher, plugins/launcher) gives every child:
 
-  WOWBG3_HOME   the WOW-BG3 folder (Mods/WOW-BG3)       WOWBG3_DATA   ~/.local/share/wow-bg3
-  WOWBG3_IO     BG3's Script Extender/wow-bg3 folder     WOWBG3_LINK   its link/ folder
+  WOWBG3_HOME   the WOW-BG3 folder (Mods/WOW-BG3)       WOWBG3_DATA   Mods/WOW-BG3/data
+  WOWBG3_IO     the mod's IO folder, Mods/WOW-BG3/data/io (Ext.IO's wow-bg3/, bg3le patch 0012)
+  WOWBG3_LINK   its link/ folder                         WOWBG3_MODS   BG3's Mods folder (its parent: BG3's profile)
   WOWBG3_SHM    a tmpfs folder (/dev/shm/wow-bg3-UID)    WOWBG3_WOW    the player's WoW 1.12.1 files
 
   configure()           sets the derived environment (WOW_BG3_SERVER, WOWBG3_SERVER_VAR, WOW_BG3_IO,
@@ -41,9 +42,10 @@ def paths():
     io = Path(env('WOWBG3_IO'))
     shm = Path(env('WOWBG3_SHM', str(data / 'shm')))
     wow = Path(env('WOWBG3_WOW', str(home / 'WoW')))
-    return {'home': home, 'data': data, 'io': io, 'link': io / 'link', 'shm': shm, 'wow': wow,
+    profile = Path(env('WOWBG3_MODS', str(home.parent))).parent    # BG3's profile: Mods/.., the saves, graphicSettings.lsx
+    return {'home': home, 'data': data, 'io': io, 'link': io / 'link', 'shm': shm, 'wow': wow, 'profile': profile,
             'server': home / 'server', 'var': data / 'server', 'snap': data / 'snapshots',
-            'saves': io.parents[1] / 'PlayerProfiles/Public/Savegames/Story', 'cells': shm / 'cells',
+            'saves': profile / 'PlayerProfiles/Public/Savegames/Story', 'cells': shm / 'cells',
             'maps': data / 'server/data/maps', 'vmaps': data / 'server/data/vmaps',
             'mmaps': data / 'server/data/mmaps', 'cache': data / 'cache'}
 

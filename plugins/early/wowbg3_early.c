@@ -7,8 +7,8 @@
  *
  * Part 1 (here): engine file overrides added at plugin load, about 10 s before the mod's Lua can add
  * them (Ext.IO.AddPathOverride), for files BG3 reads after that point. List:
- *   <Script Extender>/wow-bg3/early-overrides.txt, one per line: GAME_PATH <TAB> FILE
- *   (FILE relative to <Script Extender>/wow-bg3/; a line whose file is missing is skipped).
+ *   <the mod's IO folder, Mods/WOW-BG3/data/io>/early-overrides.txt, one per line: GAME_PATH <TAB> FILE
+ *   (FILE relative to that folder; a line whose file is missing is skipped).
  * Only paths under Cursors/ and Mods/MainUI/GUI/ are accepted. Measured: BG3's cursors
  * and its GUI pages (Mods/MainUI/GUI/Pages/Examine.xaml) are both read before plugins load, so no
  * mod file uses this list today (kept for files read later). */
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "bg3le_plugin.h"
 #include "cursor.h"
@@ -53,12 +54,26 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
         host->warn(self, "wowbg3-early: bg3le has no path overrides; nothing done");
         return 0;
     }
-    char se[1024];
-    const char* xdg = getenv("XDG_DATA_HOME");
+    /* The mod's IO folder (the Lua's Ext.IO wow-bg3/, bg3le patch 0012): $WOWBG3_IO, else data/io in this plugin's
+     * folder (Mods/WOW-BG3, beside launcher.conf), else BG3's Mods/WOW-BG3/data/io. */
+    char se[1024], conf[1100];
     const char* home = getenv("HOME");
-    if (xdg && *xdg) snprintf(se, sizeof se, "%s/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3", xdg);
-    else if (home && *home) snprintf(se, sizeof se, "%s/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3", home);
-    else { host->warn(self, "wowbg3-early: no HOME"); return 0; }
+    const char* ioe = getenv("WOWBG3_IO");
+    Dl_info di;
+    se[0] = 0;
+    if (ioe && *ioe) snprintf(se, sizeof se, "%s", ioe);
+    else if (dladdr((void*)&bg3le_plugin_init, &di) && di.dli_fname) {
+        snprintf(se, sizeof se, "%.1000s", di.dli_fname);
+        char* sl = strrchr(se, '/');
+        if (sl) *sl = 0;
+        snprintf(conf, sizeof conf, "%s/launcher.conf", se);
+        if (sl && access(conf, R_OK) == 0) strcat(se, "/data/io");
+        else se[0] = 0;
+    }
+    if (!se[0]) {
+        if (!home || !*home) { host->warn(self, "wowbg3-early: no HOME"); return 0; }
+        snprintf(se, sizeof se, "%.900s/.local/share/Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/data/io", home);
+    }
     /* Part 2 (cursor.c): WoW's quest cursors when BG3's cursors already exist. */
     cursor_init(host, self, se);
     char list[1200];

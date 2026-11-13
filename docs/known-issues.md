@@ -21,8 +21,8 @@ This is the first public version. What we know is missing or rough:
   in a BG3 you start although you never turned it off. In such a BG3 the mod does nothing: New Game is BG3's
   own, and a WOW-BG3 save asks in BG3's Mod Verification box; tick WoW-BG3 Passthrough there and it loads as
   usual. To have it on for a New Game, enable it in BG3's Mod Manager and start BG3 again.
-  When the mod is on, the last line under BG3's main menu reads "WOW-BG3 0.1.0 (build ...)"; without that line
-  it is off.
+  When the mod is on, the Script Extender's line under BG3's main menu names it: "(bg3le, WoW-BG3 0.1.0 build ...),
+  built on <the release's build time>"; when it reads "WoW-BG3 build" with no version, the mod is off.
 
 ## Picture
 
@@ -89,7 +89,7 @@ This is the first public version. What we know is missing or rough:
 - WoW's sound (music, ambience, spells) is on by default but has had little testing; turn it off in
   `settings.conf` (`wow_sound = 0`) if it misbehaves.
 - Quitting through BG3's own menu stops the WoW side as BG3 closes; check that
-  `~/.local/share/wow-bg3/logs/server.log` ends with `stopped` if you see a problem on the next start.
+  `Mods/WOW-BG3/data/logs/server.log` ends with `stopped` if you see a problem on the next start.
 - Cities have raised floors now, up to four levels a tile, but they are new: heading back across Orgrimmar's
   upper deck can jump, rooms behind tall entrance steps cannot be reached on foot, and fights on a raised
   floor have had little testing.

@@ -2,7 +2,7 @@
 --
 -- XAML overrides (WoW portraits in BG3's turn order; feasibility only): BG3's own XAML is
 -- read through the engine (Ext.IO.LoadFile in the data context), changed as text, saved under
--- Script Extender/wow-bg3/gui/ and put in place of the game's file with Ext.IO.AddPathOverride
+-- the mod's IO folder (Mods/WOW-BG3/data/io) gui/ and put in place of the game's file with Ext.IO.AddPathOverride
 -- (bg3le honours it in ls::FileReader's constructor; both paths are made absolute against the Data
 -- root, /game/Data in the sandbox, so ours is reached with ../). Nothing of the game's is shipped
 -- or written into its data. It must be in before the GUI loads the file, so it runs at bootstrap
@@ -11,7 +11,7 @@
 -- loads: DDS files (DX10 RGBA8 and legacy BGRA8 headers) under new GUI paths and in place of
 -- existing GUI textures (Assets and AssetsLowRes) never showed; BG3's GUI textures do not come
 -- through that override. So the turn-order probe stays off unless the harness asks for it
--- (Script Extender/wow-bg3/gui/turnorder-probe.txt present); see the world-fights notes.
+-- (the mod's IO folder (Mods/WOW-BG3/data/io) gui/turnorder-probe.txt present); see the world-fights notes.
 -- Report: wow-bg3/wowui-status.json.
 --
 -- The map: BG3's map panel (JournalMap) is black in
@@ -43,15 +43,18 @@ local function fromRoot(root, abs)
     return string.rep("../", depth) .. abs:gsub("^/+", "")
 end
 
--- Ext.IO.SaveFile's root on this system (XDG data home, as bg3le resolves LocalAppData).
-local function seRoot()
+-- The mod's IO folder as an absolute path (Ext.IO's "wow-bg3/"): Mods/WOW-BG3/data/io, which the launcher plugin
+-- maps it to (bg3le patch 0012) and names in WOWBG3_IO; a bg3le without that patch keeps it in its Script Extender folder.
+local function ioRoot()
+    local io = Ext._Internal.Getenv("WOWBG3_IO")
+    if type(io) == "string" and io ~= "" then return io end
     local xdg = Ext._Internal.Getenv("XDG_DATA_HOME")
     if type(xdg) ~= "string" or xdg == "" then
         local home = Ext._Internal.Getenv("HOME")
         if type(home) ~= "string" or home == "" then return nil end
         xdg = home .. "/.local/share"
     end
-    return xdg .. "/" .. SE_DIR
+    return xdg .. "/" .. SE_DIR .. "/wow-bg3"
 end
 
 -- Text edits of TurnOrderLib.xaml. Feasibility, first run: a magenta band over every
@@ -75,7 +78,7 @@ end
 
 local function override(root, se, gamePath, name, text)
     Ext.IO.SaveFile("wow-bg3/gui/" .. name, text)
-    local abs = se .. "/wow-bg3/gui/" .. name
+    local abs = se .. "/gui/" .. name
     local rel = fromRoot(root, abs)
     Ext.IO.AddPathOverride(gamePath, rel)
     return {Game = gamePath, Override = Ext.IO.GetPathOverride(gamePath), Bytes = #text}
@@ -358,7 +361,7 @@ end
 local function startMinimap(runId, s)
     local World = Ext.Require("WorldMode.lua")
     local N = Ext.Require("WowNative.lua")
-    local se = seRoot()
+    local se = ioRoot()
     local MM = M.Minimap
     MM.RunId = runId
     local ticks, shown, lastCheck = 0, nil, -1000
@@ -414,7 +417,7 @@ local function startMinimap(runId, s)
                 return
             end
             local r = minimapRect(mmj, wj, centre, size, w, h, shift)
-            local path = se .. "/wow-bg3/link/minimap/" .. mmj.File .. "?" .. tostring(mmj.Run) .. "-" .. tostring(mmj.Seq)
+            local path = se .. "/link/minimap/" .. mmj.File .. "?" .. tostring(mmj.Run) .. "-" .. tostring(mmj.Seq)
             if prop(parts.Source, "Text") ~= path then parts.Source:SetProperty("Text", path) end
             parts.Image:SetProperty("Margin", {r[1], r[2], 0.0, 0.0})
             parts.Image:SetProperty("Width", r[3])
@@ -439,18 +442,18 @@ function M.Start(runId)
     local ok, err = true, nil
     if s.TurnOrderProbe then ok, err = pcall(function()
         local root = assert(dataRoot(), "no Data root (path overrides off?)")
-        local se = assert(seRoot(), "no Script Extender directory")
+        local se = assert(ioRoot(), "no WOW-BG3 IO folder")
         s.Root, s.SeRoot = root, se
         local game = "Public/Game/GUI/Library/TurnOrderLib.xaml"
         local xaml = assert(Ext.IO.LoadFile(game, "data"), "cannot read " .. game)
         s.TurnOrderBytes = #xaml
         local changed = assert(turnOrder(xaml), "IconContainer not found in " .. game)
         s.TurnOrder = override(root, se, game, "TurnOrderLib.xaml", changed)
-        -- Our own images (DDS files in Script Extender/wow-bg3/gui/) where the GUI looks for them.
+        -- Our own images (DDS files in the mod's IO folder (Mods/WOW-BG3/data/io) gui/) where the GUI looks for them.
         local files = {a = "probe.DDS", b = "probe.DDS", c = "probe-legacy.DDS", d = "probe-legacy.DDS"}
         s.Probes = {}
         for _, pr in ipairs(PROBES) do
-            local target = fromRoot(root, se .. "/wow-bg3/gui/" .. files[pr[1]])
+            local target = fromRoot(root, se .. "/gui/" .. files[pr[1]])
             -- Second run: the existing textures still showed BG3's own. Below 1080p BG3 reads its
             -- GUI art from AssetsLowRes, so both trees get the override.
             for _, tree in ipairs({"Assets/", "AssetsLowRes/"}) do
@@ -471,7 +474,7 @@ function M.Start(runId)
     if not s.MinimapOff then
         local okl, errl = pcall(function()
             local root = assert(dataRoot(), "no Data root (path overrides off?)")
-            local se = assert(seRoot(), "no Script Extender directory")
+            local se = assert(ioRoot(), "no WOW-BG3 IO folder")
             local xaml = assert(Ext.IO.LoadFile(MAP_STYLES, "data"), "cannot read " .. MAP_STYLES)
             local changed, why = mapLayer(xaml)
             s.MinimapLayer = override(root, se, MAP_STYLES, "DefaultShared.Styles.xaml", assert(changed, why))
@@ -482,7 +485,7 @@ function M.Start(runId)
     end
     local okx, errx = pcall(function()
         local root = assert(dataRoot(), "no Data root (path overrides off?)")
-        local se = assert(seRoot(), "no Script Extender directory")
+        local se = assert(ioRoot(), "no WOW-BG3 IO folder")
         local xaml = assert(Ext.IO.LoadFile(SHEET, "data"), "cannot read " .. SHEET)
         local P = Ext.Require("Progression.lua")
         local changed, why = xpTooltip(xaml, string.format("This bar fills toward your next WoW level. WoW levels run to %d. "

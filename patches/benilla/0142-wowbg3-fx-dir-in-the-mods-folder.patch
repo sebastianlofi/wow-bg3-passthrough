@@ -1,0 +1,38 @@
+WOW-BG3 benilla patch 0142: the effects library's default folder is in the mod's own folder (on top of 0001-0141).
+
+Patch 0054's default (used only when $WOWBG3_CAPTURE_DIR is unset: the launcher always sets it in the release) was
+$XDG_DATA_HOME/wow-bg3/capture or ~/.local/share/wow-bg3/capture. Everything the mod makes now lives in its own folder
+beside the pak, Mods/WOW-BG3/data, as the launcher and the render plugin find it: $WOWBG3_DATA, else
+$WOWBG3_HOME/data, else BG3's Mods/WOW-BG3/data.
+
+--- a/crates/benilla-app/src/wowbg3_fx.rs
++++ b/crates/benilla-app/src/wowbg3_fx.rs
+@@ -1418,19 +1418,20 @@
+ 
+ /// The effects library the BG3 side writes when `$WOW_BG3_FX_DIR` is unset: `fx/` in the capture
+ /// folder, found as the capture layer and the render plugin find it (`$WOWBG3_CAPTURE_DIR`, else
+-/// `/logs/capture` when it exists, else `$XDG_DATA_HOME/wow-bg3/capture` or
+-/// `~/.local/share/wow-bg3/capture`).
++/// `/logs/capture` when it exists, else `capture` in the mod's data folder: `$WOWBG3_DATA`, else
++/// `$WOWBG3_HOME/data`, else BG3's `Mods/WOW-BG3/data`; nothing the mod makes lives outside its folder).
+ fn default_fx_dir() -> PathBuf {
+     let capture = match std::env::var_os("WOWBG3_CAPTURE_DIR").filter(|d| !d.is_empty()) {
+         Some(d) => PathBuf::from(d),
+         None if std::path::Path::new("/logs/capture").is_dir() => PathBuf::from("/logs/capture"),
+         None => {
+-            let data = match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+-                Some(d) => PathBuf::from(d),
+-                None => PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty()).unwrap_or_else(|| "/tmp".into()))
+-                    .join(".local/share"),
+-            };
+-            data.join("wow-bg3/capture")
++            let env = |k: &str| std::env::var_os(k).filter(|d| !d.is_empty()).map(PathBuf::from);
++            let data = env("WOWBG3_DATA").or_else(|| env("WOWBG3_HOME").map(|h| h.join("data"))).unwrap_or_else(|| {
++                env("HOME")
++                    .unwrap_or_else(|| "/tmp".into())
++                    .join(".local/share/Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/data")
++            });
++            data.join("capture")
+         }
+     };
+     capture.join("fx")

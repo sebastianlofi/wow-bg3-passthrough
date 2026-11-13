@@ -79,6 +79,14 @@ static int* find(const char* id) {
     return NULL;
 }
 
+// bg3le patch 0012's mod IO folders, found by the plugin with dlsym (link this host with -rdynamic); a stock bg3le
+// (TEST_OLD_BG3LE) has none.
+__attribute__((visibility("default"))) _Bool bg3le_io_root_add(const char* name, const char* dir) {
+    if (getenv("TEST_OLD_BG3LE")) return 0;
+    printf("[io root] %s/ is %s\n", name, dir);
+    return 1;
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) { fprintf(stderr, "usage: test_host PLUGIN.so < script\n"); return 2; }
     setvbuf(stdout, NULL, _IOLBF, 0);

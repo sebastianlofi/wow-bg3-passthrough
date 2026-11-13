@@ -24,7 +24,7 @@ Three layers, later ones winning (rules in wow_abilities_rules.json next to this
   3. overrides: by WoW spell id for every mob, and by creature entry and WoW spell id for one mob (a boss
      fight): the spell becomes the BG3 spell given, gives nothing (null), or follows the rules (true); a mob gets a
      spell it does not cast in WoW the same way. Names only as comments ("_name"). A player's or mod pack's
-     overlay (--overlay; wowbg3-coord.py reads ~/.local/share/wow-bg3/abilities-rules.json and
+     overlay (--overlay; wowbg3-coord.py reads Mods/WOW-BG3/data/abilities-rules.json and
      abilities-rules.d/*.json) merges over the shipped rules: objects key by key, its picks before ours, any
      other value replaces ours (merge_rules).
 Power is decided here, not in BG3's data: see ladder floors, dc(), recharge() and dice() below.

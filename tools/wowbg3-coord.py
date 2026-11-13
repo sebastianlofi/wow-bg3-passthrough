@@ -21,7 +21,7 @@ in the harness:
   * stops everything cleanly on SIGTERM (BG3 closing): benilla first (its logout), then the rest.
 
 Folders come from the launcher's environment (relenv.py). Logs: one line per step on stdout, which the
-launcher writes to ~/.local/share/wow-bg3/logs/coord.log; every child logs to logs/NAME.log.
+launcher writes to {data}/logs (Mods/WOW-BG3/data/logs)/coord.log; every child logs to logs/NAME.log.
 Settings: WOW-BG3/settings.conf (`key = value`, see the shipped file).
 """
 import argparse, ctypes, hashlib, importlib.util, json, os, re, secrets, signal, struct, subprocess, sys, threading, time
@@ -45,6 +45,7 @@ sys.path.insert(0, str(HOME / 'tools/server/tools'))
 WC = __import__('world-console')  # the release's console words (tools/server/tools/world-console.py)
 
 DATA, IO, LINK, SHM, WOW = P['data'], P['io'], P['link'], P['shm'], P['wow']
+PROFILE = P['profile']   # BG3's profile folder (graphicSettings.lsx)
 LOGS = DATA / 'logs'
 RUN = DATA / 'run'
 CAPTURE = Path(os.environ.get('WOWBG3_CAPTURE_DIR') or DATA / 'capture')
@@ -186,11 +187,18 @@ def py(module, *args):
 
 
 # ---- the server and the account ----
+STARTED = time.time()   # this coordinator's start: the server of this BG3 writes its state after it
+
+
 def server_state():
     """wowbg3-server.sh run's state (var/run/state); "running" only while its mangosd lives (a file left
-    by a BG3 that crashed says running too)."""
+    by a BG3 that crashed says running too). A state written before this coordinator started is an earlier BG3's
+    (a "failed" of a first start that BG3 was closed or killed after): this one's server has not started yet."""
+    f = VAR / 'run/state'
     try:
-        st = (VAR / 'run/state').read_text().strip()
+        st = f.read_text().strip()
+        if st != 'running' and f.stat().st_mtime < STARTED:
+            return 'none'
     except OSError:
         return 'none'
     if st == 'running':
@@ -327,7 +335,7 @@ def host_json():
 
 def window():
     """window.json {Width, Height} from BG3's own graphicSettings.lsx (the size it renders at)."""
-    g = IO.parents[1] / 'graphicSettings.lsx'
+    g = PROFILE / 'graphicSettings.lsx'
     w, h = 1920, 1080
     try:
         t = g.read_text()
@@ -606,7 +614,7 @@ def db_env():
     sec = dict(l.split('=', 1) for l in (var / 'secrets.env').read_text().split() if '=' in l)
     e = os.environ.copy()
     e.update(PATH='%s:%s' % (srv / 'mariadb/bin', e.get('PATH', '/usr/bin:/bin')), LD_LIBRARY_PATH=str(srv / 'lib'),
-             MYSQL_UNIX_PORT=str(var / 'run/mariadb.sock'), MARIADB_ROOT_PASSWORD=sec['ROOT_PASS'])
+             MYSQL_UNIX_PORT=str(wowserver.db_socket(var)), MARIADB_ROOT_PASSWORD=sec['ROOT_PASS'])
     return e
 
 
@@ -704,14 +712,14 @@ def abilities_make():
     return py('wow_abilities', *argv)
 
 
-BOOT_OVERRIDES = IO.parent / 'boot-path-overrides.txt'   # bg3le patch 0006 reads it as BG3 loads its stats
+BOOT_OVERRIDES = IO / 'boot-path-overrides.txt'   # bg3le patch 0006 reads it as BG3 loads its stats (in the IO folder: 0012)
 
 
 def boot_overrides():
     """This start's overrides file, empty: it ends bg3le's wait for it (patch 0006). BG3's stats load no longer
     reads the mobs' copies: Abilities.lua makes a stand-in's copies when it is granted (bg3le patch 0009), so
     nothing of them is made at BG3's boot and a new install's first session has them too."""
-    tmp = IO.parent / 'boot-path-overrides.tmp'
+    tmp = IO / 'boot-path-overrides.tmp'
     tmp.write_text('')
     os.replace(tmp, BOOT_OVERRIDES)
 

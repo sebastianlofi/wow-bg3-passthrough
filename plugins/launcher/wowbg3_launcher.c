@@ -8,7 +8,7 @@
 //      older copy (at plugin load, 1.7 s, well before BG3 reads its load order at ~9.4 s).
 //   3. Starts and stops the WoW side as child processes (launcher.conf: the portable server
 //      and the coordinator, which runs the offscreen benilla), with the data folder
-//      ~/.local/share/wow-bg3. They die with BG3 (PR_SET_PDEATHSIG from a supervisor thread that
+//      {home}/data (Mods/WOW-BG3/data: nothing the mod makes lives outside its own folder). They die with BG3 (PR_SET_PDEATHSIG from a supervisor thread that
 //      lives as long as the process) and get SIGTERM at a clean exit. A child with "start = session"
 //      (the server) starts when BG3's client first leaves its main menu for a load (Load, Continue,
 //      New Game), so BG3's boot and the menu run with nothing of the WoW side working.
@@ -86,6 +86,7 @@
 
 // bg3le's host table with patch 0003's additions; used only when host->size covers them.
 typedef int (*state_gate_fn)(void* user, const char* from, const char* to);
+typedef _Bool (*bool_fn)(const char*, const char*);  // bg3le_io_root_add (C++ bool)
 typedef struct {
     uint32_t abi;
     uint32_t size;
@@ -118,9 +119,9 @@ static bg3le_plugin* g_self;
 #define WARN(...) g_host->warn(g_self, __VA_ARGS__)
 
 static char g_home[PATH_MAX];   // the WOW-BG3 folder, "" if not found
-static char g_data[PATH_MAX];   // ~/.local/share/wow-bg3
+static char g_data[PATH_MAX];   // Mods/WOW-BG3/data
 static char g_mods[PATH_MAX];   // BG3's Mods folder
-static char g_io[PATH_MAX];     // Script Extender/wow-bg3 (the SE mod's IO folder)
+static char g_io[PATH_MAX];     // Mods/WOW-BG3/data/io (the mod's IO folder: Ext.IO's wow-bg3/, bg3le patch 0012)
 static char g_modsettings[PATH_MAX];
 static char g_shm[PATH_MAX];     // WOWBG3_SHM (frames, Tav's geometry): a tmpfs folder
 static char g_capture[PATH_MAX]; // WOWBG3_CAPTURE_DIR: the render plugin's compose words and log
@@ -222,18 +223,38 @@ static void expand(const char* in, char* out, size_t cap) {
 }
 
 // ---- paths ----
+static void find_home(void);
+// Everything the mod makes lives in its own folder beside the pak: {home}/data (Mods/WOW-BG3/data).
 static void find_paths(void) {
+    find_home();
+    if (g_home[0]) snprintf(g_data, sizeof g_data, "%s/data", g_home);
+    else snprintf(g_data, sizeof g_data, "%s/WOW-BG3/data", g_mods);
+    // The mod's IO folder (the Lua's Ext.IO "wow-bg3/", the plugins' link files): {data}/io, which bg3le
+    // patch 0012 maps Ext.IO's wow-bg3/ to (io_folder_register, at init, before any Lua runs).
+    snprintf(g_io, sizeof g_io, "%s/io", g_data);
+}
+
+// bg3le patch 0012: Ext.IO's wow-bg3/ is g_io. A bg3le without it keeps the Lua's files in its Script Extender
+// folder, so the plugins read them there (said in the log).
+static void io_folder_register(void) {
+    bool_fn add = (bool_fn)dlsym(RTLD_DEFAULT, "bg3le_io_root_add");
+    mkdirs(g_io, 0755);
+    if (add && add("wow-bg3", g_io)) {
+        LOG("Ext.IO's wow-bg3/ is %s", g_io);
+        return;
+    }
     const char* home = getenv("HOME");
-    const char* xdg = getenv("XDG_DATA_HOME");
-    char share[PATH_MAX];
-    if (xdg && *xdg) snprintf(share, sizeof share, "%s", xdg);
-    else snprintf(share, sizeof share, "%s/.local/share", home ? home : "/tmp");
-    snprintf(g_data, sizeof g_data, "%s/wow-bg3", share);
+    snprintf(g_io, sizeof g_io, "%s/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3",
+             home ? home : "/tmp");
+    WARN("this bg3le has no mod IO folders (WOW-BG3's patch 0012): the mod's IO folder stays %s", g_io);
+}
+
+static void find_home(void) {
+    const char* home = getenv("HOME");
     // bg3le and BG3 itself use $HOME/.local/share for the profile.
     char profile[PATH_MAX];
     snprintf(profile, sizeof profile, "%s/.local/share/Larian Studios/Baldur's Gate 3", home ? home : "/tmp");
     snprintf(g_mods, sizeof g_mods, "%s/Mods", profile);
-    snprintf(g_io, sizeof g_io, "%s/Script Extender/wow-bg3", profile);
     snprintf(g_modsettings, sizeof g_modsettings, "%s/PlayerProfiles/Public/modsettings.lsx", profile);
 
     g_home[0] = 0;
@@ -470,6 +491,7 @@ static void release_env(void) {
     else if (is_dir("/logs/capture")) snprintf(g_capture, sizeof g_capture, "/logs/capture");
     else snprintf(g_capture, sizeof g_capture, "%s/capture", g_data);
     mkdirs(g_capture, 0700);
+    setenv("WOWBG3_IO", g_io, 1);  // the mod's Lua hands it to the natives (WowUi, InventoryClient)
     setenv("WOWBG3_SHM", g_shm, 1);
     setenv("WOWBG3_CAPTURE_DIR", g_capture, 1);
     if (!getenv("WOWBG3_TAV_DIR")) setenv("WOWBG3_TAV_DIR", tav, 1);
@@ -1116,6 +1138,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
     g_session_wall = wall_s();
     g_start_wall = g_session_wall;
     LOG("WOW-BG3 folder: %s; data: %s", g_home[0] ? g_home : "(not found)", g_data);
+    io_folder_register();
     release_env();
     ensure_pak();
     s_mod_enabled = mod_enabled_now();

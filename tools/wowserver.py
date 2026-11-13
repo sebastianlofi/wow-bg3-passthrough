@@ -25,13 +25,23 @@ def db_sh(cmd, stdin=None, container='wow-bg3-database-1'):
     if p is None:
         return subprocess.run(['sudo', '-n', 'docker', 'exec', '-i', container, 'sh', '-c', cmd], input=stdin,
                               capture_output=True, text=True)
-    # var/ from WOWBG3_SERVER_VAR when set (the release: ~/.local/share/wow-bg3/server).
+    # var/ from WOWBG3_SERVER_VAR when set (the release: Mods/WOW-BG3/data/server).
     var = Path(os.environ.get('WOWBG3_SERVER_VAR') or p / 'var')
     sec = dict(l.split('=', 1) for l in (var / 'secrets.env').read_text().split() if '=' in l)
     env = dict(os.environ, PATH='%s:%s' % (p / 'mariadb/bin', os.environ.get('PATH', '/usr/bin:/bin')),
-               LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_UNIX_PORT=str(var / 'run/mariadb.sock'),
+               LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_UNIX_PORT=str(db_socket(var)),
                MARIADB_ROOT_PASSWORD=sec['ROOT_PASS'])
     return subprocess.run(['sh', '-c', cmd], input=stdin, capture_output=True, text=True, env=env)
+
+
+def db_socket(var):
+    """The portable server's MariaDB socket: the path server/wowbg3-server.sh wrote to var/run/socket (a short folder
+    when var/ is too deep for a socket's 107 bytes, as in the release's Mods/WOW-BG3/data/server), else var/run/."""
+    f = Path(var) / 'run/socket'
+    try:
+        return Path(f.read_text().strip() or Path(var) / 'run/mariadb.sock')
+    except OSError:
+        return Path(var) / 'run/mariadb.sock'
 
 
 def mangosd_running(container='wow-bg3-mangosd-1'):

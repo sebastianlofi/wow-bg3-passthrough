@@ -246,10 +246,19 @@ void each_tile(bg3se::AiGrid const& grid, bg3se::AiWorldPos const& pos, F&& f) {
 
 // ---- files in the mod's IO folder ----
 
+// The Lua's Ext.IO wow-bg3/, which the launcher maps to Mods/WOW-BG3/data/io (bg3le patch 0012) and names in
+// WOWBG3_IO; else data/io beside this plugin (Mods/WOW-BG3), as the launcher finds it.
 std::string io_dir() {
+    char const* env = std::getenv("WOWBG3_IO");
+    if (env != nullptr && *env != 0) return std::string(env) + "/";
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&io_dir), &info) != 0 && info.dli_fname != nullptr) {
+        std::string dir = info.dli_fname;
+        dir.resize(dir.rfind('/') == std::string::npos ? 0 : dir.rfind('/'));
+        if (!dir.empty() && ::access((dir + "/launcher.conf").c_str(), R_OK) == 0) return dir + "/data/io/";
+    }
     char const* home = std::getenv("HOME");
-    std::string dir = home != nullptr ? home : "";
-    return dir + "/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3/";
+    return std::string(home != nullptr ? home : "") + "/.local/share/Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/data/io/";
 }
 
 bool read_file(std::string const& name, std::vector<unsigned char>& out, std::size_t cap) {
@@ -5543,7 +5552,7 @@ std::string uitex_path(void const* uri) {
     if (str == nullptr || uri == nullptr) return {};
     char const* s = str(uri);
     if (s == nullptr) return {};
-    // WoW's item icons (tools/wow_icons.py: Script Extender/wow-bg3/gui/Icons_WowBg3.dds, made on the player's
+    // WoW's item icons (tools/wow_icons.py: the mod's IO folder's gui/Icons_WowBg3.dds, made on the player's
     // machine after BG3 booted). BG3's atlas map takes the atlas while the game runs (bg3le's LoadIconAtlas), but the
     // GUI's pictures of it come through this provider, which knows no file from outside BG3's own data: every WoW
     // item was an empty square in the bag, the trade and the loot windows (a playtest report), while the equipment

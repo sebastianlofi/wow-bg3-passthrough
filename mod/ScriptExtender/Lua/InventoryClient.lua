@@ -1,7 +1,7 @@
 -- InventoryClient (client): the client half of Inventory.lua.
 --
 -- 1. WoW's icons as an icon atlas of our own: tools/wow_icons.py writes Icons_WowBg3 (every WoW item icon the item
---    table uses, from the player's own files) to Script Extender/wow-bg3/gui/, in the background of the first
+--    table uses, from the player's own files) to the mod's IO folder (Mods/WOW-BG3/data/io) gui/, in the background of the first
 --    session. BG3 reads its atlases once, at boot, so a new install's first session has no such files then. When
 --    they exist (wow-icons.json is written last), both go in place of Public/WOWBG3's own paths
 --    (Ext.IO.AddPathOverride; bg3le honours it in ls::FileReader, as for WowUi.lua's XAML) and BG3's own atlas load
@@ -29,14 +29,18 @@ local function fromRoot(root, abs)
     return string.rep("../", depth) .. abs:gsub("^/+", "")
 end
 
-local function seRoot()
+-- The mod's IO folder as an absolute path (Ext.IO's "wow-bg3/"): Mods/WOW-BG3/data/io, which the launcher plugin
+-- maps it to (bg3le patch 0012) and names in WOWBG3_IO; a bg3le without that patch keeps it in its Script Extender folder.
+local function ioRoot()
+    local io = Ext._Internal.Getenv("WOWBG3_IO")
+    if type(io) == "string" and io ~= "" then return io end
     local xdg = Ext._Internal.Getenv("XDG_DATA_HOME")
     if type(xdg) ~= "string" or xdg == "" then
         local home = Ext._Internal.Getenv("HOME")
         if type(home) ~= "string" or home == "" then return nil end
         xdg = home .. "/.local/share"
     end
-    return xdg .. "/" .. SE_DIR
+    return xdg .. "/" .. SE_DIR .. "/wow-bg3"
 end
 
 -- The atlas into the running game, once its files exist. True when it is in.
@@ -46,9 +50,9 @@ local function loadAtlas(status)
         local list = text and Ext.Json.Parse(text)
         if not list or list.Atlas ~= "Icons_WowBg3" then status.Atlas = "not made yet"; return end
         if not (Ext.StaticData and Ext.StaticData.LoadIconAtlas) then status.Atlas = "this bg3le cannot load an atlas"; return end
-        local root, se = assert(dataRoot(), "no data root"), assert(seRoot(), "no SE root")
-        Ext.IO.AddPathOverride(GAME_LSX, fromRoot(root, se .. "/wow-bg3/gui/Icons_WowBg3.lsx"))
-        Ext.IO.AddPathOverride(GAME_DDS, fromRoot(root, se .. "/wow-bg3/gui/Icons_WowBg3.dds"))
+        local root, se = assert(dataRoot(), "no data root"), assert(ioRoot(), "no WOW-BG3 IO folder")
+        Ext.IO.AddPathOverride(GAME_LSX, fromRoot(root, se .. "/gui/Icons_WowBg3.lsx"))
+        Ext.IO.AddPathOverride(GAME_DDS, fromRoot(root, se .. "/gui/Icons_WowBg3.dds"))
         -- The GUI's own pictures of the atlas come through BG3's texture provider, which knows no file from outside
         -- BG3's data: the plugin answers it for this one (op 110, as for the minimap's images). First, so no screen
         -- asks for the texture before it can be had.

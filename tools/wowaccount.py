@@ -19,7 +19,7 @@ for it at that moment; the player never sees it.
     `lc create SPEC ACCOUNT` actions (absent: the default account). The dev launchers hand the name to
     benilla's unit (WOW_BG3_ACCOUNT) and server/tools/launch-baseline.sh reads its password here
     (`wowaccount.py password ACCOUNT`); the release's coordinator calls password() in-process.
-Folder: $WOWBG3_ACCOUNTS_DIR; else $WOWBG3_DATA (the release's data folder, ~/.local/share/wow-bg3, the
+Folder: $WOWBG3_ACCOUNTS_DIR; else $WOWBG3_DATA (the release's data folder, Mods/WOW-BG3/data, the
 launcher plugin sets it); else the parent of $WOWBG3_SERVER_VAR (the same folder, for tools run in release
 mode); else $WOW_BG3_SERVER/var (harness B's portable server); else server/private
 (harness A's test server).

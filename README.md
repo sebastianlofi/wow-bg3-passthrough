@@ -253,8 +253,9 @@ be built from your client either. The first start fetches it from vmangos' publi
 server this mod uses), at a pinned version, and checks every file against the checksums that ship with
 the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
 
-To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder and your
-`settings.conf`) and run the installer again. Your saves and `~/.local/share/wow-bg3/` stay.
+To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder, your
+`settings.conf` and the `data/` folder, where the mod keeps its server, snapshots and logs) and run the installer
+again. Your saves stay.
 
 More: [docs/install.md](docs/install.md). Known issues of this version:
 [docs/known-issues.md](docs/known-issues.md).
@@ -263,7 +264,7 @@ More: [docs/install.md](docs/install.md). Known issues of this version:
 
 Which BG3 abilities a WoW mob gets comes from rules in `WOW-BG3/tools/link/tools/wow_abilities_rules.json`.
 To give or take away a mob's spells (a boss fight of your own, a mod pack's), put a file of your own in
-`~/.local/share/wow-bg3/abilities-rules.json` (or several in `~/.local/share/wow-bg3/abilities-rules.d/*.json`,
+`Mods/WOW-BG3/data/abilities-rules.json` (or several in `Mods/WOW-BG3/data/abilities-rules.d/*.json`,
 read in name order). It is merged over the shipped rules and survives updates; BG3's next start uses it.
 Mobs are keyed by creature entry and spells by WoW spell id (look them up in any vanilla database site);
 names are only comments (`_name`). A value is a BG3 spell, `null` (the mob does not get it) or `true` (the
@@ -404,8 +405,8 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   before you try a beta anyway.
 - **Uninstall.** Switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
   installer with `--uninstall` to take the Script Extender back out of BG3's launch options, and
-  remove `Mods/WOW-BG3.pak`, `Mods/WOW-BG3/` and `~/.local/share/wow-bg3/`.
-- **When something goes wrong.** The logs are in `~/.local/share/wow-bg3/logs/` (the WoW side) and
+  remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its `data/` folder).
+- **When something goes wrong.** The logs are in `Mods/WOW-BG3/data/logs/` (the WoW side) and
   `~/.local/share/bg3le/logs/` (BG3's side). Please attach both to a bug report, with what you did
   just before.
 
@@ -414,7 +415,7 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
 If the WoW side crashes, WOW-BG3 starts it again and a popup names one file. To send a report yourself at any
 time, for a crash or anything that looks wrong, type `/wowbg3 report` in chat.
 
-1. Find the newest `WOW-BG3-report-<time>.zip` in `~/.local/share/wow-bg3/reports/`.
+1. Find the newest `WOW-BG3-report-<time>.zip` in `Mods/WOW-BG3/data/reports/`.
 2. Open an [issue](https://github.com/sebastianlofi/wow-bg3-passthrough/issues), say what you were doing, and
    attach that one file.
 

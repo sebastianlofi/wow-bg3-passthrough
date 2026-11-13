@@ -310,7 +310,7 @@
   ],
 
   "overrides": {
-    "_read": "Rulings that win over everything above, keyed by numbers only. spells: {\"WoW spell id\": value} for every mob; mobs: {\"creature entry\": {\"_name\": \"a comment\", \"spells\": {\"WoW spell id\": value}}} for one mob, winning over spells. value: a BG3 spell name; {\"b\": BG3 spell, and a rung's options}; null: the mob does not get it; true: the rules above decide. A mob's spell it does not cast in WoW is given to it. A player's or mod pack's overlay merges over this file: ~/.local/share/wow-bg3/abilities-rules.json and abilities-rules.d/*.json (README: Changing mob abilities).",
+    "_read": "Rulings that win over everything above, keyed by numbers only. spells: {\"WoW spell id\": value} for every mob; mobs: {\"creature entry\": {\"_name\": \"a comment\", \"spells\": {\"WoW spell id\": value}}} for one mob, winning over spells. value: a BG3 spell name; {\"b\": BG3 spell, and a rung's options}; null: the mob does not get it; true: the rules above decide. A mob's spell it does not cast in WoW is given to it. A player's or mod pack's overlay merges over this file: Mods/WOW-BG3/data/abilities-rules.json and abilities-rules.d/*.json (README: Changing mob abilities).",
     "spells": {},
     "mobs": {}
   }

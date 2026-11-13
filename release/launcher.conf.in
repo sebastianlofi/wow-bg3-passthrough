@@ -1,7 +1,7 @@
 # WOW-BG3 launcher: the WoW side, run by the wowbg3-launcher plugin as BG3's child processes.
 # One [section] per child. Values may use {home} (this WOW-BG3 folder), {data}
-# (~/.local/share/wow-bg3), {wow} ({home}/WoW, the player's WoW 1.12.1 files), {io} (BG3's
-# Script Extender/wow-bg3 folder), {link} ({io}/link) and {mods} (BG3's Mods folder).
+# (this folder's data/, Mods/WOW-BG3/data), {wow} ({home}/WoW, the player's WoW 1.12.1 files), {io} (the mod's IO
+# folder, {data}/io: the Lua's Ext.IO wow-bg3/, bg3le patch 0012), {link} ({io}/link) and {mods} (BG3's Mods folder).
 #   exec      the program (no shell; one arg per "arg" line)
 #   env       KEY=VALUE for this child only (repeatable)
 #   start     enabled: whenever WOW-BG3 is enabled in the mod manager (from the main menu on)

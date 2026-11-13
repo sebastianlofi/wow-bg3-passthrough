@@ -17,6 +17,7 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -45,13 +46,13 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 // Paths: read once, from the environment the launcher plugin sets
 // (it loads first). WOWBG3_CAPTURE_DIR: this layer's log, requests and dumps, compose words, fx library
 // (default /logs/capture, the dev sandbox's log mount; created if missing). WOWBG3_SHM: benilla's frames
-// wowframe.a.bin/.b.bin (default /wowshm). WOWBG3_IO: BG3's Script Extender/wow-bg3 folder (default
-// $HOME/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3, as the launcher finds it).
+// wowframe.a.bin/.b.bin (default /wowshm). WOWBG3_IO: the mod's IO folder, the Lua's Ext.IO wow-bg3/
+// (default <data>/io, Mods/WOW-BG3/data/io, as the launcher maps it with bg3le patch 0012).
 // WOWBG3_LINK: the link folder, bg3cam.bin, bg3screen.txt, tavplan.txt (default <io>/link).
 // Unset (a plugin bg3le starts early, before the launcher plugin sets them: bg3le patch 0005), each is found
 // as the launcher's release_env() finds it, so both name the same folders: capture /logs/capture if it exists,
 // else <data>/capture; frames /wowshm if it exists, else /dev/shm/wow-bg3-<uid>, else <data>/shm; Tav
-// /wowtav beside /wowshm, else <frames>/tav (<data>: $XDG_DATA_HOME or $HOME/.local/share, then /wow-bg3).
+// /wowtav beside /wowshm, else <frames>/tav (<data>: $WOWBG3_DATA, else Mods/WOW-BG3/data, as the launcher).
 static struct { char out[512], fx[528], wow[2][560], io[1024], link[1040], cam[1060], shm[512], tav[530]; } g_path;
 static pthread_once_t g_path_once = PTHREAD_ONCE_INIT;
 static int path_is_dir(const char* p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
@@ -63,11 +64,26 @@ static void path_mkdirs(const char* dir) {
     mkdir(b, 0700);
 }
 static void path_init(void) {
+    // <data> is the launcher's: the mod's own folder (this plugin's, beside launcher.conf) /data, else
+    // BG3's Mods/WOW-BG3/data. Nothing the mod makes lives outside its folder.
     char data[400];
-    const char* xdg = getenv("XDG_DATA_HOME");
     const char* hm = getenv("HOME");
-    if (xdg && *xdg) snprintf(data, sizeof data, "%.380s/wow-bg3", xdg);
-    else snprintf(data, sizeof data, "%.360s/.local/share/wow-bg3", hm && *hm ? hm : "/tmp");
+    const char* de = getenv("WOWBG3_DATA");
+    Dl_info di;
+    char conf[460];
+    data[0] = 0;
+    if (de && *de) snprintf(data, sizeof data, "%.390s", de);
+    else if (dladdr((void*)&path_init, &di) && di.dli_fname) {
+        snprintf(data, sizeof data, "%.380s", di.dli_fname);
+        char* sl = strrchr(data, '/');
+        if (sl) *sl = 0;
+        snprintf(conf, sizeof conf, "%s/launcher.conf", data);
+        if (sl && access(conf, R_OK) == 0) strcat(data, "/data");
+        else data[0] = 0;
+    }
+    if (!data[0])
+        snprintf(data, sizeof data, "%.320s/.local/share/Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/data",
+                 hm && *hm ? hm : "/tmp");
     const char* e = getenv("WOWBG3_CAPTURE_DIR");
     if (e && *e) snprintf(g_path.out, sizeof g_path.out, "%s", e);
     else if (path_is_dir("/logs/capture")) snprintf(g_path.out, sizeof g_path.out, "/logs/capture");
@@ -86,11 +102,9 @@ static void path_init(void) {
     if (strcmp(g_path.shm, "/wowshm")) { path_mkdirs(g_path.shm); path_mkdirs(g_path.tav); }
     for (int k = 0; k < 2; k++)
         snprintf(g_path.wow[k], sizeof g_path.wow[k], "%s/wowframe.%c.bin", g_path.shm, "ab"[k]);
-    e = getenv("WOWBG3_IO");
-    const char* home = getenv("HOME");
+    e = getenv("WOWBG3_IO");  // the mod's IO folder (Ext.IO's wow-bg3/, bg3le patch 0012): <data>/io
     if (e && *e) snprintf(g_path.io, sizeof g_path.io, "%s", e);
-    else snprintf(g_path.io, sizeof g_path.io, "%s/.local/share/Larian Studios/Baldur's Gate 3/Script Extender/wow-bg3",
-                  home && *home ? home : "/home/wow-bg3");
+    else snprintf(g_path.io, sizeof g_path.io, "%s/io", data);
     e = getenv("WOWBG3_LINK");
     if (e && *e) snprintf(g_path.link, sizeof g_path.link, "%s", e);
     else snprintf(g_path.link, sizeof g_path.link, "%s/link", g_path.io);

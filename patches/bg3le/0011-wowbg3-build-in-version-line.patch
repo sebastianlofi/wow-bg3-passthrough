@@ -6,8 +6,8 @@
  void show_version_number() {
 -    std::string text = "\r\nbg3le loaded, Script Extender v32 API, built on " __DATE__
 +    // WOW-BG3 patch 0009: the original's wording (Windows BG3SE: "Script Extender v32 loaded, built on
-+    // <date>."), naming the extender and the WOW-BG3 build, as WOW-BG3's macOS extender does.
-+    std::string text = "\r\nScript Extender v32 loaded (bg3le, WOW-BG3 build), built on " __DATE__
++    // <date>."), naming the extender and the WoW-BG3 build (the mod writes its version and build id there).
++    std::string text = "\r\nScript Extender v32 loaded (bg3le, WoW-BG3 build), built on " __DATE__
                         " " __TIME__ ".";
      if (log_previous_crash()[0] != '\0') {
          text += "\r\nThe last run crashed. Its log is ";

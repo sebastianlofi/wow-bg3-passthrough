@@ -38,7 +38,7 @@ The release zip has its own README with the same steps; this page adds what is b
 
 The very first start builds the server's data from your WoW files and the first movement maps, and
 downloads the server's world database once (about 48 MB from vmangos' public sources, checked against the
-hashes in `server/sql.lock`; kept in `~/.local/share/wow-bg3/server/downloads`): about three minutes behind
+hashes in `server/sql.lock`; kept in `Mods/WOW-BG3/data/server/downloads`): about three minutes behind
 the loading screen. It needs the internet that once; offline it stops with a message, and the next start
 tries again. The mobs' abilities are made from that database and your WoW files before BG3 reads its stats
 (bg3le patch 0008), so the first time WOW-BG3 runs BG3 stays on its loading screen for about two minutes
@@ -57,7 +57,7 @@ the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and not
   (`tools/wowbg3-coord.py`). Both stop when BG3 closes. Nothing listens outside your own machine.
 - The coordinator makes a local WoW account and, per BG3 playthrough, a hidden WoW character that
   matches your BG3 character's race and class. You never log in to anything.
-- Data lives in `~/.local/share/wow-bg3/`: the server's data and database, the WoW side of your
+- Data lives in the mod's own folder, `Mods/WOW-BG3/data/` (nothing outside BG3's Mods folder): the server's data and database, the WoW side of your
   saves (snapshots), logs (`logs/`) and status files (`run/launcher.json`, `run/coord.json`: during the first
   start its `Detail` says the server's step, such as the download's progress, and `Error` why it failed).
 - Settings: `Mods/WOW-BG3/settings.conf` (WoW's sound, view distance, test chat commands). Read when
@@ -70,26 +70,26 @@ the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and not
 World mode only happens in games started with WOW-BG3 enabled; older saves stay plain BG3 (loading
 one says so in a message box). Saving and loading work as in BG3: each BG3 save keeps a snapshot of
 the WoW characters, and loading an older save takes them back to that point too. A new server
-database (a reinstall that dropped `~/.local/share/wow-bg3/server/` but kept the snapshots) keeps
+database (a reinstall that dropped `Mods/WOW-BG3/data/server/` but kept the snapshots) keeps
 them as well: when the server starts, it puts each saved WoW character back from its snapshot.
 
 ## Removing it
 
-Disable WoW-BG3 Passthrough in the mod manager, then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/`. Delete
-`~/.local/share/wow-bg3/` to drop the server data and snapshots as well. Run the Script Extender
+Disable WoW-BG3 Passthrough in the mod manager, then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (its `data/`
+folder holds the server data and snapshots; keep a copy of it if you may come back). Run the Script Extender
 installer with `--uninstall` if you no longer want bg3le. World-mode saves need the mod to load
 properly.
 
 ## When something goes wrong
 
 - The loading screen waits at most a few minutes for the WoW side. If it gives up, look at
-  `~/.local/share/wow-bg3/logs/` (`coord.log`, `server.log`, `benilla.log`) and bg3le's newest log
+  `Mods/WOW-BG3/data/logs/` (`coord.log`, `server.log`, `benilla.log`) and bg3le's newest log
   in `~/.local/share/bg3le/logs/`.
-- When reporting a bug, attach those logs and `~/.local/share/wow-bg3/run/launcher.json`.
+- When reporting a bug, attach those logs and `Mods/WOW-BG3/data/run/launcher.json`.
 - Characters are black with a pale ring round them, or the picture has a grey haze: the render plugin has no
-  colour table. Look for `NO COLOUR TABLE` in `~/.local/share/wow-bg3/capture/layer.log` and in
-  `~/.local/share/wow-bg3/logs/coord.log`. `Mods/WOW-BG3/fxbg-table.bin` must be there (it is part of the zip); the
-  mod copies it into `~/.local/share/wow-bg3/capture/` at the next start.
+  colour table. Look for `NO COLOUR TABLE` in `Mods/WOW-BG3/data/capture/layer.log` and in
+  `Mods/WOW-BG3/data/logs/coord.log`. `Mods/WOW-BG3/fxbg-table.bin` must be there (it is part of the zip); the
+  mod copies it into `Mods/WOW-BG3/data/capture/` at the next start.
 - Nothing works any more after a stock bg3le install or update: it replaced WOW-BG3's patched
   library in `~/.local/share/bg3le`. Run WOW-BG3's `bg3le/install.py` again with Steam closed.
 - Known issues of this version: [known-issues.md](known-issues.md).

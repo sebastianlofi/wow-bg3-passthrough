@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""The line under BG3's main menu says which WOW-BG3 this is: "WOW-BG3 0.1.0 (build 1a2b3c4d)".
+"""The extender's line under BG3's main menu says which WoW-BG3 this is: "(bg3le, WoW-BG3 0.1.0 build 1a2b3c4d)".
 
 The release builder writes the version and a build id into the pak (Version.lua); MenuLine.lua puts them after the
-Script Extender's line, in a BG3 that loaded the mod. A release number stays the same over several builds, so the
+Script Extender's own words for the build (bg3le patch 0011), in a BG3 that loaded the mod. A release number stays the same over several builds, so the
 id is what tells two of them apart on screen: these tests fail when it stops following the release's files, when
-the pak loses the file, or when the line could land before the extender's or twice.
+the pak loses the file, or when it could be written before the extender's line, on a line of its own, or twice.
 
   python3 tools/test_menu_line.py     (the Lua part needs the `lupa` module; without it that part is skipped)
 """
@@ -36,8 +36,26 @@ def test_the_build_id_follows_every_file_of_the_pak_and_of_the_release():
 
 
 def test_version_lua_says_the_version_and_the_build():
-    text = br.version_lua('0.1.0', '1a2b3c4d').decode()
-    assert 'return {Version = "0.1.0", Build = "1a2b3c4d"}' in text
+    text = br.version_lua('0.1.0', '1a2b3c4d', 'Jan  2 2026 03:04:05').decode()
+    assert 'return {Version = "0.1.0", Build = "1a2b3c4d", Built = "Jan  2 2026 03:04:05"}' in text
+
+
+def test_built_is_when_the_release_is_built_in_the_extenders_form():
+    import os
+    old = os.environ.get('SOURCE_DATE_EPOCH')
+    try:
+        os.environ['SOURCE_DATE_EPOCH'] = '1767323045'
+        import time
+        want = time.strftime('%b %d %Y %H:%M:%S', time.localtime(1767323045))
+        want = want[:4] + ('%2d' % int(want[4:6])) + want[6:]
+        assert br.built_at() == want
+        assert re.fullmatch(r'[A-Z][a-z]{2} [ 1-3][0-9] \d{4} \d\d:\d\d:\d\d', br.built_at())
+        del os.environ['SOURCE_DATE_EPOCH']
+        assert br.built_at()[-8:-6] == time.strftime('%H'), 'now, without SOURCE_DATE_EPOCH'
+        assert 'Built = "' in br.version_lua('0.1.0', '1a2b3c4d').decode()
+    finally:
+        if old is not None:
+            os.environ['SOURCE_DATE_EPOCH'] = old
 
 
 def test_the_source_tree_has_no_version_file_and_the_builder_writes_it_last():
@@ -74,26 +92,37 @@ def test_the_line_goes_after_the_extenders_and_only_once():
     """)
     M = L.execute((LUA / 'MenuLine.lua').read_text())
     g = L.globals()
-    assert M.Line() == 'WOW-BG3 0.1.0 (build 1a2b3c4d)'
+    assert M.Line() == 'WoW-BG3 0.1.0 build 1a2b3c4d'
     copyright_line = '(c) Larian Studios. All rights reserved.'
     g.strings[M.HANDLE] = copyright_line
     M.Start()
     assert g.strings[M.HANDLE] == copyright_line, "not before the extender's line is there"
-    ext = copyright_line + '\r\nScript Extender v32 loaded (bg3le, WOW-BG3 build), built on Oct 10 2026 18:54:29.'
+    ext = copyright_line + '\r\nScript Extender v32 loaded (bg3le, WoW-BG3 build), built on Oct 10 2026 18:54:29.'
+    want = copyright_line + '\r\nScript Extender v32 loaded (bg3le, WoW-BG3 0.1.0 build 1a2b3c4d), built on Oct 10 2026 18:54:29.'
     g.strings[M.HANDLE] = ext
     g.changed()
-    assert g.strings[M.HANDLE] == ext + '\r\nWOW-BG3 0.1.0 (build 1a2b3c4d)'
+    assert g.strings[M.HANDLE] == want, 'in the extender\'s own line, no line of its own'
     g.changed()
     g.changed()
-    assert g.strings[M.HANDLE].count('WOW-BG3 0.1.0') == 1, 'once, however often the game state changes'
+    assert g.strings[M.HANDLE] == want, 'once, however often the game state changes'
     g.strings[M.HANDLE] = ext   # BG3 loaded its texts anew and the extender wrote its line again
     g.changed()
-    assert g.strings[M.HANDLE].endswith('\r\nWOW-BG3 0.1.0 (build 1a2b3c4d)')
-    # the extender's present wording on Linux counts as its line too
+    assert g.strings[M.HANDLE] == want
+    # the extender's older wording ("WOW-BG3 build") is taken too
+    g.strings[M.HANDLE] = ext.replace('WoW-BG3 build', 'WOW-BG3 build')
+    g.changed()
+    assert g.strings[M.HANDLE] == want
+    # an extender line without those words: ours at its end, on the same line
     g.strings[M.HANDLE] = copyright_line + '\r\nbg3le loaded, Script Extender v32 API, built on Oct 10 2026 18:54:29.'
     g.changed()
-    assert g.strings[M.HANDLE].endswith('\r\nWOW-BG3 0.1.0 (build 1a2b3c4d)')
-
+    assert g.strings[M.HANDLE].endswith('18:54:29. WoW-BG3 0.1.0 build 1a2b3c4d') and g.strings[M.HANDLE].count('\r\n') == 1
+    # the release's build time in place of the extender's (fixed at the bg3le commit's by its reproducible build)
+    g.Ext.Require = L.eval('function(name) return {Version = "0.1.0", Build = "1a2b3c4d", Built = "Jan  2 2026 03:04:05"} end')
+    g.strings[M.HANDLE] = ext + '\r\nThe last run crashed. Its log is x.log.'
+    g.changed()
+    assert g.strings[M.HANDLE] == want.replace('Oct 10 2026 18:54:29', 'Jan  2 2026 03:04:05') + '\r\nThe last run crashed. Its log is x.log.'
+    g.changed()
+    assert g.strings[M.HANDLE].count('built on') == 1
 
 if __name__ == '__main__':
     for k, f in sorted(globals().items()):

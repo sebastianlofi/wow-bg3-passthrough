@@ -22,7 +22,7 @@
 #                                         running, stopping, stopped, failed; during init var/run/progress says
 #                                         the step (one line), and a failed one says why in var/run/error.
 #
-# var/ is WOWBG3_SERVER_VAR when set (the release: ~/.local/share/wow-bg3/server), else this folder's var/.
+# var/ is WOWBG3_SERVER_VAR when set (the release: Mods/WOW-BG3/data/server), else this folder's var/.
 #
 # Ports (127.0.0.1 only): world WOWBG3_WORLD_PORT (8105), auth WOWBG3_AUTH_PORT (3744); MariaDB has
 # no TCP port at all (a unix socket in var/run). Several copies can run side by side with other ports.
@@ -30,7 +30,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 V="${WOWBG3_SERVER_VAR:-$ROOT/var}"
 RUN="$V/run"
+# MariaDB's socket: var/run/mariadb.sock, unless that path is longer than a socket's 107 bytes (the release's var/ is
+# deep in BG3's profile: Mods/WOW-BG3/data/server); then the launcher's runtime folder (WOWBG3_SHM, a tmpfs) or
+# XDG_RUNTIME_DIR, one socket per var/ (its path's hash). Written to run/socket for the tools (wowserver.db_socket).
 SOCK="$RUN/mariadb.sock"
+if [ "${#SOCK}" -gt 100 ]; then
+    SOCK="${WOWBG3_SHM:-${XDG_RUNTIME_DIR:-/tmp}}/mariadb-$(printf %s "$V" | md5sum | cut -c1-8).sock"
+fi
+[ "${#SOCK}" -le 107 ] || { echo "wowbg3-server: no socket path for MariaDB under 108 bytes ($SOCK)" >&2; exit 1; }
 WORLD_PORT="${WOWBG3_WORLD_PORT:-8105}"
 AUTH_PORT="${WOWBG3_AUTH_PORT:-3744}"
 export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -38,11 +45,11 @@ export LD_LIBRARY_PATH="$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # libmariadb's own default is pointed at ours.
 export MYSQL_UNIX_PORT="$SOCK"
 MDB="$ROOT/mariadb"
-# MariaDB's scripts (mariadb-install-db) break on a base folder with spaces, and the release sits in
-# BG3's "Larian Studios/Baldur's Gate 3/Mods": then MariaDB is reached
-# through a link in var/ (made where the server runs: init and start).
+# MariaDB's scripts (mariadb-install-db) break on a folder with spaces, and the release and its var/ sit in BG3's
+# "Larian Studios/Baldur's Gate 3/Mods": then MariaDB is reached through a link in var/ (made where the server runs:
+# init and start), and its install script is run from var/ with paths relative to it, which have none.
 mdb_link() {
-    case "$ROOT" in
+    case "$ROOT$V" in
         *[[:space:]\'\"]*) mkdir -p "$V"; ln -sfn "$ROOT/mariadb" "$V/mariadb-base"; MDB="$V/mariadb-base";;
     esac
 }
@@ -91,7 +98,8 @@ sql() { "$MDB/bin/mariadb" --socket="$SOCK" -uroot -p"$(secret ROOT_PASS)" "$@";
 db_start() {
     mdb_link
     alive mariadb && return 0
-    mkdir -p "$RUN" "$V/logs"
+    mkdir -p "$RUN" "$V/logs" "$(dirname "$SOCK")"
+    echo "$SOCK" > "$RUN/socket"
     "$MDB/bin/mariadbd" --no-defaults --basedir="$MDB" --datadir="$V/db" --socket="$SOCK" \
         --skip-networking --pid-file="$RUN/mariadb.pid" --log-error="$V/logs/mariadb.err" \
         --innodb-buffer-pool-size=256M --max-connections=50 --character-set-server=utf8mb3 \
@@ -164,8 +172,10 @@ init() {
     say "creating the databases"
     progress "Creating the databases"
     mkdir -p "$V/db"
-    "$MDB/scripts/mariadb-install-db" --no-defaults --basedir="$MDB" --datadir="$V/db" --auth-root-authentication-method=normal \
-        --skip-test-db > "$V/logs/install-db.log" 2>&1
+    mdb_link
+    mdb_rel="$MDB"; case "$MDB" in "$V"/*) mdb_rel="./${MDB#"$V"/}";; esac
+    (cd "$V" && "$mdb_rel/scripts/mariadb-install-db" --no-defaults --basedir="$mdb_rel" --datadir=./db \
+        --auth-root-authentication-method=normal --skip-test-db) > "$V/logs/install-db.log" 2>&1
     db_start
     "$MDB/bin/mariadb" --socket="$SOCK" -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$(secret ROOT_PASS)'; FLUSH PRIVILEGES;"
     local t0=$SECONDS
@@ -233,6 +243,11 @@ start() {
     [ -e "$V/.initialized" ] || die "not initialised (init WOW_DIR first)"
     stale_pids
     db_start
+    # The folders of var/ as it is now, at every start (a var/ moved since init, as the release's data folder moved
+    # into Mods/WOW-BG3/data, keeps working; init writes the same).
+    set_conf "$V/etc/mangosd.conf" "DataDir=\"$V/data\"" "LogsDir=\"$V/logs\"" "HonorDir=\"$V/honor\"" \
+        "PidFile=\"$RUN/mangosd-self.pid\""
+    set_conf "$V/etc/realmd.conf" "LogsDir=\"$V/logs\"" "PidFile=\"$RUN/realmd-self.pid\""
     sid=setsid
     if [ "$OWN" = 1 ]; then sid=""; fi   # `set -e`: a plain `&&` test that fails would end the script
     # `exec` in each background subshell, so the pid written here is the program's own: without it bash

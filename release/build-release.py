@@ -107,10 +107,21 @@ def build_id(files, release=()) -> str:
     return h.hexdigest()[:8]
 
 
-def version_lua(version: str, build: str) -> bytes:
-    """What MenuLine.lua shows under BG3's main menu: "WOW-BG3 <version> (build <build>)"."""
-    return ('-- Written by release/build-release.py: this release and this build of it.\n'
-            'return {Version = "%s", Build = "%s"}\n' % (version, build)).encode()
+def built_at() -> str:
+    """When this release is built, in the extender's own form ("Jan  2 2026 03:04:05", C's __DATE__ __TIME__): the
+    builder's local time, or SOURCE_DATE_EPOCH's when it is set (a reproducible build). bg3le's line says its own date,
+    which its reproducible build fixes at the bg3le commit's; the menu shows this one."""
+    import time
+    t = time.localtime(int(os.environ['SOURCE_DATE_EPOCH'])) if os.environ.get('SOURCE_DATE_EPOCH') else time.localtime()
+    months = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()
+    return '%s %2d %d %02d:%02d:%02d' % (months[t.tm_mon - 1], t.tm_mday, t.tm_year, t.tm_hour, t.tm_min, t.tm_sec)
+
+
+def version_lua(version: str, build: str, built: str = None) -> bytes:
+    """What MenuLine.lua writes into the extender's line under BG3's main menu: "(bg3le, WoW-BG3 <version> build
+    <build>), built on <built>"."""
+    return ('-- Written by release/build-release.py: this release, this build of it and when it was built.\n'
+            'return {Version = "%s", Build = "%s", Built = "%s"}\n' % (version, build, built or built_at())).encode()
 
 
 def pak_files(version: str, native_plugins, release=()):

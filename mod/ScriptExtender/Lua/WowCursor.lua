@@ -32,7 +32,7 @@
 -- BG3 builds its SDL cursors from Game.pak's Cursors/*.cur before any plugin or Lua runs (harness:
 -- an override of the files came too late), so the bg3le plugin wowbg3-early (plugins/early)
 -- hooks BG3's SDL_SetCursor and swaps BG3's Listen cursors for SDL cursors made from
--- Script Extender/wow-bg3/cursors/quest-*.cur (WoW's Interface\GossipFrame\AvailableQuestIcon.blp
+-- the mod's IO folder's cursors/quest-*.cur (Mods/WOW-BG3/data/io) (WoW's Interface\GossipFrame\AvailableQuestIcon.blp
 -- and ActiveQuestIcon.blp of the player's WoW; link/tools/wowcursor.py, or benilla in the release).
 -- Used only when that plugin is loaded and the four files are there (otherwise the quest giver keeps
 -- BG3's Talk cursor). The quest state comes from benilla: wowhover.bin's 36-byte form adds WoW's

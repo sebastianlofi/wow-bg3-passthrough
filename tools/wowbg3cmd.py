@@ -19,7 +19,7 @@ One verb each, no domain word in front:
   --json on any party verb: the mod's whole answer
 
 Where things are (each from the environment, else harness A's place on the PC):
-  WOWBG3_IO      BG3's Script Extender/wow-bg3 folder      (A: bg3/private/home/...)
+  WOWBG3_IO      the mod's IO folder (release: Mods/WOW-BG3/data/io; A: bg3/private/home/.../Script Extender/wow-bg3)
   WOWBG3_LINK    the link folder benilla writes             (WOWBG3_IO/link)
   WOW_CHAR       the hero's WoW character                   (else the one online on a WOW-BG3 account)
   WOW_BG3_SERVER a portable server folder (harness B, the release), its var/ in WOWBG3_SERVER_VAR
@@ -108,7 +108,7 @@ def sql(query, db=''):
     else:
         v = server_var()
         sec = dict(l.split('=', 1) for l in (v / 'secrets.env').read_text().split() if '=' in l)
-        cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % (v / 'run/mariadb.sock'), '-uroot', '-N', '-B'] + ([db] if db else [])
+        cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % wowserver.db_socket(v), '-uroot', '-N', '-B'] + ([db] if db else [])
         env = dict(os.environ, LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_PWD=sec['ROOT_PASS'])
     r = subprocess.run(cmd, input=query, capture_output=True, text=True, env=env)
     if r.returncode:

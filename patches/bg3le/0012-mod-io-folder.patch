@@ -1,0 +1,131 @@
+WOW-BG3 bg3le patch 0012: a mod's own IO folder (on top of 0001-0011).
+
+A native plugin names a top-level folder of Ext.IO's user root and where it really lives
+(bg3le_io_root_add(name, absolute dir), at plugin init, before any Lua runs). Ext.IO.LoadFile (user context),
+SaveFile and AppendFile paths under that name read and write there; every other path is upstream's. WOW-BG3's
+launcher registers wow-bg3/ as Mods/WOW-BG3/data/io, so nothing the mod makes lives outside its own folder.
+Patch 0006's boot-path-overrides.txt (and 0008's .wait beside it) is read from the registered folder when there is one.
+
+--- a/src/ext_libs.cpp
++++ b/src/ext_libs.cpp
+@@ -91,6 +91,22 @@
+     return true;
+ }
+ 
++// WOW-BG3 patch 0012: a mod's own IO folder. A native plugin names a top-level folder of Ext.IO's user root and
++// where it really lives (bg3le_io_root_add, before any Lua runs); Ext.IO paths under that name read and write
++// there, so a mod keeps what it makes in its own folder. Every other path is upstream's.
++std::mutex g_io_roots_lock;
++std::map<std::string, std::string> g_io_roots;
++
++bool resolve_user(char const* relative, std::string* out) {
++    char const* slash = relative != nullptr ? std::strchr(relative, '/') : nullptr;
++    if (slash != nullptr && slash[1] != '\0') {
++        std::lock_guard<std::mutex> held(g_io_roots_lock);
++        auto it = g_io_roots.find(std::string(relative, static_cast<std::size_t>(slash - relative)));
++        if (it != g_io_roots.end()) return resolve_under(it->second, slash + 1, out);
++    }
++    return resolve_under(extender_root(), relative, out);
++}
++
+ bool make_parents(std::string const& path) {
+     const std::size_t slash = path.rfind('/');
+     if (slash == std::string::npos) return true;
+@@ -267,24 +283,46 @@
+ 
+ // ---- files ----------------------------------------------------------------
+ 
++// WOW-BG3 patch 0012: Ext.IO's NAME/ is DIR (an absolute folder), for a native plugin at init.
++extern "C" bool bg3le_io_root_add(char const* name, char const* dir) {
++    if (name == nullptr || name[0] == '\0' || std::strchr(name, '/') != nullptr || std::strstr(name, "..") != nullptr
++        || dir == nullptr || dir[0] != '/') {
++        return false;
++    }
++    {
++        std::lock_guard<std::mutex> held(g_io_roots_lock);
++        g_io_roots[name] = dir;
++    }
++    bg3le::logf("io: Ext.IO's %s/ is %s", name, dir);
++    return true;
++}
++
++// The registered folders, for the boot overrides (patch 0006): up to CAP of them into OUT; the count.
++extern "C" int bg3le_io_root_dirs(char const** out, int cap) {
++    std::lock_guard<std::mutex> held(g_io_roots_lock);
++    int n = 0;
++    for (auto const& r : g_io_roots) {
++        if (n >= cap) break;
++        out[n++] = r.second.c_str();
++    }
++    return n;
++}
++
+ // Ext.IO.LoadFile(path[, context]) where context is "user" or "data".
+ extern "C" int bg3le_ext_load_file(lua_State* L) {
+     char const* relative = luaL_checkstring(L, 1);
+     char const* context = lua_isnoneornil(L, 2) ? "user"
+                                                 : luaL_checkstring(L, 2);
+ 
+-    std::string root;
++    std::string path;
+     if (std::strcmp(context, "user") == 0) {
+-        root = extender_root();
++        if (!resolve_user(relative, &path)) return 0;
+     } else if (std::strcmp(context, "data") == 0) {
+-        root = data_root();
++        if (!resolve_under(data_root(), relative, &path)) return 0;
+     } else {
+         return luaL_error(L, "Unknown file loading context: %s", context);
+     }
+ 
+-    std::string path;
+-    if (!resolve_under(root, relative, &path)) return 0;
+-
+     // Upstream reads this context through the engine's FileReader, which
+     // sees what the engine sees and honours path overrides.
+     if (std::strcmp(context, "data") == 0) {
+@@ -333,7 +371,7 @@
+     const bool append = lua_toboolean(L, 3) != 0;
+ 
+     std::string path;
+-    if (!resolve_under(extender_root(), relative, &path)
++    if (!resolve_user(relative, &path)
+         || !make_parents(path)) {
+         lua_pushboolean(L, 0);
+         return 1;
+--- a/src/vendor/path_override.cpp
++++ b/src/vendor/path_override.cpp
+@@ -174,19 +174,27 @@
+ }
+ 
+ // WOW-BG3: overrides for the files RPGStats::Load reads, which Lua cannot give: the client's mods load after it.
+-// <Script Extender folder>/boot-path-overrides.txt, one "game path<TAB>absolute file" a line, the game path as
++// boot-path-overrides.txt (in the mod's IO folder, patch 0012), one "game path<TAB>absolute file" a line, the game path as
+ // Ext.IO.AddPathOverride takes it. Under WOW-BG3's launcher (WOWBG3_SHM) its coordinator writes the file at every
+ // start, moments after BG3 starts: wait a little for this start's. Without it, or when late, whatever is there.
+ // On a new install's first start the coordinator makes the stats this load reads (the mobs' abilities, from the WoW
+ // server's database that start imports) and says so in boot-path-overrides.wait, written every 2 s: while that file
+ // is this start's and fresh (under 10 s old), wait on, at most 20 minutes. Writing the overrides file ends the wait.
++// Patch 0012: in a mod's own IO folder (bg3le_io_root_add) when a plugin registered one, else the Script Extender folder.
++extern "C" int bg3le_io_root_dirs(char const** out, int cap);
+ extern "C" void bg3le_path_overrides_boot() {
+     if (g_real == nullptr) return;
+-    char const* xdg = std::getenv("XDG_DATA_HOME");
+-    char const* home = std::getenv("HOME");
+-    if ((xdg == nullptr || *xdg == 0) && home == nullptr) return;
+-    const std::string file = ((xdg != nullptr && *xdg != 0) ? std::string(xdg) : std::string(home) + "/.local/share")
+-                             + "/Larian Studios/Baldur's Gate 3/Script Extender/boot-path-overrides.txt";
++    char const* dirs[1] = {nullptr};
++    std::string file;
++    if (bg3le_io_root_dirs(dirs, 1) == 1) {
++        file = std::string(dirs[0]) + "/boot-path-overrides.txt";
++    } else {
++        char const* xdg = std::getenv("XDG_DATA_HOME");
++        char const* home = std::getenv("HOME");
++        if ((xdg == nullptr || *xdg == 0) && home == nullptr) return;
++        file = ((xdg != nullptr && *xdg != 0) ? std::string(xdg) : std::string(home) + "/.local/share")
++               + "/Larian Studios/Baldur's Gate 3/Script Extender/boot-path-overrides.txt";
++    }
+     if (std::getenv("WOWBG3_SHM") != nullptr) {
+         const std::string wait = file.substr(0, file.size() - 4) + ".wait";
+         const std::time_t asked = std::time(nullptr);

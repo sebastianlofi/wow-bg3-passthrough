@@ -98,7 +98,7 @@ server this mod uses), at a pinned version, and checks every file against the ch
 the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
 
 To change which abilities a mob gets, see "Changing mob abilities" in the
-project's README: a file of yours in ~/.local/share/wow-bg3/abilities-rules.json.
+project's README: a file of yours in Mods/WOW-BG3/data/abilities-rules.json.
 
 World mode only happens in games started with WOW-BG3 enabled.
 Saves you made before installing it stay normal BG3; loading one with WOW-BG3
@@ -134,11 +134,11 @@ and to add new spells for those new levels. That is still to come.
 
 ## Where things are
 
-- Server data, database, save snapshots, logs: `~/.local/share/wow-bg3/`
-- Logs of the WoW side: `~/.local/share/wow-bg3/logs/`
+- Server data, database, save snapshots, logs: `Mods/WOW-BG3/data/` (all the mod makes stays in its own folder)
+- Logs of the WoW side: `Mods/WOW-BG3/data/logs/`
 - bg3le's own logs: `~/.local/share/bg3le/logs/`
-- What the plugin is doing: `~/.local/share/wow-bg3/run/launcher.json`
-- What the WoW side is doing: `~/.local/share/wow-bg3/logs/coord.log`
+- What the plugin is doing: `Mods/WOW-BG3/data/run/launcher.json`
+- What the WoW side is doing: `Mods/WOW-BG3/data/logs/coord.log`
 - Settings: `Mods/WOW-BG3/settings.conf` (WoW's sound, view distance, the test
   commands of `/wowbg3` in WoW's chat). Read when BG3 starts.
   This beta ships `debug_commands = 1`, so every `/wowbg3` command typed in
@@ -149,13 +149,13 @@ and to add new spells for those new levels. That is still to come.
 ## Remove
 
 Disable WOW-BG3 in the Mod Manager, then delete `Mods/WOW-BG3.pak` and
-`Mods/WOW-BG3/`. To drop the WoW server data and snapshots too, delete
-`~/.local/share/wow-bg3/`. World-mode saves need the mod to load properly.
+`Mods/WOW-BG3/` (with it goes `data/`, the WoW server data and snapshots;
+keep a copy of it to come back later). World-mode saves need the mod to load properly.
 
 ## When something goes wrong
 
 - The loading screen waits at most two minutes for the WoW side. If it gives
-  up, look at `~/.local/share/wow-bg3/logs/` and bg3le's newest log.
+  up, look at `Mods/WOW-BG3/data/logs/` and bg3le's newest log.
 - Report a bug with those logs and `launcher.json` from the `run` folder.
 - The WoW side runs where Steam runs BG3, with the Python that comes in
   `WOW-BG3/python/`. Nothing else to install.

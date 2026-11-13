@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests wowbg3-launcher with test_host.c and stub children, no BG3 needed.
-#   test.sh PLUGIN.so TEST_HOST     (both built for this machine)
+#   test.sh PLUGIN.so TEST_HOST     (both built for this machine; TEST_HOST linked with -rdynamic)
 # Checks: pak copy into Mods, child started only once the mod is enabled, request-started child,
 # stop on request (SIGTERM reaches the child), loading-screen gate and input hold, release by
 # setting, by file and by timeout, SIGTERM to children at exit(), and at SIGKILL of the host
@@ -43,7 +43,7 @@ once = 1
 CONF
 printf '#!/usr/bin/env bash\necho "job ran $$"\nexit 0\n' > "$t/WOW-BG3/job.sh"; chmod +x "$t/WOW-BG3/job.sh"
 export WOWBG3_HOME="$t/WOW-BG3" LD_PRELOAD= WOWBG3_ANY_EXE=1  # test_host is not bg3
-data="$XDG_DATA_HOME/wow-bg3"
+data="$WOWBG3_HOME/data"  # the mod's own folder; nothing in $XDG_DATA_HOME/wow-bg3
 enable() { sed -i 's#<node id="Mods">#<node id="Mods"><attribute id="UUID" value="a97c1258-37c3-434c-9309-c982f6cea252"/>#' "$prof/PlayerProfiles/Public/modsettings.lsx"; }
 
 # 1: pak, enable, request, gate, release by setting, reset at unload, exit()
@@ -141,7 +141,7 @@ grep -q "TERM server" "$data/logs/server.log" && pass "server got SIGTERM when t
 [[ ! -f "$data/logs/datagen.log" ]] && pass "once job not run again on the next start" || bad "once job ran again"
 
 # 4: release by the lifecycle's phase "up" for this session; bg3-state.json at a load start
-io="$prof/Script Extender/wow-bg3"
+io="$data/io"  # bg3le patch 0012: Ext.IO's wow-bg3/ in the mod's own folder
 "$host" "$plugin" > "$t/out4" 2>&1 <<S &
 state Running
 frame
@@ -309,6 +309,10 @@ gate LoadLevel StopLoading
 exit
 S
 grep -q "no state gates" "$t/out3" && grep -q "init -> 0" "$t/out3" && pass "stock bg3le: loads and says the hold is off" || bad "stock bg3le"
+grep -q "no mod IO folders" "$t/out3" && pass "stock bg3le: says the IO folder stays in the Script Extender folder" || bad "stock bg3le: IO folder"
+grep -q "\[io root\] wow-bg3/ is $data/io" "$t/out1" && pass "Ext.IO's wow-bg3/ registered as $data/io" || bad "IO folder not registered"
+[[ -d "$data/run" && ! -e "$XDG_DATA_HOME/wow-bg3" ]] && pass "data in the mod's own folder ($data), nothing in \$XDG_DATA_HOME/wow-bg3" \
+    || bad "data folder: $(ls -d "$data" "$XDG_DATA_HOME/wow-bg3" 2>&1)"
 sleep 1
 for f in "$t"/out*; do echo "--- $f"; cat "$f"; done > "$t/all.txt"
 echo "transcripts: $t/all.txt"

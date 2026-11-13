@@ -44,8 +44,19 @@ def run(*cmd):
         return '%s: %s\n' % (cmd[0], e)
 
 
+def mod_data():
+    """The mod's data folder, Mods/WOW-BG3/data: data/ in the WOW-BG3 folder ($WOWBG3_HOME, else the folder
+    above this file that holds launcher.conf)."""
+    if os.environ.get('WOWBG3_HOME'):
+        return Path(os.environ['WOWBG3_HOME']) / 'data'
+    for d in Path(__file__).resolve().parents:
+        if (d / 'launcher.conf').is_file():
+            return d / 'data'
+    return Path.home() / ".local/share/Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/data"
+
+
 def make(reason='asked'):
-    data = Path(os.environ.get('WOWBG3_DATA') or Path.home() / '.local/share/wow-bg3')
+    data = Path(os.environ.get('WOWBG3_DATA') or mod_data())
     out = data / 'reports'
     out.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S')
