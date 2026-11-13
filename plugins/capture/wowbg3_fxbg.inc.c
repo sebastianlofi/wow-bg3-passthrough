@@ -523,7 +523,7 @@ static int composite_fs(uint64_t k) { return k == FOG_FS || k == FOG_FS_NOSSS; }
 static struct {
     int ready, failed; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkPipeline pipe;
     VkDescriptorPool pool; VkDescriptorSet set[FOG_SETS]; uint32_t ring; uint64_t refused;
-    SfImg st; uint32_t stw, sth; int stfail; VkRenderPass rpst; VkPipeline pipest; VkFramebuffer fbst;
+    SfImg st; uint32_t stw, sth, stfw, stfh; int stfail; VkRenderPass rpst; VkPipeline pipest; VkFramebuffer fbst;
 } g_fog;
 static __thread struct { DescSlot dep, frox, samp, u30, u4, b1, b2, b3; uint64_t o30, o4; } t_fogd;
 static int fog_make(DeviceData* d) {
@@ -578,25 +578,53 @@ static int fog_make(DeviceData* d) {
 }
 
 // The S/T image (RGBA16F at the target's size: BG3's in-scatter, its transmittance) and the fog pass that writes it.
+// The plugin's images a pixel of BG3's scene (fog_st, bl_imgs) are made at the scene's first feed and again when its size
+// changes (the resolution, the upscaler or its quality). BG3 records on several threads, so two feeds can reach this at once;
+// one lock makes and swaps them. The new images are made beside the old and only then put in place: a thread reading a
+// handle never sees one half made or cleared, and the old ones are retired (destroyed some presents later).
+static pthread_mutex_t g_mk_m = PTHREAD_MUTEX_INITIALIZER;
 static int fog_st(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {
-    if (g_fog.st.img && g_fog.stw == w && g_fog.sth == h) return 1;
-    if (g_fog.st.img) { fb_retire(&g_fog.st); g_fog.stfail = 0; }  // BG3's scene changed size (bl_imgs)
-    if (g_fog.stfail) return 0;
-    g_fog.stfail = 1;
-    if (!sf_img_make(d, &g_fog.st, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    g_fog.stw = w; g_fog.sth = h;
-    sf_barrier(d, cb, g_fog.st.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    pthread_mutex_lock(&g_mk_m);
+    int ok = 0;
+    if (g_fog.st.img && g_fog.stw == w && g_fog.sth == h) { ok = 1; goto out; }
+    if (g_fog.stfail && g_fog.stfw == w && g_fog.stfh == h) goto out;
+    SfImg n = {0};
+    if (!sf_img_make(d, &n, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        g_fog.stfail = 1; g_fog.stfw = w; g_fog.stfh = h; goto out;
+    }
+    sf_barrier(d, cb, n.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     VkClearColorValue one = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
     VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    d->CmdClearColorImage(cb, g_fog.st.img, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &rg);
-    sf_barrier(d, cb, g_fog.st.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+    d->CmdClearColorImage(cb, n.img, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &rg);
+    sf_barrier(d, cb, n.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    g_fog.stfail = 0;
+    if (g_fog.st.img) {  // the S/T pass's framebuffer holds the old view: it goes with it and is made again at the next pass
+        logf_("wdfog: BG3's scene is %ux%u now (was %ux%u): the S/T image made again", w, h, g_fog.stw, g_fog.sth);
+        SfImg old = g_fog.st;
+        fb_retire_fb(g_fog.fbst, VK_NULL_HANDLE);
+        g_fog.fbst = VK_NULL_HANDLE;
+        fb_retire(&old);
+    }
+    g_fog.st = n; g_fog.stw = w; g_fog.sth = h; g_fog.stfail = 0;
     logf_("wdfog: S/T image %ux%u", w, h);
-    return 1;
+    ok = 1;
+out:
+    pthread_mutex_unlock(&g_mk_m);
+    return ok;
 }
-static int fog_st_pass(DeviceData* d) {
-    if (g_fog.pipest) return 1;
+static int fog_st_fb(DeviceData* d, VkFramebuffer* out) {  // the S/T pass's framebuffer on the current S/T image (made again after a size change)
+    pthread_mutex_lock(&g_mk_m);
+    if (!g_fog.fbst && g_fog.st.view && g_fog.rpst) {
+        VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_fog.rpst, 1, &g_fog.st.view, g_fog.stw, g_fog.sth, 1};
+        if (d->CreateFramebuffer(d->device, &fci, NULL, &g_fog.fbst) != VK_SUCCESS) g_fog.fbst = VK_NULL_HANDLE;
+    }
+    *out = g_fog.fbst;  // read under the lock: a size change on another thread cannot clear it between here and the pass
+    const int ok = g_fog.fbst != VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_mk_m);
+    return ok;
+}
+static int fog_st_pass(DeviceData* d, VkFramebuffer* fb) {
+    if (g_fog.pipest) return fog_st_fb(d, fb);
     if (!g_fog.st.img || !g_fog.ready) return 0;
     VkAttachmentDescription at = {0, VK_FORMAT_R16G16B16A16_SFLOAT, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_STORE,
         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
@@ -604,8 +632,6 @@ static int fog_st_pass(DeviceData* d) {
     VkSubpassDescription sp = {0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &cr, NULL, NULL, 0, NULL};
     VkRenderPassCreateInfo rci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &at, 1, &sp, 0, NULL};
     if (d->CreateRenderPass(d->device, &rci, NULL, &g_fog.rpst) != VK_SUCCESS) return 0;
-    VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, g_fog.rpst, 1, &g_fog.st.view, g_fog.stw, g_fog.sth, 1};
-    if (d->CreateFramebuffer(d->device, &fci, NULL, &g_fog.fbst) != VK_SUCCESS) return 0;
     VkShaderModule vs, fs;
     VkShaderModuleCreateInfo mv = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_surf_alb_vert, wowbg3_surf_alb_vert};
     VkShaderModuleCreateInfo mf = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof wowbg3_fxfog_frag, wowbg3_fxfog_frag};
@@ -626,7 +652,7 @@ static int fog_st_pass(DeviceData* d) {
     VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, &dy, g_fog.layout, g_fog.rpst, 0, VK_NULL_HANDLE, -1};
     if (d->CreateGraphicsPipelines(d->device, VK_NULL_HANDLE, 1, &pci, NULL, &g_fog.pipest) != VK_SUCCESS) { g_fog.pipest = VK_NULL_HANDLE; return 0; }
     logf_("wdfog: S/T pass ready");
-    return 1;
+    return fog_st_fb(d, fb);
 }
 
 // wdbare: the lighting buffer's image and layout, and BG3's own views of its G-buffer albedo and surface (recording thread).
@@ -872,7 +898,7 @@ static void fb_bare(DeviceData* d, VkCommandBuffer cb) {
 
 // ---- wdbloom (patch28): bare WoW pixels out of BG3's bloom. wfed: what the feed wrote (rgb, a 1); nob: 1 at pure WoW pixels.
 static struct {
-    SfImg wfed, nob, wdsp; uint32_t w, h; int fail;  // wdsp: WoW's own displayed colour per fed pixel (the feed), for wdpostcas
+    SfImg wfed, nob, wdsp; uint32_t w, h, fw, fh; int fail;  // wdsp: WoW's own displayed colour per fed pixel (the feed), for wdpostcas
     SfImg cmp0, cmp1, late;  // BG3's composite before and after its effects pass; late: what that pass drew over a pure pixel (wowbg3_post.frag)
     int ready, failed; VkDescriptorSetLayout mdsl, cdsl; VkPipelineLayout ml, cl; VkPipeline mp, cp; VkSampler smp;
     VkDescriptorPool pool; VkDescriptorSet mset[FOG_SETS], cset[FOG_SETS]; uint32_t mring, cring;
@@ -880,38 +906,51 @@ static struct {
     uint64_t masks, cuts, refused;
     uint64_t cmp_img, cmp_at, mask_at;  // the composite's image, the present at which its effects pass was last copied before and after, and of the last mask
 } g_blm;
-static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {
-    if (g_blm.wfed.img && g_blm.w == w && g_blm.h == h) return 1;
-    if (g_blm.wfed.img) {
-        // BG3's scene changed size (the resolution, or upscaling: FSR renders the scene smaller than the screen). The images
-        // a pixel of the scene are made again at the new size; until then every feed was refused and the scene kept BG3's
-        // placeholder (with FSR 1.0 a black figure, WoW's colours a frame behind).
-        logf_("wdbloom: BG3's scene is %ux%u now (was %ux%u): the plugin's images a pixel made again", w, h, g_blm.w, g_blm.h);
-        SfImg* old[6] = {&g_blm.wfed, &g_blm.nob, &g_blm.wdsp, &g_blm.cmp0, &g_blm.cmp1, &g_blm.late};
-        for (int i = 0; i < 6; i++) fb_retire(old[i]);
-        g_blm.fail = 0; g_blm.cmp_img = 0;
-    }
-    if (g_blm.fail) return 0;
-    g_blm.fail = 1;
-    if (!sf_img_make(d, &g_blm.wfed, VK_FORMAT_R32G32B32A32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (!sf_img_make(d, &g_blm.nob, VK_FORMAT_R32_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (!sf_img_make(d, &g_blm.wdsp, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (!sf_img_make(d, &g_blm.cmp0, VK_FORMAT_B10G11R11_UFLOAT_PACK32, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (!sf_img_make(d, &g_blm.cmp1, VK_FORMAT_B10G11R11_UFLOAT_PACK32, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    if (!sf_img_make(d, &g_blm.late, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
-    g_blm.w = w; g_blm.h = h;
+static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) {  // made and swapped under g_mk_m (fog_st)
+    pthread_mutex_lock(&g_mk_m);
+    int ok = 0;
+    if (g_blm.wfed.img && g_blm.w == w && g_blm.h == h) { ok = 1; goto out; }
+    if (g_blm.fail && g_blm.fw == w && g_blm.fh == h) goto out;
+    SfImg n[6] = {{0}};
+    const VkFormat fm[6] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT};
+    const VkImageUsageFlags us[6] = {
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,  // wfed
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // nob
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,  // wdsp
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // cmp0
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // cmp1
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT}; // late
+    static const char* const nm[6] = {"g_blm.wfed", "g_blm.nob", "g_blm.wdsp", "g_blm.cmp0", "g_blm.cmp1", "g_blm.late"};
+    for (int i = 0; i < 6; i++)
+        if (!sf_img_make_named(d, &n[i], fm[i], w, h, us[i], nm[i])) {
+            for (int j = 0; j < i; j++) sf_img_free(d, &n[j]);  // never used: freed now
+            g_blm.fail = 1; g_blm.fw = w; g_blm.fh = h;
+            goto out;
+        }
     VkClearColorValue z = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
     VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkImage im[6] = {g_blm.wfed.img, g_blm.nob.img, g_blm.wdsp.img, g_blm.cmp0.img, g_blm.cmp1.img, g_blm.late.img};
     for (int i = 0; i < 6; i++) {
-        sf_barrier(d, cb, im[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        d->CmdClearColorImage(cb, im[i], VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
-        sf_barrier(d, cb, im[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        sf_barrier(d, cb, n[i].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        d->CmdClearColorImage(cb, n[i].img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
+        sf_barrier(d, cb, n[i].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
-    g_blm.fail = 0;
+    SfImg* cur[6] = {&g_blm.wfed, &g_blm.nob, &g_blm.wdsp, &g_blm.cmp0, &g_blm.cmp1, &g_blm.late};
+    if (g_blm.wfed.img) {
+        // BG3's scene changed size (the resolution, or upscaling: FSR renders the scene smaller than the screen). Until the
+        // images are made again every feed is refused and the scene keeps BG3's placeholder (with FSR 1.0 a black figure).
+        logf_("wdbloom: BG3's scene is %ux%u now (was %ux%u): the plugin's images a pixel made again", w, h, g_blm.w, g_blm.h);
+        for (int i = 0; i < 6; i++) { SfImg old = *cur[i]; fb_retire(&old); }
+        g_blm.cmp_img = 0;
+    }
+    for (int i = 0; i < 6; i++) *cur[i] = n[i];
+    g_blm.w = w; g_blm.h = h; g_blm.fail = 0;
     logf_("wdbloom: images %ux%u", w, h);
-    return 1;
+    ok = 1;
+out:
+    pthread_mutex_unlock(&g_mk_m);
+    return ok;
 }
 static VkPipeline bl_pipe(DeviceData* d, VkPipelineLayout layout, const uint32_t* code, size_t size, VkColorComponentFlags wmask) {
     VkShaderModule vs, fs;
@@ -1914,10 +1953,11 @@ static void fb_draw(DeviceData* d, VkCommandBuffer cb, uint64_t img, VkImageLayo
     sf_barrier(d, cb, g_blm.wfed.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);  // patch28: after the last mask read it
     const int tost = fog && g_cc.wdfogst;
-    if (tost && !fog_st_pass(d)) { g_fbg.refused++; return; }
+    VkFramebuffer stfb = VK_NULL_HANDLE;
+    if (tost && !fog_st_pass(d, &stfb)) { g_fbg.refused++; return; }
     if (tost) sf_barrier(d, cb, g_fog.st.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, tost ? g_fog.rpst : g_fbg.rp, tost ? g_fog.fbst : slot_fb, {{0, 0}, {ii->w, ii->hgt}}, 0, NULL};
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, tost ? g_fog.rpst : g_fbg.rp, tost ? stfb : slot_fb, {{0, 0}, {ii->w, ii->hgt}}, 0, NULL};
     d->CmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
     uint32_t eoffs[2] = {wdx_fix ? 0u : (uint32_t)g_fbg.eoff[0], (uint32_t)g_fbg.eoff[1]};
     d->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fog ? (tost ? g_fog.pipest : g_fog.pipe) : g_fbg.pipe);
