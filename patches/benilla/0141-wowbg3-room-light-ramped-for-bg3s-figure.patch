@@ -1,0 +1,103 @@
+WOW-BG3 benilla patch 0141: the room light BG3's figure takes is WoW's own as it ramps, not its settled value (on top of 0001-0140).
+
+Patch 0132 hands the plugin the light WoW gives a unit in a room (link/wowunitlight.txt, wowsky.txt's unit ambient) for the
+hidden root under each of the party's figures, and it handed the settled words at once: the room's ambient (cap96 of the
+floor's MOCV) and the floor lobe at intensity 1. WoW eases both for its own units (interior.rs, the Bake law): the ambient
+chases cap96 at 2.0/s from the scene ambient a unit entered with, and the floor's diffuse word is scaled by the node's
+chased intensity. A play report: the character's light "very abruptly" changes at a door; this was the step where WoW eases.
+- classify_shade_only_roots seeds the root's ambient chase on entering a room, as interior.rs does for a drawn unit, and
+  keeps its target while it stays.
+- ramp_shade_only_rooms, after the ramps step each frame: the room light as WoW holds it (the chased ambient; the floor's
+  lobe times the chased intensity; the room's own lights as before). ShadeOnlyRoot::room_light returns it.
+
+--- a/crates/benilla-world/src/entity_shade.rs
++++ b/crates/benilla-world/src/entity_shade.rs
+@@ -224,6 +224,7 @@
+                 classify_shade_only_roots, // WOW-BG3 patch 0127
+                 detect_shade_reclaims,
+                 update_ground_shade,
++                ramp_shade_only_rooms, // WOW-BG3 patch 0141
+                 census_shade_marks,
+             )
+                 .chain()
+@@ -244,6 +245,8 @@
+     generation: u32,
+     /// Patch 0132: over a room's baked floor, the light WoW gives a unit standing here ([`Self::room_light`]).
+     room: Option<([f32; 3], Vec<(Vec3, [f32; 3])>)>,
++    /// Patch 0141: the same light as WoW holds it this frame, its ramps part way ([`ramp_shade_only_rooms`]).
++    ramped: Option<([f32; 3], Vec<(Vec3, [f32; 3])>)>,
+ }
+ 
+ impl ShadeOnlyRoot {
+@@ -252,8 +255,10 @@
+     /// [`interior_lobes`](crate::terrain_stream::interior_lobes), each (toward the light in Bevy space, colour): the
+     /// floor's floor-168 word on the fixed axis and the room's MOLR lights as they reach the figure's middle.
+     /// `None` outdoors and on the day/night law.
++    /// Patch 0141: as WoW holds it this frame: its ambient chase part way from the scene ambient it entered with, the
++    /// floor's lobe at the chased intensity (the room's own lights are not ramped, as in the interior fold).
+     pub fn room_light(&self) -> Option<&([f32; 3], Vec<(Vec3, [f32; 3])>)> {
+-        self.room.as_ref()
++        self.ramped.as_ref().or(self.room.as_ref())
+     }
+ }
+ 
+@@ -263,6 +268,7 @@
+     instances: Query<(Entity, &crate::wmo_portal::WmoPortalInstance)>,
+     streamer: Option<Res<TerrainStreamer>>,
+     adt_tiles: Res<Assets<AdtTile>>,
++    lighting: Option<Res<crate::lighting::WowLighting>>,
+     mut roots: Query<(&GlobalTransform, &mut GroundShade, &mut ShadeOnlyRoot)>,
+ ) {
+     let Some(streamer) = streamer else {
+@@ -292,6 +298,7 @@
+         if shade.indoor != indoor {
+             shade.indoor = indoor;
+         }
++        let was_room = root.room.is_some();
+         // Patch 0132: the room's light for the figure BG3 draws here (the settled words: the indoor intensity is 1).
+         root.room = match &verdict {
+             crate::wmo_portal::IndoorVerdict::Baked { mocv, lobes } => Some((
+@@ -300,12 +307,43 @@
+             )),
+             _ => None,
+         };
++        // Patch 0141: WoW's own chase of a unit's ambient on its room's floor (`interior.rs`, the Bake law): seeded from
++        // the scene ambient on entering, toward cap96 of the floor's MOCV at 2.0/s. The export used to hand BG3 the
++        // settled word at once, a step where WoW eases.
++        if let Some((cap, _)) = &root.room {
++            let target = Vec3::from_array(*cap);
++            if !was_room {
++                let scene = lighting.as_ref().map_or(target, |l| Vec3::from_array(l.ambient));
++                shade.seed_ambient(scene, target);
++            } else {
++                shade.ambient_target = target;
++            }
++        }
+         root.asked = true;
+         root.last = pos;
+         root.generation = residency.generation();
+     }
+ }
+ 
++/// WOW-BG3 patch 0141: each frame, the room light of a shade-only root as WoW holds it (its ramps part way), after the
++/// ramps stepped (`update_ground_shade`). WoW lights a unit in a room through the fold of these words at every step of
++/// its chase (`interior.rs`); the figure BG3 draws there takes the same.
++fn ramp_shade_only_rooms(mut roots: Query<(&GroundShade, &mut ShadeOnlyRoot)>) {
++    for (shade, mut root) in &mut roots {
++        let ramped = root.room.as_ref().map(|(_, lobes)| {
++            let k = shade.intensity();
++            let mut l = lobes.clone();
++            if let Some(first) = l.first_mut() {
++                first.1 = [first.1[0] * k, first.1[1] * k, first.1[2] * k];
++            }
++            (shade.ambient.to_array(), l)
++        });
++        if root.ramped != ramped {
++            root.ramped = ramped;
++        }
++    }
++}
++
+ /// Sample and ramp each shaded root, then push its byte to its parts' tags.
+ #[allow(clippy::type_complexity)]
+ pub(crate) fn update_ground_shade(
