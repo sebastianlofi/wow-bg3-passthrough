@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""test_disk_bounds.py: what the mod keeps on a player's disk stays bounded. tavtex.py's prune_cache (bakes unused for
+a while, then the least recently used past the cap; detail maps no bake names) and crashreport.py's prune (the newest
+reports). The functions are lifted out of their files, so neither file's imports (numpy) are needed.
+
+  python3 tools/test_disk_bounds.py
+"""
+import ast, os, re, tempfile, time, unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def lift(path, names, extra=None):
+    """The named top-level functions and assignments of a file, run in a fresh namespace."""
+    tree = ast.parse(path.read_text())
+    keep = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names)
+            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', '') in names for t in n.targets))]
+    ns = {'os': os, 're': re, 'time': time, 'Path': Path}
+    ns.update(extra or {})
+    exec(compile(ast.Module(body=keep, type_ignores=[]), str(path), 'exec'), ns)
+    return ns
+
+
+def write(p, size, age_days=0.0):
+    p.write_bytes(b'x' * size)
+    t = time.time() - age_days * 86400
+    os.utime(p, (t, t))
+
+
+class Tavtex(unittest.TestCase):
+    def setUp(self):
+        self.ns = lift(HERE / 'tavtex.py', {'prune_cache', 'CACHE_CAP', 'CACHE_IDLE_DAYS'})
+        self.d = Path(tempfile.mkdtemp())
+
+    def test_idle_bakes_go_and_used_ones_stay(self):
+        write(self.d / 'aaaa.tvt', 10, 40)
+        write(self.d / 'aaaa-p256.tvt', 10, 40)
+        write(self.d / 'bbbb.tvt', 10, 1)
+        write(self.d / 'bbbb-g.json', 0, 1)
+        gone, _ = self.ns['prune_cache'](str(self.d))
+        self.assertEqual(gone, 1)
+        self.assertEqual(sorted(p.name for p in self.d.iterdir()), ['bbbb-g.json', 'bbbb.tvt'])
+
+    def test_over_the_cap_the_least_recently_used_go(self):
+        self.ns['CACHE_CAP'] = 25
+        write(self.d / 'old1.tvt', 10, 3)
+        write(self.d / 'old2.tvt', 10, 2)
+        write(self.d / 'new1.tvt', 10, 0)
+        gone, freed = self.ns['prune_cache'](str(self.d))
+        self.assertEqual((gone, freed), (1, 10))
+        self.assertFalse((self.d / 'old1.tvt').exists())
+        self.assertTrue((self.d / 'old2.tvt').exists() and (self.d / 'new1.tvt').exists())
+
+    def test_detail_maps_go_with_the_last_bake_naming_them(self):
+        write(self.d / 'aaaa.tvt', 10, 40)
+        (self.d / 'aaaa-g.json').write_text('{"detail": "d-11.tvt"}')
+        os.utime(self.d / 'aaaa-g.json', (time.time() - 40 * 86400,) * 2)
+        write(self.d / 'bbbb.tvt', 10, 1)
+        (self.d / 'bbbb-g.json').write_text('{"detail": "d-22.tvt"}')
+        write(self.d / 'd-11.tvt', 5)
+        write(self.d / 'd-22.tvt', 5)
+        self.ns['prune_cache'](str(self.d))
+        self.assertFalse((self.d / 'd-11.tvt').exists())
+        self.assertTrue((self.d / 'd-22.tvt').exists())
+
+    def test_a_small_young_cache_is_left_alone(self):
+        write(self.d / 'aaaa.tvt', 10, 1)
+        self.assertEqual(self.ns['prune_cache'](str(self.d)), (0, 0))
+
+
+class Reports(unittest.TestCase):
+    def test_the_newest_reports_stay(self):
+        ns = lift(HERE / 'crashreport.py', {'prune', 'KEEP'})
+        d = Path(tempfile.mkdtemp())
+        for i in range(8):
+            write(d / ('WOW-BG3-report-2026010%d.zip' % i), 1, 8 - i)
+        write(d / 'notes.txt', 1, 30)
+        ns['prune'](d)
+        left = sorted(p.name for p in d.iterdir())
+        self.assertEqual(len([n for n in left if n.endswith('.zip')]), ns['KEEP'])
+        self.assertIn('WOW-BG3-report-20260107.zip', left)
+        self.assertIn('notes.txt', left)
+
+
+if __name__ == '__main__':
+    unittest.main()

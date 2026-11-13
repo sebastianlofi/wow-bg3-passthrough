@@ -121,7 +121,7 @@ CHAR_Pubes is alpha-tested from its ID_Depth_Root_Alpha_MSKA like hair (baked op
 
   tavtex.py [--once] PLAN GAME_DATA INDEX.json TAV_DIR CACHE_DIR
   (--once: serve the plan until every mesh has its full bake, then exit)"""
-import hashlib, heapq, itertools, json, os, struct, sys, threading, time
+import glob, hashlib, heapq, itertools, json, os, re, struct, sys, threading, time
 
 import numpy as np
 
@@ -1372,6 +1372,64 @@ def tvt_flags(path, memo={}):  # noqa: B006
     return memo[k]
 
 
+CACHE_CAP = 3 << 30        # bytes of bakes kept; past it the least recently used go first
+CACHE_IDLE_DAYS = 30       # a bake not used for this long goes whatever the size
+
+
+def prune_cache(cache):
+    """At start: bakes (all files of one key h) unused for CACHE_IDLE_DAYS go, then the least recently used
+    while the cache is over CACHE_CAP; then the detail maps (d-*.tvt) no remaining bake's h-g.json names. A bake
+    served from the cache is marked used (Baker.touch), so the party's own stay; a removed one is baked again
+    when it is needed. Returns (bakes removed, bytes freed)."""
+    groups = {}
+    try:
+        names = os.listdir(cache)
+    except OSError:
+        return 0, 0
+    for name in names:
+        if name.startswith('d-') or name.endswith('.tmp'):
+            continue
+        p = os.path.join(cache, name)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        g = groups.setdefault(name.split('.')[0].split('-')[0], [0.0, 0, []])
+        g[0] = max(g[0], st.st_mtime)
+        g[1] += st.st_size
+        g[2].append(p)
+    now, total = time.time(), sum(g[1] for g in groups.values())
+    gone = freed = 0
+    for _, (used, size, paths) in sorted(groups.items(), key=lambda kv: kv[1][0]):
+        if now - used < CACHE_IDLE_DAYS * 86400 and total <= CACHE_CAP:
+            break
+        for p in paths:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        total -= size
+        freed += size
+        gone += 1
+    if gone:
+        refs = set()
+        for name in os.listdir(cache):
+            if name.endswith('-g.json'):
+                try:
+                    refs.update(re.findall(r'd-[0-9a-f]+\.tvt', open(os.path.join(cache, name)).read()))
+                except OSError:
+                    pass
+        for name in os.listdir(cache):
+            if name.startswith('d-') and name.endswith('.tvt') and name not in refs:
+                p = os.path.join(cache, name)
+                try:
+                    freed += os.stat(p).st_size
+                    os.unlink(p)
+                except OSError:
+                    pass
+    return gone, freed
+
+
 class Baker:
     """Serves the plan: tavtex.txt lists for every mesh the best look the cache holds now (its full
     bake; else the full bake it showed before, while its new one is made; else a preview) and is
@@ -1392,7 +1450,22 @@ class Baker:
         self.written = None
         self.deferred = 0
         self.workers = workers
+        self.touched = set()                # bake keys marked used this run (prune_cache)
         os.makedirs(cache, exist_ok=True)
+        gone, freed = prune_cache(cache)
+        if gone:
+            print(f'tavtex: cache: {gone} bakes not used lately removed ({freed >> 20} MB)', file=sys.stderr, flush=True)
+
+    def touch(self, h):
+        """A bake served from the cache is in use: its files' times say so (prune_cache keeps it)."""
+        if h in self.touched:
+            return
+        self.touched.add(h)
+        for p in glob.glob(os.path.join(self.cache, h + '*')):
+            try:
+                os.utime(p)
+            except OSError:
+                pass
 
     def log(self, msg):
         t = time.time() - self.cur['t0'] if self.cur else 0.0
@@ -1506,6 +1579,7 @@ class Baker:
         prev = os.path.join(self.cache, f'{h}-p{PREVIEW_SIZE}.tvt')
         job = (h, mat, ccf, cb, colour, full, prev, nrm, srf)
         if os.path.exists(full):
+            self.touch(h)
             albedo = self.final(full, h, mat)
             # The full albedo shows at once; its G-buffer maps follow (job 'g'), the mesh showing the
             # maps it had (the old bake's, or the raw ones) meanwhile.

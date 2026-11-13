@@ -8,7 +8,7 @@
   "llvm_commit": "392dfff97d29b59d77e5cac6d4b6ef2585fe7117",
   "max_glibc": "2.29",
   "upstream_library_sha256": "6dab1ae91720d63826dbe494a6168d80f41500766812b13d24cbf5c90dbea895",
-  "library_sha256": "314739e732824ec80ac5e01dae4c0968cd728478d3c9aee7a681dc249ce75414",
+  "library_sha256": "6580673baef3cc96704571efadf61745f4195ad0515617bae840fb0f3167c545",
   "library_build": "a full build by build.sh, every object (libc++, abseil, protobuf, bg3le) through repro-cc.sh: -ffile-prefix-map for the source and build folders, SOURCE_DATE_EPOCH = the bg3le commit time",
   "runtime_patches": [
     {
@@ -268,9 +268,21 @@
           "after_sha256": "7a1f109935961837b02fd842d1fe3223bb3b78edf753c072b8497547fbb3333c"
         }
       ]
+    },
+    {
+      "file": "patches/0015-osiris-dump-only-when-asked.patch",
+      "sha256": "0c9d356afeef16bb92dfef31ef9e63574f8f037ff383c4f4d8d04ccfdf82d0c0",
+      "purpose": "The list of Osiris's functions and types is written only when BG3LE_OSI_DUMP names a file (it went to /tmp/bg3le-osi.PID.txt on every start, a file per start that nothing removed)",
+      "targets": [
+        {
+          "path": "src/preload.cpp",
+          "before_sha256": "e351a19fb6be0d18ba0ddfd71c7617d120404f38403ce689396901e179a6d881",
+          "after_sha256": "9b5d8e3e35e3ca13f7eb05d11955dd3b1691cf59f6b08ba1f41bcf471cb5cef6"
+        }
+      ]
     }
   ],
-  "previous_library_sha256": "4ff031c4a01ceb0a9131cbfd46a66ebf1808de9231266003cfaa75535e2ef258",
+  "previous_library_sha256": "314739e732824ec80ac5e01dae4c0968cd728478d3c9aee7a681dc249ce75414",
   "retired_patches": [
     {
       "file": "patches/0003-wow-arena-hooks.patch",

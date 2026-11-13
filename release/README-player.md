@@ -7,7 +7,7 @@ Your BG3 characters walk WoW's world; fights against WoW's mobs are BG3 fights;
 BG3 saves keep the WoW side too.
 
 Linux only, native BG3 from Steam (not the Windows version under Proton).
-Tested on AMD graphics (RADV) only so far.
+Tested on AMD graphics (Mesa RADV 25.0 and 26.2) and on Nvidia (RTX 4070 Ti, driver 595); Intel is untested.
 
 **Photosensitivity and epilepsy warning.** This is a work-in-progress mod. When the passthrough
 between WoW and BG3 glitches, the screen can flash suddenly, including bright white flashes. If
@@ -20,7 +20,7 @@ playing it. Stop right away if you feel unwell.
 - Your own World of Warcraft 1.12.1 client (build 5875, English).
   WOW-BG3 contains no Blizzard files. It reads your client's `Data/` folder
   to build what the local WoW server needs, on your machine.
-- About 10 GB free disk space for the generated server data.
+- About 15 GB free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it.
 - An internet connection for the first start only (a 48 MB download).
 
 Everything else is in this download: the Linux Script Extender (bg3le, with

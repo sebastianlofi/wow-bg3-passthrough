@@ -88,7 +88,21 @@ def make(reason='asked'):
         z.writestr('system/machine.txt', clean('\n'.join([platform.platform(), run('uname', '-a'), run('sh', '-c', 'cat /etc/os-release'),
                                                           run('sh', '-c', 'lspci | grep -iE "vga|3d"'), run('sh', '-c', 'vulkaninfo --summary')])))
         z.writestr('report.txt', 'reason: %s\ntime: %s\nnot kept:\n%s\n' % (reason, time.strftime('%c'), clean('\n'.join(notes))))
+    prune(out)
     return path
+
+
+KEEP = 5  # reports kept; one is made at every crash of the WoW side, up to tens of MB each
+
+
+def prune(out):
+    """The newest KEEP reports stay; older ones go (a player sends the newest)."""
+    reports = sorted(out.glob('WOW-BG3-report-*.zip'), key=lambda p: p.stat().st_mtime)
+    for old in reports[:-KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':

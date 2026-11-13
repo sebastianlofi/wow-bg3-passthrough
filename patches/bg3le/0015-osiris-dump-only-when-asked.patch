@@ -1,0 +1,22 @@
+--- a/src/preload.cpp
++++ b/src/preload.cpp
+@@ -926,14 +926,15 @@
+     // The engine's settings object is up by now; the overlay reads its language.
+     bg3le_global_switches();
+ 
++    // The list of Osiris's functions and types, for whoever works on the extender: only when BG3LE_OSI_DUMP names
++    // a file. Written to /tmp on every start before, a file per start that nothing removed.
+     char path[4096];
+     const char* out = std::getenv("BG3LE_OSI_DUMP");
+-    if (out != nullptr) {
++    std::FILE* f = nullptr;
++    if (out != nullptr && *out) {
+         std::snprintf(path, sizeof(path), "%s", out);
+-    } else {
+-        std::snprintf(path, sizeof(path), "/tmp/bg3le-osi.%d.txt", (int)::getpid());
++        f = std::fopen(path, "w");
+     }
+-    std::FILE* f = std::fopen(path, "w");
+     if (f != nullptr) {
+         for (const auto& t : type_names) std::fprintf(f, "type %u %s\n", t.first, t.second.c_str());
+         for (unsigned i = 0; i < func_count; ++i) {

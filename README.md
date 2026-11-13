@@ -230,7 +230,8 @@ Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://gith
 step. In short:
 
 1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
-   about 10 GB of free disk space for the server data built from it.
+   about 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it
+   (the WoW server's data and caches).
 2. Put `WOW-BG3.pak` and the `WOW-BG3/` folder side by side into BG3's Mods folder
    (`~/.local/share/Larian Studios/Baldur's Gate 3/Mods`).
 3. Copy your WoW 1.12.1 client files into `Mods/WOW-BG3/WoW/` (so `Mods/WOW-BG3/WoW/Data/` exists).
@@ -284,7 +285,32 @@ every mob.
 
 That takes Pierce Armor (6016) from Hogger, gives him BG3's Rage once a fight, named after WoW's Enrage (8599), and
 makes every mob's Lightning Bolt (9532) a Fire Bolt. What came of it is in `logs/abilities.log` and
-`wow-bg3/link/abilities-status.json` (BG3's Script Extender folder).
+`Mods/WOW-BG3/data/io/link/abilities-status.json`.
+
+## What it puts on your PC
+
+Everything the mod makes lives in `Mods/WOW-BG3/` (its `data/` folder), with two exceptions the installer makes and
+`--uninstall` takes back out:
+
+- `~/.local/share/bg3le/`: the Linux Script Extender (its library, launch wrapper and logs; it keeps only its newest
+  logs).
+- BG3's Steam launch option, so Steam starts BG3 with the Script Extender. The installer asks before it stops Steam
+  to change it and keeps a copy of Steam's file as `localconfig.vdf.bg3le-backup`.
+
+While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>` (about 50 to
+150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
+
+- **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
+  and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1); its database has
+  no network port at all.
+- **Processes.** The WoW server, its database and the WoW engine start with BG3 and stop with it, also when BG3
+  crashes. The Script Extender loads only into BG3; other games and programs are untouched.
+- **Disk.** Logs are kept to two of each (a log over 16 MB starts afresh at BG3's next start, the older one kept
+  as `.1`). The party's textures converted for WoW are kept up to 3 GB (the least recently used go first, and any
+  unused for a month). Crash reports keep the newest five. A first start that was stopped part-way is cleaned up at
+  the next one.
+- **Your files.** Nothing is written into BG3's game folder or into your WoW files. The local server's generated
+  passwords are readable by your user only.
 
 ## Work in progress
 
@@ -405,7 +431,8 @@ with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
   before you try a beta anyway.
 - **Uninstall.** Switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at once), run the
   installer with `--uninstall` to take the Script Extender back out of BG3's launch options, and
-  remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its `data/` folder).
+  remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its `data/` folder; the memory
+  folder in `/dev/shm` goes at the next reboot).
 - **When something goes wrong.** The logs are in `Mods/WOW-BG3/data/logs/` (the WoW side) and
   `~/.local/share/bg3le/logs/` (BG3's side). Please attach both to a bug report, with what you did
   just before.

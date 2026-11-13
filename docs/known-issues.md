@@ -5,7 +5,7 @@ This is the first public version. What we know is missing or rough:
 ## Platform
 
 - Linux and the native Linux BG3 from Steam only. No Windows version yet.
-- Tested on AMD graphics (Mesa RADV) only. NVIDIA and Intel are untested.
+- Tested on AMD graphics (Mesa RADV 25.0 and 26.2) and on Nvidia (RTX 4070 Ti, driver 595); Intel is untested.
 - The local server uses two fixed ports on the loopback interface (3744 and 8105). Another program
   on those ports stops the WoW side from starting.
 
@@ -27,8 +27,10 @@ This is the first public version. What we know is missing or rough:
 ## Picture
 
 - BG3's video options: every one this mod was tried with works (anti-aliasing None, SMAA, TAA; FidelityFX Sharpening on
-  and off; Upscaling Off, AMD FSR 1.0, AMD FSR 2.2; the quality presets Low and Ultra). DLAA and DLSS are Nvidia-only:
-  BG3 does not offer them on AMD cards, and they were not tried.
+  and off; Upscaling Off, AMD FSR 1.0, AMD FSR 2.2; the quality presets Low and Ultra; on Nvidia also DLSS and DLAA,
+  which BG3 offers there only). Each can be changed while playing.
+- Nvidia only: after Upscaling (FSR or DLSS) is switched on and back off while playing, WoW's distant ground stays a
+  little hazier (bluish) until BG3 is started again. A restart of BG3 after changing Upscaling clears it.
 - WoW's world is shown in WoW's own colours. BG3's spell glow no longer spills onto WoW ground that the effect
   itself does not cover.
 - BG3's characters are shaded as WoW shades its own: as a whole, when the ground they stand on is in a tree's or a

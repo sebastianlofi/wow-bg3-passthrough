@@ -379,11 +379,17 @@ mmtile() {
 }
 
 # The release's foreground mode (launcher.conf [server]). A var/ whose init never finished (BG3 closed
-# during the first start) is moved aside, never deleted, and made again.
+# during the first start) is made again: what of it was finished and checked (the built data, the
+# passwords, the downloads) is kept, the rest removed, as is any var/.incomplete-* an older version left.
 state() { mkdir -p "$RUN"; echo "$1" > "$RUN/state.tmp" && mv -f "$RUN/state.tmp" "$RUN/state"; }
 run() {
     local wow="${1:?WOW_DIR (the folder with Data/)}" quit=0
     trap 'quit=1' TERM INT
+    for old in "$V".incomplete-*; do
+        [ -d "$old" ] || continue
+        say "removing $old (an unfinished first start an older version kept)"
+        rm -rf -- "$old"
+    done
     if [ ! -e "$V/.initialized" ]; then
         if [ -d "$V/db" ]; then
             local aside="$V.incomplete-$(date +%Y%m%d-%H%M%S)"
@@ -392,6 +398,7 @@ run() {
             mkdir -p "$V"; [ -d "$aside/data" ] && [ -f "$aside/data/.complete" ] && mv "$aside/data" "$V/data"
             [ -f "$aside/secrets.env" ] && mv "$aside/secrets.env" "$V/secrets.env"
             [ -d "$aside/downloads" ] && mv "$aside/downloads" "$V/downloads"
+            rm -rf -- "$aside"
         fi
         state init
         ( trap - TERM INT; init "$wow" ) & local ip=$!

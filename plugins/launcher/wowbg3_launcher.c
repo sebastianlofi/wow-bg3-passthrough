@@ -608,6 +608,44 @@ static int spawn_child_main(void* arg) {
     _exit(127);
 }
 
+// The mod's logs append across BG3's starts: the children's (data/logs, benilla's among them), the WoW server's
+// (data/server/logs) and the render plugin's (capture/layer.log and its CSVs). At each start, before any of them
+// writes, one at LOG_ROTATE_BYTES or more becomes <name>.1, which replaces the one before it: at most two of each,
+// so none grows without end over months of play.
+#define LOG_ROTATE_BYTES (16L << 20)
+static void rotate_dir(const char* dir) {
+    static const char* ends[] = {".log", ".out", ".err", ".csv"};
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        int ours = 0;
+        for (size_t k = 0; k < sizeof ends / sizeof ends[0]; k++) {
+            size_t s = strlen(ends[k]);
+            if (n > s && strcmp(e->d_name + n - s, ends[k]) == 0) ours = 1;
+        }
+        if (!ours) continue;
+        char p[PATH_MAX + 260], old[PATH_MAX + 264];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < LOG_ROTATE_BYTES) continue;
+        snprintf(old, sizeof old, "%s.1", p);
+        if (rename(p, old) == 0) LOG("log %s was %lld MB: kept as %s.1, the one before it gone", e->d_name,
+                                     (long long)(st.st_size >> 20), e->d_name);
+    }
+    closedir(d);
+}
+
+static void rotate_logs(void) {
+    char dir[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s/logs", g_data);
+    rotate_dir(dir);
+    snprintf(dir, sizeof dir, "%s/server/logs", g_data);
+    rotate_dir(dir);
+    if (g_capture[0]) rotate_dir(g_capture);
+}
+
 static pid_t spawn(child_t* c) {
     char logdir[PATH_MAX + 16], log[PATH_MAX + 64];
     snprintf(logdir, sizeof logdir, "%s/logs", g_data);
@@ -1140,6 +1178,7 @@ BG3LE_PLUGIN_EXPORT int bg3le_plugin_init(const bg3le_host* host, bg3le_plugin* 
     LOG("WOW-BG3 folder: %s; data: %s", g_home[0] ? g_home : "(not found)", g_data);
     io_folder_register();
     release_env();
+    rotate_logs();
     ensure_pak();
     s_mod_enabled = mod_enabled_now();
     LOG("WOW-BG3 is %s in modsettings.lsx", s_mod_enabled ? "enabled" : "not enabled");
