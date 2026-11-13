@@ -27,7 +27,7 @@
 //   6. The release's environment (0.3.0), set in BG3's own process at plugin
 //      init (before the mod's Lua and the render plugin start) and given to every child:
 //      WOW_BG3_RUN_ID (a fresh id when BG3 has none: the mod's files carry it), WOWBG3_SHM (a tmpfs
-//      folder for WoW's frames, /dev/shm/wow-bg3-UID), WOWBG3_TAV_DIR and WOW_BG3_TAV_DIR ($WOWBG3_SHM/tav),
+//      folder for WoW's frames, /dev/shm/wow-bg3-UID when that is this user's own: wowbg3_shm.h), WOWBG3_TAV_DIR and WOW_BG3_TAV_DIR ($WOWBG3_SHM/tav),
 //      WOWBG3_CAPTURE_DIR (<data>/capture: the render plugin's compose words and log). The harness's
 //      sandbox mounts (/wowshm, /logs/capture) win where they exist, so a dev run stays as it was.
 //      The coordinator child (launcher.conf [coord], tools/wowbg3-coord.py) does the rest: lifecycle,
@@ -77,6 +77,7 @@
 #include <unistd.h>
 
 #include "bg3le_plugin.h"
+#include "../wowbg3_shm.h"
 
 #define LAUNCHER_VERSION "0.4.1"
 #define MOD_UUID "a97c1258-37c3-434c-9309-c982f6cea252"
@@ -476,8 +477,11 @@ static void release_env(void) {
     const char* e = getenv("WOWBG3_SHM");
     if (e && *e) snprintf(g_shm, sizeof g_shm, "%s", e);
     else if (is_dir("/wowshm")) snprintf(g_shm, sizeof g_shm, "/wowshm");  // the harness sandbox's mount
-    else if (is_dir("/dev/shm") && access("/dev/shm", W_OK) == 0) snprintf(g_shm, sizeof g_shm, "/dev/shm/wow-bg3-%d", (int)getuid());
-    else snprintf(g_shm, sizeof g_shm, "%s/shm", g_data);
+    else if (wowbg3_shm_dir(g_shm, sizeof g_shm, "/dev/shm", getenv("XDG_RUNTIME_DIR"), g_data, getuid()) != 0) {
+        // wowbg3_shm.h: only a folder of our own. The render code decides the same way.
+        WARN("no folder of this user's own in /dev/shm (wow-bg3-%d there is someone else's, or /dev/shm cannot be "
+             "written): WoW's frames go through %s", (int)getuid(), g_shm);
+    }
     char tav[PATH_MAX + 8];
     snprintf(tav, sizeof tav, "%s/tav", g_shm);
     if (strcmp(g_shm, "/wowshm") != 0) {
@@ -847,8 +851,9 @@ static void* supervisor(void* unused) {
     return NULL;
 }
 
-// At a clean exit: everything gets SIGTERM, and BG3's exit waits (up to each child's grace, at most
-// 15 s) for them to finish their own shutdown (the server flushes its database). Measured in the
+// At a clean exit: everything gets SIGTERM, and BG3's exit waits (up to the longest grace launcher.conf gives a
+// child, at most 30 s; a stop takes one to five seconds, so the wait ends as soon as they are gone) for them to
+// finish their own shutdown (the server flushes its database). It was cut at 15 s whatever launcher.conf said. Measured in the
 // harness: when BG3's process tree goes away, children still running are SIGKILLed with
 // it (a pid namespace), so waiting here is what makes a clean quit clean. A crash or SIGKILL of BG3
 // ends the supervisor thread and PR_SET_PDEATHSIG sends the same SIGTERM, without the wait.
@@ -863,7 +868,7 @@ static void at_exit(void) {
             if (g_child[i].grace > grace) grace = g_child[i].grace;
         }
     }
-    if (grace > 15) grace = 15;
+    if (grace > 30) grace = 30;
     double until = now_s() + grace;
     for (;;) {
         int left = 0;

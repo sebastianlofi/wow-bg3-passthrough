@@ -103,10 +103,12 @@ def make(reason='asked'):
                                                           run('sh', '-c', 'lspci | grep -iE "vga|3d"'), run('sh', '-c', 'vulkaninfo --summary')])))
         z.writestr('report.txt', 'reason: %s\ntime: %s\nnot kept:\n%s\n' % (reason, time.strftime('%c'), clean('\n'.join(notes))))
     prune(out)
+    prune_crashes(data / 'benilla/Diagnostics')
     return path
 
 
 KEEP = 5  # reports kept; one is made at every crash of the WoW side, up to tens of MB each
+KEEP_CRASHES = 10  # of the WoW engine's own crash files (benilla writes Diagnostics/crash-TIME.txt at a panic and never removes one)
 
 
 def prune(out):
@@ -117,6 +119,20 @@ def prune(out):
             old.unlink()
         except OSError:
             pass
+
+
+def prune_crashes(diagnostics):
+    """The WoW engine's newest KEEP_CRASHES crash files stay (a report holds the newest four); nothing else in its
+    Diagnostics folder is touched. Returns how many went."""
+    files = sorted(Path(diagnostics).glob('crash-*.txt'), key=lambda p: p.stat().st_mtime)
+    gone = 0
+    for old in files[:-KEEP_CRASHES]:
+        try:
+            old.unlink()
+            gone += 1
+        except OSError:
+            pass
+    return gone
 
 
 if __name__ == '__main__':

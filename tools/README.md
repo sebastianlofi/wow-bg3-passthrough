@@ -22,6 +22,7 @@ header. The tools' own folder constants are development defaults that `relenv.py
 | `lifecycle.py` | follows BG3's sessions: new game, load, save, death; WoW characters and snapshots |
 | `wowsave.py`, `wowchar.py`, `wowaccount.py`, `wowserver.py` | WoW character snapshots, BG3 to WoW character mapping, playthrough accounts, the server's console and database |
 | `devserver.py` | the developers' Docker test server behind `wowserver.py` when `WOW_BG3_SERVER` is unset; source tree only, no release carries it |
+| `test_shm_dir.py` | the folder WoW's frames go through is one of this user's own (`plugins/wowbg3_shm.h`, the one rule of the launcher and the render code; needs a C compiler) |
 | `test_release_contents.py` | what a release carries and leaves out: no developer-only code in the shipped tools, the python and server packs without what no install uses, no links, bg3le's debugger off, the crash report's masking, the removal texts |
 | `world_bridge.py`, `wow_arena.py`, `wow_stand.py`, `wow_vmap.py`, `wow_mpq.py` | world mode's ground squares from the server's map data |
 | `wow_places.py` | where each WoW map lies in the one BG3 level: three floors (Eastern Kingdoms, Kalimdor, every other map) |

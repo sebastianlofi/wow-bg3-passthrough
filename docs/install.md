@@ -8,8 +8,7 @@ The release zip has its own README with the same steps; this page adds what is b
   under Proton). Tested on AMD graphics (Mesa RADV 25.0 and 26.2) and on Nvidia (RTX 4070 Ti, driver 595); Intel is untested.
 - Your own World of Warcraft 1.12.1 client, build 5875, English. WOW-BG3 never runs `WoW.exe`; it
   reads the client's `Data/` folder to build the local server's data and the textures it needs.
-- About 15 GB of free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
-  (the ground data made from your WoW files grows as you explore).
+- About 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it.
 - An internet connection for the first start only (a 48 MB download, see below).
 - Nothing else: the release brings the Linux Script Extender (bg3le with WOW-BG3's patches), the
   local WoW server (vmangos and MariaDB), the WoW engine (benilla), a Python for its tools and the

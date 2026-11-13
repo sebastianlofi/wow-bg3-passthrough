@@ -61,8 +61,12 @@ class ServerPids(unittest.TestCase):
         (self.var / '.initialized').touch()
         (self.var / 'secrets.env').write_text('ROOT_PASS=x\nMANGOS_PASS=y\n')
         (self.var / 'ports.env').write_text('WORLD_PORT=18105\nAUTH_PORT=13744\n')
-        (self.var / 'etc/mangosd.conf').write_text('AutoHonorRestart = 1\nReusableGuidPoolSize = 100\n')
-        (self.var / 'etc/realmd.conf').write_text('\n')
+        # Every key `start` sets must be there once (set_conf refuses otherwise): the folders and pid files of var/
+        # as it is now, and the three settings of ours.
+        (self.var / 'etc/mangosd.conf').write_text(
+            'DataDir = "."\nLogsDir = ""\nHonorDir = ""\nPidFile = ""\n'
+            'AutoHonorRestart = 1\nReusableGuidPoolSize = 100\nInstance.IgnoreRaid = 0\n')
+        (self.var / 'etc/realmd.conf').write_text('LogsDir = ""\nPidFile = ""\n')
         self.log = t / 'mangosd-fake.log'
         self.env = dict(os.environ, WOWBG3_SERVER_VAR=str(self.var), FAKE_LOG=str(self.log))
         for k in ('WOWBG3_HOME', 'WOWBG3_DATA', 'WOWBG3_IO'):
@@ -114,6 +118,63 @@ class ServerPids(unittest.TestCase):
         self.assertEqual(self.log.read_text(), 'console: saveall\nSIGINT\n')
         time.sleep(0.5)
         self.assertEqual([p for p in pids if self.running(p)], [])
+
+    def test_a_second_signal_does_not_end_the_stop_half_way(self):
+        """`run` (the release's way), then the signals of a BG3 that is being closed from outside: one to the whole
+        process group, and another while the stop is under way (the launcher's own at BG3's exit). The stop
+        finishes: saveall and the interrupt reach mangosd, no pid file is left, the state says stopped, exit 0."""
+        wow = Path(self.tmp) / 'wow'
+        (wow / 'Data').mkdir(parents=True)
+        out = open(str(Path(self.tmp) / 'run.out'), 'w')
+        p = subprocess.Popen(['bash', str(self.root / 'wowbg3-server.sh'), 'run', str(wow)], env=self.env,
+                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        self.others.append(p)
+        state = self.var / 'run/state'
+        for _ in range(200):
+            if state.is_file() and state.read_text().strip() == 'running':
+                break
+            time.sleep(0.1)
+        self.assertEqual(state.read_text().strip(), 'running', (Path(self.tmp) / 'run.out').read_text())
+        pids = [self.pid(n) for n in ('realmd', 'mariadb', 'console-holder')]
+        os.kill(p.pid, signal.SIGTERM)   # the script alone first, as when BG3 dies (PR_SET_PDEATHSIG)
+        for _ in range(100):
+            if state.read_text().strip() == 'stopping':
+                break
+            time.sleep(0.02)
+        time.sleep(0.3)   # inside stop(): its `sleep 1` after saveall
+        os.killpg(p.pid, signal.SIGTERM)
+        os.kill(p.pid, signal.SIGTERM)
+        rc = p.wait(60)
+        text = (Path(self.tmp) / 'run.out').read_text()
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(state.read_text().strip(), 'stopped', text)
+        self.assertEqual(sorted(f.name for f in (self.var / 'run').glob('*.pid')), [], text)
+        self.assertIn('console: saveall', self.log.read_text())
+        time.sleep(0.5)
+        self.assertEqual([q for q in pids if self.running(q)], [])
+
+    def test_one_signal_to_the_whole_group_stops_cleanly(self):
+        """A session being ended signals the script and its daemons at once: the daemons go by themselves, and the
+        script ends as stopped (not failed), exit 0, with no pid file left."""
+        wow = Path(self.tmp) / 'wow'
+        (wow / 'Data').mkdir(parents=True)
+        out = open(str(Path(self.tmp) / 'run.out'), 'w')
+        p = subprocess.Popen(['bash', str(self.root / 'wowbg3-server.sh'), 'run', str(wow)], env=self.env,
+                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+        self.others.append(p)
+        state = self.var / 'run/state'
+        for _ in range(200):
+            if state.is_file() and state.read_text().strip() == 'running':
+                break
+            time.sleep(0.1)
+        self.assertEqual(state.read_text().strip(), 'running', (Path(self.tmp) / 'run.out').read_text())
+        os.killpg(p.pid, signal.SIGTERM)
+        rc = p.wait(60)
+        text = (Path(self.tmp) / 'run.out').read_text()
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(state.read_text().strip(), 'stopped', text)
+        self.assertNotIn('stopped by itself', text)
+        self.assertEqual(sorted(f.name for f in (self.var / 'run').glob('*.pid')), [], text)
 
     def test_a_pid_file_naming_another_process_is_left_over_and_that_process_left_alone(self):
         other = subprocess.Popen(['sleep', '60'])

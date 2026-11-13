@@ -35,6 +35,7 @@ import relenv  # noqa: E402
 P = relenv.configure()
 import lifecycle  # noqa: E402
 import colour_table  # noqa: E402
+import crashreport  # noqa: E402
 import wowsave  # noqa: E402
 import wowserver  # noqa: E402
 try:
@@ -461,6 +462,10 @@ class Release:
 
     def benilla_start(self, char=None, spec=None, account=None):
         (SHM / 'tav').mkdir(parents=True, exist_ok=True)
+        try:  # benilla's crash files: it writes one at a panic and removes none
+            crashreport.prune_crashes(DATA / 'benilla/Diagnostics')
+        except OSError:
+            pass
         addons = DATA / 'benilla/AddOns'
         addons.mkdir(parents=True, exist_ok=True)
         src = HOME / 'benilla/AddOns'

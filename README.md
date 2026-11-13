@@ -230,8 +230,8 @@ Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://gith
 step. In short:
 
 1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
-   about 15 GB of free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
-   (the WoW server's data and caches; they grow as you explore, see "What it puts on your PC").
+   about 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it
+   (the WoW server's data and caches; "What it puts on your PC" says what grows and where it stops).
 2. Put `WOW-BG3.pak` and the `WOW-BG3/` folder side by side into BG3's Mods folder
    (`~/.local/share/Larian Studios/Baldur's Gate 3/Mods`).
 3. Copy your WoW 1.12.1 client files into `Mods/WOW-BG3/WoW/` (so `Mods/WOW-BG3/WoW/Data/` exists).
@@ -305,6 +305,8 @@ in a `ScriptExtenderSettings.json` next to BG3's `bin/bg3` turns the first off.
 
 While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>` (about 50 to
 150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
+Only you can read it. If a folder of that name is already there and is not yours, the mod leaves it alone and uses
+one of its own in your runtime folder (`$XDG_RUNTIME_DIR/wow-bg3`) instead.
 
 - **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
   and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1, ports 3744 and
@@ -313,14 +315,16 @@ While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wo
   ask for it (`BG3LE_DEBUG=1` in BG3's launch options, or `"EnableLuaDebugger": true` in
   `ScriptExtenderSettings.json`), because it runs whatever Lua any program on your PC sends it.
 - **Processes.** The WoW server, its database and the WoW engine start with BG3 and stop with it, also when BG3
-  crashes. The Script Extender loads only into BG3; other games and programs are untouched.
+  crashes. Closing BG3 waits for them to save and stop: a second or two, at most thirty. The Script Extender loads only into BG3; other games and programs are untouched.
 - **Disk.** Logs are kept to two of each (a log over 16 MB starts afresh at BG3's next start, the older one kept
   as `.1`). The party's textures converted for WoW are kept up to 3 GB (the least recently used go first, and any
   unused for a month). Crash reports keep the newest five. A first start that was stopped part-way is cleaned up at
   the next one. The WoW side of a save BG3 has overwritten or deleted is kept a month (`data/#recycle_bin`), then
-  removed. What is made from your WoW files for the ground you walk (movement maps, ground and collision caches in
-  `data/server/data/mmaps` and `data/cache`) grows as you explore and stops at the size of WoW's world: about
-  1 GB after two days in a few zones. The whole world has not been measured; expect several GB.
+  removed. The WoW engine's own crash files keep the newest ten. What is made from your WoW files for the ground
+  you walk has an end too: the squares round every flight point are made in the background, a fixed set of about
+  0.7 GB (`data/cache/cuts`); movement maps (`data/server/data/mmaps`, about 1.5 MB for each map tile you come
+  near, about 3.5 GB if you walked every tile of every map) and collision cells (`data/cache/vmap`, about 0.2 GB
+  after a few zones) grow as you explore.
 - **Your files.** Nothing is written into BG3's game folder or into your WoW files. The local server's generated
   passwords are readable by your user only.
 

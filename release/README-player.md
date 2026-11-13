@@ -20,8 +20,7 @@ playing it. Stop right away if you feel unwell.
 - Your own World of Warcraft 1.12.1 client (build 5875, English).
   WOW-BG3 contains no Blizzard files. It reads your client's `Data/` folder
   to build what the local WoW server needs, on your machine.
-- About 15 GB free disk space: your WoW client copy (about 5 GB) and about 10 GB the mod builds from it
-  (it grows as you explore).
+- About 15 GB free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it.
 - An internet connection for the first start only (a 48 MB download).
 
 Everything else is in this download: the Linux Script Extender (bg3le, with
@@ -182,8 +181,8 @@ mod to load properly.
 - The Script Extender loads only into BG3. As on Windows, it keeps Steam achievements on
   with mods and clears BG3's own crash marker (`ModCrashSanityCheck`) at each start.
 - Disk: logs, textures and crash reports are capped; the ground data made from your WoW
-  files grows as you explore (about 1 GB after a few zones; expect several GB for the
-  whole world).
+  files grows as you explore (about 1 GB after a few zones, about 4.5 GB for every map
+  tile of the whole world).
 
 ## When something goes wrong
 

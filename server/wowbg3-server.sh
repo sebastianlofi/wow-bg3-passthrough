@@ -31,11 +31,18 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 V="${WOWBG3_SERVER_VAR:-$ROOT/var}"
 RUN="$V/run"
 # MariaDB's socket: var/run/mariadb.sock, unless that path is longer than a socket's 107 bytes (the release's var/ is
-# deep in BG3's profile: Mods/WOW-BG3/data/server); then the launcher's runtime folder (WOWBG3_SHM, a tmpfs) or
-# XDG_RUNTIME_DIR, one socket per var/ (its path's hash). Written to run/socket for the tools (wowserver.db_socket).
+# deep in BG3's profile: Mods/WOW-BG3/data/server); then the first of the launcher's runtime folder (WOWBG3_SHM, a
+# tmpfs), XDG_RUNTIME_DIR and /tmp where it fits (WOWBG3_SHM itself is as deep as var/ when the launcher had to fall
+# back to the data folder), one socket per var/ (its path's hash). Written to run/socket for the tools
+# (wowserver.db_socket).
 SOCK="$RUN/mariadb.sock"
 if [ "${#SOCK}" -gt 100 ]; then
-    SOCK="${WOWBG3_SHM:-${XDG_RUNTIME_DIR:-/tmp}}/mariadb-$(printf %s "$V" | md5sum | cut -c1-8).sock"
+    sock_name="mariadb-$(printf %s "$V" | md5sum | cut -c1-8).sock"
+    for d in "${WOWBG3_SHM:-}" "${XDG_RUNTIME_DIR:-}" /tmp; do
+        [ -n "$d" ] || continue
+        SOCK="$d/$sock_name"
+        [ "${#SOCK}" -gt 100 ] || break
+    done
 fi
 [ "${#SOCK}" -le 107 ] || { echo "wowbg3-server: no socket path for MariaDB under 108 bytes ($SOCK)" >&2; exit 1; }
 WORLD_PORT="${WOWBG3_WORLD_PORT:-8105}"
@@ -109,8 +116,8 @@ db_start() {
 }
 db_stop() {
     alive mariadb || return 0
-    kill "$(cat "$RUN/mariadb.pid")"
-    for _ in $(seq 1 120); do alive mariadb || return 0; sleep 0.5; done
+    kill "$(cat "$RUN/mariadb.pid")" 2>/dev/null || true   # gone since the line above: stopped is what was wanted
+    for _ in $(seq 1 120); do alive mariadb || return 0; sleep 0.5 || true; done
     die "MariaDB did not stop"
 }
 
@@ -282,21 +289,27 @@ start() {
     die "mangosd did not finish starting in 2 minutes"
 }
 
+# Every step of a stop holds whatever the daemons are doing meanwhile. A stop is often asked for by a signal that
+# reached them too (BG3's whole process group, a session being ended), so one may be gone between the check and the
+# signal meant for it, and a second signal may end a sleep here: with errexit on, either used to end the script in
+# the middle of the stop (the pid files and the state "stopping" left, MariaDB never told to stop by us).
 stop() {
     stale_pids
     if alive mangosd; then
-        echo "saveall" > "$RUN/console"; sleep 1
-        kill -INT "$(cat "$RUN/mangosd.pid")"
+        # Not for ever: with mangosd and the holder both just gone the pipe has no reader and the write would wait.
+        timeout 3 bash -c 'echo saveall > "$1"' _ "$RUN/console" 2>/dev/null || true
+        sleep 1 || true
+        kill -INT "$(cat "$RUN/mangosd.pid")" 2>/dev/null || true
         # Its console thread waits in a read on the pipe: end of input lets it finish.
-        alive console-holder && kill "$(cat "$RUN/console-holder.pid")"
-        for _ in $(seq 1 120); do alive mangosd || break; sleep 0.5; done
-        alive mangosd && kill -9 "$(cat "$RUN/mangosd.pid")"
+        alive console-holder && { kill "$(cat "$RUN/console-holder.pid")" 2>/dev/null || true; }
+        for _ in $(seq 1 120); do alive mangosd || break; sleep 0.5 || true; done
+        alive mangosd && { kill -9 "$(cat "$RUN/mangosd.pid")" 2>/dev/null || true; }
     fi
-    alive console-holder && kill "$(cat "$RUN/console-holder.pid")"
-    alive realmd && kill "$(cat "$RUN/realmd.pid")"
+    alive console-holder && { kill "$(cat "$RUN/console-holder.pid")" 2>/dev/null || true; }
+    alive realmd && { kill "$(cat "$RUN/realmd.pid")" 2>/dev/null || true; }
     for _ in $(seq 1 20); do            # a moment for the polite signals, so reap has nothing to do
         alive realmd || alive console-holder || break
-        sleep 0.25
+        sleep 0.25 || true
     done
     db_stop
     reap
@@ -415,11 +428,16 @@ run() {
     state running
     while [ "$quit" = 0 ]; do
         for p in mariadb realmd mangosd; do
-            alive "$p" || { say "$p stopped by itself"; state failed; stop || true; exit 1; }
+            alive "$p" && continue
+            [ "$quit" = 1 ] && break   # we are being stopped: the signal that told us reached the daemons too
+            say "$p stopped by itself"; state failed; stop || true; exit 1
         done
         sleep 1 || true   # a SIGTERM to the process group ends the sleep (set -e must not end us)
     done
     state stopping
+    # From here a further signal changes nothing: the launcher sends its own at BG3's exit after the one that began
+    # this stop, and a session that is being ended signals every process at once (stop() says what that used to do).
+    trap '' TERM INT
     stop
     state stopped
     exit 0

@@ -83,6 +83,25 @@ class Reports(unittest.TestCase):
         self.assertIn('WOW-BG3-report-20260107.zip', left)
         self.assertIn('notes.txt', left)
 
+    def test_the_engines_newest_crash_files_stay(self):
+        ns = lift(HERE / 'crashreport.py', {'prune_crashes', 'KEEP_CRASHES'})
+        d = Path(tempfile.mkdtemp())
+        for i in range(14):
+            write(d / ('crash-17000000%02d.txt' % i), 1, 14 - i)
+        write(d / 'fx-trail.txt', 1, 30)
+        write(d / 'fps-journal.csv', 1, 30)
+        self.assertEqual(ns['prune_crashes'](d), 4)
+        left = sorted(p.name for p in d.iterdir())
+        self.assertEqual(len([n for n in left if n.startswith('crash-')]), ns['KEEP_CRASHES'])
+        self.assertIn('crash-1700000013.txt', left)
+        self.assertNotIn('crash-1700000000.txt', left)
+        self.assertIn('fx-trail.txt', left)
+        self.assertIn('fps-journal.csv', left)
+        self.assertEqual(ns['prune_crashes'](d / 'none'), 0)
+
+    def test_the_coordinator_prunes_them_at_each_start_of_the_engine(self):
+        self.assertIn("crashreport.prune_crashes(DATA / 'benilla/Diagnostics')", (HERE / 'wowbg3-coord.py').read_text())
+
 
 class SnapshotBin(unittest.TestCase):
     def ns(self, root, days):

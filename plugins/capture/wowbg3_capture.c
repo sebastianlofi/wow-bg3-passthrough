@@ -51,8 +51,10 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 // WOWBG3_LINK: the link folder, bg3cam.bin, bg3screen.txt, tavplan.txt (default <io>/link).
 // Unset (a plugin bg3le starts early, before the launcher plugin sets them: bg3le patch 0005), each is found
 // as the launcher's release_env() finds it, so both name the same folders: capture /logs/capture if it exists,
-// else <data>/capture; frames /wowshm if it exists, else /dev/shm/wow-bg3-<uid>, else <data>/shm; Tav
+// else <data>/capture; frames /wowshm if it exists, else /dev/shm/wow-bg3-<uid> when it is this user's own, else
+// the runtime folder or <data>/shm (wowbg3_shm.h, the one rule both use); Tav
 // /wowtav beside /wowshm, else <frames>/tav (<data>: $WOWBG3_DATA, else Mods/WOW-BG3/data, as the launcher).
+#include "../wowbg3_shm.h"
 static struct { char out[512], fx[528], wow[2][560], io[1024], link[1040], cam[1060], shm[512], tav[530]; } g_path;
 static pthread_once_t g_path_once = PTHREAD_ONCE_INIT;
 static int path_is_dir(const char* p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
@@ -93,8 +95,7 @@ static void path_init(void) {
     e = getenv("WOWBG3_SHM");
     if (e && *e) snprintf(g_path.shm, sizeof g_path.shm, "%s", e);
     else if (path_is_dir("/wowshm")) snprintf(g_path.shm, sizeof g_path.shm, "/wowshm");
-    else if (path_is_dir("/dev/shm") && access("/dev/shm", W_OK) == 0) snprintf(g_path.shm, sizeof g_path.shm, "/dev/shm/wow-bg3-%d", (int)getuid());
-    else snprintf(g_path.shm, sizeof g_path.shm, "%s/shm", data);
+    else wowbg3_shm_dir(g_path.shm, sizeof g_path.shm, "/dev/shm", getenv("XDG_RUNTIME_DIR"), data, getuid());  // only a folder of our own, as the launcher
     e = getenv("WOWBG3_TAV_DIR");
     if (e && *e) snprintf(g_path.tav, sizeof g_path.tav, "%s", e);
     else if (!strcmp(g_path.shm, "/wowshm") && path_is_dir("/wowtav")) snprintf(g_path.tav, sizeof g_path.tav, "/wowtav");
