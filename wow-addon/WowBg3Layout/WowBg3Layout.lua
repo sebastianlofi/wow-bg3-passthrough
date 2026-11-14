@@ -16,13 +16,17 @@ local HIDE = {
     "MainMenuBar", "MultiBarBottomLeft", "MultiBarBottomRight", "MultiBarLeft", "MultiBarRight",
     "PlayerFrame", "PetFrame", "PartyMemberFrame1", "PartyMemberFrame2", "PartyMemberFrame3",
     "PartyMemberFrame4", "CastingBarFrame", "ShapeshiftBarFrame", "PetActionBarFrame",
-    "BonusActionBarFrame", "MainMenuExpBar", "ReputationWatchBar", "TutorialFrameAlertButton",
-    "TutorialFrame", -- WoW's new-player tips (also turned off for good below).
+    "BonusActionBarFrame", "MainMenuExpBar", "ReputationWatchBar",
+    "TutorialFrame", "TutorialFrameParent", -- WoW's new-player tips (also turned off for good below).
     -- BG3 shows the target.
     "TargetFrame", "TargetofTargetFrame", "ComboFrame",
     "MinimapCluster", -- BG3's minimap shows WoW's ground.
     "DurabilityFrame", -- the armor figure for damaged gear (hide it).
 }
+-- The tips' "!" buttons at the bottom middle: WoW 1.12 names them TutorialFrameAlertButton1 to 10
+-- (FrameXML TutorialFrame.xml, MAX_TUTORIAL_ALERTS); a plain "TutorialFrameAlertButton" does not exist,
+-- so they kept coming back on a new character (a play report).
+for i = 1, 10 do HIDE[table.getn(HIDE) + 1] = "TutorialFrameAlertButton" .. i end
 local MICRO = {
     "CharacterMicroButton", "SpellbookMicroButton", "TalentMicroButton", "QuestLogMicroButton",
     "SocialsMicroButton", "WorldMapMicroButton", "MainMenuMicroButton", "HelpMicroButton",
