@@ -101,9 +101,13 @@ def sql(query, db=''):
     else:
         v = server_var()
         sec = dict(l.split('=', 1) for l in (v / 'secrets.env').read_text().split() if '=' in l)
-        cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % wowserver.db_socket(v), '-uroot', '-N', '-B'] + ([db] if db else [])
+        # UTF-8 asked for, not left to the locale: started from BG3 there is none (Steam's runtime passes no LANG), the
+        # client then answered in latin1, and a name with an accent (game_tele's "trépas") stopped every query of the
+        # places table, the guardian's crossings among them (a play report: the Dream Visitor took no one to Durotar).
+        cmd = [str(p / 'mariadb/bin/mariadb'), '--socket=%s' % wowserver.db_socket(v), '-uroot', '-N', '-B',
+               '--default-character-set=utf8mb4'] + ([db] if db else [])
         env = dict(os.environ, LD_LIBRARY_PATH=str(p / 'lib'), MYSQL_PWD=sec['ROOT_PASS'])
-        r = subprocess.run(cmd, input=query, capture_output=True, text=True, env=env)
+        r = subprocess.run(cmd, input=query, capture_output=True, text=True, encoding='utf-8', env=env)
     if r.returncode:
         raise CmdError('database: %s' % (r.stderr.strip()[-200:] or r.returncode))
     return r.stdout

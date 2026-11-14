@@ -144,6 +144,8 @@ def handle(replies, seq, who, text, refused=None, debug=None):
         out('the command failed: %s' % e, True)
         result = 'error'
         traceback.print_exc()
+        if refused:  # the guardian's or the panel's side shows it too (a failure there used to show nothing at all)
+            refused('the command failed: %s' % e)
     finally:
         replies.add(seq, '.', '')
     log('#%d %r from %s: %s in %.1f s' % (seq, text, who or '?', result, time.time() - t0))
