@@ -10,8 +10,11 @@ gets a place of its own in the level: a centre, and from it world mode's mapping
 The level keeps the width of one continent and has three floors, FLOOR metres apart: the Eastern Kingdoms
 where world mode has always had them, Kalimdor above them, every other map in rows on the third floor. Every
 centre is a whole number of 64 m squares from the first, so one lattice holds every map's squares.
-(A level of one floor, wide enough for everything side by side, was tried: BG3 loads it, world mode does
-not start in it.)
+(One floor with every map side by side cannot work, tried twice, the second time on 2026-11-14 at the maintainer's
+ask: BG3 keeps AI-grid tile positions as 16-bit numbers of 0.5 m tiles (bg3se::AiTilePos {int16 X, Y}), so its ground,
+pathing and surfaces end 16383.5 m from the level's origin; the continents side by side need about 36 km. With
+Kalimdor placed at x 16.5 to 41.4 km, world mode started but a click there walked nobody, while the Eastern Kingdoms
+inside the limit walked. AI Context/flat-level-limit.md.)
 
   places()              {map: centre}
   centre(map)           KeyError for a map WoW's data has no ground for
