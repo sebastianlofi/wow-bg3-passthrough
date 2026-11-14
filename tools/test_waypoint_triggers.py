@@ -37,11 +37,14 @@ class WaypointTriggers(unittest.TestCase):
     def test_the_level_has_them_as_point_triggers(self):
         d = tempfile.mkdtemp()
         wowbg3_level.build(dict(self.spec), d)  # the level folder as the release builds it
-        x = open(os.path.join(d, 'Triggers', '_merged.lsx')).read()
+        x = open(os.path.join(d, '_Globals', 'Triggers', '_merged.lsx')).read()
         for u in own_triggers():
             i = x.index(u)
             node = x[x.rindex('<node id="GameObjects">', 0, i):x.index('</node>', i)]
             self.assertIn('15111ce4-12fc-4757-bb81-7c2c212e141a', node)  # BG3's point trigger template
+            # Global, as BGO_Main_A's: the panel lists only entries on global triggers (level triggers were never listed)
+            self.assertIn('id="IsGlobal" type="bool" value="True"', node)
+        self.assertNotIn(own_triggers()[0], open(os.path.join(d, 'Triggers', '_merged.lsx')).read())
 
     def test_own_level_switches_to_them(self):
         self.assertIn('if Hero.OWN then M.TRIGGERS = M.OWN_TRIGGERS end', LUA.read_text())

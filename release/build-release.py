@@ -179,6 +179,9 @@ def level_files():
                 # BG3 reads a level's meta, triggers and scenery as .lsf; its layer files stay .lsx, as in BG3's own levels.
                 if rel.endswith(".lsx") and not rel.startswith("Layers/"):
                     rel, data = rel[:-4] + ".lsf", lsf_write.lsx_to_lsf(data)
+                if rel.startswith("_Globals/"):  # the level's global objects (waypoint triggers): BG3's Globals folder
+                    files.append((f"Mods/{FOLDER}/Globals/{name}/{rel[len('_Globals/'):]}", data))
+                    continue
                 files.append((f"Mods/{FOLDER}/Levels/{name}/{rel}", data))
     # The names BG3 shows for these levels (the load list, the loading screen): a key a level and its English text.
     # Without them BG3 shows the level's folder name.

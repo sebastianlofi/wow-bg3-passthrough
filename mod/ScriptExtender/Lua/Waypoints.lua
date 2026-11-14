@@ -66,6 +66,14 @@ M.OWN_TRIGGERS = {
     "a39a2cfc-2ce4-5e2e-bd85-67e7f63de0fb",
 }
 
+-- A save made before our own level's triggers (the release before 0.1.2354) keeps its entries on BGO_Main_A's: BG3
+-- stores each unlocked entry's trigger in the save, and offer() never offers an entry twice, so a click there still
+-- loaded Act 3's map (his Gale save, slot B: "entering a different region", then BGO_Main_A). Each party member carries
+-- this persistent mark once their entries sit on our level's triggers; without it they are locked and unlocked again
+-- on ours, once a save (BG3 shows its Waypoint Discovered notice that once).
+local BOUND = "WowBg3WaypointsOwn"
+pcall(Ext.Vars.RegisterUserVariable, BOUND, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
     if ok then return v end
@@ -101,27 +109,50 @@ function M.Start()
     local function offer(points)
         bySlot = {}
         local party = players()
+        if Hero.OWN and #points > 0 then  -- with the list in hand (an empty first read would mark nothing moved)
+            for _, who in ipairs(party) do
+                local e = q(Ext.Entity.Get, who)
+                if e and q(function() return e.Vars[BOUND] end) ~= true then
+                    local moved = 0
+                    for _, p in ipairs(points) do
+                        if offered(p.Name, who) then
+                            q(Osi.LockWaypoint, p.Name, who)
+                            q(function() Osi.DB_WaypointUnlocked:Delete(p.Name, who) end)
+                            moved = moved + 1
+                        end
+                    end
+                    pcall(function() e.Vars[BOUND] = true end)
+                    if moved > 0 then
+                        Ext.Utils.Print(string.format("WOW-BG3 waypoints: %d entries of %s moved to our level's triggers", moved, tostring(who)))
+                    end
+                end
+            end
+        end
         for _, p in ipairs(points) do
             local trigger = M.TRIGGERS[p.Slot + 1]
             if trigger and p.Known then bySlot[p.Slot] = p end
+            -- In our level an entry has an id of its own: BG3 keeps the trigger a waypoint id was first unlocked on, for
+            -- good in a save (locking and unlocking it on our trigger brought back BGO_Main_A's: the click still loaded Act
+            -- 3's map, slot B). The name with a no-break space after it reads the same in the panel and binds anew.
+            local id = Hero.OWN and (p.Name .. "\194\160") or p.Name
             for _, who in ipairs(party) do
-                if trigger and p.Known and not offered(p.Name, who) then
+                if trigger and p.Known and not offered(id, who) then
                     if not item then
                         local x, y, z = Osi.GetPosition(who)
                         -- Off the squares: an item on one keeps it from going home clean, and the pool loses it.
                         item = x and q(Osi.CreateAt, M.HELPER, x, y - 30, z + 500, 1, 0, "") or nil
                     end
                     if item then
-                        if not done[p.Name] then
-                            q(Osi.RegisterWaypoint, p.Name, item)
-                            done[p.Name] = true
+                        if not done[id] then
+                            q(Osi.RegisterWaypoint, id, item)
+                            done[id] = true
                         end
-                        q(Osi.UnlockWaypoint, p.Name, trigger, who)
-                        q(function() Osi.DB_WaypointUnlocked(p.Name, who) end)
+                        q(Osi.UnlockWaypoint, id, trigger, who)
+                        q(function() Osi.DB_WaypointUnlocked(id, who) end)
                     end
-                elseif not p.Known and offered(p.Name, who) then
-                    q(Osi.LockWaypoint, p.Name, who)
-                    q(function() Osi.DB_WaypointUnlocked:Delete(p.Name, who) end)
+                elseif not p.Known and offered(id, who) then
+                    q(Osi.LockWaypoint, id, who)
+                    q(function() Osi.DB_WaypointUnlocked:Delete(id, who) end)
                 end
             end
         end

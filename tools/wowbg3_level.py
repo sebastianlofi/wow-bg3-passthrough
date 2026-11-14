@@ -7,8 +7,9 @@ What it writes: an empty level the size of a WoW continent, whose ground world m
   meta.lsx               LevelData: LevelBounds, LevelLighting, LevelAtmosphere (ids of stock BG3
                          lighting/atmosphere *resources*, referenced by id, not copied)
   Layers/<guid>.lsx      one editor layer ("Triggers") the triggers belong to
-  Triggers/_merged.lsx   start points (Player 0..3), one lighting trigger and one atmosphere trigger, and
-                         "Waypoints": N point triggers for BG3's waypoint panel (Waypoints.lua)
+  Triggers/_merged.lsx   start points (Player 0..3), one lighting trigger and one atmosphere trigger
+  _Globals/Triggers/_merged.lsx   "Waypoints": N global point triggers for BG3's waypoint panel (Waypoints.lua);
+                         the release writes them to Mods/<mod>/Globals/<level>/Triggers
                          covering the bounds; same structure as Basic_Level_A's triggers
   Scenery/_merged.lsx    optional: static objects from stock BG3 templates (by id), e.g. the WoW rays' proxy shape
   Ai/aigrid.data         AI grid, version 21 (layout from libbg3, github.com/eiz/libbg3, MIT):
@@ -187,16 +188,6 @@ def write_triggers(path, spec, layer):
                     + attr("TemplateName", "FixedString", "e1dd1fce-eb20-4824-b232-5a78344351b1")
                     + attr("Type", "FixedString", "trigger") + "<children><node id=\"FadeChildren\" />"
                     + layer_list(name, layer) + transform((sx + 2 * p, sy, sz)) + "</children></node>")
-    # BG3's waypoint panel lists an entry only on a point trigger of the level the party is in (Waypoints.lua): one per
-    # panel slot, BG3's plain point trigger template 15111ce4 (its camps' own spots use it), beside the start points.
-    # A click's teleport to one is undone the same tick; the WoW flight is the move.
-    for i in range(int(spec.get("Waypoints", 0))):
-        objs.append('<node id="GameObjects">' + attr("Flag", "int32", "1") + attr("LevelName", "FixedString", name)
-                    + attr("MapKey", "FixedString", waypoint_uid(name, i)) + attr("Name", "LSString", f"WOWBG3_Waypoint_{i:03d}")
-                    + attr("OnlyCharacterEvents", "bool", "False") + attr("OnlyOsirisEvents", "bool", "False")
-                    + attr("TemplateName", "FixedString", "15111ce4-12fc-4757-bb81-7c2c212e141a")
-                    + attr("Type", "FixedString", "trigger") + "<children><node id=\"FadeChildren\" />"
-                    + layer_list(name, layer) + transform((sx + 2 * (i % 8), sy, sz + 2 + 2 * (i // 8))) + "</children></node>")
     # Lighting (template 1a4cfe92) and atmosphere (template 14ec1f7b) zones: polygon over the bounds, a height.
     poly = [(b[0], b[2]), (b[3], b[2]), (b[3], b[5]), (b[0], b[5])]
     for kind, tpl, res in (("Lighting", "1a4cfe92-0a55-4253-b856-44cd0b0e8f8f", spec["Lighting"]),
@@ -210,6 +201,27 @@ def write_triggers(path, spec, layer):
                     + '<node id="ResourceIDs"><children>'
                     + "".join('<node id="ResourceID">' + attr("Object", "FixedString", r) + "</node>" for r in (spec.get(kind + "List") or [res]))
                     + "</children></node>" + transform((0.0, float(b[1]), 0.0)) + "</children></node>")
+    x = (HDR + '\t<region id="Templates">\n\t\t<node id="Templates">\n\t\t\t<children>\n'
+         + "".join("\t\t\t\t" + o + "\n" for o in objs) + "\t\t\t</children>\n\t\t</node>\n\t</region>\n</save>\n")
+    open(path, "w").write(x)
+
+
+def write_global_triggers(path, spec, layer):
+    """Globals/<level>/Triggers: the point triggers of BG3's waypoint panel, one per slot ("Waypoints": N; Waypoints.lua
+    names them). Global objects, as BG3's own (BGO_Main_A's are IsGlobal, template 15111ce4): the panel lists only
+    entries on global triggers. Written as level triggers they were accepted by UnlockWaypoint and never listed. A click's
+    teleport to one is undone the same tick; the WoW flight is the move."""
+    name = spec["Name"]
+    sx, sy, sz = spec["Start"]
+    objs = []
+    for i in range(int(spec.get("Waypoints", 0))):
+        objs.append('<node id="GameObjects">' + attr("Flag", "int32", "1") + attr("IsGlobal", "bool", "True")
+                    + attr("LevelName", "FixedString", name)
+                    + attr("MapKey", "FixedString", waypoint_uid(name, i)) + attr("Name", "LSString", f"WOWBG3_Waypoint_{i:03d}")
+                    + attr("OnlyCharacterEvents", "bool", "False") + attr("OnlyOsirisEvents", "bool", "False")
+                    + attr("TemplateName", "FixedString", "15111ce4-12fc-4757-bb81-7c2c212e141a")
+                    + attr("Type", "FixedString", "trigger") + "<children><node id=\"FadeChildren\" />"
+                    + layer_list(name, layer) + transform((sx + 2 * (i % 8), sy, sz + 2 + 2 * (i // 8))) + "</children></node>")
     x = (HDR + '\t<region id="Templates">\n\t\t<node id="Templates">\n\t\t\t<children>\n'
          + "".join("\t\t\t\t" + o + "\n" for o in objs) + "\t\t\t</children>\n\t\t</node>\n\t</region>\n</save>\n")
     open(path, "w").write(x)
@@ -316,6 +328,9 @@ def build(spec, out):
     if not platform:   # a platform is a piece of another level: that level's start points, zones and map
         write_minimap(os.path.join(out, "WorldMap", "MiniMap.lsx"), spec)
         write_triggers(os.path.join(out, "Triggers", "_merged.lsx"), spec, layer)
+        if int(spec.get("Waypoints", 0)) > 0:  # global objects: the release puts _Globals/ under Mods/<mod>/Globals/<level>/
+            os.makedirs(os.path.join(out, "_Globals", "Triggers"), exist_ok=True)
+            write_global_triggers(os.path.join(out, "_Globals", "Triggers", "_merged.lsx"), spec, layer)
     if spec.get("Scenery"):
         os.makedirs(os.path.join(out, "Scenery"), exist_ok=True)
         write_scenery(os.path.join(out, "Scenery", "_merged.lsx"), spec, layer)
