@@ -19,7 +19,8 @@ void main() {
     ivec2 q = ivec2(gl_FragCoord.xy);
     float n0 = imageLoad(nob, q).r;
     // 1: pure WoW ground at the composite; 0.3: WoW ground with something of BG3's drawn before the composite.
-    if (!(n0 > 0.25)) { imageStore(late, q, vec4(0.0)); discard; }
+    // Below 0: a decal on WoW's ground, its gain on WoW's colour in `late` (alpha 4, wowbg3_blmask.frag) for wdpostcas.
+    if (!(n0 > 0.25)) { if (!(n0 < 0.0 && abs(imageLoad(late, q).a - 4.0) < 0.5)) imageStore(late, q, vec4(0.0)); discard; }
     vec3 c = texelFetch(cur, q, 0).rgb;
     // Pure at the composite (wowbg3_blmask.frag: the forward buffer the composite read was what the feed wrote, the
     // G-buffer bare). This pass used to look at the forward image again here, at the TAA, and call the pixel touched

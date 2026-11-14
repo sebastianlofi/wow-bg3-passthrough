@@ -249,13 +249,13 @@ void main() {
     if ((pc.flags & 64u) != 0u) { vec4 st = imageLoad(stimg, ivec2(gl_FragCoord.xy)); W = max((W - st.rgb) / max(st.a, 1e-4), vec3(0.0)); }
     o = vec4(W, 1.0);
     imageStore(wfed, ivec2(gl_FragCoord.xy), o);
-    // What BG3 laid on the ground here (a surface, a decal: its albedo over the placeholder's black) is lit by BG3's
+    // What BG3 laid on the ground here (a surface, a decal: its albedo over the placeholder's grey) is lit by BG3's
     // sun alone, as its characters were: black wherever that sun does not reach, in a shadow or behind the blocker
     // that keeps the sun off a figure in WoW's shade. WoW's ambient for it, as for BG3's own pixels (after wfed: the
     // mask compares the forward buffer with what stands there for WoW alone).
     if (pc.amb.a > 0.5) {
         vec3 al = texelFetch(galb, ivec2(gl_FragCoord.xy), 0).rgb;
-        if (max(al.r, max(al.g, al.b)) >= 0.5 / 255.0) {
+        if (any(greaterThan(abs(al - vec3(46.0 / 255.0)), vec3(0.5 / 255.0)))) {  // not the bare placeholder (wowbg3_ground.frag)
             vec3 tex = pow(clamp(al, vec3(0.0), vec3(1.0)), vec3(1.0 / 2.2));
             o.rgb += max(inv3(tex * min(pc.amb.rgb, vec3(1.0))) - inv3(vec3(0.0)), vec3(0.0)) / ex;
         }

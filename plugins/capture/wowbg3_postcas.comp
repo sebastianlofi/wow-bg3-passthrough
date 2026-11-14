@@ -52,11 +52,14 @@ void main() {
         else if (n < 0.0) { float v = -n - 1.0; imageStore(cout, q, vec4(0.15 + 0.85 * floor(v) / 255.0, fract(v), 0.0, 1.0)); }
         return;
     }
-    // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255 + g)): WoW's own colour, lightened by g,
-    // for WoW's share, BG3's picture for BG3's share t. Nearly all BG3's: its sharpened output stays.
+    // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255)): WoW's own colour for WoW's share, BG3's
+    // picture for BG3's share t. Under a decal (a surface) WoW's colour takes the decal's change of the ground first: its
+    // gain a channel in `late`, alpha 4 (water darkens it). Nearly all BG3's: its sharpened output stays.
     if (n < 0.0) {
-        float v = -n - 1.0, t = floor(v) / 255.0, g = fract(v);
-        if (w.a > 0.5 && t < 0.98) imageStore(cout, q, vec4(mix(min(w.rgb * (1.0 + g), vec3(1.0)), texelFetch(cin, q, 0).rgb, t), 1.0));
+        float v = -n - 1.0, t = floor(v) / 255.0;
+        vec4 lg = texelFetch(late, m(q), 0);
+        vec3 gain = abs(lg.a - 4.0) < 0.5 ? lg.rgb : vec3(1.0);
+        if (w.a > 0.5 && t < 0.98) imageStore(cout, q, vec4(mix(clamp(w.rgb * gain, vec3(0.0), vec3(1.0)), texelFetch(cin, q, 0).rgb, t), 1.0));
         return;
     }
     const bool early = n > 0.35 && n < 0.45;  // WoW's ground with something BG3 drew before its composite: WoW's colour with that on it

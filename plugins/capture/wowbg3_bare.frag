@@ -1,5 +1,5 @@
 // fx-route prototype (wdbare, wowbg3_fxbg.inc.c): 0 into BG3's lighting buffer at WoW's pixels whose G-buffer is
-// still the bare placeholder (albedo 0, surface 1 0 0 with shading model 0); everything else is left as BG3 lit it.
+// still the bare placeholder (albedo 46/255 grey, surface 1 0 0 with shading model 0); everything else is left as BG3 lit it.
 #version 450
 layout(r32f, set = 0, binding = 0) uniform readonly image2D wmask;  // >0: the placeholder is what shows here
 layout(set = 0, binding = 1) uniform sampler2D alb;   // BG3's G-buffer albedo (alpha its occlusion)
@@ -10,7 +10,7 @@ void main() {
     if (!(imageLoad(wmask, q).r > 0.0)) discard;
     vec4 a = texelFetch(alb, q, 0), s = texelFetch(surf, q, 0);
     uint mat = uint(s.w * 255.0 + 0.5);
-    bool bare = all(lessThan(a.rgb, vec3(0.5 / 255.0))) && s.x > 254.5 / 255.0 && s.y < 0.5 / 255.0 && s.z < 0.5 / 255.0 && (mat & 0xf7u) == 0u;
+    bool bare = all(lessThan(abs(a.rgb - vec3(46.0 / 255.0)), vec3(0.5 / 255.0))) && s.x > 254.5 / 255.0 && s.y < 0.5 / 255.0 && s.z < 0.5 / 255.0 && (mat & 0xf7u) == 0u;
     if (!bare) discard;
     o = vec4(0.0, 0.0, 0.0, 1.0);
 }

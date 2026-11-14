@@ -48,7 +48,7 @@ void main() {
     if (!(z < 1e20)) {  // WoW's sky: placeholder at the far end, so whatever BG3 drew stays in front
         gl_FragDepth = 1e-7;
         o_normal = vec4(0.5, 0.5, 0.0, 0.0);
-        o_albedo = vec4(0.0, 0.0, 0.0, pc.occ);
+        o_albedo = vec4(vec3(46.0 / 255.0), pc.occ);  // the bare placeholder (wowbg3_ground.frag)
         o_surface = vec4(1.0, 0.0, 0.0, 0.0);
         o_z = vec4(1e7, 0.0, 0.0, 0.0);
         return;
@@ -66,7 +66,7 @@ void main() {
     if (any(isnan(n)) || any(isinf(n))) n = vec3(0.0, 0.0, -1.0);
     float k = max(1.0 - n.z, 1e-4);
     o_normal = vec4((n.xy / k + 1.7777) / 3.5554, 0.0, 0.0);
-    o_albedo = vec4(0.0, 0.0, 0.0, pc.occ);
+    o_albedo = vec4(vec3(46.0 / 255.0), pc.occ);  // the bare placeholder (wowbg3_ground.frag)
     o_surface = vec4(1.0, 0.0, 0.0, 0.0);  // no "receives decals": the ground mark sets it
     o_z = vec4(max(z, 1e-3), 0.0, 0.0, 0.0);
 }

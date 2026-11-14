@@ -21,34 +21,35 @@ void main() {
     if (pc.cal == 0u) {
         vec4 a = texelFetch(alb, q, 0), s = texelFetch(surf, q, 0);
         uint mat = uint(s.w * 255.0 + 0.5);
-        bool bare = all(lessThan(a.rgb, vec3(0.5 / 255.0))) && s.x > 254.5 / 255.0 && s.y < 0.5 / 255.0 && s.z < 0.5 / 255.0 && (mat & 0xf7u) == 0u;
+        bool bare = all(lessThan(abs(a.rgb - vec3(46.0 / 255.0)), vec3(0.5 / 255.0))) && s.x > 254.5 / 255.0 && s.y < 0.5 / 255.0 && s.z < 0.5 / 255.0 && (mat & 0xf7u) == 0u;
         pure = same && bare && imageLoad(wmask, q).r > 0.0;
     }
     // WoW's ground with something of BG3's on it: not pure, but still WoW's pixel under BG3's addition. Before, such a
     // pixel was BG3's composite alone, and an ability whose range decal covers the screen put BG3's relit picture of
     // WoW's ground back everywhere (a playtest report: "the fog comes back when I aim").
-    // The mask holds, negative, what wdpostcas needs: -(1 + t * 255 + g), t (0..1 in 255 steps) BG3's share of the
-    // pixel and g (0..0.99) a gain on WoW's own colour.
+    // The mask holds, negative, what wdpostcas needs: -(1 + t * 255), t (0..1 in 255 steps) BG3's share of the pixel.
     //   * Something drawn over the ground (an effect, a preview: the G-buffer still bare, the forward buffer changed):
     //     t is the share of the pixel's light that BG3 added.
-    //   * A decal lit over the placeholder (an ability's range, a surface): BG3 lights the decal's own colour there,
-    //     and over its own ground that lightens the ground by the decal's share of the albedo. The placeholder's albedo
-    //     is black, so BG3's result is the decal's colour alone under BG3's exposure: a grey lift that covers WoW's
-    //     night ground like fog. WoW's colour gets the lightening the decal means instead (g: the decal's albedo over
-    //     a ground albedo of 0.18), and a decal strong enough to hide the ground (t from its albedo) is BG3's pixel.
+    //   * A decal over the placeholder (a surface, an ability's range): BG3's albedo there over the placeholder's grey
+    //     (wowbg3_ground.frag). Each channel's ratio to the grey is the change the decal makes to a ground of that
+    //     albedo, so WoW's colour times it is the decal on WoW's ground in WoW's own light: water darkens it, blood
+    //     darkens and reddens it, a trace of either does little. That gain goes in `late` (alpha 4). A decal brighter
+    //     than the ground by enough to hide it (grease, an ability's area) is BG3's own lit pixel by that much (t).
+    //     The placeholder was black before, and a surface that darkens could not darken black: water was not seen at
+    //     all (a playtest report: "the water is invisible on the ground"). Lightening WoW's colour by the decal's albedo
+    //     over black (tried before) showed a pale patch under every faint decal, a trace of blood among them.
     float m = pure ? 1.0 : 0.0;
     vec4 early = vec4(0.0);
     if (!pure && pc.cal == 0u && w.a > 0.5 && imageLoad(wmask, q).r > 0.0) {
         vec3 d = abs(f - w.rgb) / max(max(f, w.rgb), vec3(1e-5));
         float t = clamp((max(d.r, max(d.g, d.b)) - 0.04) / 0.96, 0.0, 1.0), g = 0.0;
-        vec4 a = texelFetch(alb, q, 0);
-        float al = max(a.r, max(a.g, a.b));
-        if (al >= 0.5 / 255.0) {
-            // A decal on the ground: BG3's pixel by the strength of its albedo. A faint one leaves WoW's colour as it
-            // is. (It used to lighten WoW's colour by the decal's albedo, which showed a pale patch on the ground
-            // under every faint decal, a trace of blood among them: a playtest report.)
-            t = smoothstep(0.06, 0.30, al);
+        const vec3 PH = vec3(46.0 / 255.0);
+        vec3 A = texelFetch(alb, q, 0).rgb;
+        if (any(greaterThan(abs(A - PH), vec3(0.5 / 255.0)))) {
+            vec3 up = max(A - PH, vec3(0.0)) / (1.0 - PH);
+            t = smoothstep(0.06, 0.30, max(up.r, max(up.g, up.b)));
             m = -(1.0 + floor(t * 255.0 + 0.5) + g);
+            early = vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), 4.0);
         } else {
             // Something drawn over the bare ground before the composite (a glow at a caster's feet, a bolt): what it
             // added is known a channel, what the feed wrote against what stands there now, as wowbg3_post.frag
