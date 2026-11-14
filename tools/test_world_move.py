@@ -141,11 +141,8 @@ class OwnPlaces(Base):
         a, b = Fake(self.tmp), Fake(self.tmp)
         a.centre, b.centre = B.centre_of(0), B.centre_of(1)
         pa, pb = a.to_bg3((100.0, 200.0, 30.0)), b.to_bg3((100.0, 200.0, 30.0))
-        # One floor (wow_places.py): apart side by side, never one over the other.
-        self.assertEqual(pa[1], pb[1])
-        self.assertGreater(abs(pa[0] - pb[0]), 1000.0)
-        for x, y in zip(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2])):
-            self.assertAlmostEqual(x, y, places=6)
+        self.assertGreater(abs(pa[1] - pb[1]), 1000.0)
+        self.assertEqual(a.wow_xy(pa[0], pa[2]), b.wow_xy(pb[0], pb[2]))
 
 
 class Moves(Base):
