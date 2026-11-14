@@ -9,6 +9,7 @@ layout(set = 0, binding = 3) uniform sampler2D b1;    // BG3's forward buffer, a
 layout(set = 0, binding = 4) uniform sampler2D alb;   // BG3's G-buffer albedo
 layout(set = 0, binding = 5) uniform sampler2D surf;  // roughness, specular level, metalness, material byte
 layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D late;  // BG3's share of a pixel it drew over before its composite (wowbg3_post.frag goes on from it)
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D gain;  // under a decal: its change of WoW's ground a channel (wdpostcas)
 layout(push_constant) uniform PC { uint cal; } pc;
 layout(location = 0) out vec4 o;
 void main() {
@@ -33,7 +34,8 @@ void main() {
     //   * A decal over the placeholder (a surface, an ability's range): BG3's albedo there over the placeholder's grey
     //     (wowbg3_ground.frag). Each channel's ratio to the grey is the change the decal makes to a ground of that
     //     albedo, so WoW's colour times it is the decal on WoW's ground in WoW's own light: water darkens it, blood
-    //     darkens and reddens it, a trace of either does little. That gain goes in `late` (alpha 4). A decal brighter
+    //     darkens and reddens it, a trace of either does little. That gain goes in `gain`; `late` stays free for what
+    //     BG3 draws over the decal after its composite (wowbg3_ovl.comp), as over bare ground. A decal brighter
     //     than the ground by enough to hide it (grease, an ability's area) is BG3's own lit pixel by that much (t).
     //     The placeholder was black before, and a surface that darkens could not darken black: water was not seen at
     //     all (a playtest report: "the water is invisible on the ground"). Lightening WoW's colour by the decal's albedo
@@ -49,7 +51,7 @@ void main() {
             vec3 up = max(A - PH, vec3(0.0)) / (1.0 - PH);
             t = smoothstep(0.06, 0.30, max(up.r, max(up.g, up.b)));
             m = -(1.0 + floor(t * 255.0 + 0.5) + g);
-            early = vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), 4.0);
+            imageStore(gain, q, vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), 1.0));
         } else {
             // Something drawn over the bare ground before the composite (a glow at a caster's feet, a bolt): what it
             // added is known a channel, what the feed wrote against what stands there now, as wowbg3_post.frag

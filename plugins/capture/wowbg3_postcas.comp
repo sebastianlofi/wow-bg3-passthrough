@@ -13,6 +13,7 @@ layout(r32f, set = 0, binding = 0) uniform readonly image2D nob;
 layout(set = 0, binding = 1) uniform sampler2D wdsp;                    // WoW's own colour per pixel (the feed), a 1 where written
 layout(set = 0, binding = 2) uniform sampler2D wdspl;                   // the same, through a filtering sampler
 layout(set = 0, binding = 3) uniform sampler2D late;                    // BG3's late addition over a pure pixel: its share of BG3's pixel a channel, a 1 (wowbg3_post.frag)
+layout(set = 0, binding = 4) uniform sampler2D gimg;                    // under a decal: its change of WoW's ground a channel (wowbg3_blmask.frag)
 layout(set = 0, binding = 5) uniform sampler2D cin;                     // the display transform's output (mode 0: a copy of it; mode 1: CAS's input)
 layout(rgb10_a2, set = 0, binding = 6) uniform image2D cout;  // mode 0: the display transform's output; mode 1: CAS's output
 layout(push_constant) uniform PC { uint dbg; uint mode; } pc;  // dbg: word wdpcdbg, the mask's classes as colours; mode below
@@ -53,13 +54,17 @@ void main() {
         return;
     }
     // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255)): WoW's own colour for WoW's share, BG3's
-    // picture for BG3's share t. Under a decal (a surface) WoW's colour takes the decal's change of the ground first: its
-    // gain a channel in `late`, alpha 4 (water darkens it). Nearly all BG3's: its sharpened output stays.
+    // picture for BG3's share t. Under a decal (a surface) WoW's colour takes the decal's change of the ground (gimg: water
+    // darkens it), then what BG3 drew over the decal after its composite (late, as over bare ground below). Nearly all
+    // BG3's: its sharpened output stays.
     if (n < 0.0) {
         float v = -n - 1.0, t = floor(v) / 255.0;
-        vec4 lg = texelFetch(late, m(q), 0);
-        vec3 gain = abs(lg.a - 4.0) < 0.5 ? lg.rgb : vec3(1.0);
-        if (w.a > 0.5 && t < 0.98) imageStore(cout, q, vec4(mix(clamp(w.rgb * gain, vec3(0.0), vec3(1.0)), texelFetch(cin, q, 0).rgb, t), 1.0));
+        if (w.a > 0.5 && t < 0.98) {
+            vec3 c = texelFetch(cin, q, 0).rgb, g = clamp(w.rgb * texelFetch(gimg, m(q), 0).rgb, vec3(0.0), vec3(1.0));
+            vec4 l = texelFetch(late, m(q), 0);
+            if (l.a > 0.5) g = clamp(mix(g * (1.0 + l.rgb), g + c * l.rgb, step(vec3(0.0), l.rgb)), vec3(0.0), vec3(1.0));
+            imageStore(cout, q, vec4(mix(g, c, t), 1.0));
+        }
         return;
     }
     const bool early = n > 0.35 && n < 0.45;  // WoW's ground with something BG3 drew before its composite: WoW's colour with that on it

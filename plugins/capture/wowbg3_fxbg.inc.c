@@ -927,6 +927,7 @@ static void fb_bare(DeviceData* d, VkCommandBuffer cb) {
 static struct {
     SfImg wfed, nob, wdsp; uint32_t w, h, fw, fh; int fail;  // wdsp: WoW's own displayed colour per fed pixel (the feed), for wdpostcas
     SfImg cmp0, cmp1, late;  // BG3's composite before and after its effects pass; late: what that pass drew over a pure pixel (wowbg3_post.frag)
+    SfImg gain;  // a decal's change of WoW's ground a channel (wowbg3_blmask.frag), for wdpostcas
     int ready, failed; VkDescriptorSetLayout mdsl, cdsl; VkPipelineLayout ml, cl; VkPipeline mp, cp; VkSampler smp;
     VkDescriptorPool pool; VkDescriptorSet mset[FOG_SETS], cset[FOG_SETS]; uint64_t mat[FOG_SETS], cat[FOG_SETS]; uint32_t mring, cring;
     struct { uint64_t img; VkImageView view; VkFramebuffer fb; uint32_t w, h; } t[8];
@@ -938,18 +939,19 @@ static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) { 
     int ok = 0;
     if (g_blm.wfed.img && g_blm.w == w && g_blm.h == h) { ok = 1; goto out; }
     if (g_blm.fail && g_blm.fw == w && g_blm.fh == h) goto out;
-    SfImg n[6] = {{0}};
-    const VkFormat fm[6] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
-                            VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT};
-    const VkImageUsageFlags us[6] = {
+    SfImg n[7] = {{0}};
+    const VkFormat fm[7] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
+    const VkImageUsageFlags us[7] = {
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,  // wfed
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // nob
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,  // wdsp
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // cmp0
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,                               // cmp1
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT}; // late
-    static const char* const nm[6] = {"g_blm.wfed", "g_blm.nob", "g_blm.wdsp", "g_blm.cmp0", "g_blm.cmp1", "g_blm.late"};
-    for (int i = 0; i < 6; i++)
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,  // late
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT}; // gain
+    static const char* const nm[7] = {"g_blm.wfed", "g_blm.nob", "g_blm.wdsp", "g_blm.cmp0", "g_blm.cmp1", "g_blm.late", "g_blm.gain"};
+    for (int i = 0; i < 7; i++)
         if (!sf_img_make_named(d, &n[i], fm[i], w, h, us[i], nm[i])) {
             for (int j = 0; j < i; j++) sf_img_free(d, &n[j]);  // never used: freed now
             g_blm.fail = 1; g_blm.fw = w; g_blm.fh = h;
@@ -957,21 +959,21 @@ static int bl_imgs(DeviceData* d, VkCommandBuffer cb, uint32_t w, uint32_t h) { 
         }
     VkClearColorValue z = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
     VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         sf_barrier(d, cb, n[i].img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         d->CmdClearColorImage(cb, n[i].img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
         sf_barrier(d, cb, n[i].img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
-    SfImg* cur[6] = {&g_blm.wfed, &g_blm.nob, &g_blm.wdsp, &g_blm.cmp0, &g_blm.cmp1, &g_blm.late};
+    SfImg* cur[7] = {&g_blm.wfed, &g_blm.nob, &g_blm.wdsp, &g_blm.cmp0, &g_blm.cmp1, &g_blm.late, &g_blm.gain};
     if (g_blm.wfed.img) {
         // BG3's scene changed size (the resolution, or upscaling: FSR renders the scene smaller than the screen). Until the
         // images are made again every feed is refused and the scene keeps BG3's placeholder (with FSR 1.0 a black figure).
         logf_("wdbloom: BG3's scene is %ux%u now (was %ux%u): the plugin's images a pixel made again", w, h, g_blm.w, g_blm.h);
-        for (int i = 0; i < 6; i++) { SfImg old = *cur[i]; fb_retire(&old); }
+        for (int i = 0; i < 7; i++) { SfImg old = *cur[i]; fb_retire(&old); }
         g_blm.cmp_img = 0;
     }
-    for (int i = 0; i < 6; i++) *cur[i] = n[i];
+    for (int i = 0; i < 7; i++) *cur[i] = n[i];
     g_blm.w = w; g_blm.h = h; g_blm.fail = 0;
     logf_("wdbloom: images %ux%u", w, h);
     ok = 1;
@@ -1006,10 +1008,11 @@ static int bl_make(DeviceData* d) {
     if (g_blm.ready) return 1;
     if (g_blm.failed) return 0;
     g_blm.failed = 1;
-    VkDescriptorSetLayoutBinding mb[7] = {{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+    VkDescriptorSetLayoutBinding mb[8] = {{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
-        {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
-    VkDescriptorSetLayoutCreateInfo mci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 7, mb};
+        {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}, {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};  // 7: gain
+    VkDescriptorSetLayoutCreateInfo mci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 8, mb};
     VkDescriptorSetLayoutBinding cb1 = {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
     VkDescriptorSetLayoutCreateInfo cci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &cb1};
     if (d->CreateDescriptorSetLayout(d->device, &mci, NULL, &g_blm.mdsl) != VK_SUCCESS || d->CreateDescriptorSetLayout(d->device, &cci, NULL, &g_blm.cdsl) != VK_SUCCESS) return 0;
@@ -1023,7 +1026,7 @@ static int bl_make(DeviceData* d) {
     g_blm.mp = bl_pipe(d, g_blm.ml, wowbg3_blmask_frag, sizeof wowbg3_blmask_frag, 0);  // writes nob only
     g_blm.cp = bl_pipe(d, g_blm.cl, wowbg3_blcut_frag, sizeof wowbg3_blcut_frag, VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT);
     if (!g_blm.mp || !g_blm.cp) return 0;
-    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * FOG_SETS}};
+    VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 * FOG_SETS}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * FOG_SETS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 2 * FOG_SETS, 2, ps};
     if (d->CreateDescriptorPool(d->device, &dpi, NULL, &g_blm.pool) != VK_SUCCESS) return 0;
     VkDescriptorSetLayout l[FOG_SETS];
@@ -1169,7 +1172,9 @@ static void fb_bmask(DeviceData* d, VkCommandBuffer cb) {
     VkDescriptorImageInfo i4 = {g_blm.smp, ga ? ga : (VkImageView)t_blm_b1, ga ? GBV_LAY : (VkImageLayout)t_blm_b1lay};
     VkDescriptorImageInfo i5 = {g_blm.smp, gs ? gs : (VkImageView)t_blm_b1, gs ? GBV_LAY : (VkImageLayout)t_blm_b1lay};
     VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};  // BG3's early addition a pixel, for wdpost
-    VkWriteDescriptorSet wr[7] = {
+    VkDescriptorImageInfo i7 = {VK_NULL_HANDLE, g_blm.gain.view, VK_IMAGE_LAYOUT_GENERAL};  // a decal's change of WoW's ground, for wdpostcas
+    VkWriteDescriptorSet wr[8] = {
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i7, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i6, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i1, NULL, NULL},
@@ -1177,9 +1182,9 @@ static void fb_bmask(DeviceData* d, VkCommandBuffer cb) {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 3, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i3, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 4, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i4, NULL, NULL},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 5, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &i5, NULL, NULL}};
-    d->UpdateDescriptorSets(d->device, 7, wr, 0, NULL);
-    VkImage im[3] = {g_blm.wfed.img, g_blm.nob.img, g_blm.late.img};  // the feed's writes before; the last cut's reads before; wdpostcas's reads before
-    for (int i = 0; i < 3; i++)
+    d->UpdateDescriptorSets(d->device, 8, wr, 0, NULL);
+    VkImage im[4] = {g_blm.wfed.img, g_blm.nob.img, g_blm.late.img, g_blm.gain.img};  // the feed's writes before; the last cut's reads before; wdpostcas's reads before
+    for (int i = 0; i < 4; i++)
         sf_barrier(d, cb, im[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     uint32_t pc[4] = {g_cc.fxcal ? 1u : 0u, 0, 0, 0};
@@ -1599,12 +1604,13 @@ static void post_cas_l(DeviceData* d, VkCommandBuffer cb) {
         (unsigned long long)si->slot[2].res, (unsigned long long)oimg, (int)ii->fmt, ii->w, ii->hgt, (int)si->slot[2].layout);
     VkDescriptorSet set = ds_take(g_pcas.set, g_pcas.at, &g_pcas.ring, "wdpostcas");
     if (!set) { g_pcas.refused++; return; }
-    VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL};  // patch46: the mask; 1-4 unused, 5 CAS's input
+    VkDescriptorImageInfo i0 = {VK_NULL_HANDLE, g_blm.nob.view, VK_IMAGE_LAYOUT_GENERAL};  // patch46: the mask; 1, 2 WoW's colour, 3 late, 4 gain, 5 CAS's input
     VkDescriptorImageInfo im[5];
     for (int j = 0; j < 5; j++) im[j] = (VkDescriptorImageInfo){g_pst.smp, (VkImageView)si->slot[1].res, (VkImageLayout)si->slot[1].layout};
     im[0] = (VkDescriptorImageInfo){g_pst.smp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 1: WoW's own colour per pixel
     im[1] = (VkDescriptorImageInfo){g_pcas.lsmp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 2: the same, filtered
     im[2] = (VkDescriptorImageInfo){g_pst.smp, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 3: what BG3 drew over a pure pixel after its composite
+    im[3] = (VkDescriptorImageInfo){g_pst.smp, g_blm.gain.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 4: a decal's change of WoW's ground
     VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, (VkImageView)si->slot[2].res, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr[7] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL}};
     for (uint32_t j = 0; j < 5; j++) wr[1 + j] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1 + j, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &im[j], NULL, NULL};
@@ -1705,6 +1711,7 @@ static void post_dt_run(DeviceData* d, VkCommandBuffer cb, ImgInfo* oi, VkImageL
     im[0] = (VkDescriptorImageInfo){g_pst.smp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
     im[1] = (VkDescriptorImageInfo){g_pcas.lsmp, g_blm.wdsp.view, VK_IMAGE_LAYOUT_GENERAL};
     im[2] = (VkDescriptorImageInfo){g_pst.smp, g_blm.late.view, VK_IMAGE_LAYOUT_GENERAL};
+    im[3] = (VkDescriptorImageInfo){g_pst.smp, g_blm.gain.view, VK_IMAGE_LAYOUT_GENERAL};  // binding 4: a decal's change of WoW's ground
     VkDescriptorImageInfo i6 = {VK_NULL_HANDLE, (VkImageView)outv, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr[7] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, NULL, NULL}};
     for (uint32_t j = 0; j < 5; j++) wr[1 + j] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 1 + j, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &im[j], NULL, NULL};

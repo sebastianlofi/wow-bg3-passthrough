@@ -22,7 +22,10 @@ void main() {
     ivec2 q = ivec2(gl_GlobalInvocationID.xy), sz = imageSize(nob);
     if (q.x >= sz.x || q.y >= sz.y) return;
     float n = imageLoad(nob, q).r;
-    if (pc.mode == 1u ? !(n > 0.25) : !(n > 1.5 || (n > 0.35 && n < 0.45))) return;  // WoW's own colour shows here
+    // WoW's own colour shows here, alone or under a decal (n below 0, wowbg3_blmask.frag). Under a decal these passes used
+    // to be skipped, and what BG3 drew over a surface (a spell's particles, an ability's preview) showed only by the
+    // decal's share of the pixel: behind the surface, and over water not at all (a play report).
+    if (pc.mode == 1u ? !(n > 0.25 || n < 0.0) : !(n > 1.5 || (n > 0.35 && n < 0.45) || n < 0.0)) return;
     vec3 b = texelFetch(before, q, 0).rgb, a = texelFetch(after, q, 0).rgb;
     if (!any(greaterThan(abs(a - b), max(a, b) * 0.02 + vec3(1e-6)))) return;
     // The added light's share (0..1), or minus the part of the light taken away (-1..0). Not a difference of displayed
