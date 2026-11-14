@@ -7,11 +7,14 @@ gets a place of its own in the level: a centre, and from it world mode's mapping
 
   BG3 = centre(map) + (wow y, wow z, -wow x) * 0.9144
 
-The level keeps the width of one continent and has three floors, FLOOR metres apart: the Eastern Kingdoms
-where world mode has always had them, Kalimdor above them, every other map in rows on the third floor. Every
-centre is a whole number of 64 m squares from the first, so one lattice holds every map's squares.
-(A level of one floor, wide enough for everything side by side, was tried: BG3 loads it, world mode does
-not start in it.)
+The level is one floor, every map side by side (the maintainer, 2026-11-14: "one huge flat map instead of laid out on top
+of each other"; stacked floors put a member left in the Eastern Kingdoms under one in Kalimdor, same spot from above,
+for BG3's minimap). The Eastern Kingdoms stay where world mode has always had them (their saves and cuts with them);
+Kalimdor east of the level's old edge, past the parked pool; every other map in rows north of Kalimdor, from the
+Eastern Kingdoms' east edge to Kalimdor's; Development Land (451, a strip 31 km long) north of them all. The camp's corner, the start square
+and the pool stay where they were. Every centre is a whole number of 64 m squares from the first, so one lattice
+holds every map's squares. (A wide level tried once before failed only because the plugin's ray proxy, a scenery
+object, was no longer under the middle of the level's grid: release/levels/*.json puts it there, PROXY_AT.)
 
   places()              {map: centre}
   centre(map)           KeyError for a map WoW's data has no ground for
@@ -32,7 +35,12 @@ YD = 0.9144
 CELL = 64
 TILE = 533.33333 * YD      # one WoW map tile in metres
 BASE = (0.0, 1000.0, 0.0)  # the Eastern Kingdoms' centre (world_bridge.py FIXED_CENTRE): WoW's sea level at y 1000
-FLOOR = 4096.0             # metres between floors
+# Where the rows of the other maps begin (east of the Eastern Kingdoms' place), and Kalimdor's west edge, past the
+# parked pool (release/levels: BlankGrid X0 15648).
+BAND_X0 = 4416.0
+POOL_X0 = 15648.0
+KALIMDOR_X0 = 16512.0
+WIDE = (451,)              # maps wider than the band: their own strip along the north (z past every other place)
 # A map's ground lies this far under and over its centre at most. Measured over every map's movement tiles:
 # -504 to 1970 yd (Kalimdor both); only the two unused test maps (13, 29) reach lower, to -1132 yd.
 BELOW, ABOVE = 1000.0, 2500.0
@@ -82,14 +90,47 @@ def _rows(maps, xlo, xhi, zlo):
     return out
 
 
+def _fill(maps, regions):
+    """{map: (x offset, z offset)}: _rows over several regions (x0, x1, z0, z1) in turn: a map whose row would leave
+    its region's depth goes on in the next one (the last one has no depth limit)."""
+    out, ri = {}, 0
+    x0r, x1r, z0r, z1r = regions[0]
+    x, z, depth = x0r, z0r, 0.0
+    for m in maps:
+        bx0, bz0, bx1, bz1 = _flat_box(m)
+        while True:
+            if x > x0r and _up(x - bx0) + bx1 > x1r:
+                x, z, depth = x0r, z + depth + GAP, 0.0
+            ox, oz = _up(x - bx0), _up(z - bz0)
+            if _up(x - bx0) + bx1 <= x1r and oz + bz1 <= z1r:
+                break
+            ri += 1
+            x0r, x1r, z0r, z1r = regions[ri]
+            x, z, depth = x0r, z0r, 0.0
+        out[m] = (ox, oz)
+        x = ox + bx1 + GAP
+        depth = max(depth, oz + bz1 - z)
+    return out
+
+
 def places():
-    """{map: centre}."""
+    """{map: centre}: one floor (BASE's height), side by side."""
     if not _cache:
         _cache[0] = BASE
-        _cache[1] = (BASE[0], BASE[1] + FLOOR, BASE[2])
-        rest = sorted(m for m in TILES if m not in CONTINENTS)
-        for m, (ox, oz) in _rows(rest, -EDGE, EDGE, -EDGE).items():
-            _cache[m] = (BASE[0] + ox, BASE[1] + 2 * FLOOR, BASE[2] + oz)
+        k0 = _flat_box(1)[0]
+        _cache[1] = (BASE[0] + _up(KALIMDOR_X0 - k0), BASE[1], BASE[2])
+        # Deepest first (then by number): rows of like depth waste the least of the level.
+        rest = sorted((m for m in TILES if m not in CONTINENTS and m not in WIDE),
+                      key=lambda m: (-(_flat_box(m)[3] - _flat_box(m)[1]), m))
+        k = _flat_box(1)
+        east, north_k = _cache[1][0] + k[2], _cache[1][2] + k[3]
+        # The band between the Eastern Kingdoms and Kalimdor first (its pool corner kept clear), then north of Kalimdor.
+        regions = [(BAND_X0, POOL_X0 - GAP, -EDGE, north_k), (BAND_X0, east, north_k + GAP, 10 ** 9)]
+        for m, (ox, oz) in _fill(rest, regions).items():
+            _cache[m] = (BASE[0] + ox, BASE[1], BASE[2] + oz)
+        north = max(max(c[2] + _flat_box(m)[3] for m, c in list(_cache.items())), EDGE + 128)
+        for m, (ox, oz) in _rows(list(WIDE), -EDGE, 10 ** 9, north + GAP).items():
+            _cache[m] = (BASE[0] + ox, BASE[1], BASE[2] + oz)
     return _cache
 
 
@@ -104,9 +145,19 @@ def box(m):
 
 
 def bounds():
-    """(x0, y0, z0, x1, y1, z1) of the level: its proven width, as high as the top floor needs."""
+    """(x0, y0, z0, x1, y1, z1) of the level: its old south-west corner (the camp, the start square), east and north
+    as far as the places reach, as high as their ground."""
     top = max(box(m)[4] for m in places())
-    return -16000, -100, -16000, 16000, int(_up(top + 128)), 16000
+    east = max(box(m)[3] for m in places())
+    north = max(box(m)[5] for m in places())
+    return -16000, -100, -16000, int(_up(east + 128)), int(_up(top + 128)), int(_up(north + 128))
+
+
+def proxy_at():
+    """Where the plugin's ray proxy (a static scenery object) goes: under the middle of the level's grid, where the
+    plugin's first probe column is (scene_proxy: a 7 x 7 lattice over the grid's bounds, its middle first)."""
+    b = bounds()
+    return [(b[0] + b[3]) / 2.0, -40.0, (b[2] + b[5]) / 2.0]
 
 
 def to_bg3(m, w):
@@ -129,9 +180,15 @@ def map_at(b):
 
 
 def level(spec):
-    """A level's spec with the bounds that hold every place. The level keeps its width, so its own squares
-    (the two corners BG3 sizes its maps by, the start square, the parked pool) stay where they are."""
-    return dict(spec, Bounds=list(bounds()))
+    """A level's spec with the bounds that hold every place: the far corner square BG3 sizes its maps by at the new
+    north-east corner, the ray proxy under the grid's middle. The start square, the parked pool, the near corner and
+    the camp stay where they are."""
+    b = bounds()
+    subs = [dict(q) for q in spec['Subgrids']]
+    far = max(subs, key=lambda q: (q['X'], q['Z']))
+    far['X'], far['Z'] = b[3] - CELL, b[5] - CELL
+    scenery = [dict(o, Pos=proxy_at()) if 'RayProxy' in o.get('Name', '') else o for o in spec.get('Scenery', [])]
+    return dict(spec, Bounds=list(b), Subgrids=subs, Scenery=scenery)
 
 
 def level_squares(spec):
