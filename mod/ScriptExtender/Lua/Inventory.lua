@@ -417,6 +417,7 @@ function M.Redress()
 end
 
 M.Fresh = {}
+M.MadeAt = {} -- uuid -> tick M.Create made it (the loot log below)
 -- A new item is dressed again 10 ticks on. Why was never shown: "components settle" dates from the first version,
 -- when the blank names this may have been written for had another cause (M.MakeAll's note). So it says what it
 -- finds: if every line in a session of buying and looting says "as dressed", this goes, M.Fresh with it.
@@ -453,6 +454,7 @@ function M.Create(entry, holder, count, tag, rand)
     M.Dress(u, row)
     setValue(e, M.ValueOf(row, tostring(tag):sub(1, 1) == "V"))
     M.Fresh[u] = {Row = row, Tick = tick} -- dressed again a few ticks later (see M.DressFresh)
+    M.MadeAt[u] = tick
     e.Vars[VAR] = tag
     e.Vars[ENTRY_VAR] = row.e
     e.Vars[BASE_VAR] = row.b
@@ -1218,7 +1220,14 @@ local function lootTaken(standin, tag, old)
     if tostring(tag):sub(1, 1) ~= "L" or not (WOWBG3MirrorOwned or {})[standin] or not q(Ext.Entity.Get, standin) then
         return false
     end
-    if not asked[old] then state.LootMerged = (state.LootMerged or 0) + 1 end
+    if not asked[old] then
+        state.LootMerged = (state.LootMerged or 0) + 1
+        -- Why this item reads as taken, for a report of loot taken with no click (his play, 11:43:30: boots made in
+        -- the corpse at 11:43:28 were gone 1.5 s later and taken): how old it was, its stand-in, who holds what.
+        local at = M.MadeAt[old]
+        Ext.Utils.Print(string.format("WOW-BG3 inventory: loot %s item %s gone without a trace from %s (made %s ticks ago): taken",
+            tostring(tag), tostring(old), tostring(standin), at and tostring(tick - at) or "?"))
+    end
     return true
 end
 -- Looked at every pass, not only when WoW's next list comes (2 s and more): WoW takes it only while the looter's
@@ -1237,6 +1246,7 @@ local function lootMerged()
         local guid = corpseOf[standin]
         if guid and put > 0 and not M.MoneyAsked and (WOWBG3MirrorOwned or {})[standin] and q(Ext.Entity.Get, standin)
             and goldOf(standin) < put then
+            Ext.Utils.Print(string.format("WOW-BG3 inventory: corpse %s gold %d, seen %d: taken", tostring(guid), goldOf(standin), put))
             M.MoneyAsked = true
             M.Request({Op = "take", Member = Hero.Uuid(), Npc = guid, Idx = "money", At = M.PlaceOf(Hero.Uuid())})
         end
@@ -1279,6 +1289,9 @@ local function fillHolder(standin, prefix, list)
                 -- Sold out, or no longer sold. A ware just bought is the buyer's now (M.Reconcile makes it WoW's).
                 local at = holderOf(u)
                 if prefix:sub(1, 1) ~= "V" or not at or at == standin then
+                    if prefix:sub(1, 1) == "L" then
+                        Ext.Utils.Print(string.format("WOW-BG3 inventory: loot %s item %s no longer in WoW's loot: deleted", tag, tostring(u)))
+                    end
                     deleted[u] = true
                     M.Suppress(u); pcall(Osi.RequestDelete, u)
                 end
@@ -1474,12 +1487,16 @@ local function fillVendors(inv)
             local g = goldOf(standin)
             if corpseGold[standin] and corpseGold[standin] > 0 and g < corpseGold[standin] and not M.MoneyAsked then
                 -- The player took the corpse's gold (BG3's loot window): WoW's money from that corpse.
+                Ext.Utils.Print(string.format("WOW-BG3 inventory: corpse %s gold %d, seen %d: taken", tostring(guid), g, corpseGold[standin]))
                 M.MoneyAsked = true
                 M.Request({Op = "take", Member = Hero.Uuid(), Npc = guid, Idx = "money", At = M.PlaceOf(Hero.Uuid())})
             elseif (lt.Money or 0) ~= g and not M.MoneyAsked then
                 setGold(standin, lt.Money or 0)
             end
-            corpseGold[standin] = lt.Money or 0
+            -- The gold as seen on the corpse, not as asked: BG3 sets no gold on a container whose loot window is open
+            -- (as a trader's in a trade), so the gold asked for was not there at the next look, and that read as the
+            -- player taking it: WoW's money sound and the money taken as each corpse opened (his play, 11:43:29).
+            if g == (lt.Money or 0) then corpseGold[standin] = g end
             if (lt.Money or 0) == 0 then M.MoneyAsked = nil end
         end
     end
