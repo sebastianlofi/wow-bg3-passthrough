@@ -51,12 +51,20 @@ void main() {
             vec3 up = max(A - PH, vec3(0.0)) / (1.0 - PH);
             t = smoothstep(0.06, 0.30, max(up.r, max(up.g, up.b)));
             m = -(1.0 + floor(t * 255.0 + 0.5) + g);
-            imageStore(gain, q, vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), 1.0));
+            // Its gloss (alpha): a smooth decal (water) gets its look from what it reflects, which BG3 lit on top of the
+            // fed colour; wdpostcas keeps that part of BG3's pixel over WoW's darkened ground. Its albedo alone is
+            // near black: water was a black hole in WoW's ground (a check on both PCs, 0.1.2358). A rough decal (ash,
+            // blood) reflects next to nothing and keeps WoW's colour times the gain alone.
+            float gloss = 1.0 - texelFetch(surf, q, 0).x;
+            imageStore(gain, q, vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), gloss));
             // What BG3's forward layers added over the decal before the composite (a fire's glow over its ashes: wfed
             // holds the feed with the decal's ambient, wowbg3_fxbg2.frag), a channel, as over bare ground below:
             // wdpostcas puts it over the decal's look. Without it the fire showed under its own ashes (a play report).
+            // Only what they add: under a decal BG3's forward buffer also holds its own lighting of the decal (its sun
+            // alone, black in the shade), darker than what was fed; taken as a layer over the ground, that turned water
+            // and ash black on WoW's ground (a check on both PCs, 0.1.2358).
             if (!same && w.a > 0.5)
-                early = vec4(mix(-(1.0 - f / max(w.rgb, vec3(1e-6))), (f - w.rgb) / max(f, vec3(1e-6)), step(w.rgb, f)), 1.0);
+                early = vec4(max((f - w.rgb) / max(f, vec3(1e-6)), vec3(0.0)), 1.0);
         } else {
             // Something drawn over the bare ground before the composite (a glow at a caster's feet, a bolt): what it
             // added is known a channel, what the feed wrote against what stands there now, as wowbg3_post.frag

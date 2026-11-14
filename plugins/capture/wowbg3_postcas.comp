@@ -50,7 +50,7 @@ void main() {
         if ((n > 1.5 || (n > 0.35 && n < 0.45)) && l.a > 0.5) imageStore(cout, q, vec4(1.0, 0.0, 1.0, 1.0));
         else if (n > 1.5) imageStore(cout, q, vec4(w.rgb, 1.0));
         else if (n > 0.5) imageStore(cout, q, vec4(0.0, 0.0, 1.0, 1.0));
-        else if (n < 0.0) { float v = -n - 1.0; imageStore(cout, q, vec4(0.15 + 0.85 * floor(v) / 255.0, fract(v), 0.0, 1.0)); }
+        else if (n < 0.0) { float v = -n - 1.0; imageStore(cout, q, vec4(0.15 + 0.85 * floor(v) / 255.0, fract(v), texelFetch(gimg, m(q), 0).a, 1.0)); }  // blue: the decal's gloss
         return;
     }
     // WoW's ground under something of BG3's (wowbg3_blmask.frag: -(1 + t * 255)): WoW's own colour for WoW's share, BG3's
@@ -60,9 +60,18 @@ void main() {
     if (n < 0.0) {
         float v = -n - 1.0, t = floor(v) / 255.0;
         if (w.a > 0.5 && t < 0.98) {
-            vec3 c = texelFetch(cin, q, 0).rgb, g = clamp(w.rgb * texelFetch(gimg, m(q), 0).rgb, vec3(0.0), vec3(1.0));
+            vec4 gn = texelFetch(gimg, m(q), 0);
+            vec3 c = texelFetch(cin, q, 0).rgb, g = clamp(w.rgb * gn.rgb, vec3(0.0), vec3(1.0));
             vec4 l = texelFetch(late, m(q), 0);
             if (l.a > 0.5) g = clamp(mix(g * (1.0 + l.rgb), g + c * l.rgb, step(vec3(0.0), l.rgb)), vec3(0.0), vec3(1.0));
+            // A glossy decal (water) is wet ground on WoW's: darker by at most WET. BG3 draws water by what it reflects,
+            // over an albedo near black and a forward layer that takes away what is behind it; in our level it has no sky
+            // over WoW's ground to reflect, and its albedo's change and that layer took WoW's ground to black (a check on
+            // both PCs, 0.1.2358). the maintainer's choice, 2026-11-14: a wet-ground look. What BG3's light added over the fed
+            // colour there stays on it (its sheen). A rough decal (ash, blood) keeps all of its change (blmask: gloss).
+            const float WET = 0.55;
+            float gl = clamp(gn.a, 0.0, 1.0);
+            g = mix(g, clamp(max(g, w.rgb * WET) + max(c - w.rgb, vec3(0.0)), vec3(0.0), vec3(1.0)), gl);
             imageStore(cout, q, vec4(mix(g, c, t), 1.0));
         }
         return;
