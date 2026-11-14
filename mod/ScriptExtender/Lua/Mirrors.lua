@@ -1164,9 +1164,15 @@ function M.Start(runId)
     local function keepCalling()
         for victim, c in pairs(calling) do
             local alive = Ext.Entity.Get(victim) ~= nil and q(Osi.IsDead, victim) ~= 1
-            if alive and q(Osi.IsInCombat, victim) == 1 then
+            -- Help needs someone to fight: an attacker dead (its body stays in BG3's combat) or gone to camp leaves BG3
+            -- nothing to start a combat on, so the guard called in was thrown out again at once, and called in again
+            -- each step: a fight's start and its dice, over and over (his play, 2026-11-14 15:43: Tav dead,
+            -- Shadowheart fled to camp, Orgrimmar's guard 932240a5 entered and left combat every 10 ticks).
+            local foe = c.Attacker and Ext.Entity.Get(c.Attacker) ~= nil and q(Osi.IsDead, c.Attacker) ~= 1
+                and #(q(function() return Osi.DB_PlayerInCamp:Get(c.Attacker) end) or {}) == 0
+            if alive and foe and q(Osi.IsInCombat, victim) == 1 then
                 callHelp(victim, c.Attacker)
-            elseif not alive or ticks - c.Tick > CALL_QUIET then
+            elseif not alive or not foe or ticks - c.Tick > CALL_QUIET then
                 calling[victim] = nil
             end
         end
