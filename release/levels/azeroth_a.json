@@ -62,5 +62,32 @@
   "Y": -20
  },
  "LiftPlatforms": true,
- "Waypoints": 33
+ "Waypoints": 33,
+ "LevelTemplates": [
+  {"Root": "d30d891b-7a52-462c-b1ca-68d7aed75ef9", "MapKey": "07ee3511-8b7b-4721-8690-7c28e8cb9cfa", "Name": "LT_CMP_Halsin_A_INT", "Pos": [-14017.1703, 1000.5745, -13999.6261], "Rot": [0.0, -0.2362468, 0.0, 0.9716931]},
+  {"Root": "5f40707d-630e-4861-8953-dc4fa9255b01", "MapKey": "14072092-ed8e-4f41-9f69-a26568638b17", "Name": "CLT_CMP_WyllTriggers_A_INT", "Pos": [-14023.028, 1000.995, -13969.005], "Rot": [0.0, 0.0, 0.0, 1.0]},
+  {"Root": "cc0ea3aa-8a2c-43dc-a5e2-67d22963d471", "MapKey": "15809a56-6564-4ab6-a2ad-1e8e58c98aee", "Name": "CLT_CMP_GaleTriggers_A_INT", "Pos": [-14011.109, 1000.348, -14025.255], "Rot": [0.0, 0.9903432, 0.0, 0.1386374]},
+  {"Root": "dc39774c-f2c5-4e05-a426-46cec35e3ce0", "MapKey": "1cb7018d-2c1c-438f-96df-69af3a2c9b83", "Name": "LT_CMP_Laezel_INT", "Pos": [-14030.1457, 1000.9526, -13979.4814], "Rot": [0.0, 0.9748039, 0.0, -0.2230634]},
+  {"Root": "54f05ea1-1d71-40aa-8393-3b8a32c08fb2", "MapKey": "211f5b74-cd22-41d0-bcd7-ce5e08f2bd94", "Name": "LT_CMP_Gale_INT", "Pos": [-14011.1091, 1000.3477, -14025.2553], "Rot": [0.0, 0.990343, 0.0, 0.1386393]},
+  {"Root": "d9422e33-d00e-4084-8b2c-184acf0fb91b", "MapKey": "30567d7d-3f18-4da9-96fa-1abd859c5693", "Name": "LT_CMP_INTMAIN_Day_Bag3_A", "Pos": [-14018.8067, 1001.1672, -13978.4799], "Rot": [0.0, -0.6724806, 0.0, 0.7401148]},
+  {"Root": "331ec773-d9fb-4626-99b2-6dec7c1f8fa2", "MapKey": "37125c35-d20d-451f-81ca-fb98ced31b41", "Name": "CLT_CMP_LaezelTriggers_A_INT", "Pos": [-14030.146, 1000.953, -13979.481], "Rot": [0.0, -0.974804, 0.0, 0.223063]},
+  {"Root": "00d6ac18-9267-4e61-ad48-b468771a902a", "MapKey": "46d215a0-ac71-4588-9eec-60352a9967da", "Name": "LT_CMP_Jaheira_A_INT", "Pos": [-13997.9474, 1004.4741, -13952.5796], "Rot": [0.0, 0.7625108, 0.0, 0.6469755]},
+  {"Root": "f9e561e3-fd91-43db-b95a-2ca0b89d3d63", "MapKey": "5161ac86-6354-458b-9815-fd73f4c4e4c9", "Name": "LT_CMP_Wyll_INT", "Pos": [-14023.0285, 1000.9946, -13969.005], "Rot": [0.0, 0.0, 0.0, 1.0]},
+  {"Root": "ffe725c3-92c7-4841-bb71-53376892cf77", "MapKey": "5c03f9c3-2833-49ea-905a-b0bc3e602bfa", "Name": "LT_CMP_INTMAIN_Day_Bag1_A", "Pos": [-14018.7853, 1001.1672, -13978.5321], "Rot": [0.0, -0.6724806, 0.0, 0.7401148]},
+  {"Root": "0c2271eb-24ff-4d0d-ba83-8fe0928fb779", "MapKey": "5d508ba4-1205-4f35-ae36-e6dc9e51f852", "Name": "LT_CMP_Astarion_INT", "Pos": [-13996.4369, 1000.112, -14023.5197], "Rot": [0.0, 1.0, 0.0, 0.0]},
+  {"Root": "4f75cc94-846c-4365-b0b3-78918e1ad78a", "MapKey": "6cb14256-c890-4994-99a9-f9a0d7fda146", "Name": "CLT_CMP_JaheiraTriggers_A_INT", "Pos": [-13997.947, 1004.474, -13952.58], "Rot": [0.0, 0.7625102, 0.0, 0.6469761]},
+  {"Root": "cd4c689e-5f3f-4996-86a3-025469138a14", "MapKey": "72901570-3f5d-47e0-a393-4acec0c14878", "Name": "CLT_CMP_KarlachTriggers_A_INT", "Pos": [-13994.55, 999.911, -14001.388], "Rot": [-0.0, 1.0, -0.0, -0.0]},
+  {"Root": "036bd655-5585-4b06-a10b-a5fd77e277dc", "MapKey": "77a3be34-5b51-4a48-b3d6-4dbc68d1e918", "Name": "CLT_CMP_MintharaTriggers_A_INT", "Pos": [-14017.17, 1000.575, -13999.626], "Rot": [0.0, -0.2362446, 0.0, 0.9716936]},
+  {"Root": "8546708b-9e45-4e5d-a5c0-a214820193e3", "MapKey": "7cf3eefa-3a91-4f19-b8f8-9e5b92bad145", "Name": "CLT_CMP_ShadowheartTriggers_A_INT", "Pos": [-14007.987, 1001.021, -13970.434], "Rot": [0.0, 0.0, 0.0, 1.0]},
+  {"Root": "acc04cac-6301-4658-b328-c9629435981e", "MapKey": "7e2e16a8-1bee-4428-a26e-eafdb0606c9d", "Name": "LT_CMP_Shadowheart_INT", "Pos": [-14007.9869, 1001.0212, -13970.434], "Rot": [0.0, 0.0, 0.0, 1.0]},
+  {"Root": "bf6ea1ea-4af1-4915-99a4-50b6b7ce3ab1", "MapKey": "8ce891c0-6388-4c82-b9a1-39dfb1f2e017", "Name": "LT_CMP_INTMAIN_Day_Bag2_A", "Pos": [-14018.7923, 1001.1672, -13978.5171], "Rot": [0.0, -0.6724806, 0.0, 0.7401148]},
+  {"Root": "63bd6a03-8c7e-453a-9772-f5cb9cd8f7fb", "MapKey": "9a1453ed-5afb-46a5-8f4f-3dd5bd762cef", "Name": "CLT_MagicMirror_A_000", "Pos": [-14019.7509, 1000.6325, -14008.7736], "Rot": [0.0, -0.711477, 0.0, 0.7027094]},
+  {"Root": "ed65c8c2-91d5-45de-8891-1bd7c49601fa", "MapKey": "9ed7bc89-bbd9-4d73-9c7c-2ad55ca37f5b", "Name": "LT_CMP_INTMAIN_Day_Bag4_A", "Pos": [-14018.796, 1001.1672, -13978.4987], "Rot": [0.0, -0.6724806, 0.0, 0.7401148]},
+  {"Root": "82845360-672c-45d2-b7a1-db28e7d16c14", "MapKey": "a4c40700-f5c3-4aa0-9db8-6f9b6347f07d", "Name": "CLT_CMP_AstarionTriggers_A_INT", "Pos": [-13996.437, 1000.112, -14023.52], "Rot": [-0.0, 1.0, -0.0, -0.0]},
+  {"Root": "10164a03-eead-4598-a33c-83e1aa40491b", "MapKey": "b83374de-618d-4bbf-8bff-ee89b43eb6ef", "Name": "LT_CMP_Karlach_INT", "Pos": [-13994.55, 999.9114, -14001.3878], "Rot": [0.0, 1.0, 0.0, 0.0]},
+  {"Root": "392f48d9-45ce-4a09-acbf-e3a66edfb07d", "MapKey": "c57c9410-5626-47d9-b6e7-0ffda79e75d5", "Name": "CLT_CMP_HalsinTriggers_A_INT", "Pos": [-14017.17, 1000.575, -13999.626], "Rot": [0.0, -0.2362446, 0.0, 0.9716936]},
+  {"Root": "c0865ea8-8e34-4a9d-803f-9b3658ddbc1e", "MapKey": "cf64e678-24af-44e8-aa98-7e72279f37ef", "Name": "LT_SCL_Intermezzo_C_ART_000", "Pos": [-14000.0, 1000.0, -14000.0], "Rot": [0.0, 0.0, 0.0, 1.0]},
+  {"Root": "aedb754f-97c5-42f2-b873-110ba537d893", "MapKey": "d593173b-4cae-4895-bbc8-a69e4bcf6ad1", "Name": "CLT_CMP_MintharaTriggers_B_INT", "Pos": [-14017.17, 1000.575, -13999.626], "Rot": [0.0, -0.2362446, 0.0, 0.9716936]},
+  {"Root": "0eaf0001-a51c-48f7-8a1b-247c4acd99a5", "MapKey": "ebe18958-2683-4f2d-9633-53413b5c41f8", "Name": "LT_CMP_Minthara_A_INT", "Pos": [-14017.17, 1000.575, -13999.626], "Rot": [0.0, -0.2362446, 0.0, 0.9716936]}
+ ]
 }

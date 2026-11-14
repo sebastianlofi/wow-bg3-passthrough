@@ -169,8 +169,9 @@ def layer_list(name, layer):
             + '</node></children></node></children></node></children></node>')
 
 
-def transform(pos):
-    return ('<node id="Transform">' + attr("Position", "fvec3", f3(pos)) + attr("RotationQuat", "fvec4", "0 0 0 1")
+def transform(pos, rot=None):
+    q = " ".join(repr(float(v)) for v in rot) if rot else "0 0 0 1"
+    return ('<node id="Transform">' + attr("Position", "fvec3", f3(pos)) + attr("RotationQuat", "fvec4", q)
             + attr("Scale", "float", "1") + "</node>")
 
 
@@ -237,7 +238,7 @@ def write_level_templates(path, spec, layer):
         objs.append('<node id="GameObjects">' + attr("Flag", "int32", "1") + attr("LevelName", "FixedString", name)
                     + attr("MapKey", "FixedString", t["MapKey"]) + attr("Name", "LSString", t["Name"])
                     + attr("TemplateName", "FixedString", t["Root"]) + attr("Type", "FixedString", "LevelTemplate")
-                    + "<children>" + layer_list(name, layer) + transform(t["Pos"]) + "</children></node>")
+                    + "<children>" + layer_list(name, layer) + transform(t["Pos"], t.get("Rot")) + "</children></node>")
     x = (HDR + '\t<region id="Templates">\n\t\t<node id="Templates">\n\t\t\t<children>\n'
          + "".join("\t\t\t\t" + o + "\n" for o in objs) + "\t\t\t</children>\n\t\t</node>\n\t</region>\n</save>\n")
     open(path, "w").write(x)

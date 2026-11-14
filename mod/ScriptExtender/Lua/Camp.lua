@@ -249,9 +249,90 @@ local function startOwn(runId)
     end)
 end
 
+-- Camp inside our own level (his choice, 2026-11-14): release/levels/azeroth_a.json places BG3's own INTMAIN camp, the
+-- level template LT_SCL_Intermezzo_C_ART (sub-level SCL_Intermezzo_C_ART: its ground, scenery, lights, campfire, beds,
+-- area, entry and wake-up triggers) and INT_Main_A's camp templates (companion corners, bags, companion triggers) by
+-- id, at INT_Main_A's offsets from it, in a corner of the level (references, nothing of Larian's copied). BG3's story
+-- knows that camp as INTMAIN of INT_Main_A only (Act2b_CAMP.txt); its rows are written here for our level, as the
+-- story writes them, and DB_MainCamp names our level, so Go to Camp, Long Rest and Leave Camp are the story's own
+-- teleports inside one level, with no level change: the WoW side stays logged in (the coordinator only takes it down
+-- outside the host level, lifecycle.py) and camp is BG3's own picture as in a borrowed level (below).
+M.CAMP = "INTMAIN"
+M.CAMPFIRE = "S_CAMP_INT_Campfire_29837405-038d-438b-89f5-8d0363f32e16"
+local CAMP_ROWS = {
+    {"DB_Camp", "INTMAIN", M.CAMPFIRE, "S_CAMP_INT_Area_9ef2ce12-074b-456a-9808-19c80dff20ff",
+        "S_CAMP_INT_EntryPoint_ffff4e4a-4e43-4bf1-a54f-bbf3798b90c0"},
+    {"DB_Camp_Ambiance", "INTMAIN", "ATM_Intermezzo_C_ART_aec98272-5ee3-473a-b8e8-38cf5467ec09",
+        "d9f9c3d0-7835-6bc8-4b04-140bc54f192c", "1795ccf6-2364-16a8-a3f6-b9ee2d709622",
+        "LTN_Intermezzo_C_ART_0c1b1b1e-9e74-420a-996c-2dbb4eaad1eb", "fbcc894a-721c-bf4d-6d14-0469a6026756",
+        "29e803da-dfea-94a1-f52a-a6c54025e711", "S_CAMP_INT_SoundVolume_54db3a88-53b8-443a-9d4c-827d7db37158"},
+    {"DB_InRegionFlag", "S_CAMP_INT_Area_9ef2ce12-074b-456a-9808-19c80dff20ff", "CAMP_INT_State_InRegion_6cbd54fb-ee55-46dc-a97f-2771cc0114d1"},
+    {"DB_CampBed", "INTMAIN", 1, "S_Camp_Bedroll1_b57c550d-23ac-861a-369f-62aa1d011b17", "S_CAMP_INT_Bed1_ce371fc0-35e4-4601-b641-42d6063d2c05",
+        "LT_CMP_INTMAIN_Day_Bag1_A_5c03f9c3-2833-49ea-905a-b0bc3e602bfa", "NULL_00000000-0000-0000-0000-000000000000",
+        "S_CAMP_MorningWakeUp_Trigger1_06229502-d20a-4ed4-87fa-1edc9b0d0473"},
+    {"DB_CampBed", "INTMAIN", 2, "S_Camp_Bedroll2_3c608d19-464d-8da0-684a-c9976f035c67", "S_CAMP_INT_Bed2_ae108ddf-e426-4f01-a8a7-265078cb4c7b",
+        "LT_CMP_INTMAIN_Day_Bag2_A_8ce891c0-6388-4c82-b9a1-39dfb1f2e017", "NULL_00000000-0000-0000-0000-000000000000",
+        "S_CAMP_MorningWakeUp_Trigger2_9f948f7b-e16d-4bf2-b7cb-87e32505e255"},
+    {"DB_CampBed", "INTMAIN", 3, "S_Camp_Bedroll3_5bfa7163-8c38-8755-1243-4c7a5fc88f7c", "S_CAMP_INT_Bed3_c0ad058f-c17e-4f56-9c32-e813b64d439c",
+        "LT_CMP_INTMAIN_Day_Bag3_A_30567d7d-3f18-4da9-96fa-1abd859c5693", "NULL_00000000-0000-0000-0000-000000000000",
+        "S_CAMP_MorningWakeUp_Trigger3_609588b9-973c-462b-bd4a-69749353c225"},
+    {"DB_CampBed", "INTMAIN", 4, "S_Camp_Bedroll4_c02b3152-f7a4-88a1-1fdd-230d65312652", "S_CAMP_INT_Bed4_93bc5170-1b9d-45b8-a2c8-172bc75e3df0",
+        "LT_CMP_INTMAIN_Day_Bag4_A_9ed7bc89-bbd9-4d73-9c7c-2ad55ca37f5b", "NULL_00000000-0000-0000-0000-000000000000",
+        "S_CAMP_MorningWakeUp_Trigger4_973d48b9-69a8-430e-8897-1cabd0db093d"},
+}
+local CORNERS = {
+    {"S_Player_Gale_ad9af97d-75da-406a-ae13-7071c563f604", "LT_CMP_Gale_000_211f5b74-cd22-41d0-bcd7-ce5e08f2bd94"},
+    {"S_Player_Astarion_c7c13742-bacd-460a-8f65-f864fe41f255", "LT_CMP_Astarion_000_5d508ba4-1205-4f35-ae36-e6dc9e51f852"},
+    {"S_Player_ShadowHeart_3ed74f06-3c60-42dc-83f6-f034cb47c679", "LT_CMP_Shadowheart_000_7e2e16a8-1bee-4428-a26e-eafdb0606c9d"},
+    {"S_Player_Laezel_58a69333-40bf-8358-1d17-fff240d7fb12", "LT_CMP_Laezel_000_1cb7018d-2c1c-438f-96df-69af3a2c9b83"},
+    {"S_Player_Wyll_c774d764-4a17-48dc-b470-32ace9ce447d", "LT_CMP_Wyll_000_5161ac86-6354-458b-9815-fd73f4c4e4c9"},
+    {"S_Player_Karlach_2c76687d-93a2-477b-8b18-8a14b549304c", "LT_CMP_Karlach_000_b83374de-618d-4bbf-8bff-ee89b43eb6ef"},
+    {"S_GOB_DrowCommander_25721313-0c15-4935-8176-9f134385451b", "LT_CMP_Minthara_A_000_ebe18958-2683-4f2d-9633-53413b5c41f8"},
+    {"S_GLO_Halsin_7628bc0e-52b8-42a7-856a-13a6fd413323", "LT_CMP_Halsin_A_000_07ee3511-8b7b-4721-8690-7c28e8cb9cfa"},
+    {"S_Player_Jaheira_91b6b200-7d00-4d62-8dc9-99e8339dfa1a", "LT_CMP_Jaheira_A_000_46d215a0-ac71-4588-9eec-60352a9967da"},
+}
+for _, c in ipairs(CORNERS) do CAMP_ROWS[#CAMP_ROWS + 1] = {"DB_Camp_PersonalCornerLevelTemplate", "INTMAIN", c[1], c[2]} end
+
+-- The camp stands in this level (the level template is placed and loaded): its campfire is here.
+local function campHere()
+    local raw = Ext.IO.LoadFile("wow-bg3/camp-grid.json")  -- the coordinator joined the camp's AI grid to ours
+    local g = raw and #raw < 256 and Ext.Json.Parse(raw)
+    if not (type(g) == "table" and g.On == true) then return false end
+    local ok, r = pcall(Osi.GetRegion, M.CAMPFIRE)
+    return ok and r == Hero.REGION
+end
+
+-- The story's rows for INTMAIN in our level, each once (a save keeps them; a row the story has is left alone).
+local function registerCamp()
+    local added = 0
+    for _, row in ipairs(CAMP_ROWS) do
+        local db = Osi[row[1]]
+        local args = {table.unpack(row, 2)}
+        local probe = {table.unpack(args)}
+        local have = q(function() return db:Get(table.unpack(probe)) end)
+        if not have or #have == 0 then
+            if pcall(function() db(table.unpack(args)) end) then added = added + 1 end
+        end
+    end
+    for _, r in ipairs(q(function() return Osi.DB_MainCamp:Get(Hero.REGION, nil) end) or {}) do
+        if r[2] ~= M.CAMP then pcall(function() Osi.DB_MainCamp:Delete(r[1], r[2]) end) end
+    end
+    if #(q(function() return Osi.DB_MainCamp:Get(Hero.REGION, M.CAMP) end) or {}) == 0 then
+        Osi.DB_MainCamp(Hero.REGION, M.CAMP); added = added + 1
+    end
+    if #(q(function() return Osi.DB_Camp_Unlocked:Get(1) end) or {}) == 0 then pcall(function() Osi.DB_Camp_Unlocked(1) end) end
+    -- GLO_Camp makes the main camp active at LevelLoaded when none is: these rows come after it.
+    if #(q(function() return Osi.DB_ActiveCamp:Get(nil) end) or {}) == 0 then pcall(function() Osi.DB_ActiveCamp(M.CAMP) end) end
+    Ext.Utils.Print(string.format("WOW-BG3 camp: INTMAIN in %s (%d story rows written, active camp %s)", Hero.REGION, added,
+        Ext.Json.Stringify(q(function() return Osi.DB_ActiveCamp:Get(nil) end) or {})))
+end
+
 function M.Start(runId)
     if not M.On() then return end
-    if Hero.OWN then return startOwn(runId) end
+    if Hero.OWN then
+        if not campHere() then return startOwn(runId) end
+        registerCamp()
+    end
     local ticks, seq, pending, outFor = 0, 0, nil, 0
     local own = nil -- where this module just sent the hero: its Teleported arrives ticks later, no one's travel
     local regroup = nil -- after a walk off camp: the hero's walking away undid the party's following

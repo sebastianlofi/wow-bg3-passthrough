@@ -64,6 +64,7 @@ TOOLS_LATER = ["wowaccount.py", "wowbg3-chatcmd.py", "wowbg3cmd.py",  # playthro
                "wow_icons.py", "wowcursor.py",  # the icon atlas and the quest cursors (first run, with --python)
                "wow_abilities.py", "wow_abilities_rules.json",  # the mobs' abilities (first run, with --python)
                "wow_spells.py",  # our spells' names from the player's client (first run, with --python)
+               "camp_grid.py",  # the camp's AI grid joined to our level's, from the player's BG3 paks (each start)
                "seenoise.py"]  # BG3's see-through noise for benilla (first run, with --python)
 
 

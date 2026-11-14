@@ -725,12 +725,35 @@ def abilities_make():
 BOOT_OVERRIDES = IO / 'boot-path-overrides.txt'   # bg3le patch 0006 reads it as BG3 loads its stats (in the IO folder: 0012)
 
 
+def camp_grid():
+    """Our level's AI grid with BG3's camp in it (tools/camp_grid.py), made here from this PC's BG3 paks when its
+    inputs changed: the camp inside our own level (Camp.lua) needs the camp's walkable tiles, which BG3 bakes into the
+    parent level's grid and does not load with the placed sub-level. Returns the override line, or None (Camp.lua then
+    keeps the camp trip to INT_Main_A: camp-grid.json says which)."""
+    on = False
+    line = None
+    try:
+        import camp_grid as CG
+        data = game_data()
+        if S.get('camp') == '1' and data and (IO / 'host.json').is_file() \
+                and json.loads((IO / 'host.json').read_text()).get('Region') == CG.LEVEL:
+            out = DATA / 'levels' / CG.LEVEL / 'aigrid.data'
+            log(CG.make(HOME.parent / 'WOW-BG3.pak', data, out))
+            line, on = '%s\t%s' % (CG.GAME_PATH, out), True
+    except Exception as e:  # noqa: BLE001  the camp falls back to its own level; the game goes on
+        log('camp grid: not made (%s): camp stays a trip to INT_Main_A' % e)
+    (IO / 'camp-grid.json').write_text(json.dumps({'On': on}))
+    return line
+
+
 def boot_overrides():
-    """This start's overrides file, empty: it ends bg3le's wait for it (patch 0006). BG3's stats load no longer
-    reads the mobs' copies: Abilities.lua makes a stand-in's copies when it is granted (bg3le patch 0009), so
-    nothing of them is made at BG3's boot and a new install's first session has them too."""
+    """This start's overrides file: it ends bg3le's wait for it (patch 0006). BG3's stats load no longer reads the
+    mobs' copies: Abilities.lua makes a stand-in's copies when it is granted (bg3le patch 0009), so nothing of them is
+    made at BG3's boot and a new install's first session has them too. The one line now: our level's AI grid with the
+    camp in it (camp_grid), read in place of the pak's."""
+    lines = [l for l in (camp_grid(),) if l]
     tmp = IO / 'boot-path-overrides.tmp'
-    tmp.write_text('')
+    tmp.write_text(''.join(l + '\n' for l in lines))
     os.replace(tmp, BOOT_OVERRIDES)
 
 

@@ -135,8 +135,12 @@ function M.Start()
         for _, who in ipairs(players()) do party[uuidOf(who) or who] = true end
         -- From another level (camp) BG3's answer is a level change into ours: nothing to undo there (Camp.lua puts the
         -- party on its way-back spot); the WoW flight follows once camp is over (wowbg3cmd.py waits, panel clicks).
+        -- At camp inside our level (Camp.lua, INTMAIN) the same holds: the hop takes the party off camp and the story's
+        -- way back (Camp.lua) puts it on the spot it left, from where the flight goes.
         local lv = q(function() local r = Osi.DB_CurrentLevel:Get(nil); return r and r[1] and r[1][1] end)
-        hop = {Until = ticks + M.HOP_TICKS, Party = party, Back = {}, Away = lv ~= Hero.REGION}
+        local hero = Hero.Uuid and Hero.Uuid() or nil
+        local inCamp = hero and #(q(function() return Osi.DB_PlayerInCamp:Get(hero) end) or {}) > 0
+        hop = {Until = ticks + M.HOP_TICKS, Party = party, Back = {}, Away = lv ~= Hero.REGION or inCamp}
         M.State.Clicks = M.State.Clicks + 1
         local p = bySlot[slot]
         if not p then return end
