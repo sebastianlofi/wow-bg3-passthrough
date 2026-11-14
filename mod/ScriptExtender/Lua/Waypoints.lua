@@ -87,6 +87,7 @@ function M.Hopping() return hop ~= nil end
 function M.Start()
     if Hero.OWN then M.TRIGGERS = M.OWN_TRIGGERS end
     local ticks, lastRaw, item, lastRefused = 0, nil, nil, false -- false: nothing read yet, an old refusal stays quiet
+    local lastParty = nil -- who the panel was last offered to: a New Game's first read comes before its party exists
     local bySlot, done = {}, {}  -- slot -> discovered point; id -> registered in this session
     local slotOf = {}
     for i, t in ipairs(M.TRIGGERS) do slotOf[t] = i - 1 end
@@ -193,8 +194,12 @@ function M.Start()
         if ticks % 30 ~= 0 or Ext.Utils.GetGameState() ~= "Running" then return end
         local ok, err = pcall(function()
             local raw = Ext.IO.LoadFile("wow-bg3/link/waypoint-panel.json")
-            if raw and raw ~= lastRaw then
-                lastRaw = raw
+            -- Offered again when the party changes too: a New Game reads the file before its party exists, offered
+            -- it to no one, and the same text never came again (slot B, 0.1.2358: an empty panel until the file changed).
+            local who = players(); table.sort(who)
+            local party = table.concat(who, ",")
+            if raw and (raw ~= lastRaw or party ~= lastParty) then
+                lastRaw, lastParty = raw, party
                 offer(Ext.Json.Parse(raw).Points or {})
             end
             local no = Ext.IO.LoadFile("wow-bg3/link/waypoint-refused.json")

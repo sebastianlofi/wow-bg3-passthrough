@@ -292,6 +292,21 @@ local CORNERS = {
     {"S_Player_Jaheira_91b6b200-7d00-4d62-8dc9-99e8339dfa1a", "LT_CMP_Jaheira_A_000_46d215a0-ac71-4588-9eec-60352a9967da"},
 }
 for _, c in ipairs(CORNERS) do CAMP_ROWS[#CAMP_ROWS + 1] = {"DB_Camp_PersonalCornerLevelTemplate", "INTMAIN", c[1], c[2]} end
+-- Each companion's own spot at camp (Act2b_CAMP.txt's "Post EA Origin Camp Spots"): GLO_Camp's QRY_Camp_GetCamperPos
+-- reads these, and without them every camper went to the camp's entry point (a play report: all of them in one spot).
+local SPOTS = {
+    {"S_Player_Astarion_c7c13742-bacd-460a-8f65-f864fe41f255", "S_CAMP_Astarion_A_9b40319f-e45f-8294-5008-5a3c0ac79528"},
+    {"S_GLO_JergalAvatar_0133f2ad-e121-4590-b5f0-a79413919805", "S_CAMP_INT_Jergal_c3bbd7d5-0b5d-453b-92c8-651639ecb2dc"},
+    {"S_GLO_Halsin_7628bc0e-52b8-42a7-856a-13a6fd413323", "S_CAMP_Halsin_A_59b22af4-d1e8-8b88-15b8-f52995d7b6e8"},
+    {"S_Player_Gale_ad9af97d-75da-406a-ae13-7071c563f604", "S_CMP_Gale_A_338bcdd8-e554-8cb3-30bc-b25b5267aadf"},
+    {"S_Player_Karlach_2c76687d-93a2-477b-8b18-8a14b549304c", "S_CAMP_Karlach_A_ff17ad1a-5cb7-8c7a-2108-879164acb6f2"},
+    {"S_Player_ShadowHeart_3ed74f06-3c60-42dc-83f6-f034cb47c679", "S_CAMP_Shadowheart_A_ca065702-0ddc-8047-55c2-c9c179feade6"},
+    {"S_Player_Wyll_c774d764-4a17-48dc-b470-32ace9ce447d", "S_CAMP_Wyll_A_8f0f4ef3-d312-8883-2460-8b1b8e178aa1"},
+    {"S_Player_Laezel_58a69333-40bf-8358-1d17-fff240d7fb12", "S_CAMP_Laezel_A_b053993b-0ba0-83d7-1835-8dc448beff7d"},
+    {"S_Player_Jaheira_91b6b200-7d00-4d62-8dc9-99e8339dfa1a", "S_CAMP_Jaheira_A_9efc08a6-5e27-8b78-25f0-90148ea16991"},
+    {"S_GOB_DrowCommander_25721313-0c15-4935-8176-9f134385451b", "S_CAMP_Minthara_A_76a2a125-07bd-8a90-1c49-52808393889b"},
+}
+for _, c in ipairs(SPOTS) do CAMP_ROWS[#CAMP_ROWS + 1] = {"DB_ORI_OriginCampData", c[1], "INTMAIN", c[2]} end
 
 -- The camp stands in this level (the level template is placed and loaded): its campfire is here.
 local function gridOn()
@@ -326,6 +341,13 @@ local function registerCamp()
     if #(q(function() return Osi.DB_Camp_Unlocked:Get(1) end) or {}) == 0 then pcall(function() Osi.DB_Camp_Unlocked(1) end) end
     -- GLO_Camp makes the main camp active at LevelLoaded when none is: these rows come after it.
     if #(q(function() return Osi.DB_ActiveCamp:Get(nil) end) or {}) == 0 then pcall(function() Osi.DB_ActiveCamp(M.CAMP) end) end
+    local found, missing = 0, {}
+    for _, c in ipairs(SPOTS) do
+        local ok, x = pcall(Osi.GetPosition, c[2])
+        if ok and x then found = found + 1 else missing[#missing + 1] = c[2]:sub(1, 24) end
+    end
+    Ext.Utils.Print(string.format("WOW-BG3 camp: %d of %d companion spots in the level%s", found, #SPOTS,
+        #missing > 0 and (" (missing " .. table.concat(missing, ", ") .. ")") or ""))
     Ext.Utils.Print(string.format("WOW-BG3 camp: INTMAIN in %s (%d story rows written, active camp %s)", Hero.REGION, added,
         Ext.Json.Stringify(q(function() return Osi.DB_ActiveCamp:Get(nil) end) or {})))
 end
