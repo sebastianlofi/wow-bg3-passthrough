@@ -195,16 +195,21 @@ def guard_item_guids(floor=0):
 
 
 def apply(secs, names):
-    """Deletes every row the sections cover, then their inserts (statements in one client call)."""
-    stmts = []
+    """Deletes every row the sections cover, then their inserts (statements in one client call). Every delete comes
+    before any insert: an item can move between the characters restored together (Shadowheart's water given to Gale
+    after the save), and restoring them one by one put Shadowheart's row back while Gale's still held the item, which
+    character_inventory's key (the item) refuses (a play report: an older save loaded on WoW's latest state)."""
+    deletes, inserts = [], []
     for name in names:
         guid, lines = secs[name]
-        stmts += ['delete from %s where %s;' % (t, w) for t, w in wheres(guid)]
+        deletes += ['delete from %s where %s;' % (t, w) for t, w in wheres(guid)]
         items = [m.group(1) for m in map(ITEM_GUID.match, lines) if m]
-        if items:  # an item of the snapshot that has another owner now (traded, mailed)
-            stmts.append('delete from item_instance where guid in (%s);' % ','.join(items))
-        stmts += lines
-    sql('\n'.join(stmts) + '\n')
+        if items:  # an item of the snapshot that has another owner now (traded, mailed, given), whoever holds it
+            deletes.append('delete from item_instance where guid in (%s);' % ','.join(items))
+            deletes.append('delete from character_inventory where item_guid in (%s);' % ','.join(items))
+            deletes.append('delete from item_loot where guid in (%s);' % ','.join(items))
+        inserts += lines
+    sql('\n'.join(deletes + inserts) + '\n')
 
 
 def restore(sid, names=None):

@@ -13,7 +13,7 @@ TABLES = {
     'characters': 'guid, account, name, race, class, gender, level, online',
     'character_action': 'guid, button, action, type',
     'character_aura': 'guid, caster_guid, item_guid, spell, stacks',
-    'character_inventory': 'guid, bag, slot, item_guid, item_id',
+    'character_inventory': 'guid, bag, slot, item_guid primary key, item_id',  # vmangos: PRIMARY KEY (item_guid)
     'character_spell': 'guid, spell, active, disabled',
     'item_instance': 'guid, item_id, owner_guid, creator_guid, gift_creator_guid, count, enchantments, text',
     'item_loot': 'guid, owner_guid, item_id, amount, property',
@@ -73,7 +73,7 @@ class FakeDB:
         return lines
 
     def columns(self):
-        return {t: [c.strip() for c in cols.split(',')] for t, cols in TABLES.items()}
+        return {t: [c.split()[0] for c in cols.split(',')] for t, cols in TABLES.items()}
 
     def one(self, q):
         return self.db.execute(q).fetchall()
@@ -303,6 +303,20 @@ class Rehome(Base):
         db.db.execute("insert into characters values (1, 16, 'Tav', 2, 1, 1, 1, 0)")
         with self.assertRaisesRegex(AssertionError, 'Tav was guid 15, is 1 now'):
             wowsave.restore('s1')
+
+    def test_an_item_given_to_another_restored_character_comes_back(self):
+        # A play report: Shadowheart's water given to Gale after the save; the load restored them one by one and
+        # Shadowheart's row met Gale's (Duplicate entry for key PRIMARY): the restore failed, WoW's latest state stayed.
+        db = self.old_database()
+        db.db.execute('update characters set online = 0')
+        wowsave.rehome()
+        db.db.execute("insert into characters values (20, 16, 'Gale', 1, 8, 0, 1, 0)")
+        wowsave.snapshot('s3', ['Tav', 'Gale'])
+        db.db.execute('update character_inventory set guid = 20, slot = 23 where item_guid = 111')
+        db.db.execute('update item_instance set owner_guid = 20 where guid = 111')
+        wowsave.restore('s3')
+        self.assertEqual(db.one('select guid from character_inventory where item_guid = 111'), [(15,)])
+        self.assertEqual(db.one('select owner_guid from item_instance where guid = 111'), [(15,)])
 
     def test_only_while_mangosd_is_stopped(self):
         self.old_database()
