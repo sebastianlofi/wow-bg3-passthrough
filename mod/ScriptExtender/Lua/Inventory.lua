@@ -565,8 +565,15 @@ local function setParked(u, p)
     if e then pcall(function() e.Vars[PARK_VAR] = p and Ext.Json.Stringify(p) or "" end) end
 end
 local parkWait = {} -- entry .. "@" .. member -> tick a park's del went out (the stack waits for WoW's list)
+-- WoW item guid -> tick it was put down: until WoW's list drops it (the del a moment behind), nothing is made for it
+-- again (a thrown Hearthstone had a second one made at once, slot B, 0.1.2368).
+local parkedGuid = {}
 local PARK_WAIT = 150
 local vanished = {} -- entry .. "@" .. member -> {Count, At}: a parked piece gone (picked up and merged, or destroyed)
+-- What left a member by the player's hand (BG3's RemovedFrom, not one of our own moves): only such an item lying in
+-- the world was put down. An item just made (M.Create) lies at its making spot until BG3 moves it into the bag, and
+-- read as put down there: a New Game's every WoW item left WoW at once (slot B, 0.1.2367). uuid -> member.
+local leftBy = {}
 
 -- ---- reconcile BG3 with inventory.json ----
 local state = {Seq = -1, Members = {}, Created = 0, Errors = {}}
@@ -701,6 +708,7 @@ local function park(u, member, tag, why)
             if tostring(it.Guid) == tag then p.Rand, p.Dur = it.Rand, it.Dur end
         end
         M.Request({Op = "del", Member = member, Guid = tag})
+        parkedGuid[tag] = tick
     else
         local left = count
         for _, it in ipairs(items) do
@@ -713,7 +721,7 @@ local function park(u, member, tag, why)
         parkWait[tostring(entry) .. "@" .. member] = tick
     end
     setParked(u, p)
-    pieceOwner[u] = nil
+    pieceOwner[u], leftBy[u] = nil, nil
     local e = q(Ext.Entity.Get, u)
     if e then pcall(function() e.Vars[VAR] = "P" .. u end) end
     local okp, x, y, z = pcall(Osi.GetPosition, u)
@@ -811,14 +819,17 @@ local function reconcileStacks(uuid, stacks, have, items)
                 end
             end
         end
-        if not u and total > 0 and not waiting then
+        local pw = parkWait[tostring(entry) .. "@" .. uuid]
+        if not u and total > 0 and not waiting and not (pw and tick - pw < PARK_WAIT) then
             local ok, made = pcall(M.Create, entry, uuid, total, tag)
             if ok then u = made; have[tag] = u; state.Created = state.Created + 1 else note(made) end
         end
         if u and not pendingItem[u] and not waiting then
             local at, key = holderOf(u), tostring(entry) .. "@" .. uuid
-            if at == nil then
+            if at == nil and leftBy[u] == uuid then
                 if not inThrow(uuid) then park(u, uuid, nil, "stack on the ground") end
+            elseif at == nil and inThrow(uuid) then
+                -- in the air: BG3's until the throw ends
             else
                 if at ~= uuid then putBack(u, uuid, total, "stack") end
                 local amount = q(Osi.GetStackAmount, u)
@@ -883,7 +894,8 @@ local function reconcileMember(uuid, m, have)
             stacks[it.Entry] = (stacks[it.Entry] or 0) + (it.Count or 1)
             row = nil -- handled as a stack below
         end
-        if row and not u then
+        if parkedGuid[tag] and tick - parkedGuid[tag] >= PARK_WAIT then parkedGuid[tag] = nil end
+        if row and not u and not parkedGuid[tag] then
             local ok, made = pcall(M.Create, it.Entry, uuid, it.Count, tag, it.Rand)
             if ok then
                 u = made
@@ -903,9 +915,9 @@ local function reconcileMember(uuid, m, have)
                 pcall(M.Dress, u, v)
             end
             local at = holderOf(u)
-            if at == nil and not equipped(u) then
+            if at == nil and not equipped(u) and leftBy[u] == uuid then
                 if not inThrow(uuid) then park(u, uuid, tag, "item on the ground") end
-            elseif at ~= uuid and not equipped(u) then
+            elseif at ~= uuid and not equipped(u) and not (at == nil and inThrow(uuid)) then
                 putBack(u, uuid, M.AmountOf(row, it.Count) or 1, "item")
             end
             local eq = equipped(u)
@@ -1083,7 +1095,9 @@ function M.Reconcile(inv)
     end
     -- A part split off a member's stack lying in the world (dropped from the bag, a throw that did not break): out of WoW.
     for u, owner in pairs(pieceOwner) do
-        if q(Ext.Entity.Get, u) and not holderOf(u) and not inThrow(owner) then park(u, owner, nil, "part of a stack on the ground") end
+        if leftBy[u] == owner and q(Ext.Entity.Get, u) and not holderOf(u) and not inThrow(owner) then
+            park(u, owner, nil, "part of a stack on the ground")
+        end
     end
     wowOwner, stackWant = {}, {}
     local blind = false
@@ -1724,6 +1738,7 @@ end
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
     if not u or not h then return end
+    leftBy[u] = nil
     local tag = tagOf(u)
     priceItem(u, h, tag) -- at once: a ware just bought can be sold straight back
     if suppressed(u) then return end
@@ -1785,6 +1800,7 @@ end
 local function onRemovedFrom(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
     if not u or not h or suppressed(u) then return end
+    if (lastInv.Members or {})[h] then leftBy[u] = h end
     local tag = M.SideTag[u] or tagOf(u)
     local kind = tostring(tag):match("^([LV])%x+:%d+$")
     local pick = picking[h]

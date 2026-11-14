@@ -493,7 +493,8 @@ class FillHolder(unittest.TestCase):
           function q(f, ...) local ok, v = pcall(f, ...); if ok then return v end end
           function buying(standin) return standin ~= "boar" end -- a vendor's trade is open; a corpse has none
           function askFor(u, tag) if not asked[u] then asked[u] = true; taken[#taken + 1] = tag end end
-          Ext = {Entity = {Get = function(u) return ents[u] end}}
+          Ext = {Entity = {Get = function(u) return ents[u] end}, Utils = {Print = function() end}}
+          M.MadeAt = {}
           ents.boar = true
           Osi = {RequestDelete = function(u) gone[#gone + 1] = u; for t, x in pairs(inv) do if x == u then inv[t] = nil end end; ents[u] = nil end,
                  GetStackAmount = function(u) return stacks[u] end, SetStackAmount = function(u, n) stacks[u] = n end,

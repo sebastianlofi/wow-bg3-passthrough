@@ -68,6 +68,11 @@ function note() end
 function reconcileStacks() end
 function keepsOwn() return false end
 function holderOf() return "hero" end
+parkedGuid, PARK_WAIT, tick, leftBy, parked = {}, 150, 0, {}, {}
+function inThrow() return false end
+function parkedOf(u) return parked[u] end
+function putBack(u, member, count) M.Suppress(u); Osi.ToInventory(u, member, count, 0, 0) end
+function park(u, member, tag) parked[u] = {Member = member, Tag = tag} end
 function equipped(u) return hands.main == u or hands.off == u or hands.ranged == u end
 function entryOf(u) return entry_of[u] end
 function uuidOf(s) return s end
@@ -166,6 +171,21 @@ class Landed(Member):
         self.L.execute('holderOf = function() return nil end')
         self.go([('sword', 1, 30)], 1)
         self.assertEqual(list(self.L.globals().back.values()), ['sword'])
+
+    def test_a_sword_the_hero_put_down_leaves_wow(self):
+        # the maintainer: items can be put on the ground; WoW loses them while they lie there (Inventory.lua park).
+        self.L.execute('holderOf = function() return nil end; leftBy.sword = "hero"')
+        self.go([('sword', 1, 30)], 1)
+        self.assertEqual(len(self.L.globals().back), 0)
+        self.assertEqual(self.L.eval('parked.sword.Member'), 'hero')
+        self.assertEqual(self.L.eval('parked.sword.Tag'), 'sword')
+
+    def test_an_item_just_made_is_not_put_down(self):
+        # M.Create's item lies at its making spot until BG3 moves it into the bag (slot B, 0.1.2367: a New Game's
+        # every WoW item left WoW): nobody put it down, so it goes back.
+        self.L.execute('holderOf = function() return nil end')
+        self.go([('sword', 1, 30)], 1)
+        self.assertIsNone(self.L.eval('parked.sword'))
 
 
 class Amount(Member):

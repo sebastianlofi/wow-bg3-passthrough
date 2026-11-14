@@ -324,6 +324,10 @@ class Spend(unittest.TestCase):
           function note() end
           function tagOf(u) return "S4540@hero" end
           function eachOurs(f) for u in pairs(stack) do f(u) end end
+          -- put-down items (Inventory.lua park): none here, the stack is in the bag
+          parkWait, PARK_WAIT, vanished, leftBy = {}, 150, {}, {}
+          function inThrow() return false end
+          function putBack() end
         ''')
         L.execute(body + '\nreconcile = reconcileStacks\npieces = pieceOwner')
 
@@ -590,6 +594,9 @@ class ListGaps(unittest.TestCase):
           function sweepStrays() end
           listedAt, LISTED_WAIT, tick = {}, 900, 0
           stackLast, stackSpent, dropSeen = {}, {}, {}
+          pieceOwner, leftBy = {}, {}
+          function parkedOf() return nil end
+          function holderOf() return "hero" end
           function goldOf() return 0 end
           function reconcileMember(uuid, m) if m.Items then wowOwner["123"] = uuid; wowOwner["6F"] = uuid; stackWant["S117@hero"] = true end end
           M.Suppress = function() end
