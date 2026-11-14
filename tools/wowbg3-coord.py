@@ -356,7 +356,12 @@ def bridge_project():
     proj = SHM / 'bridge'
     (proj / 'link').mkdir(parents=True, exist_ok=True)
     (proj / 'tmp').mkdir(exist_ok=True)
+    # Rewritten when it points anywhere else: the folder is per user id, not per install, so another install with the
+    # same user id (a Wolf container's next to the desktop's, a moved Steam library) leaves its own link there, and every
+    # fight then failed on a wow_arena.py that was not there (a play report: the guards' stand-ins came and went at once).
     t = proj / 'link/tools'
+    if t.is_symlink() and os.readlink(t) != str(TOOLS):
+        t.unlink()
     if not t.is_symlink():
         t.symlink_to(TOOLS)
     return proj
