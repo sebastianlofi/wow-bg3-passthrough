@@ -115,6 +115,29 @@ class Trip(unittest.TestCase):
         self.assertEqual(len(L.globals().teleports), 0)
         self.assertFalse(L.eval('Camp.InTrip()'))
 
+    def test_the_controlled_companion_takes_the_trip(self):
+        # His play, 2026-11-14 14:43: the avatar dead (BG3 leaves its body where it fell), Gale selected, Go to Camp
+        # took Gale and Shadowheart; the trip, kept to the avatar alone, never began: WoW's picture and camera stayed on
+        # the body. It follows the character the player controls.
+        L, frm, gale = self.L, [-3927.1, 5113.3, -1477.4], 'S_Player_Gale_ad9af97d-75da-406a-ae13-7071c563f604'
+        L.execute('Osi.GetHostCharacter = function() return "%s" end' % gale)
+        L.globals().position = L.table_from([-14012.9, 1004.7, -13938.5])
+        L.globals().listeners['Teleported'](gale, 'x', *frm, -14012.9, 1004.7, -13938.5, 'Invalid')
+        L.globals().in_camp = True
+        L.eval('tick(10)')
+        s = self.state()
+        self.assertTrue(s['InCamp'])
+        self.assertEqual(s['From'], frm)
+
+    def test_a_companion_not_selected_takes_no_trip(self):
+        L = self.L
+        L.execute('Osi.GetHostCharacter = function() return "%s" end' % HERO)
+        L.globals().listeners['Teleported']('S_Player_Gale_ad9af97d-75da-406a-ae13-7071c563f604', 'x', -3927.1, 5113.3,
+                                            -1477.4, -14012.9, 1004.7, -13938.5, 'Invalid')
+        L.globals().in_camp = True
+        L.eval('tick(10)')
+        self.assertFalse(self.state()['InCamp'])
+
     def test_world_modes_start_is_no_travel(self):
         L = self.L
         L.globals().files['wow-bg3/link/world.json'] = '{"Active": true, "Centre": [-2600.0, 120.0, -1000.0]}'

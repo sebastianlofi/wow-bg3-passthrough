@@ -386,14 +386,20 @@ local function startSame(runId)
             Ext.Utils.Print(string.format("WOW-BG3 camp: %s jumped %.0f m (%.1f %.1f %.1f to %.1f %.1f %.1f), cause %s, %s",
                 u == hero and "the hero" or tostring(who), jump, ox, oy, oz, nx, ny, nz, tostring(cause), tostring(reason)))
         end
-        if u ~= hero then return end
+        -- The trip follows the character the player controls, as BG3's camera does, besides the avatar: with the
+        -- avatar dead BG3 takes the living party to camp and leaves its body where it fell, and a trip kept to the
+        -- avatar alone left world mode running, WoW's picture and camera on the body while Gale stood at camp (his
+        -- play, 2026-11-14 14:43). Who is selected and alive goes first: the avatar's jump, when it makes one, is the same trip.
+        local ctl = uuidOf(tostring(q(Osi.GetHostCharacter) or ""))
+        if u ~= hero and u ~= ctl then return end
+        if u ~= ctl and pending and pending.Hero == ctl then return end
         -- Into the void: world mode's own Start. Undoing it put the hero on the host level's spot, inside camp's
         -- ground, about 5 s after each load whose world.json a killed bridge had left Active.
         local c = w.Spot or w.Centre
         if type(c) == "table" and math.sqrt((nx - c[1]) ^ 2 + (nz - c[3]) ^ 2) < M.VOID_REACH then return end
         local mine = own and ticks <= own.Until and math.sqrt((nx - own.X) ^ 2 + (nz - own.Z) ^ 2) < M.JUMP
         own = nil
-        pending = {Hero = hero, From = {ox, oy, oz}, Until = ticks + M.PENDING, Own = mine}
+        pending = {Hero = u, From = {ox, oy, oz}, Until = ticks + M.PENDING, Own = mine}
     end
     pcall(Ext.Osiris.RegisterListener, "Teleported", 9, "before", onTeleported)
 
