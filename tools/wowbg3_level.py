@@ -7,7 +7,8 @@ What it writes: an empty level the size of a WoW continent, whose ground world m
   meta.lsx               LevelData: LevelBounds, LevelLighting, LevelAtmosphere (ids of stock BG3
                          lighting/atmosphere *resources*, referenced by id, not copied)
   Layers/<guid>.lsx      one editor layer ("Triggers") the triggers belong to
-  Triggers/_merged.lsx   start points (Player 0..3), one lighting trigger and one atmosphere trigger
+  Triggers/_merged.lsx   start points (Player 0..3), one lighting trigger and one atmosphere trigger, and
+                         "Waypoints": N point triggers for BG3's waypoint panel (Waypoints.lua)
                          covering the bounds; same structure as Basic_Level_A's triggers
   Scenery/_merged.lsx    optional: static objects from stock BG3 templates (by id), e.g. the WoW rays' proxy shape
   Ai/aigrid.data         AI grid, version 21 (layout from libbg3, github.com/eiz/libbg3, MIT):
@@ -67,6 +68,11 @@ def lz4_literals(data):
         out.append(r)
     out += data
     return bytes(out)
+
+
+def waypoint_uid(level, i):
+    """The point trigger of BG3's waypoint panel slot i in a level of ours (Waypoints.lua names them)."""
+    return uid(level, "waypoint", i)
 
 
 def subgrid_id(obj_uuid):
@@ -180,6 +186,16 @@ def write_triggers(path, spec, layer):
                     + attr("TemplateName", "FixedString", "e1dd1fce-eb20-4824-b232-5a78344351b1")
                     + attr("Type", "FixedString", "trigger") + "<children><node id=\"FadeChildren\" />"
                     + layer_list(name, layer) + transform((sx + 2 * p, sy, sz)) + "</children></node>")
+    # BG3's waypoint panel lists an entry only on a point trigger of the level the party is in (Waypoints.lua): one per
+    # panel slot, BG3's plain point trigger template 15111ce4 (its camps' own spots use it), beside the start points.
+    # A click's teleport to one is undone the same tick; the WoW flight is the move.
+    for i in range(int(spec.get("Waypoints", 0))):
+        objs.append('<node id="GameObjects">' + attr("Flag", "int32", "1") + attr("LevelName", "FixedString", name)
+                    + attr("MapKey", "FixedString", waypoint_uid(name, i)) + attr("Name", "LSString", f"WOWBG3_Waypoint_{i:03d}")
+                    + attr("OnlyCharacterEvents", "bool", "False") + attr("OnlyOsirisEvents", "bool", "False")
+                    + attr("TemplateName", "FixedString", "15111ce4-12fc-4757-bb81-7c2c212e141a")
+                    + attr("Type", "FixedString", "trigger") + "<children><node id=\"FadeChildren\" />"
+                    + layer_list(name, layer) + transform((sx + 2 * (i % 8), sy, sz + 2 + 2 * (i // 8))) + "</children></node>")
     # Lighting (template 1a4cfe92) and atmosphere (template 14ec1f7b) zones: polygon over the bounds, a height.
     poly = [(b[0], b[2]), (b[3], b[2]), (b[3], b[5]), (b[0], b[5])]
     for kind, tpl, res in (("Lighting", "1a4cfe92-0a55-4253-b856-44cd0b0e8f8f", spec["Lighting"]),

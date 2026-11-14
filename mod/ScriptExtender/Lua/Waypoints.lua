@@ -15,6 +15,7 @@
 -- no rule can stop it from Lua. The party was left there for the 3 s Camp.lua takes to notice: the Act 3 story
 -- of the place played and the WoW picture went wrong. So each arrival is undone in the listener, the same tick.
 local M = {}
+local Hero = Ext.Require("Hero.lua")
 
 M.HELPER = "Helper_Waypoint_A_2dab7df1-7914-4748-b329-b4fe8b60fcc9"
 M.HOP_TICKS = 30 -- after a click: how long the party's teleports count as the story's hop
@@ -40,6 +41,31 @@ M.TRIGGERS = {
     "338b4f15-a078-480f-8f6c-7783586169f3", "0b212438-3336-4fe4-a115-a9cd92eec867",
 }
 
+-- In a level of our own (Hero.OWN) the panel's points are its own: tools/wowbg3_level.py writes one point trigger per
+-- slot ("Waypoints" in release/levels/*.json, waypoint_uid). The 36 above are BGO_Main_A's, the borrowed host before:
+-- a click on one from our level or from camp is BG3's teleport into that level, which no undo can catch (a play
+-- report: the Undercity flight from camp loaded Act 3's map and world mode never started). test_waypoint_triggers.py
+-- holds the two lists together.
+M.OWN_TRIGGERS = {
+    "b6f7c1a9-5e1d-55d8-a7d2-c4dac79d8f2b", "e28bf3b4-5e21-5205-8cbf-af90a059dfa3",
+    "d9988c85-5c43-5ad6-b85d-f548be141c52", "dede610e-d56f-5e87-833f-3ade86ef968f",
+    "6c090d83-88ba-5a85-a66c-1ccdef333b5b", "5208028f-d711-5269-87cc-55dbe8a05637",
+    "2e7930df-bf6a-5892-8271-151fcb51fae8", "6dc8d561-01e3-53c6-9028-7f852f9d0cb1",
+    "da5eac30-a80d-5d85-854c-1cfa209eb15c", "8f004ee8-5f09-5eaa-8a83-3a731b4882d7",
+    "c370f6a6-7db5-5435-983c-b7502673939a", "ea3b1baa-766e-580f-9f76-65f899da1317",
+    "f8a0f211-8889-5aff-9528-dc9bae358224", "f4da39d3-b4a2-5036-90cc-a965ed34c6d1",
+    "586e8980-855a-577f-b482-b94187f8175f", "f21394d8-a577-5c6c-8b9b-61da261110e9",
+    "21eb7b9a-7472-56f0-b028-ed7509863f42", "8a97cfcd-53dc-5a8b-9317-dc7af77c69c6",
+    "0cbaf580-c193-56c5-b9f5-93f76b0060af", "dfd81b08-7f00-58cb-bb5e-d2b724846b57",
+    "4ac05719-cedd-54ed-ba26-4a263ed00876", "0a78dd5f-12a0-56f3-80ac-0f57ac932589",
+    "c8f3c1b8-c713-57b8-a9af-f1a8d749e16a", "b26c9c05-a316-5da4-83d1-dc0210489132",
+    "f3c84a30-f03a-5992-b2f7-d1ce4ed2945f", "2b311516-cd7f-54cb-9c70-391ac89513f1",
+    "db880b30-5f51-53d4-900f-e3b6f8236c5f", "a67110a9-6d98-5479-a6f3-67e5a4c7ff8c",
+    "3ef1e5c5-548b-5d41-8f8b-0add71c28ba6", "322392ca-b4fd-5f22-a26c-5ec7f8481462",
+    "355b4710-edf0-589f-9410-043103b0a085", "6a94680a-c1d2-5208-ab26-ce2b7f0158db",
+    "a39a2cfc-2ce4-5e2e-bd85-67e7f63de0fb",
+}
+
 local function q(fn, ...)
     local ok, v = pcall(fn, ...)
     if ok then return v end
@@ -51,6 +77,7 @@ local hop = nil
 function M.Hopping() return hop ~= nil end
 
 function M.Start()
+    if Hero.OWN then M.TRIGGERS = M.OWN_TRIGGERS end
     local ticks, lastRaw, item, lastRefused = 0, nil, nil, false -- false: nothing read yet, an old refusal stays quiet
     local bySlot, done = {}, {}  -- slot -> discovered point; id -> registered in this session
     local slotOf = {}
@@ -106,7 +133,10 @@ function M.Start()
         if not slot then return end
         local party = {}
         for _, who in ipairs(players()) do party[uuidOf(who) or who] = true end
-        hop = {Until = ticks + M.HOP_TICKS, Party = party, Back = {}}
+        -- From another level (camp) BG3's answer is a level change into ours: nothing to undo there (Camp.lua puts the
+        -- party on its way-back spot); the WoW flight follows once camp is over (wowbg3cmd.py waits, panel clicks).
+        local lv = q(function() local r = Osi.DB_CurrentLevel:Get(nil); return r and r[1] and r[1][1] end)
+        hop = {Until = ticks + M.HOP_TICKS, Party = party, Back = {}, Away = lv ~= Hero.REGION}
         M.State.Clicks = M.State.Clicks + 1
         local p = bySlot[slot]
         if not p then return end
@@ -115,7 +145,7 @@ function M.Start()
     end)
     pcall(Ext.Osiris.RegisterListener, "Teleported", 9, "before", function(who, _, ox, oy, oz)
         local u = hop and uuidOf(who)
-        if not u or not hop.Party[u] then return end
+        if not u or not hop.Party[u] or hop.Away then return end
         if hop.Back[u] then hop.Back[u] = nil return end
         hop.Back[u] = true
         Osi.TeleportToPosition(who, ox, oy, oz, "", 0, 0, 0, 0, 1)

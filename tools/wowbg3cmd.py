@@ -66,6 +66,7 @@ class Ctx:
         self.char = char or os.environ.get('WOW_CHAR') or None
         self.debug = debug
         self.chat = chat  # WoW's chat: shorter lists
+        self.panel = False  # a click in BG3's waypoint panel (wowbg3-chatcmd.py), not a typed command
         self.out = out or (lambda line, error=False: print(line, file=sys.stderr if error else sys.stdout, flush=True))
 
     def say(self, line=''):
@@ -712,6 +713,15 @@ def waypoint(ctx, args):
         if dead:
             raise CmdError('waypoint: not while dead in WoW')
         p = hits[0]
+        # A click in BG3's panel at camp: BG3 answers it with its own teleport, which takes the party out of camp into
+        # world mode's level (Waypoints.lua); the flight follows once camp is over and the WoW side is up (tele waits
+        # for world mode). His choice: the panel travels from camp too. Typed in WoW's chat, camp still refuses.
+        if getattr(ctx, 'panel', False) and at_camp(ctx.io):
+            ctx.say('waypoint: leaving camp first')
+            for _ in range(240):
+                if not at_camp(ctx.io):
+                    break
+                time.sleep(0.5)
         try:
             tele(ctx, ['waypoint'], at=(p['x'], p['y'], p['z'], p['map'], p['name']))
         except CmdError as e:

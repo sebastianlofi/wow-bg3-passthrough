@@ -61,5 +61,6 @@
   "NZ": 20,
   "Y": -20
  },
- "LiftPlatforms": true
+ "LiftPlatforms": true,
+ "Waypoints": 33
 }

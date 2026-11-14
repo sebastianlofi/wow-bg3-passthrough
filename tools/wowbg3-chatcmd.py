@@ -115,7 +115,7 @@ def is_move(text):
     return verb == 'tp' or (verb == 'waypoint' and rest[:1] == ['go']) or (verb == 'cross' and rest[:1] != ['list'])
 
 
-def handle(replies, seq, who, text, refused=None, debug=None):
+def handle(replies, seq, who, text, refused=None, debug=None, panel=False):
     """debug: True for a line this helper wrote itself (the guardian's "yes" runs the test command cross)."""
     first = [True]
 
@@ -125,6 +125,7 @@ def handle(replies, seq, who, text, refused=None, debug=None):
                 l, first[0] = 'WOW-BG3: ' + l, False
             replies.add(seq, '!' if error else '+', l)
     ctx = W.Ctx(char=who or None, debug=debug_commands() if debug is None else debug, out=out, chat=True)
+    ctx.panel = panel
     t0 = time.time()
     try:
         lock = LOCKS[kind_of(text)]
@@ -226,7 +227,7 @@ def main():
                 log('#%d %r from the panel' % (seq, text))
                 # WoW's chat prints only answers to its own requests: a refusal goes back to the panel's side.
                 said = lambda why, s=seq: W.atomic_write(link / 'waypoint-refused.json', json.dumps({'Seq': s, 'Text': why}))
-                threading.Thread(target=handle, args=(replies, seq, None, text, said), daemon=True).start()
+                threading.Thread(target=handle, args=(replies, seq, None, text, said, None, True), daemon=True).start()
             except (OSError, ValueError, KeyError, TypeError) as e:
                 log('panel click: %s' % e)
         stamp = stamp_of(req)
