@@ -52,6 +52,11 @@ void main() {
             t = smoothstep(0.06, 0.30, max(up.r, max(up.g, up.b)));
             m = -(1.0 + floor(t * 255.0 + 0.5) + g);
             imageStore(gain, q, vec4(clamp(A / PH, vec3(0.0), 1.0 / PH), 1.0));
+            // What BG3's forward layers added over the decal before the composite (a fire's glow over its ashes: wfed
+            // holds the feed with the decal's ambient, wowbg3_fxbg2.frag), a channel, as over bare ground below:
+            // wdpostcas puts it over the decal's look. Without it the fire showed under its own ashes (a play report).
+            if (!same && w.a > 0.5)
+                early = vec4(mix(-(1.0 - f / max(w.rgb, vec3(1e-6))), (f - w.rgb) / max(f, vec3(1e-6)), step(w.rgb, f)), 1.0);
         } else {
             // Something drawn over the bare ground before the composite (a glow at a caster's feet, a bolt): what it
             // added is known a channel, what the feed wrote against what stands there now, as wowbg3_post.frag
