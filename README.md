@@ -303,10 +303,11 @@ keeps Steam achievements on while mods are loaded, and at each start it removes 
 BG3 leaves in its profile after a crash (BG3 would switch your mods off otherwise). `"EnableAchievements": false`
 in a `ScriptExtenderSettings.json` next to BG3's `bin/bg3` turns the first off.
 
-While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>` (about 50 to
-150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
-Only you can read it. If a folder of that name is already there and is not yours, the mod leaves it alone and uses
-one of its own in your runtime folder (`$XDG_RUNTIME_DIR/wow-bg3`) instead.
+While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>/<install>` (about
+50 to 150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
+`<install>` is a short code of the mod's folder, so two copies of the mod under one user (two Steam libraries, a game
+container beside the desktop) never share it. Only you can read it. If a folder of that name is already there and is
+not yours, the mod leaves it alone and uses one of its own in your runtime folder (`$XDG_RUNTIME_DIR/wow-bg3`) instead.
 
 - **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
   and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1, ports 3744 and

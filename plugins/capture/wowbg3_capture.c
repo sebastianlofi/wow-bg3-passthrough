@@ -51,7 +51,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 // WOWBG3_LINK: the link folder, bg3cam.bin, bg3screen.txt, tavplan.txt (default <io>/link).
 // Unset (a plugin bg3le starts early, before the launcher plugin sets them: bg3le patch 0005), each is found
 // as the launcher's release_env() finds it, so both name the same folders: capture /logs/capture if it exists,
-// else <data>/capture; frames /wowshm if it exists, else /dev/shm/wow-bg3-<uid> when it is this user's own, else
+// else <data>/capture; frames /wowshm if it exists, else /dev/shm/wow-bg3-<uid>/<install key> when it is this user's own, else
 // the runtime folder or <data>/shm (wowbg3_shm.h, the one rule both use); Tav
 // /wowtav beside /wowshm, else <frames>/tav (<data>: $WOWBG3_DATA, else Mods/WOW-BG3/data, as the launcher).
 #include "../wowbg3_shm.h"

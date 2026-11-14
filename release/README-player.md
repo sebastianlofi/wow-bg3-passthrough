@@ -165,7 +165,7 @@ In this order:
 
 Left behind: `localconfig.vdf.bg3le-backup` beside Steam's `localconfig.vdf` (the copy
 made before the launch option was set; delete it if you like), and a folder in memory,
-`/dev/shm/wow-bg3-<your user id>`, gone at the next reboot. World-mode saves need the
+`/dev/shm/wow-bg3-<your user id>/`, gone at the next reboot. World-mode saves need the
 mod to load properly.
 
 ## What it does on your PC

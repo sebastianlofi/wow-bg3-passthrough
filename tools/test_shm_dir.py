@@ -19,6 +19,7 @@ DRIVER = r'''
 int main(int argc, char** argv) {
     char out[800];
     if (argc != 5) return 2;
+    if (!strcmp(argv[1], "key")) { char k[13]; wowbg3_install_key(k, argv[2]); printf("0 %s\n", k); return 0; }
     int r = wowbg3_shm_dir(out, sizeof out, argv[1], argv[2][0] ? argv[2] : NULL, argv[3], (uid_t)atoi(argv[4]));
     printf("%d %s\n", r, out);
     return 0;
@@ -41,7 +42,14 @@ class ShmDir(unittest.TestCase):
         for d in (self.shm, self.rt, self.data):
             d.mkdir()
         self.me = os.getuid()
-        self.ours = self.shm / ('wow-bg3-%d' % self.me)
+        self.uid = self.shm / ('wow-bg3-%d' % self.me)
+        self.ours = self.uid / self.key()
+
+    def key(self, data=None):
+        out = subprocess.run([str(self.build / 'driver'), 'key', str(data or self.data), '', '0'], capture_output=True,
+                             text=True, check=True).stdout.split()[1]
+        self.assertRegex(out, '^[0-9a-f]{12}$')
+        return out
 
     def ask(self, me=None, runtime=True):
         out = subprocess.run([str(self.build / 'driver'), str(self.shm), str(self.rt) if runtime else '', str(self.data),
@@ -55,23 +63,43 @@ class ShmDir(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.ours.stat().st_mode), 0o700)
 
     def test_our_own_folder_with_a_loose_mode_is_closed(self):
-        self.ours.mkdir()
-        os.chmod(self.ours, 0o755)
+        self.uid.mkdir()
+        os.chmod(self.uid, 0o755)
         self.assertEqual(self.ask(), (0, self.ours))
+        self.assertEqual(stat.S_IMODE(self.uid.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.ours.stat().st_mode), 0o700)
+
+    def test_each_install_has_its_own_folder(self):
+        """Two installs of one user id (Wolf's and the desktop's) never share a folder; another install's leftovers in
+        the uid folder are not seen."""
+        other = self.t / 'other/Mods/WOW-BG3/data'
+        other.mkdir(parents=True)
+        self.assertNotEqual(self.key(other), self.key())
+        (self.uid / self.key(other)).mkdir(parents=True)
+        (self.uid / self.key(other) / 'leftover').write_text('theirs')
+        where, path = self.ask()
+        self.assertEqual((where, path), (0, self.ours))
+        self.assertEqual(list(path.iterdir()), [])
+
+    def test_the_key_is_the_same_however_the_folder_is_reached(self):
+        """The launcher and the render code may name the data folder through a link or with a trailing slash."""
+        link = self.t / 'link'
+        link.symlink_to(self.t)
+        self.assertEqual(self.key(link / 'data'), self.key())
+        self.assertEqual(self.key(str(self.data) + '/'), self.key())
 
     def test_a_link_of_that_name_is_not_followed(self):
         elsewhere = self.t / 'elsewhere'
         elsewhere.mkdir()
-        self.ours.symlink_to(elsewhere)
-        self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3'))
+        self.uid.symlink_to(elsewhere)
+        self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3' / self.key()))
         self.assertEqual(list(elsewhere.iterdir()), [])
-        self.assertEqual(stat.S_IMODE((self.rt / 'wow-bg3').stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.rt / 'wow-bg3' / self.key()).stat().st_mode), 0o700)
 
     def test_a_file_of_that_name_is_left_alone(self):
-        self.ours.write_text('x')
-        self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3'))
-        self.assertEqual(self.ours.read_text(), 'x')
+        self.uid.write_text('x')
+        self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3' / self.key()))
+        self.assertEqual(self.uid.read_text(), 'x')
 
     def test_somebody_elses_folder_is_left_alone(self):
         """Asked as another user: the folder of that user's name exists and belongs to us, not to them."""
@@ -89,12 +117,12 @@ class ShmDir(unittest.TestCase):
     def test_without_a_writable_shm_the_runtime_folder(self):
         os.chmod(self.shm, 0o555)
         try:
-            self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3'))
+            self.assertEqual(self.ask(), (1, self.rt / 'wow-bg3' / self.key()))
         finally:
             os.chmod(self.shm, 0o755)
 
     def test_without_a_runtime_folder_the_data_folder(self):
-        self.ours.write_text('x')
+        self.uid.write_text('x')
         self.assertEqual(self.ask(runtime=False), (2, self.data / 'shm'))
 
     def test_both_plugins_use_the_one_rule(self):

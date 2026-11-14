@@ -27,7 +27,7 @@
 //   6. The release's environment (0.3.0), set in BG3's own process at plugin
 //      init (before the mod's Lua and the render plugin start) and given to every child:
 //      WOW_BG3_RUN_ID (a fresh id when BG3 has none: the mod's files carry it), WOWBG3_SHM (a tmpfs
-//      folder for WoW's frames, /dev/shm/wow-bg3-UID when that is this user's own: wowbg3_shm.h), WOWBG3_TAV_DIR and WOW_BG3_TAV_DIR ($WOWBG3_SHM/tav),
+//      folder for WoW's frames, /dev/shm/wow-bg3-UID/<install key> when that is this user's own: wowbg3_shm.h), WOWBG3_TAV_DIR and WOW_BG3_TAV_DIR ($WOWBG3_SHM/tav),
 //      WOWBG3_CAPTURE_DIR (<data>/capture: the render plugin's compose words and log). The harness's
 //      sandbox mounts (/wowshm, /logs/capture) win where they exist, so a dev run stays as it was.
 //      The coordinator child (launcher.conf [coord], tools/wowbg3-coord.py) does the rest: lifecycle,

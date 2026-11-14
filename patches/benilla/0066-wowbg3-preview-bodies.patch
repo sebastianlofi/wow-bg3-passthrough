@@ -4,8 +4,8 @@ WOW-BG3 benilla patch 0066: a stand-in's WoW body for BG3's examine and trade pr
   like the inspect pane by sync_wowbg3_body at the unit and turn wowbg3::drive_body sets.
 - portrait/wowbg3.rs drive_body: while link/wowpreview.txt names a stand-in (RenderScreen.lua: the
   screen, its previews, the stand-in's, its guid and BG3's turn of it), renders that unit every frame,
-  animated and turned with BG3's preview, and writes every readback to the live file (/dev/shm when
-  there is one, named in link/wowbody/live.path; a header and two frame slots). In between it bakes a
+  animated and turned with BG3's preview, and writes every readback to the live file (WOWBG3_SHM when
+  it is set, named in link/wowbody/live.path; a header and two frame slots). In between it bakes a
   still per mirrored display (link/wowbody/d<display>.rgba) and writes link/wowbody/<guid>.txt (display,
   WoW race, creature type, NPC flags). The capture layer draws the body over BG3's preview; PreviewRaces.lua
   names the race in BG3's screens.
@@ -156,7 +156,7 @@ WOW-BG3 benilla patch 0066: a stand-in's WoW body for BG3's examine and trade pr
 +//!   <index> <guid hex> <turn>`, the turn being BG3's preview yaw in radians; `0` when no preview shows
 +//!   a stand-in), its own booth, [`BODY_SLOT`] ([`BODY_W`]x[`BODY_H`], the inspect pane's light and
 +//!   framing), renders that unit every frame, animated as WoW's body panes are and turned with BG3's
-+//!   preview, and every finished readback goes into the live file (`/dev/shm` when there is one; its
++//!   preview, and every finished readback goes into the live file (`$WOWBG3_SHM` when set; its
 +//!   path in `wowbody/live.path`): a 64-byte header (`WBL1`, width, height, newest slot, sequence,
 +//!   guid, the covered box so far, display) and two frame slots, written alternately.
 +//! - In between it bakes a still of every mirrored mob's display once per run,
@@ -418,8 +418,8 @@ WOW-BG3 benilla patch 0066: a stand-in's WoW body for BG3's examine and trade pr
 +                .to_string_lossy()
 +                .bytes()
 +                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-+            let shm = Path::new("/dev/shm");
-+            let path = if shm.is_dir() {
++            let shm = std::env::var_os("WOWBG3_SHM").map(std::path::PathBuf::from); // the install's own tmpfs folder
++            let path = if let Some(shm) = shm.filter(|s| s.is_dir()) {
 +                shm.join(format!("wowbg3-body-{key:016x}.bin"))
 +            } else {
 +                dir.join("wowbody").join("live.bin")

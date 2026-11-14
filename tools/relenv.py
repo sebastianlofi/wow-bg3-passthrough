@@ -8,7 +8,7 @@ this module points them at the player's folders, from the environment the launch
   WOWBG3_HOME   the WOW-BG3 folder (Mods/WOW-BG3)       WOWBG3_DATA   Mods/WOW-BG3/data
   WOWBG3_IO     the mod's IO folder, Mods/WOW-BG3/data/io (Ext.IO's wow-bg3/, bg3le patch 0012)
   WOWBG3_LINK   its link/ folder                         WOWBG3_MODS   BG3's Mods folder (its parent: BG3's profile)
-  WOWBG3_SHM    a tmpfs folder (/dev/shm/wow-bg3-UID)    WOWBG3_WOW    the player's WoW 1.12.1 files
+  WOWBG3_SHM    a tmpfs folder (/dev/shm/wow-bg3-UID/KEY) WOWBG3_WOW    the player's WoW 1.12.1 files
 
   configure()           sets the derived environment (WOW_BG3_SERVER, WOWBG3_SERVER_VAR, WOW_BG3_IO,
                         WOW_VMAP_CACHE, WOW_BG3_MAPS...) and imports and points every tool module

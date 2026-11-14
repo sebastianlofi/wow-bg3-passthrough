@@ -93,7 +93,7 @@ In this order:
    copy of it if you may come back).
 
 Left behind: `localconfig.vdf.bg3le-backup` beside Steam's `localconfig.vdf` (the copy made before the launch
-option was set; delete it if you like) and `/dev/shm/wow-bg3-<your user id>`, gone at the next reboot. World-mode
+option was set; delete it if you like) and `/dev/shm/wow-bg3-<your user id>/`, gone at the next reboot. World-mode
 saves need the mod to load properly.
 
 If you deleted the folder first: BG3 still starts through bg3le. Remove the `bg3le-launch` part from BG3's launch
