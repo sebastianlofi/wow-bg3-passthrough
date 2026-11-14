@@ -196,6 +196,14 @@ def verbs_ok(hero):
     return _verbs[hero]
 
 
+def host_region():
+    """World mode's level: host.json's Region (the coordinator writes it from settings.conf), else the tutorial level,
+    as Hero.lua takes it."""
+    h = read('host.json') or {}
+    r = h.get('Region') if isinstance(h, dict) else None
+    return r if isinstance(r, str) and re.fullmatch(r'[A-Za-z0-9_]+', r) else 'TUT_Avernus_C'
+
+
 class Life:
     def __init__(self, a):
         self.a = a
@@ -725,6 +733,16 @@ class Life:
                 self.session = None
             if lc_.get('Loading'):
                 return None
+        # The hero in a level other than world mode's (camp, or a BG3 level a waypoint's trigger took the party to) with
+        # the WoW side up: down now, whatever was seen of the change. It used to go only when a load was caught under
+        # way, and a long rest's trip to camp (3 s) passed entirely inside a save's snapshot (8 s, this loop busy):
+        # the WoW world stayed up and was drawn over camp (a play report: "it merges camp and the wow world"). Back in
+        # the host level within the same session, the WoW side comes back as after any camp trip (was_up).
+        region = lc_.get('Region')
+        if self.session and session == self.session and region and region != host_region():
+            self.down('the hero in %s, not %s (session %s)' % (region, host_region(), session))
+            self.session = None
+            return None
         req = read('wowsave-request.json')
         # A save while the WoW side is down inside its own session (at camp in a level of our own) is snapshotted too,
         # its characters offline as they stand: a load of it then puts them back like any other save's.
