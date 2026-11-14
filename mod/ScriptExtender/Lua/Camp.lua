@@ -294,13 +294,16 @@ local CORNERS = {
 for _, c in ipairs(CORNERS) do CAMP_ROWS[#CAMP_ROWS + 1] = {"DB_Camp_PersonalCornerLevelTemplate", "INTMAIN", c[1], c[2]} end
 
 -- The camp stands in this level (the level template is placed and loaded): its campfire is here.
-local function campHere()
+local function gridOn()
     local raw = Ext.IO.LoadFile("wow-bg3/camp-grid.json")  -- the coordinator joined the camp's AI grid to ours
     local g = raw and #raw < 256 and Ext.Json.Parse(raw)
-    if not (type(g) == "table" and g.On == true) then return false end
+    return type(g) == "table" and g.On == true
+end
+local function campHere()
     local ok, r = pcall(Osi.GetRegion, M.CAMPFIRE)
     return ok and r == Hero.REGION
 end
+M.WAIT_CAMP = 1800  -- ticks to wait for the camp's campfire in our level before the camp falls back to its own level
 
 -- The story's rows for INTMAIN in our level, each once (a save keeps them; a row the story has is left alone).
 local function registerCamp()
@@ -327,12 +330,7 @@ local function registerCamp()
         Ext.Json.Stringify(q(function() return Osi.DB_ActiveCamp:Get(nil) end) or {})))
 end
 
-function M.Start(runId)
-    if not M.On() then return end
-    if Hero.OWN then
-        if not campHere() then return startOwn(runId) end
-        registerCamp()
-    end
+local function startSame(runId)
     local ticks, seq, pending, outFor = 0, 0, nil, 0
     local own = nil -- where this module just sent the hero: its Teleported arrives ticks later, no one's travel
     local regroup = nil -- after a walk off camp: the hero's walking away undid the party's following
@@ -432,6 +430,33 @@ function M.Start(runId)
             end
         end)
         if not ok then M.State.Error = tostring(err) end
+    end)
+end
+
+-- In our level the camp is ours once its campfire is here: a loaded save has it at the session's start, a New Game only
+-- some seconds later (its first session started before the level's templates were in: the camp took its own level, a
+-- New Game on slot B). Checked each second until it is, then the story's rows and the same-level trip; with no
+-- joined grid, or no campfire by M.WAIT_CAMP, the trip to INT_Main_A as before.
+function M.Start(runId)
+    if not M.On() then return end
+    if not Hero.OWN then return startSame(runId) end
+    if not gridOn() then return startOwn(runId) end
+    local waited, sub, decided = 0, nil, false
+    sub = Ext.Events.Tick:Subscribe(function()
+        if decided then return end
+        waited = waited + 1
+        if waited % 30 ~= 0 then return end
+        local here = Ext.Utils.GetGameState() == "Running" and campHere()
+        if not here and waited < M.WAIT_CAMP then return end
+        decided = true
+        pcall(function() Ext.Events.Tick:Unsubscribe(sub) end)
+        if here then
+            registerCamp()
+            startSame(runId)
+        else
+            Ext.Utils.Print("WOW-BG3 camp: no camp in our level after " .. waited .. " ticks: camp is INT_Main_A")
+            startOwn(runId)
+        end
     end)
 end
 
