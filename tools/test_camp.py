@@ -129,6 +129,28 @@ class Trip(unittest.TestCase):
         self.assertTrue(s['InCamp'])
         self.assertEqual(s['From'], frm)
 
+    def test_what_shows_follows_the_selected_character(self):
+        # His play, 2026-11-14 15:03: Gale and Shadowheart at camp, Astarion selected in the world still showed camp.
+        L, gale, ast = self.L, 'S_Player_Gale_ad9af97d-75da-406a-ae13-7071c563f604', 'S_Player_Astarion_c7c13742-bacd-460a-8f65-f864fe41f255'
+        L.execute('''
+          host = "%s"
+          at_camp = {["%s"] = true}
+          Osi.GetHostCharacter = function() return host end
+          -- Osiris takes a name or its bare uuid alike
+          local function id(h) return tostring(h):match("(%%x+%%-%%x+%%-%%x+%%-%%x+%%-%%x+)$") end
+          Osi.DB_PlayerInCamp = {Get = function(_, h) for k in pairs(at_camp) do if id(k) == id(h) then return {{h}} end end return {} end}
+        ''' % (gale, gale))
+        L.globals().listeners['Teleported'](gale, 'x', -3927.1, 5113.3, -1477.4, -14012.9, 1004.7, -13938.5, 'Invalid')
+        L.eval('tick(10)')
+        self.assertTrue(self.state()['InCamp'])
+        L.execute('host = "%s"' % ast)
+        L.eval('tick(10)')
+        self.assertFalse(self.state()['InCamp'])
+        self.assertTrue(L.eval('Camp.InTrip()'))  # Gale is still at camp: the trip goes on
+        L.execute('host = "%s"' % gale)
+        L.eval('tick(10)')
+        self.assertTrue(self.state()['InCamp'])
+
     def test_a_companion_not_selected_takes_no_trip(self):
         L = self.L
         L.execute('Osi.GetHostCharacter = function() return "%s" end' % HERO)

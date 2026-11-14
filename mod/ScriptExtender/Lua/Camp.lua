@@ -416,7 +416,7 @@ local function startSame(runId)
             end
             if pending then
                 if inCampDb(pending.Hero) then
-                    trip, pending = {Hero = pending.Hero, From = pending.From}, nil
+                    trip, pending = {Hero = pending.Hero, From = pending.From, Shown = true}, nil
                     outFor = 0
                     M.State.Trips = M.State.Trips + 1
                     publish(true)
@@ -437,6 +437,18 @@ local function startSame(runId)
                     Ext.Utils.Print("WOW-BG3 camp: BG3's own travel in the level undone, the party back on WoW's ground")
                 end
             elseif trip then
+                -- What shows follows whom the player controls now: part of the party at camp and part in the world (the
+                -- avatar's body left where it fell), a switch to one in the world brings WoW's world back around them and a
+                -- switch back to one at camp sets it aside again (his play, 2026-11-14 15:03: Astarion selected in the
+                -- world still showed camp). The trip itself lasts until the party that went leaves camp (below).
+                local ctl = uuidOf(tostring(q(Osi.GetHostCharacter) or ""))
+                local shown = ctl == nil or inCampDb(ctl)
+                if shown ~= trip.Shown then
+                    trip.Shown = shown
+                    publish(shown, {Selected = ctl})
+                    Ext.Utils.Print(string.format("WOW-BG3 camp: %s selected, %s", tostring(ctl),
+                        shown and "at camp: the WoW side waits" or "in the world: WoW's world shows"))
+                end
                 outFor = inCampDb(trip.Hero) and 0 or outFor + 5
                 if outFor >= M.LEFT_AFTER then
                     local x, y, z = Osi.GetPosition(trip.Hero)
