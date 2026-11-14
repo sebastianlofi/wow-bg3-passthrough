@@ -97,15 +97,18 @@ class Fake:
 
     def list(self, name):
         c = self.char(name)
-        return c['money'], [{'Guid': g, 'Entry': i['entry'], 'Count': i['count'], 'Bag': i['bag'], 'Slot': i['slot']}
+        return c['money'], [dict({'Guid': g, 'Entry': i['entry'], 'Count': i['count'], 'Bag': i['bag'], 'Slot': i['slot']},
+                                 **({'Rand': i['rand']} if i.get('rand') else {}))
                             for g, i in sorted(c['items'].items())]
 
-    def add(self, name, entry, count):
+    def add(self, name, entry, count, rand=None, dur=None):
         c = self.char(name)
         row = self.items.get(entry)
         if not row:
             return False, 'unknown', {}
         g = self._new(c, entry, count)
+        if g and rand:
+            c['items'][g]['rand'] = rand
         return (True, '', {'Guid': g}) if g else (False, 'full', {})
 
     def delete(self, name, guid, count=None):
@@ -278,6 +281,8 @@ class Server:
                 items.append({'Guid': w[6], 'Entry': int(w[7]), 'Count': int(w[8]), 'Bag': int(w[4]), 'Slot': int(w[5])})
                 if len(w) >= 12 and w[11] != '0':
                     items[-1]['Rand'] = int(w[11])  # the random suffix: Durability, MaxDurability, Rand after Count
+                if len(w) >= 11 and w[10] != '0':
+                    items[-1]['Dur'] = int(w[9])  # what wears out: kept while BG3 holds the piece outside WoW (add)
             elif len(w) >= 5 and w[1] == 'inv' and w[3] == 'end':
                 end = int(w[4])
             elif 'refused' in w:
@@ -297,8 +302,10 @@ class Server:
                 extra[key] = w[i + 1]
         return ok, why, extra
 
-    def add(self, name, entry, count):
-        return self._after_ok(self.call('inv', 'add', name, entry, count), 'Guid')
+    def add(self, name, entry, count, rand=None, dur=None):
+        # rand and dur (server patch 0032): a piece BG3 held outside WoW comes back as it was.
+        more = [] if rand is None else [rand] + ([] if dur is None else [dur])
+        return self._after_ok(self.call('inv', 'add', name, entry, count, *more), 'Guid')
 
     def delete(self, name, guid, count=None):
         return self._after_ok(self.call('inv', 'del', name, guid, *([count] if count else [])), None)
@@ -450,7 +457,9 @@ class Bridge:
             if npc in self.pockets:  # stolen from a pocket (pocket()): gone from it
                 self.vendors[npc] = [r for r in self.vendors.get(npc, []) if r['Idx'] != req.get('Idx')]
                 self.urgent = True
-            return be.add(name, int(req['Entry']), int(req.get('Count', 1)))
+            rand, dur = req.get('Rand'), req.get('Dur')
+            return be.add(name, int(req['Entry']), int(req.get('Count', 1)), None if rand is None else int(rand),
+                          None if dur is None else int(dur))
         if op == 'del':
             return be.delete(name, str(req['Guid']), req.get('Count'))
         if op == 'money':

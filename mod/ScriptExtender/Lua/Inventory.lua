@@ -544,6 +544,30 @@ local function putBack(u, member, count, why)
     pcall(Osi.ToInventory, u, member, count, 0, 0)
 end
 
+-- ---- a WoW item put on BG3's ground (the maintainer, 2026-11-14: "items should be placable on the ground"; his
+-- choice: WoW loses it while it lies there and gets it back when it is picked up) ----
+-- An item of a member's lying in the world (dropped, placed, landed after a throw) leaves WoW at once (the bridge's
+-- `del`) and carries what it was (PARK_VAR: member, entry, count, WoW's random property and durability) under a tag of
+-- its own ("P" .. uuid), which the sync neither puts back nor deletes nor makes again. Back in a member's bag it is
+-- given to WoW again as it was (`add` with RAND and DURABILITY, server patch 0032) and takes the new WoW item's tag.
+-- Destroyed where it lies (a thrown bottle breaks) it stays spent. A thrown dagger keeps its own rule (landed).
+local PARK_VAR = "WowBg3Parked"
+pcall(Ext.Vars.RegisterUserVariable, PARK_VAR, {Server = true, Client = false, SyncToClient = false, Persistent = true})
+local function parkedOf(u)
+    local e = q(Ext.Entity.Get, u)
+    local raw = e and q(function() return e.Vars[PARK_VAR] end)
+    if type(raw) ~= "string" or raw == "" then return nil end
+    local ok, p = pcall(Ext.Json.Parse, raw)
+    return ok and type(p) == "table" and p or nil
+end
+local function setParked(u, p)
+    local e = q(Ext.Entity.Get, u)
+    if e then pcall(function() e.Vars[PARK_VAR] = p and Ext.Json.Stringify(p) or "" end) end
+end
+local parkWait = {} -- entry .. "@" .. member -> tick a park's del went out (the stack waits for WoW's list)
+local PARK_WAIT = 150
+local vanished = {} -- entry .. "@" .. member -> {Count, At}: a parked piece gone (picked up and merged, or destroyed)
+
 -- ---- reconcile BG3 with inventory.json ----
 local state = {Seq = -1, Members = {}, Created = 0, Errors = {}}
 local lastInv = {} -- the last inventory.json
@@ -663,6 +687,41 @@ local function spend(uuid, entry, n, items)
     end
     M.Spent = M.Spent + (n - left)
 end
+-- An item of `member`'s out of WoW, as above. tag: its WoW guid (one item) or nil (part of a stack: `count` of the
+-- entry from WoW's stacks of it, bags before anything else, as spend does).
+local function park(u, member, tag, why)
+    if parkedOf(u) then return end
+    local entry = entryOf(u)
+    if not entry or not member then return end
+    local count = q(Osi.GetStackAmount, u) or 1
+    local p = {Member = member, Entry = entry, Count = count}
+    local items = (((lastInv.Members or {})[member]) or {}).Items or {}
+    if tag and isWowGuid(tag) then
+        for _, it in ipairs(items) do
+            if tostring(it.Guid) == tag then p.Rand, p.Dur = it.Rand, it.Dur end
+        end
+        M.Request({Op = "del", Member = member, Guid = tag})
+    else
+        local left = count
+        for _, it in ipairs(items) do
+            if left > 0 and it.Entry == entry then
+                local c = math.min(left, it.Count or 1)
+                M.Request({Op = "del", Member = member, Guid = tostring(it.Guid), Count = c})
+                left = left - c
+            end
+        end
+        parkWait[tostring(entry) .. "@" .. member] = tick
+    end
+    setParked(u, p)
+    pieceOwner[u] = nil
+    local e = q(Ext.Entity.Get, u)
+    if e then pcall(function() e.Vars[VAR] = "P" .. u end) end
+    local okp, x, y, z = pcall(Osi.GetPosition, u)
+    Ext.Utils.Print(string.format("WOW-BG3 inventory: %s (entry %s x%d) put down by %s%s (%s): out of WoW", tostring(u),
+        tostring(entry), count, tostring(member), okp and x and string.format(" at %.1f %.1f %.1f", x, y, z) or "", why))
+end
+M.Park = park
+
 -- What is split off an entry's stacks right now: in the barter columns, or on its way out of a hand.
 local function piecesOf(entry)
     local n = 0
@@ -757,9 +816,24 @@ local function reconcileStacks(uuid, stacks, have, items)
             if ok then u = made; have[tag] = u; state.Created = state.Created + 1 else note(made) end
         end
         if u and not pendingItem[u] and not waiting then
-            if holderOf(u) ~= uuid and not (holderOf(u) == nil and inThrow(uuid)) then putBack(u, uuid, total, "stack") end
-            local amount = q(Osi.GetStackAmount, u)
-            if amount and amount ~= total then pcall(Osi.SetStackAmount, u, total) end
+            local at, key = holderOf(u), tostring(entry) .. "@" .. uuid
+            if at == nil then
+                if not inThrow(uuid) then park(u, uuid, nil, "stack on the ground") end
+            else
+                if at ~= uuid then putBack(u, uuid, total, "stack") end
+                local amount = q(Osi.GetStackAmount, u)
+                local v = vanished[key]
+                if v and tick - v.At > 300 then vanished[key], v = nil, nil end
+                if amount and v and amount > total and amount - total <= v.Count then
+                    -- A parked piece picked up and merged into this stack (BG3 sends no event for a merge): back to WoW.
+                    vanished[key] = nil
+                    Ext.Utils.Print(string.format("WOW-BG3 inventory: %d of entry %s picked up into %s's stack: back to WoW",
+                        amount - total, tostring(entry), uuid))
+                    M.Request({Op = "add", Member = uuid, Entry = entry, Count = amount - total, Item = u})
+                elseif amount and amount ~= total and not (amount < total and parkWait[key] and tick - parkWait[key] < PARK_WAIT) then
+                    pcall(Osi.SetStackAmount, u, total)
+                end
+            end
         end
     end
 end
@@ -828,11 +902,16 @@ local function reconcileMember(uuid, m, have)
                 pcall(M.MakeStrings, v)
                 pcall(M.Dress, u, v)
             end
-            if holderOf(u) ~= uuid and not equipped(u) and not (holderOf(u) == nil and inThrow(uuid)) then
+            local at = holderOf(u)
+            if at == nil and not equipped(u) then
+                if not inThrow(uuid) then park(u, uuid, tag, "item on the ground") end
+            elseif at ~= uuid and not equipped(u) then
                 putBack(u, uuid, M.AmountOf(row, it.Count) or 1, "item")
             end
             local eq = equipped(u)
-            if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row)
+            if parkedOf(u) then
+                -- out of WoW now: nothing below is for it
+            elseif wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row)
                 and not M.ThrownWaits(row, m.Items) then
                 freeHand(uuid, it.Slot)
                 M.Suppress(u)
@@ -980,6 +1059,32 @@ function M.Reconcile(inv)
         end
     end
     local have = ours()
+    -- Put-down items: back in a member's bag, back to WoW; gone, remembered for a merge (reconcileStacks).
+    for tag, u in pairs(have) do
+        if tag:match("^P") then
+            local p = parkedOf(u)
+            local h = holderOf(u)
+            if p and h and (inv.Members or {})[h] and not pendingItem[u] then
+                Ext.Utils.Print(string.format("WOW-BG3 inventory: %s (entry %s x%d) picked up by %s: back to WoW", u,
+                    tostring(p.Entry), p.Count or 1, h))
+                M.Request({Op = "add", Member = h, Entry = p.Entry, Count = q(Osi.GetStackAmount, u) or p.Count or 1,
+                    Rand = p.Rand, Dur = p.Dur, Item = u, Parked = true})
+            end
+        end
+    end
+    for u, p in pairs(M.ParkedLast or {}) do
+        if not q(Ext.Entity.Get, u) then
+            vanished[tostring(p.Entry) .. "@" .. tostring(p.Member)] = {Count = p.Count or 1, At = tick}
+        end
+    end
+    M.ParkedLast = {}
+    for tag, u in pairs(have) do
+        if tag:match("^P") then M.ParkedLast[u] = parkedOf(u) end
+    end
+    -- A part split off a member's stack lying in the world (dropped from the bag, a throw that did not break): out of WoW.
+    for u, owner in pairs(pieceOwner) do
+        if q(Ext.Entity.Get, u) and not holderOf(u) and not inThrow(owner) then park(u, owner, nil, "part of a stack on the ground") end
+    end
     wowOwner, stackWant = {}, {}
     local blind = false
     for uuid, m in pairs(inv.Members or {}) do
@@ -1090,6 +1195,21 @@ local function onReplies(inv)
             if rep.Ok and r.Item and rep.Guid and row and row.k ~= "object" then
                 local e = q(Ext.Entity.Get, r.Item)
                 if e then pcall(function() e.Vars[VAR] = tostring(rep.Guid) end) end
+            end
+            if r.Parked and r.Item then
+                if rep.Ok then
+                    setParked(r.Item, nil)
+                    if row and row.k == "object" then
+                        -- WoW has it in its stacks again: the member's BG3 stack of the entry shows it (or this becomes it).
+                        local stag = stackTag(r.Entry, r.Member)
+                        local e = q(Ext.Entity.Get, r.Item)
+                        if ours()[stag] then M.Suppress(r.Item); pcall(Osi.RequestDelete, r.Item)
+                        elseif e then pcall(function() e.Vars[VAR] = stag end) end
+                    end
+                else
+                    Ext.Utils.Print(string.format("WOW-BG3 inventory: %s not taken back by WoW (%s): stays out of WoW", r.Item, tostring(rep.Why)))
+                    pcall(Osi.ShowNotification, r.Member, "WoW has no room for that item.")
+                end
             end
             if not rep.Ok then
                 if r.Item and (r.Op == "buy" or r.Op == "buypart" or r.Op == "take") then M.Refused[r.Item] = true end
@@ -1718,8 +1838,15 @@ function M.Start(id)
     pcall(Ext.Osiris.RegisterListener, "CastedSpell", 5, "after", function(caster, spell) throwEnds(caster, spell) end)
     pcall(Ext.Osiris.RegisterListener, "CastSpellFailed", 5, "after", function(caster, spell) throwEnds(caster, spell) end)
     pcall(Ext.Osiris.RegisterListener, "OnThrown", 7, "after", function(item, _, thrower, _, x, y, z)
+        local u, t = uuidOf(item), uuidOf(thrower)
+        local tag = u and tagOf(u)
         Ext.Utils.Print(string.format("WOW-BG3 inventory: %s thrown by %s to %.1f %.1f %.1f (tag %s)", tostring(item),
-            tostring(thrower), x or 0, y or 0, z or 0, tostring(tagOf(uuidOf(item) or ""))))
+            tostring(thrower), x or 0, y or 0, z or 0, tostring(tag)))
+        -- Thrown is put down: out of WoW now, whether it lands whole (picked up, it comes back) or breaks (spent).
+        local row = u and M.Item(entryOf(u) or -1)
+        if u and t and row and row.s ~= "Thrown" and (pieceOwner[u] or (tag and (isWowGuid(tag) or tag:match("^S")))) then
+            pcall(park, u, pieceOwner[u] or t, tag and isWowGuid(tag) and tag or nil, "thrown")
+        end
     end)
     pcall(Ext.Osiris.RegisterListener, "LongRestStarted", 0, "after", function() restGuard = tick + REST_START end)
     pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER end)

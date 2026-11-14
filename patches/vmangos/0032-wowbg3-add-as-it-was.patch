@@ -1,0 +1,33 @@
+diff --git a/src/game/WowBg3Items.cpp b/src/game/WowBg3Items.cpp
+index 6b4d0ef..1c10a5f 100644
+--- a/src/game/WowBg3Items.cpp
++++ b/src/game/WowBg3Items.cpp
+@@ -684,8 +684,13 @@ namespace
+         }
+         if (sub == "add")
+         {
+-            uint32 entry = 0, count = 1;
+-            if (a.size() < 5 || !ParseUInt(a[4], entry) || (a.size() > 5 && (!ParseUInt(a[5], count, 10000) || count == 0)))
++            // inv add NAME ENTRY [COUNT [RAND [DURABILITY]]]: RAND and DURABILITY bring back an item BG3 held
++            // outside WoW (a piece put on BG3's ground, wowbg3 Inventory.lua) as it was: its random property, not a new one.
++            uint32 entry = 0, count = 1, dur = 0;
++            int32 rand = 0;
++            bool const ownRand = a.size() > 6, ownDur = a.size() > 7;
++            if (a.size() < 5 || !ParseUInt(a[4], entry) || (a.size() > 5 && (!ParseUInt(a[5], count, 10000) || count == 0))
++                || (ownRand && !ParseInt(a[6], rand)) || (ownDur && !ParseUInt(a[7], dur)))
+                 return out.Add(head + "refused usage");
+             if (!sObjectMgr.GetItemPrototype(entry))
+                 return out.Add(head + std::to_string(entry) + " refused unknown");
+@@ -694,9 +699,11 @@ namespace
+             InventoryResult r = m->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count, &noSpace);
+             if (r != EQUIP_ERR_OK && (dest.empty() || count == noSpace))
+                 return out.Add(head + std::to_string(entry) + " refused " + Code(r));
+-            Item* it = m->StoreNewItem(dest, entry, true, Item::GenerateItemRandomPropertyId(entry));
++            Item* it = m->StoreNewItem(dest, entry, true, ownRand ? rand : Item::GenerateItemRandomPropertyId(entry));
+             if (!it)
+                 return out.Add(head + std::to_string(entry) + " refused failed");
++            if (ownDur && dur <= it->GetUInt32Value(ITEM_FIELD_MAXDURABILITY))
++                it->SetUInt32Value(ITEM_FIELD_DURABILITY, dur);
+             m->SendNewItem(it, count - noSpace, true, false);
+             return out.Add(head + std::to_string(entry) + " ok " + Hex(it->GetObjectGuid()) + " " + std::to_string(count - noSpace));
+         }
