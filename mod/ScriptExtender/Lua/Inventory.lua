@@ -1210,6 +1210,17 @@ local function onReplies(inv)
                 local e = q(Ext.Entity.Get, r.Item)
                 if e then pcall(function() e.Vars[VAR] = tostring(rep.Guid) end) end
             end
+            if r.Op == "give" and rep.Ok and r.Item and r.To and row and row.k == "object" then
+                -- A whole stack given to another member: the moved item is the receiver's stack where it lies (it had
+                -- been deleted with the giver's and made again where BG3 sends new food, the Camp Supply Sack).
+                local stag, e = stackTag(entryOf(r.Item), r.To), q(Ext.Entity.Get, r.Item)
+                local there = ours()[stag]
+                if there and there ~= r.Item then
+                    local a = q(Osi.GetStackAmount, there)
+                    if a then pcall(Osi.SetStackAmount, there, a + (q(Osi.GetStackAmount, r.Item) or 0)) end
+                    M.Suppress(r.Item); pcall(Osi.RequestDelete, r.Item)
+                elseif e then pcall(function() e.Vars[VAR] = stag end) end
+            end
             if r.Parked and r.Item then
                 if rep.Ok then
                     setParked(r.Item, nil)
@@ -1734,6 +1745,26 @@ local function returnPiece(u, h)
     if amount then pcall(Osi.SetStackAmount, stack, amount + (q(Osi.GetStackAmount, u) or 0)) end
     dropPiece(u)
 end
+-- A part split off a member's stack and put in another member's bag (the maintainer, 2026-11-14: moves between the party's
+-- inventories are fully supported and keep where the player put the item; food moved to another member had gone back,
+-- or been made again where BG3 sends new food, the Camp Supply Sack). WoW moves that many of the entry from the one to
+-- the other (del, add); the part becomes the receiver's stack where it lies, or joins the one it has (onReplies).
+local function movePiece(u, from, to)
+    local entry, n = entryOf(u), q(Osi.GetStackAmount, u) or 1
+    local left = n
+    for _, it in ipairs((((lastInv.Members or {})[from]) or {}).Items or {}) do
+        if left > 0 and it.Entry == entry then
+            local c = math.min(left, it.Count or 1)
+            M.Request({Op = "del", Member = from, Guid = tostring(it.Guid), Count = c})
+            left = left - c
+        end
+    end
+    if left == n then return returnPiece(u, to) end -- WoW has none of it to move: as before
+    parkWait[tostring(entry) .. "@" .. from] = tick
+    pieceOwner[u] = to
+    M.Request({Op = "add", Member = to, Entry = entry, Count = n - left, Item = u, Parked = true})
+    Ext.Utils.Print(string.format("WOW-BG3 inventory: %d of entry %s moved from %s to %s", n - left, tostring(entry), from, to))
+end
 
 local function onAddedTo(item, holder)
     local u, h = uuidOf(item), uuidOf(holder)
@@ -1750,7 +1781,7 @@ local function onAddedTo(item, holder)
             -- like this and breaks it where it lands (water, alcohol's surface), or a split the player wanted.
             -- When it is gone it reads as spent; a load sweeps what is left (sweepStrays), WoW's count stands.
             if M.SideTag[u] then dropPiece(u)
-            elseif pieceOwner[u] and pieceOwner[u] ~= h then returnPiece(u, pieceOwner[u])
+            elseif pieceOwner[u] and pieceOwner[u] ~= h then movePiece(u, pieceOwner[u], h)
             else pieceOwner[u] = h end
         elseif vendorOf[h] and (pieceOwner[u] or buying(h)) then
             -- Part of a stack sold: that many, out of WoW's stacks of that entry. Split in the drag, no look has seen it.
