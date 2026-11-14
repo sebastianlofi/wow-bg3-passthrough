@@ -519,6 +519,29 @@ local function holderOf(u) return uuidOf(q(Osi.GetInventoryOwner, u)) end
 local function isWowGuid(tag) return tag:match("^%x+$") ~= nil end
 local function equipped(u) return q(Osi.IsEquipped, u) == 1 end
 
+-- A member's throw under way (BG3's Throw_*: from UsingSpell to CastedSpell or CastSpellFailed): the thrown item is
+-- in the air, held by no one, and is BG3's until it lands. The sync below put every WoW item not in its member's
+-- bag back at once, and one in flight went back into the thrower's bag and broke there: a thrown water bottle wet
+-- its thrower, not the zombie aimed at (his play, 2026-11-14 11:45, 7.8 m apart). member uuid -> tick it began.
+local throwing = {}
+local THROW_MAX = 600 -- ticks (about 20 s): a throw whose end BG3 never reports stops holding the sync
+local function inThrow(member)
+    local t = member and throwing[member]
+    if t and tick - t > THROW_MAX then throwing[member] = nil; t = nil end
+    return t ~= nil
+end
+-- What the sync puts back from outside the bag, logged: an item BG3 moved (a throw, a drop) and the sync undid.
+local function putBack(u, member, count, why)
+    local h = holderOf(u)
+    if not h then
+        local okp, x, y, z = pcall(Osi.GetPosition, u)
+        Ext.Utils.Print(string.format("WOW-BG3 inventory: %s back to %s from the world%s (%s)", tostring(u), tostring(member),
+            okp and x and string.format(" at %.1f %.1f %.1f", x, y, z) or "", why))
+    end
+    M.Suppress(u)
+    pcall(Osi.ToInventory, u, member, count, 0, 0)
+end
+
 -- ---- reconcile BG3 with inventory.json ----
 local state = {Seq = -1, Members = {}, Created = 0, Errors = {}}
 local lastInv = {} -- the last inventory.json
@@ -732,7 +755,7 @@ local function reconcileStacks(uuid, stacks, have, items)
             if ok then u = made; have[tag] = u; state.Created = state.Created + 1 else note(made) end
         end
         if u and not pendingItem[u] and not waiting then
-            if holderOf(u) ~= uuid then M.Suppress(u); pcall(Osi.ToInventory, u, uuid, total, 0, 0) end
+            if holderOf(u) ~= uuid and not (holderOf(u) == nil and inThrow(uuid)) then putBack(u, uuid, total, "stack") end
             local amount = q(Osi.GetStackAmount, u)
             if amount and amount ~= total then pcall(Osi.SetStackAmount, u, total) end
         end
@@ -803,9 +826,8 @@ local function reconcileMember(uuid, m, have)
                 pcall(M.MakeStrings, v)
                 pcall(M.Dress, u, v)
             end
-            if holderOf(u) ~= uuid and not equipped(u) then
-                M.Suppress(u)
-                pcall(Osi.ToInventory, u, uuid, M.AmountOf(row, it.Count) or 1, 0, 0)
+            if holderOf(u) ~= uuid and not equipped(u) and not (holderOf(u) == nil and inThrow(uuid)) then
+                putBack(u, uuid, M.AmountOf(row, it.Count) or 1, "item")
             end
             local eq = equipped(u)
             if wantEquip and not eq and (row.k == "weapon" or row.k == "armor") and not keepsOwn(uuid, row)
@@ -1664,6 +1686,24 @@ function M.Start(id)
     Ext.Osiris.RegisterListener("Unequipped", 2, "after", function(item, char) onEquipped(item, char, false) end)
     Ext.Osiris.RegisterListener("AddedTo", 3, "after", function(item, holder) onAddedTo(item, holder) end)
     Ext.Osiris.RegisterListener("RemovedFrom", 2, "after", function(item, holder) onRemovedFrom(item, holder) end)
+    local function throwSpell(spell) return type(spell) == "string" and spell:match("^Throw_") ~= nil end
+    pcall(Ext.Osiris.RegisterListener, "UsingSpell", 5, "after", function(caster, spell)
+        local c = uuidOf(caster)
+        if c and throwSpell(spell) then throwing[c] = tick end
+    end)
+    local function throwEnds(caster, spell)
+        local c = uuidOf(caster)
+        if c and throwSpell(spell) and throwing[c] then
+            throwing[c] = nil
+            Ext.Utils.Print(string.format("WOW-BG3 inventory: %s's %s over, the sync holds no more", c, spell))
+        end
+    end
+    pcall(Ext.Osiris.RegisterListener, "CastedSpell", 5, "after", function(caster, spell) throwEnds(caster, spell) end)
+    pcall(Ext.Osiris.RegisterListener, "CastSpellFailed", 5, "after", function(caster, spell) throwEnds(caster, spell) end)
+    pcall(Ext.Osiris.RegisterListener, "OnThrown", 7, "after", function(item, _, thrower, _, x, y, z)
+        Ext.Utils.Print(string.format("WOW-BG3 inventory: %s thrown by %s to %.1f %.1f %.1f (tag %s)", tostring(item),
+            tostring(thrower), x or 0, y or 0, z or 0, tostring(tagOf(uuidOf(item) or ""))))
+    end)
     pcall(Ext.Osiris.RegisterListener, "LongRestStarted", 0, "after", function() restGuard = tick + REST_START end)
     pcall(Ext.Osiris.RegisterListener, "LongRestFinished", 0, "after", function() restGuard = tick + REST_AFTER end)
     -- The restock follows BG3's own traders: one per long rest (it ran on LongRestFinished as well, so twice).
