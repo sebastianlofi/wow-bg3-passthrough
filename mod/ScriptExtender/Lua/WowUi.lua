@@ -489,8 +489,8 @@ function M.Start(runId)
         local xaml = assert(Ext.IO.LoadFile(SHEET, "data"), "cannot read " .. SHEET)
         local P = Ext.Require("Progression.lua")
         local changed, why = xpTooltip(xaml, string.format("This bar fills toward your next WoW level. WoW levels run to %d. "
-            .. "From level %d, each WoW level levels up one party member, and every %dth levels up two. "
-            .. "At level %d, a party of four is BG3 level %d.", P.WOW_MAX, P.FIRST_EARN, P.CURVE.Every, P.WOW_MAX, P.CURVE.Cap))
+            .. "From level %d, each WoW level levels up one party member, and levels %s level up two. "
+            .. "At level %d, a party of four is BG3 level %d.", P.WOW_MAX, P.FIRST_EARN, P.DoublesText(), P.WOW_MAX, P.CURVE.Cap))
         s.XpTooltip = override(root, se, SHEET, "CharacterSheetTemplates.xaml", assert(changed, why))
     end)
     if not okx then s.XpTooltipError = tostring(errx) end

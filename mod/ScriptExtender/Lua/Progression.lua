@@ -1,7 +1,7 @@
 -- Progression (server; the progression notes): BG3 levels the WoW way.
 --
 -- The design: the hero's WoW levels 1 to 4 each open a party slot (level 1: the hero alone); every WoW level
--- from 5 on earns one level-up for one member, every 5th two (M.CURVE): 4 members x BG3 level 18 at WoW 60.
+-- from 5 on earns one level-up for one member, 18, 32, 46 and 60 two (M.CURVE): 4 members x BG3 level 16 at WoW 60.
 -- BG3 itself stops at 12 without a level-cap mod, and the rest waits in the pool.
 -- One command (a playtest request): the WoW level, the only one. While the pool holds a level-up,
 -- BG3's own Level Up button shows on every member who has room (M.Offer: its next level's XP); the
@@ -37,10 +37,12 @@ M.SLOT_LEVELS = 4  -- WoW levels 1..4: one party slot each
 M.FIRST_EARN = 5   -- every WoW level from here on: one level-up
 
 -- The curve is this one table, a party of four at BG3 level Cap at WoW 60. One level-up per WoW level from 5 and a second at every Every-th, counted back
--- from 60: 56 + 12 = 68 = 4 x 17 for 4x18, so all four can be 17 at WoW 57. 4x17 is this one change:
--- Cap = 17, Every = 7 (64 = 4 x 16). BG3's own party limit follows the slots, and the popups below explain it all.
+-- from 60: 56 + 4 = 60 = 4 x 15 level-ups for 4x16 (doubles at 18, 32, 46, 60), so all four can be 15 at WoW 57 and
+-- a party of four reaches BG3 12 at WoW 46. the maintainer's choice (2026-11-14): BG3 16 over 18 gives most classes a feat
+-- only, so the level-15 spells come into play. 4x18 was Cap = 18, Every = 5 (68). BG3's own party limit follows the
+-- slots, and the popups below explain it all.
 M.WOW_MAX = 60
-M.CURVE = {Cap = 18, Every = 5}
+M.CURVE = {Cap = 16, Every = 14}
 -- Companions at camp and the popups: settings.conf `companions = 1`, the launcher's wow-bg3/companions.json {On}.
 local camp = false
 function M.CampOn() return camp end
@@ -176,6 +178,14 @@ function M.Slots() return math.max(1, math.min(M.WowLevel(), M.SLOT_LEVELS)) end
 local function isDouble(l)
     return l >= M.FIRST_EARN and l <= M.WOW_MAX and (M.WOW_MAX - l) % M.CURVE.Every == 0
 end
+-- The WoW levels that give two, as text ("18, 32, 46 and 60").
+local function doublesText()
+    local t = {}
+    for l = M.FIRST_EARN, M.WOW_MAX do if isDouble(l) then t[#t + 1] = tostring(l) end end
+    if #t < 2 then return t[1] or "" end
+    return table.concat(t, ", ", 1, #t - 1) .. " and " .. t[#t]
+end
+M.DoublesText = doublesText
 function M.Earned()
     local top, n = math.min(M.WowLevel(), M.WOW_MAX), 0
     for l = M.FIRST_EARN, top do if isDouble(l) then n = n + 1 end end
@@ -552,9 +562,9 @@ local POPUPS = {
     recruit = "You reached level 2! You can recruit a new companion. Ask them in camp to join your party. "
         .. "Levels 3 and 4 unlock an extra slot.",
     refused = "You're not high enough level for another companion. Levels 2, 3 and 4 each unlock a slot.",
-    levels = string.format("You reached level 5! From now on, each level levels up one party member, and every %dth levels up two. "
+    levels = string.format("You reached level 5! From now on, each level levels up one party member, and levels %s level up two. "
         .. "Use the Level Up button. At level %d, a party of four is BG3 level %d.",
-        M.CURVE.Every, M.WOW_MAX, M.CURVE.Cap),
+        doublesText(), M.WOW_MAX, M.CURVE.Cap),
     cap = "A party member reached level 12, BG3's limit, and has level-ups waiting. To go higher, add a level mod: "
         .. "UnlockLevelCurve or Expansion, with 5e Spells and Advanced Tabletop Spells.",
 }

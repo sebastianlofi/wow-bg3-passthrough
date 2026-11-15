@@ -151,32 +151,33 @@ local server runs at normal WoW rates), and WoW levels turn into BG3 levels:
 |---|---|
 | 1 | Your character alone |
 | 2, 3, 4 | One more party slot each: a party of four at WoW level 4 |
-| 5 to 60 | One BG3 level-up each, two at every 5th (5, 10 and on to 60): 68 in all |
+| 5 to 60 | One BG3 level-up each, two at 18, 32, 46 and 60: 60 in all |
 
 **Your characters do not all level together.** One WoW level is one level-up for one character of your choice, not a level
 for the whole party, so going from BG3 level 3 to 4 across a party of four takes four level-ups.
 
-Each WoW level from 5 on puts one BG3 level-up into a **pool**, every 5th WoW level two. While the pool holds one, BG3's own
+Each WoW level from 5 on puts one BG3 level-up into a **pool**, WoW levels 18, 32, 46 and 60 two. While the pool holds one, BG3's own
 Level Up button shows on every party member who can take it; level whichever one you want (every
 class choice is yours), and the others' buttons go once the pool is empty. So members sit at different
-BG3 levels on purpose. 68 level-ups take a party of four from BG3 level 1 to 18, so **WoW 60 is a party
-of four at BG3 level 18**, and all four can be at 17 from WoW 57.
+BG3 levels on purpose. 60 level-ups take a party of four from BG3 level 1 to 16, so **WoW 60 is a party
+of four at BG3 level 16**, and all four can be at 15 from WoW 57.
 
 **WoW levels run to 60, the end goal.** The level BG3 shows beside a character is that character's own BG3
 level, not your WoW level:
 
 | WoW level | Level-ups earned | A party of four at BG3 level |
 |---|---|---|
-| 5 | 2 | 1 to 2 |
-| 10 | 8 | 3 |
-| 20 | 20 | 6 |
-| 30 | 32 | 9 |
-| 40 | 44 | 12 |
-| 50 | 56 | 15 |
-| 57 | 64 | 17 |
-| 60 | 68 | 18 |
+| 5 | 1 | 1 to 2 |
+| 10 | 6 | 2 to 3 |
+| 20 | 17 | 5 to 6 |
+| 30 | 27 | 7 to 8 |
+| 40 | 38 | 10 to 11 |
+| 46 | 45 | 12 to 13 |
+| 50 | 49 | 13 to 14 |
+| 57 | 56 | 15 |
+| 60 | 60 | 16 |
 
-**The goal past level 12.** BG3 stops at level 12, which a party of four reaches around WoW 40. The idea is to unlock the levels
+**The goal past level 12.** BG3 stops at level 12, which a party of four reaches around WoW 46. The idea is to unlock the levels
 past 12 for all four, so the party keeps growing all the way to WoW 60, and to add new spells for those new levels. That is still
 to come: for now, level-ups past 12 wait in the pool unless you add a level mod (see "What you need").
 
@@ -185,7 +186,7 @@ levels work, and `/wowbg3 pool` lists your WoW level, party slots and the level-
 
 - **We strongly recommend a level mod.** BG3 itself stops at level 12, and WOW-BG3 does not bundle levels
   past it. Without a level mod, level-ups past 12 stay in the pool and a popup tells you which mods unlock
-  more. Install these yourself from Nexus Mods; WOW-BG3 still keeps its own cap of 18:
+  more. Install these yourself from Nexus Mods; WOW-BG3 still keeps its own cap of 16:
   - A level mod, one of: [UnlockLevelCurve](https://www.nexusmods.com/baldursgate3/mods/377) or
     [Expansion Level 13-20](https://www.nexusmods.com/baldursgate3/mods/279).
   - [5e Spells](https://www.nexusmods.com/baldursgate3/mods/125) and its spell list patch, for real spells

@@ -118,14 +118,14 @@ This is the first public version. What we know is missing or rough:
 ## Levels and progression
 
 - Your WoW levels 1 to 4 each open a party slot; every WoW level from 5 on earns one BG3 level-up (two at
-  every 5th), which BG3's own Level Up button offers on every party member with room: level whichever one you
+  18, 32, 46 and 60), which BG3's own Level Up button offers on every party member with room: level whichever one you
   want, so members sit at different BG3 levels on purpose. BG3's own XP is off; `pool` shows what
   your WoW levels earned and what is left.
 - Dismissing a companion does not return its level-ups to the pool. It keeps its BG3 levels and
   rejoins at them, and `pool` still counts those level-ups as given (a dismissed member is listed
   under "not in the party"). Only Withers' respec, `respec NAME`, puts them back.
 - BG3's own XP table ends at level 12, so no Level Up is offered past 12 without a level-cap mod.
-  WoW 60 is worth 68 level-ups (a party of four at level 18, the cap per character), so without such a
+  WoW 60 is worth 60 level-ups (a party of four at level 16, the cap per character), so without such a
   mod the rest of the pool stays unspent, and a popup says which mods unlock more. No level-cap mod is bundled
   or tested, and we strongly recommend one (README, Levelling); ours needs only a larger `MaxXPLevel` and
   the levels above 12 in BG3's XP table. 5e Spells needs Script Extender; on bg3le that is unknown.

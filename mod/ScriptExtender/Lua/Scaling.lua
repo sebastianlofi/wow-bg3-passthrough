@@ -8,7 +8,7 @@
 -- own level; a pack is as many of those as it is. Nothing limits a pull: every hostile stand-in chained within 40 yd
 -- of a mob in the fight joins it (Mirrors.lua; BG3's own ally join does the same).
 --
--- The level table is Progression.lua's curve (M.CURVE, 4x18 at WoW 60): effective level of a WoW level W
+-- The level table is Progression.lua's curve (M.CURVE, 4x16 at WoW 60): effective level of a WoW level W
 -- = 1 + (W - 4) x (Cap - 1) / 56.
 --
 -- From the WoW mob only its level, max HP, hit and the map are read. Rank comes from its HP against a
@@ -99,7 +99,7 @@ end
 -- The numbers for one mob. c: Level, WowMaxHp, WowDamage (WoW), Map, Cap, Difficulty. No game calls:
 -- tools/test_scaling.py runs this.
 function M.Compute(c)
-    local cap = c.Cap or 18
+    local cap = c.Cap or 16
     local d = M.DIFFICULTY[c.Difficulty] or M.DIFFICULTY.balanced
     local E = M.Effective(c.Level, cap)
     local rel = c.WowMaxHp / at(M.NORMAL_HP, c.Level)
@@ -150,7 +150,7 @@ end
 -- What Compute takes besides the mob: neither changes during a game.
 function M.Fixed()
     local Progression = Ext.Require("Progression.lua")
-    return {Cap = Progression.CURVE and Progression.CURVE.Cap or 18, Difficulty = M.Difficulty()}
+    return {Cap = Progression.CURVE and Progression.CURVE.Cap or 16, Difficulty = M.Difficulty()}
 end
 -- What BG3's templates carry that a stand-in is made without. Undead Fortitude (BG3's zombies: at 0 HP a saving
 -- throw puts them back to 1) is off for now, by the maintainer's word (2026-11-12): a WoW zombie dies at 0. BG3 gives
