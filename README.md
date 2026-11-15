@@ -18,8 +18,6 @@ Bring your own copies of BG3 and WoW.
 
 ![The full party in a BG3 fight against Giant Spiders in Dustwallow Marsh](docs/screenshots/dustwallow-party-fight.jpg)
 
-![Tav, a Half-Orc Barbarian, fighting a Mottled Boar in Durotar's Valley of Trials](docs/screenshots/durotar-orc-boar.jpg)
-
 ## The goal
 
 A proper, actual, for real, playable WoW 1 to 60 experience with the BG3 characters and BG3's combat and mechanics. I want this to be more than just some sort of tech demo, but a proper full game experience instead.
