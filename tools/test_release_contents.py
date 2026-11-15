@@ -129,7 +129,7 @@ class Bg3le(unittest.TestCase):
         self.assertIn("-    if (opt != nullptr && opt[0] == '0') return;", patch)   # upstream: on unless BG3LE_DEBUG=0
         self.assertIn("+    if (opt != nullptr && opt[0] != '\\0') return opt[0] == '1';", patch)
         self.assertIn('EnableLuaDebugger', patch)
-        for doc in ('README.md', 'release/README-player.md'):
+        for doc in ('docs/install.md',):  # the README links there for what runs and listens
             self.assertIn('9998', (ROOT / doc).read_text(), doc + ' says what can listen')
 
 
@@ -155,12 +155,24 @@ class CrashReport(unittest.TestCase):
 class Docs(unittest.TestCase):
     def test_removal_runs_the_uninstaller_before_the_folder_goes(self):
         """bg3le's installer is inside Mods/WOW-BG3/: every removal text names --uninstall, before the delete."""
-        for doc, head in (('README.md', '- **Uninstall.**'), ('docs/install.md', '## Removing it'), ('release/README-player.md', '## Remove')):
+        for doc, head in (('README.md', '**Uninstalling:**'), ('docs/install.md', '## Removing it')):
             text = (ROOT / doc).read_text()
             part = text[text.index(head):][:1500]
             self.assertIn('--uninstall', part, doc)
             cut = re.search(r'(?i)\b(delete|remove)\b[^.\n]*Mods/WOW-BG3', part)
             self.assertTrue(cut and part.index('--uninstall') < cut.start(), doc + ': --uninstall comes first')
+
+    def test_the_zip_ships_the_readme_and_the_pages_it_links(self):
+        """One README for GitHub and the zip (the maintainer, 2026-11-14): build-release.py copies the repository's README.md,
+        docs/ and LICENSE, and every local link in the README points at a file that is there."""
+        build = (ROOT / 'release/build-release.py').read_text()
+        self.assertIn('(ROOT / "README.md")', build)
+        self.assertIn('shutil.copytree(ROOT / "docs", dist / "docs"', build)
+        self.assertIn('shutil.copy2(ROOT / "LICENSE", dist / "LICENSE")', build)
+        self.assertFalse((ROOT / 'release/README-player.md').exists(), 'one README only')
+        text = (ROOT / 'README.md').read_text()
+        for link in re.findall(r'\]\(([^)#:]+)(?:#[^)]*)?\)', text):
+            self.assertTrue((ROOT / link).exists(), 'README links a missing file: ' + link)
 
 
 if __name__ == '__main__':

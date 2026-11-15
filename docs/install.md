@@ -67,6 +67,48 @@ the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and not
   works, the test ones included (`refill`, `tp`, `where`, `find`, `faction`, `level`, `xprate`, `learn`, `unlearn`); `0`
   leaves only `help`, the party commands (`list`, `add`, `remove`, `pool`, `respec`) and `chat`.
 
+## What it puts on your PC
+
+Everything the mod makes lives in `Mods/WOW-BG3/` (its `data/` folder), with two exceptions the installer makes and
+`--uninstall` takes back out:
+
+- `~/.local/share/bg3le/`: the Linux Script Extender (its library, launch wrapper, a few small cache files and its
+  logs; it keeps only its newest ten logs).
+- BG3's Steam launch option, so Steam starts BG3 with the Script Extender: for every Steam account that has logged
+  in on this PC. The installer asks before it stops Steam to change it and keeps a copy of Steam's file beside it
+  as `localconfig.vdf.bg3le-backup`; `--uninstall` leaves that copy where it is.
+
+The Script Extender itself does two things in BG3 that are its own and not WOW-BG3's, as it does on Windows: it
+keeps Steam achievements on while mods are loaded, and at each start it removes the `ModCrashSanityCheck` folder
+BG3 leaves in its profile after a crash (BG3 would switch your mods off otherwise). `"EnableAchievements": false`
+in a `ScriptExtenderSettings.json` next to BG3's `bin/bg3` turns the first off.
+
+While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>/<install>` (about
+50 to 150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
+`<install>` is a short code of the mod's folder, so two copies of the mod under one user (two Steam libraries, a game
+container beside the desktop) never share it. Only you can read it. If a folder of that name is already there and is
+not yours, the mod leaves it alone and uses one of its own in your runtime folder (`$XDG_RUNTIME_DIR/wow-bg3`) instead.
+
+- **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
+  and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1, ports 3744 and
+  8105); its database has no network port at all. Nothing else listens. The Script Extender has a Lua debugger for
+  mod authors (127.0.0.1:9998), which stock bg3le opens at every start; WOW-BG3's build keeps it closed unless you
+  ask for it (`BG3LE_DEBUG=1` in BG3's launch options, or `"EnableLuaDebugger": true` in
+  `ScriptExtenderSettings.json`), because it runs whatever Lua any program on your PC sends it.
+- **Processes.** The WoW server, its database and the WoW engine start with BG3 and stop with it, also when BG3
+  crashes. Closing BG3 waits for them to save and stop: a second or two, at most thirty. The Script Extender loads only into BG3; other games and programs are untouched.
+- **Disk.** Logs are kept to two of each (a log over 16 MB starts afresh at BG3's next start, the older one kept
+  as `.1`). The party's textures converted for WoW are kept up to 3 GB (the least recently used go first, and any
+  unused for a month). Crash reports keep the newest five. A first start that was stopped part-way is cleaned up at
+  the next one. The WoW side of a save BG3 has overwritten or deleted is kept a month (`data/#recycle_bin`), then
+  removed. The WoW engine's own crash files keep the newest ten. What is made from your WoW files for the ground
+  you walk has an end too: the squares round every flight point are made in the background, a fixed set of about
+  0.7 GB (`data/cache/cuts`); movement maps (`data/server/data/mmaps`, about 1.5 MB for each map tile you come
+  near, about 3.5 GB if you walked every tile of every map) and collision cells (`data/cache/vmap`, about 0.2 GB
+  after a few zones) grow as you explore.
+- **Your files.** Nothing is written into BG3's game folder or into your WoW files. The local server's generated
+  passwords are readable by your user only.
+
 ## Saves
 
 World mode only happens in games started with WOW-BG3 enabled; older saves stay plain BG3 (loading

@@ -1,23 +1,16 @@
-# WOW-BG3 Passthrough Mod
+# WoW-BG3 Passthrough Mod
 
-Play vanilla World of Warcraft (1.12.1) as the world of a Baldur's Gate 3 game.
+![Gale, Shadowheart, Astarion and Karlach in Stormwind's Trade District](docs/screenshots/stormwind-party.jpg)
 
-Your BG3 party walks WoW's world. WoW's mobs, NPCs, quests and loot are real WoW, served by a
-local WoW server on your own machine; fights against WoW's mobs are BG3 fights with BG3's rules,
-turns and spells. BG3 saves keep the WoW side too.
+Play vanilla World of Warcraft (1.12.1) as the world of a Baldur's Gate 3 game: your BG3 party walks WoW's world and fights its mobs with BG3's rules, turns and spells. Under the hood, a custom build of the Script Extender connects BG3 to a modified benilla client running hidden in the background, which streams WoW's world into BG3: the picture, walkable ground, walls and mobs. BG3 saves keep the WoW side too.
 
-Linux only, with the native Linux build of BG3 from Steam. It needs your own WoW 1.12.1 client:
-this project contains no Blizzard or Larian files.
+Bring your own copies of BG3 and WoW.
 
-> **State: very much a work in progress.** 0.1.0 is a first playable beta. You can make a character,
-> walk Elwynn Forest, fight its mobs, quest, loot, trade, level up and recruit companions, but a lot
-> is untested, unbalanced or not built yet. [What is work in progress](#work-in-progress) lists it
-> honestly; read it before you start a long game.
+> **State: WIP WIP WIP WIP WIP.** You can make a character, fight mobs, quest, loot, trade, level up and recruit companions, but a lot is untested, unbalanced or not built yet. I am just a dude with a fulltime day job, there is only so many scenarios I can test lol.
+>
+> Updates may break older saves, so keep that in mind before you start a long game. This is a fan project. It isn't affiliated with Blizzard Entertainment, Larian Studios or Wizards of the Coast, and you need to own both games.
 
-> **Photosensitivity and epilepsy warning.** This is a work-in-progress mod. When the passthrough
-> between WoW and BG3 glitches, the screen can flash suddenly, including bright white flashes. If
-> you or anyone watching has photosensitive epilepsy or is sensitive to flashing lights, be careful
-> playing it. Stop right away if you feel unwell.
+> **Photosensitivity and epilepsy warning.** This is a work-in-progress mod that modifies graphic pipelines. There is a chance graphics break and cause screen flashing.
 
 ![Gale exploring Elwynn Forest: BG3's character and interface on WoW's world](docs/screenshots/elwynn-forest.jpg)
 
@@ -25,185 +18,136 @@ this project contains no Blizzard or Larian files.
 
 ![The full party in a BG3 fight against Giant Spiders in Dustwallow Marsh](docs/screenshots/dustwallow-party-fight.jpg)
 
-![Tav, a Half-Orc Barbarian (an Orc Warrior on the WoW side), fighting a Mottled Boar in Durotar's Valley of Trials](docs/screenshots/durotar-orc-boar.jpg)
+![Tav, a Half-Orc Barbarian, fighting a Mottled Boar in Durotar's Valley of Trials](docs/screenshots/durotar-orc-boar.jpg)
 
 ## The goal
 
-A fully playable WoW 1 to 60 experience with the BG3 characters and BG3's combat: WoW's world,
-quests, items, zones and progression, played with BG3's party, turn-based fights, spells, dialogue
-of the companions and its look. WoW's stats and mechanics are mapped onto BG3's: most of it by
-broad automatic rules (items, mobs, health, levels), and some of it hand-made where a rule cannot
-do a thing justice, dungeon bosses for example.
+A proper, actual, for real, playable WoW 1 to 60 experience with the BG3 characters and BG3's combat and mechanics. I want this to be more than just some sort of tech demo, but a proper full game experience instead.
 
-After that: multiplayer, and then The Burning Crusade and Wrath of the Lich King once the vanilla
-version is mostly complete.
+## Requirements
 
-## How it plays
+| What | Notes |
+| --- | --- |
+| Linux (Windows and Mac coming Soon™) | x86_64, with Steam from your distribution or Valve (Flatpak Steam isn't supported) |
+| Baldur's Gate 3 | The native Linux build from Steam, not the Windows build under Proton |
+| World of Warcraft 1.12.1 | Your own client: build 5875, English |
+| Disk space | About 15 GB free: your WoW client (about 5 GB) and up to about 10 GB the mod builds from it |
+| Internet | Once, at the first start (a 48 MB download): the WoW server's world database (every NPC, quest, item and spawn). It's Blizzard-derived, so the mod can't ship it, and it isn't in your WoW client either, so it's fetched from vmangos' public sources and checked against checksums. Nothing is sent anywhere |
 
-- **Starting.** Enable WoW-BG3 Passthrough in BG3's mod manager and start a New Game. Make or pick your
-  character in BG3's character creation; you land in the WoW start zone of your character's race.
-- **Exploring.** BG3's camera, controls and interface; WoW's world under your feet, with WoW's
-  NPCs, mobs, day and night. WoW's chat, quest log and quest tracker sit beside BG3's interface.
-- **Fighting.** Walk into a WoW mob (or attack one) and a BG3 fight starts: the mob is held on the
-  WoW server and fights as a BG3 creature, turn by turn, with BG3's rules. When the fight ends the
-  result goes back to WoW as real damage, XP, loot and quest credit. Neutral (yellow) WoW mobs are
-  neutral in BG3 too and leave you alone: attack one and BG3 makes it temporarily hostile, as it does
-  for any neutral character, and the fight starts.
-- **Clicking WoW's models.** Every BG3 action aimed at a character (attack, spell, shove, throw, talk)
-  works on the WoW model under the pointer: BG3 aims it at that mob's or NPC's BG3 stand-in. A left
-  click on a hostile (red) mob attacks it.
+Tested only on:
+
+- Fedora 44 (KDE), AMD Ryzen 7 9800X3D, AMD Radeon RX 9070 XT (Mesa 25.0 and 26.2)
+- Linux Mint (X11), Nvidia RTX 4070 Ti (driver 595.99)
+
+Intel graphics are untested.
+
+## What (mostly) works
+
+- **Starting.** Enable WoW-BG3 Passthrough in BG3's mod manager and start a New Game. Make or pick your character in BG3's character creation; you land in the WoW start zone based on this table:
+
+  | BG3 race | WoW race | Faction | Start zone |
+  | --- | --- | --- | --- |
+  | Human, Half-Elf | Human | Alliance | Elwynn Forest |
+  | Elf | Night Elf | Alliance | Teldrassil |
+  | Dwarf | Dwarf | Alliance | Dun Morogh |
+  | Gnome, Halfling | Gnome | Alliance | Dun Morogh |
+  | Half-Orc | Orc | Horde | Durotar |
+  | Githyanki | Troll | Horde | Durotar |
+  | Tiefling, Drow | Undead | Horde | Tirisfal Glades |
+  | Dragonborn | Tauren | Horde | Mulgore |
+- **Exploring.** BG3's camera, controls and interface; WoW's world under your feet, with WoW's NPCs, mobs, day and night. WoW's UI is mostly hidden. Some WoW options are still available at the top left in case something goes wrong. (Indoor movement and camera can be a little whack.) You may split the party and disperse around the world without limit.
+- **Fighting.** Turn based with BG3's spells and rules. You can attack friendly NPCs too. Sneaking and surprise attacks work too. You can enable turn-based mode outside of a fight to stop time too.
 - **Looting.** A WoW corpse opens BG3's own loot window with that mob's WoW loot and gold.
-- **Questing and NPCs.** Talking to a quest giver, or to any NPC with WoW dialog, opens WoW's own
-  quest and gossip windows, as in vanilla: accept, decline and hand in there. Vendors open BG3's
-  trade screen with the vendor's WoW wares. A left click on a friendly NPC talks to it while you
-  walk and pickpockets it while you sneak; NPCs with nothing to say in WoW (guards, villagers) offer
-  no Talk. A robbed NPC reacts the way BG3's NPCs do.
-- **Money.** WoW's copper is BG3's gold: 1 copper = 1 gold, so 1 silver = 100 gold and 1 WoW gold
-  = 10,000 gold. Prices and corpse money use the same rule. Merchants show food and drink as the stacks WoW sells, and you can split a
-  stack to buy or sell just part of it. With no discount on the barter screen, a merchant charges WoW's
-  buy price and pays WoW's sell price, on every difficulty. BG3's attitude and Persuasion move both from
-  there, and the price the screen shows is the price you pay: WoW's money follows. BG3's item values are whole
-  numbers, so a buy price can show up to 1 copper off WoW's (a 1 copper item shows 3 on Balanced); sell prices
-  are exact. Inside an opened bag,
-  such as the Camp Supply Sack, BG3's tooltip shows the item's plain value, not the trade price; the sale still pays
-  the right price. What WoW won't buy (no sell price) stays with you. WoW's reputation discount shows in the base price.
-- **Vendors restock at the long rest.** As BG3's traders do, a vendor has a limited stock and a purse: what you buy
-  or steal stays gone and the gold it pays you stays spent until your next long rest. A WoW vendor of arrows and
-  bullets sells BG3's special arrows instead (fire, ice, acid, slaying and more; the stronger ones as you level).
-- **Thrown weapons.** WoW's throwing knives and axes are BG3's throwable dagger: one dagger stands for the whole WoW
-  stack, a throw spends nothing, and you pick the dagger up where it landed.
-- **Waypoints.** The WoW flight points you have discovered are BG3's waypoints: click one in BG3's waypoint panel or
-  its pin on the map, or `/wowbg3 waypoint go NAME`. Free, no flight master needed, on either continent; Ironforge
-  and Undercity too. Not in a fight, on a flight, dead, or at camp. `waypoints = 0` in `settings.conf` turns it off.
-  A move (a waypoint or `tp`) is covered by BG3's own screen fade, which lifts once WoW's world is there: about
-  8 seconds on the same continent, longer to the other one. It takes the character you control and the companions
-  chained to it; a companion you unchained stays where it stands.
-- **Lifts and the Deeprun Tram.** WoW's elevators and the tram carry your party. Each car is one of BG3's own moving
-  platforms under WoW's car: click on a car while it rests at a stop to walk onto it, ride, and walk off at the
-  other end. A car near the party is environment, as BG3's own platforms are: in turn-based mode and in a fight it
-  stands while a turn is open and moves on the environment's turn, six seconds' worth a round, in WoW's picture
-  too; out of turn-based mode it keeps WoW's own timetable. Ridden so far: Undercity's lifts and the Deeprun Tram.
-  Zeppelins and boats are not ridden (next point).
-- **Ships and zeppelins.** You cannot ride or board one (nothing of a vessel is ground for BG3's characters).
-  Your dream guardian waits at the dock instead: walk onto the pier or the zeppelin tower's platform and it stands
-  there. Talk to it and it asks, in BG3's own dialog, "Travel to <place>?"; "Yes, take me to <place>." moves the
-  party to the dock at the vessel's other end, as a waypoint does, and "Not now." leaves you where you are. It is
-  there whether the vessel is in or not. Where two vessels stop at one harbour, each pier has its own crossing and
-  the guardian stands at the one you are nearest. Not in a fight or at camp.
-- **Saving.** Save and load as in BG3; loading a save takes the WoW character back to where it was
-  in that save. World mode only happens in games started with WOW-BG3 enabled: a save made without
-  it plays as plain BG3, and WOW-BG3 says so in a message box when you load one.
+- **Questing and NPCs.** Talking to a quest giver, or to any NPC with WoW dialog, opens WoW's own quest and gossip windows, as in vanilla: accept, decline and hand in there. Vendors open BG3's trade screen with the vendor's WoW wares. A left click on a friendly NPC talks to it while you walk and pickpockets it while you sneak.
+- **Money.** All WoW money is turned into BG3's:
 
-## Your character in WoW
-
-A hidden WoW character follows your BG3 character, made for you at the first start (no WoW account
-or login is needed: everything is local). Its race, and with it the start zone and the faction,
-come from your BG3 race:
-
-| BG3 race | WoW race | Faction | Start zone |
-|---|---|---|---|
-| Human, Half-Elf, Halfling | Human | Alliance | Northshire (Elwynn Forest) |
-| Elf | Night Elf | Alliance | Shadowglen (Teldrassil) |
-| Dwarf | Dwarf | Alliance | Coldridge Valley (Dun Morogh) |
-| Gnome | Gnome | Alliance | Coldridge Valley (Dun Morogh) |
-| Half-Orc | Orc | Horde | Valley of Trials (Durotar) |
-| Githyanki | Troll | Horde | Valley of Trials (Durotar) |
-| Tiefling, Drow | Undead | Horde | Deathknell (Tirisfal Glades) |
-| Dragonborn | Tauren | Horde | Camp Narache (Mulgore) |
-
-An origin character goes by the same table, through their race:
-
-| Origin | BG3 race | WoW race and class | Faction | Start zone |
-|---|---|---|---|---|
-| Gale | Human | Human Mage | Alliance | Northshire (Elwynn Forest) |
-| Wyll | Human | Human Warlock | Alliance | Northshire (Elwynn Forest) |
-| Shadowheart | Half-Elf | Human Priest | Alliance | Northshire (Elwynn Forest) |
-| Astarion | Elf | Night Elf Rogue | Alliance | Shadowglen (Teldrassil) |
-| Lae'zel | Githyanki | Troll Warrior | Horde | Valley of Trials (Durotar) |
-| Karlach | Tiefling | Undead Warrior | Horde | Deathknell (Tirisfal Glades) |
-| The Dark Urge | Your pick | By the race you pick | By race | By race |
-
-The WoW class follows your BG3 class where vanilla allows that race and class together, and
-otherwise the closest one it does allow (Warrior is legal for every race):
-
-| BG3 class | WoW class | Where vanilla does not allow it |
-|---|---|---|
-| Barbarian, Fighter, Monk | Warrior | |
-| Ranger | Hunter | Warrior for Human, Gnome and Undead |
-| Rogue, Bard | Rogue | Warrior for Tauren |
-| Cleric | Priest | Shaman for Orc and Tauren, Warrior for Gnome |
-| Wizard, Sorcerer | Mage | Warlock for Orc, Warrior for Night Elf, Dwarf and Tauren |
-| Warlock | Warlock | Warrior for Night Elf, Dwarf, Troll and Tauren |
-| Druid | Druid (Night Elf, Tauren) | Shaman for Orc and Troll, Priest for Human, Dwarf and Undead, Warrior for Gnome |
-| Paladin | Paladin (Human, Dwarf) | Shaman for Orc, Troll and Tauren, Warrior for the rest |
-
-The WoW class matters little in play: your party fights with its BG3 classes.
-
-Northshire and Elwynn Forest are where it has been played most; the other start zones, the Horde
-side above all, have had little or no testing.
+  | WoW | BG3 |
+  | --- | --- |
+  | 1 copper | 1 gold |
+  | 1 silver | 100 gold |
+  | 1 gold | 10,000 gold |
+- **Vendors (mostly).** Vendors have a limited stock and a purse that restock upon long rest. BG3's attitude and Persuasion apply. You can pickpocket them, and they get mad if you fail. (WoW's arrows are replaced with BG3's special arrows instead.)
+- **Map and waypoints.** Use M to open the map and use the waypoints as needed. The WoW flight points you have discovered act as waypoints: free, and no flight master needed after discovering one. Ships and zeppelins are replaced by a placeholder NPC for now.
+- **Dying and saving.** No WoW corpse run, you just reload your last save like in BG3. Save and load *should* work as expected.
 
 ## Levelling
 
-BG3's own XP is off. Your **WoW** character earns XP the WoW way (kills, quests, exploration; the
-local server runs at normal WoW rates), and WoW levels turn into BG3 levels:
+You earn XP the WoW way (kills, quests, exploration):
 
-| WoW level | What you get |
-|---|---|
+| Level | What you get |
+| --- | --- |
 | 1 | Your character alone |
-| 2, 3, 4 | One more party slot each: a party of four at WoW level 4 |
-| 5 to 60 | One BG3 level-up each, two at 18, 32, 46 and 60: 60 in all |
+| 2, 3, 4 | One more party slot each, grab them from camp. |
+| 5 to 60 | One BG3 level-up each, two at WoW levels 18, 32, 46 and 60. |
 
-**Your characters do not all level together.** One WoW level is one level-up for one character of your choice, not a level
-for the whole party, so going from BG3 level 3 to 4 across a party of four takes four level-ups.
+**Your characters do not all level together.** Unlike vanilla BG3, one level is one level-up for one character of your choice, not a level for the whole party.
 
-Each WoW level from 5 on puts one BG3 level-up into a **pool**, WoW levels 18, 32, 46 and 60 two. While the pool holds one, BG3's own
-Level Up button shows on every party member who can take it; level whichever one you want (every
-class choice is yours), and the others' buttons go once the pool is empty. So members sit at different
-BG3 levels on purpose. 60 level-ups take a party of four from BG3 level 1 to 16, so **WoW 60 is a party
-of four at BG3 level 16**, and all four can be at 15 from WoW 57.
+A dismissed companion keeps its BG3 levels and rejoins at them; the pool counts them as spent. Only Withers' respec gives level-ups back.
 
-**WoW levels run to 60, the end goal.** The level BG3 shows beside a character is that character's own BG3
-level, not your WoW level:
+## Planned
 
-| WoW level | Level-ups earned | A party of four at BG3 level |
-|---|---|---|
-| 5 | 1 | 1 to 2 |
-| 10 | 6 | 2 to 3 |
-| 20 | 17 | 5 to 6 |
-| 30 | 27 | 7 to 8 |
-| 40 | 38 | 10 to 11 |
-| 46 | 45 | 12 to 13 |
-| 50 | 49 | 13 to 14 |
-| 57 | 56 | 15 |
-| 60 | 60 | 16 |
+- Mac and Windows versions coming Soon™, fixing other visual jank in Linux. LLMs kinda suck at dealing with graphics and telling what looks bad or incorrect.
+- Equipment with more interesting effects than just stats.
+- More custom-made content/scripts where mapping rules are not enough, like dungeons.
+- Proper balance and pacing for the whole 1 to 60 journey.
+- Increased BG3's level cap from 12 to 16, reachable at the equivalent of level 60 in WoW, with new custom-made abilities based on WoW's for those and previous levels for all classes.
 
-**The goal past level 12.** BG3 stops at level 12, which a party of four reaches around WoW 46. The idea is to unlock the levels
-past 12 for all four, so the party keeps growing all the way to WoW 60, and to add new spells for those new levels. That is still
-to come: for now, level-ups past 12 wait in the pool unless you add a level mod (see "What you need").
+## Known issues
 
-BG3's XP bar on your character shows how far you are into your current WoW level, and its tooltip says how the
-levels work, and `/wowbg3 pool` lists your WoW level, party slots and the level-ups waiting; the table above says what each WoW level gives.
+I am a dude with a full time day job, so there is likely a sh\*t load more of issues that I just don't have the time to test. Both WoW and BG3 have a LOT of content.
 
-- **We strongly recommend a level mod.** BG3 itself stops at level 12, and WOW-BG3 does not bundle levels
-  past it. Without a level mod, level-ups past 12 stay in the pool and a popup tells you which mods unlock
-  more. Install these yourself from Nexus Mods; WOW-BG3 still keeps its own cap of 16:
-  - A level mod, one of: [UnlockLevelCurve](https://www.nexusmods.com/baldursgate3/mods/377) or
-    [Expansion Level 13-20](https://www.nexusmods.com/baldursgate3/mods/279).
-  - [5e Spells](https://www.nexusmods.com/baldursgate3/mods/125) and its spell list patch, for real spells
-    of level 7 to 9, and [Advanced Tabletop Spells](https://www.nexusmods.com/baldursgate3/mods/14429) for
-    more of them.
+- Loading times can be a bit much (especially on first start) since the game has to build the level on your PC from your WoW client in real time.
+- Sometimes you can "see through" to the hidden BG3 world and NPCs.
+- Some spell effects may be missing, only partly drawn, or incorrectly drawn.
+- Balance and pacing are a first guess, not tuned yet.
+- Sometimes, light on the characters may not look correct (like in Orgrimmar).
+- Mostly tested on start zones.
+- Haven't tested custom bindings or a controller yet.
+- A party can't be split across continents: moving to the other continent brings the whole party along.
+- Ships and zeppelins can't be boarded; there is a placeholder NPC in the meantime.
+- Lots of items aren't mapped to their BG3 equivalents yet or given a script (like Hearthstone).
+- I DON'T KNOW WHAT TO DO WITH WATER. You can swim in WoW but you can't in BG3. Some manual/custom edits may need to be done to water sections. Currently characters just Jesus-walk on top of water. Ideas on this are very welcome.
+- The camera ignores collision and can show odd views.
+- Cities and other buildings may not have proper walkable spots, needs manual fixing.
+- A save made in a fight ends that fight when loaded.
+- Robbed NPCs sometimes don't look around for the thief.
+- Lifts and the Deeprun Tram work but may be a bit janky.
+- Many, many more...
 
-  Only UnlockLevelCurve has been tried with WOW-BG3, up to BG3 level 14 on a Wizard; the rest are untested.
-  5e Spells needs Script Extender, and whether it works on WOW-BG3's Linux Script Extender (bg3le) is unknown.
-- A dismissed companion keeps its BG3 levels and rejoins at them; the pool counts them as spent. Only
-  Withers' respec (`/wowbg3 respec NAME`) gives level-ups back.
+More in: [docs/known-issues.md](docs/known-issues.md).
+
+**If something breaks:** type `/wowbg3 report` in chat, then open an [issue](https://github.com/sebastianlofi/wow-bg3-passthrough/issues), say what you were doing, and attach the newest `WOW-BG3-report-<time>.zip` from `Mods/WOW-BG3/data/reports/`. It holds the logs and crash data; your home folder, user name and PC name are masked.
+
+## FAQ
+
+**Windows? Mac?**
+
+Soon™
+
+**How are item stats or abilities decided?**
+
+By rules, mostly automatic. A WoW weapon keeps its BG3 base weapon's damage die and gets +1 to +3 from its WoW damage per second; armour gets BG3-style AC from its armour type and item level; WoW stats become ability and resistance bonuses, and many on-equip and on-use effects are mapped too. A WoW mob gets BG3 versions of the spells it casts in WoW, from a rules file you can extend (see [Looking to contribute?](#looking-to-contribute)).
+
+Any feedback or ideas for this are appreciated!
+
+**Multiplayer?**
+
+Eventually, it would work like BG3's (up to 4 players sharing the same party) and not like WoW's (i.e. no MMO version of this).
+
+**The Burning Crusade or Wrath of the Lich King?**
+
+Maybe, the idea is to have a proper stable version of vanilla first. It's a lot more content to tune and fix than I originally thought, so I wanna stick with this scope until it is in a place I am happy with before trying the other expansions. Feel free to fork and give it a try if you want to tackle that though!
+
+**WoW: Forever's shaders for water, fog and light?**
+
+Perhaps a recreation of them of sorts. Low priority though, so if I haven't pulled all my hair out by the time I am happy with the mod, I could look into it.
 
 ## Commands
 
-Type them in WoW's chat, one word each: `/wowbg3 help` lists them.
+Type them in WoW's chat:
 
 | Command | What it does |
-|---|---|
+| --- | --- |
 | `/wowbg3 list` | The party and where everyone is |
 | `/wowbg3 add NAME` | Recruit a companion: shadowheart, astarion, laezel, wyll, karlach, gale, jaheira, minsc, halsin, minthara |
 | `/wowbg3 remove NAME` | Dismiss a companion (it keeps its BG3 levels) |
@@ -211,288 +155,56 @@ Type them in WoW's chat, one word each: `/wowbg3 help` lists them.
 | `/wowbg3 respec NAME` | Withers' respec: back to BG3 level 1, its level-ups back to the pool |
 | `/wowbg3 waypoint`, `waypoint go NAME` | The flight points you have discovered; travel to one |
 | `/wowbg3 chat on`, `off` | Show or hide WoW's chat |
-
-Test commands, on in this beta (`debug_commands = 1` in `Mods/WOW-BG3/settings.conf`; 0 turns them off):
-
-| Command | What it does |
-|---|---|
 | `/wowbg3 refill` | HP, spell slots, rage and the rest back to full |
-| `/wowbg3 tp PLACE`, `tp ZONE X Y`, `tp X Y` | Move on the WoW map (X and Y from 0 to 100, as on WoW's map) |
-| `/wowbg3 where`, `find TEXT` | Where you are; search zones and named places |
-| `/wowbg3 faction horde`, `alliance`, `own` | Your WoW side, kept in each save |
-| `/wowbg3 time day`, `night`, `dawn`, `dusk`, `HH:MM`, `now` | Hold the world's light at that time, for recording, until `now` or the next start of the game. The server's clock does not change |
-| `/wowbg3 level N` | Set your WoW level, 1 to 60 (it fills the pool: BG3's Level Up shows on the party) |
+| `/wowbg3 tp PLACE`, `tp ZONE X Y`, `tp X Y` | Move on the WoW map (X and Y from 0 to 100, as on WoW's map). Examples: `/wowbg3 tp goldshire` (a named place), `/wowbg3 tp elwynn 42 65` (a zone and a map spot), `/wowbg3 tp 50 50` (a spot in the zone you're in) |
+| `/wowbg3 faction horde`, `alliance`, `own` | Your faction (Horde or Alliance), kept in each save |
+| `/wowbg3 time day`, `night`, `dawn`, `dusk`, `HH:MM`, `now` | Hold the world's light at that time, until `now` or the next start of the game. The server's clock does not change |
+| `/wowbg3 level N` | Set your level, 1 to 60 |
 | `/wowbg3 xprate N` | The server's XP rate (1 is normal) |
 | `/wowbg3 learn SPELL`, `unlearn SPELL` | Give your hero a BG3 spell by its stats name (`Target_Grease`), or take it back |
 
 ## Install
 
-Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases); the README in it has every
-step. In short:
+Download `WOW-BG3-0.1.0.zip` from this repository's [Releases page](https://github.com/sebastianlofi/wow-bg3-passthrough/releases); the README in it has every step. In short:
 
-1. You need BG3 (native Linux build, Steam), your own WoW 1.12.1 client (build 5875, English) and
-   about 15 GB of free disk space: your WoW client copy (about 5 GB) and up to about 10 GB the mod builds from it
-   (the WoW server's data and caches; "What it puts on your PC" says what grows and where it stops).
-2. Put `WOW-BG3.pak` and the `WOW-BG3/` folder side by side into BG3's Mods folder
-   (`~/.local/share/Larian Studios/Baldur's Gate 3/Mods`).
-3. Copy your WoW 1.12.1 client files into `Mods/WOW-BG3/WoW/` (so `Mods/WOW-BG3/WoW/Data/` exists).
-4. With Steam closed, run once:
-   `python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py"`.
-   It installs the Linux Script Extender (bg3le) with WOW-BG3's patches and sets BG3's Steam launch
-   option. It still runs your other Script Extender mods; `--uninstall` undoes it.
-5. Start BG3, enable WoW-BG3 Passthrough in the mod manager, start a New Game.
+1. Unpack the zip into BG3's Mods folder, usually `~/.local/share/Larian Studios/Baldur's Gate 3/Mods/`, and copy your WoW 1.12.1 client into `WOW-BG3/WoW/`, so it looks like this:
 
-The first start takes a few minutes and needs the internet once: the local WoW server builds its data
-from your WoW files and downloads its world database (about 48 MB, from vmangos' public sources; this
-mod ships no game data). The mobs' abilities are made from that database, so the first time, BG3 stays
-on its loading screen for about two minutes before the main menu. Offline, it stops with a message
-saying so; start BG3 again once you are connected. Later starts and loads take under a minute and need
-no internet. Switching WoW-BG3 Passthrough off in the mod manager stops the whole WoW side.
+   ```
+   Mods/
+   ├── WOW-BG3.pak
+   └── WOW-BG3/
+       ├── bg3le/
+       ├── settings.conf
+       ├── ...            (the rest of the zip's WOW-BG3 folder)
+       └── WoW/           <- your WoW 1.12.1 client goes here
+           ├── Data/
+           └── WoW.exe
+   ```
+2. With Steam closed, run once: `python3 ~/.local/share/"Larian Studios/Baldur's Gate 3/Mods/WOW-BG3/bg3le/install.py"`. It installs the Linux Script Extender (bg3le) with WOW-BG3's patches and sets BG3's Steam launch option. It still runs your other Script Extender mods; `--uninstall` undoes it. Steam installed as a Flatpak isn't supported by the installer yet: use Steam from your distribution's packages or Valve's own.
+3. Start BG3, enable WoW-BG3 Passthrough in the mod manager, start a New Game.
 
-Why the download: the WoW server needs a world database (every NPC, quest, item, vendor and spawn).
-It is Blizzard-derived, so this mod can't ship it, and your WoW client doesn't contain it, so it can't
-be built from your client either. The first start fetches it from vmangos' public sources (the WoW
-server this mod uses), at a pinned version, and checks every file against the checksums that ship with
-the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
+**The first time you start a game will take some time** and needs the internet once: the local WoW server builds its data from your WoW files and downloads its world database (about 48 MB, from vmangos' public sources; this mod ships no game data). Later starts and loads take under a minute and need no internet. Switching WoW-BG3 Passthrough off in the mod manager stops the whole WoW side.
 
-To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder, your
-`settings.conf` and the `data/` folder, where the mod keeps its server, snapshots and logs) and run the installer
-again. Your saves stay.
+> **Experimental:** make backups of your existing saves before installing!
 
-More: [docs/install.md](docs/install.md). Known issues of this version:
-[docs/known-issues.md](docs/known-issues.md).
+Why the download: the WoW server needs a world database (every NPC, quest, item, vendor and spawn). It is Blizzard-derived, so it fetches it from vmangos' public sources (the WoW server this mod uses), at a pinned version, and checks every file against the checksums that ship with the mod (`server/sql.lock`) before using it. Nothing else is downloaded, and nothing is sent anywhere.
 
-### Changing mob abilities
+To update, replace `WOW-BG3.pak` and `WOW-BG3/` with the new ones (keep your `WoW/` folder, your `settings.conf` and the `data/` folder, where the mod keeps its server, snapshots and logs) and run the installer again. Your saves stay.
 
-Which BG3 abilities a WoW mob gets comes from rules in `WOW-BG3/tools/link/tools/wow_abilities_rules.json`.
-To give or take away a mob's spells (a boss fight of your own, a mod pack's), put a file of your own in
-`Mods/WOW-BG3/data/abilities-rules.json` (or several in `Mods/WOW-BG3/data/abilities-rules.d/*.json`,
-read in name order). It is merged over the shipped rules and survives updates; BG3's next start uses it.
-Mobs are keyed by creature entry and spells by WoW spell id (look them up in any vanilla database site);
-names are only comments (`_name`). A value is a BG3 spell, `null` (the mob does not get it) or `true` (the
-shipped rules decide); a spell the mob does not cast in WoW is given to it. `spells` outside `mobs` applies to
-every mob.
+More: [docs/install.md](docs/install.md). Known issues of this version: see [Known issues](#known-issues) above.
 
-```json
-{
-  "overrides": {
-    "mobs": {
-      "448": {"_name": "Hogger", "spells": {"6016": null, "8599": {"b": "Shout_Rage", "every": "fight"}}}
-    },
-    "spells": {"9532": "Projectile_FireBolt"}
-  }
-}
-```
-
-That takes Pierce Armor (6016) from Hogger, gives him BG3's Rage once a fight, named after WoW's Enrage (8599), and
-makes every mob's Lightning Bolt (9532) a Fire Bolt. What came of it is in `logs/abilities.log` and
-`Mods/WOW-BG3/data/io/link/abilities-status.json`.
+**Uninstalling:** switch WoW-BG3 Passthrough off in the mod manager and close BG3, run the installer with `--uninstall` (it lives inside the mod's folder, so before you delete it), then delete `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/`.
 
 ## What it puts on your PC
 
-Everything the mod makes lives in `Mods/WOW-BG3/` (its `data/` folder), with two exceptions the installer makes and
-`--uninstall` takes back out:
+Everything the mod makes stays in `Mods/WOW-BG3/`, apart from the Script Extender in `~/.local/share/bg3le/` and BG3's Steam launch option, which `--uninstall` takes back out. The WoW server runs on your own machine only, and nothing is sent anywhere. Full details (disk use, network, processes): [docs/install.md](docs/install.md).
 
-- `~/.local/share/bg3le/`: the Linux Script Extender (its library, launch wrapper, a few small cache files and its
-  logs; it keeps only its newest ten logs).
-- BG3's Steam launch option, so Steam starts BG3 with the Script Extender: for every Steam account that has logged
-  in on this PC. The installer asks before it stops Steam to change it and keeps a copy of Steam's file beside it
-  as `localconfig.vdf.bg3le-backup`; `--uninstall` leaves that copy where it is.
+## Building from source
 
-The Script Extender itself does two things in BG3 that are its own and not WOW-BG3's, as it does on Windows: it
-keeps Steam achievements on while mods are loaded, and at each start it removes the `ModCrashSanityCheck` folder
-BG3 leaves in its profile after a crash (BG3 would switch your mods off otherwise). `"EnableAchievements": false`
-in a `ScriptExtenderSettings.json` next to BG3's `bin/bg3` turns the first off.
-
-While BG3 runs, WoW's picture is passed through a folder in memory, `/dev/shm/wow-bg3-<your user id>/<install>` (about
-50 to 150 MB depending on your resolution; it is overwritten all the time, never grows, and is gone at the next reboot).
-`<install>` is a short code of the mod's folder, so two copies of the mod under one user (two Steam libraries, a game
-container beside the desktop) never share it. Only you can read it. If a folder of that name is already there and is
-not yours, the mod leaves it alone and uses one of its own in your runtime folder (`$XDG_RUNTIME_DIR/wow-bg3`) instead.
-
-- **Network.** The first start downloads the WoW server's world database once (above). Nothing else is downloaded
-  and nothing is sent anywhere. The local WoW server answers on your own machine only (127.0.0.1, ports 3744 and
-  8105); its database has no network port at all. Nothing else listens. The Script Extender has a Lua debugger for
-  mod authors (127.0.0.1:9998), which stock bg3le opens at every start; WOW-BG3's build keeps it closed unless you
-  ask for it (`BG3LE_DEBUG=1` in BG3's launch options, or `"EnableLuaDebugger": true` in
-  `ScriptExtenderSettings.json`), because it runs whatever Lua any program on your PC sends it.
-- **Processes.** The WoW server, its database and the WoW engine start with BG3 and stop with it, also when BG3
-  crashes. Closing BG3 waits for them to save and stop: a second or two, at most thirty. The Script Extender loads only into BG3; other games and programs are untouched.
-- **Disk.** Logs are kept to two of each (a log over 16 MB starts afresh at BG3's next start, the older one kept
-  as `.1`). The party's textures converted for WoW are kept up to 3 GB (the least recently used go first, and any
-  unused for a month). Crash reports keep the newest five. A first start that was stopped part-way is cleaned up at
-  the next one. The WoW side of a save BG3 has overwritten or deleted is kept a month (`data/#recycle_bin`), then
-  removed. The WoW engine's own crash files keep the newest ten. What is made from your WoW files for the ground
-  you walk has an end too: the squares round every flight point are made in the background, a fixed set of about
-  0.7 GB (`data/cache/cuts`); movement maps (`data/server/data/mmaps`, about 1.5 MB for each map tile you come
-  near, about 3.5 GB if you walked every tile of every map) and collision cells (`data/cache/vmap`, about 0.2 GB
-  after a few zones) grow as you explore.
-- **Your files.** Nothing is written into BG3's game folder or into your WoW files. The local server's generated
-  passwords are readable by your user only.
-
-## Work in progress
-
-What works is listed above; this is what does not, or has not been tried:
-
-- **Balance and pacing are a first guess.** The numbers that map WoW's mobs, health, damage, levels
-  and XP onto BG3's were set by hand to make things playable, not tuned. A BG3 level 1 character
-  out-damages a level 4 WoW human today, and the 1 to 60 pace is unknown.
-- **Most of the play so far was in Elwynn Forest.** Of the dungeons only the Deadmines has been entered and the
-  Stockade stood in; the other start zones and the Horde side have had little or no testing.
-- **A party spread far apart** is partly built. Switching to a party member far from the one you
-  controlled keeps BG3's fade until WoW's world there is loaded, and party members stay in the game
-  when your hero travels to the other continent. Still to come: a member on another continent than
-  the hero, and fights far from the hero.
-- **Zeppelins and boats** do not carry the party: a ship turns as it sails, and BG3's moving platforms never turn
-  (also not on a curved path). The guardian at the dock takes the party across. Crossed in testing, one way each:
-  the ships Menethil Harbor to Auberdine and to Theramore, Auberdine to Rut'theran Village and Ratchet to Booty Bay,
-  and the zeppelins between Durotar, Tirisfal Glades and Grom'gol. The ferry between Feathermoon Stronghold and the
-  Forgotten Coast is not offered (no place to stand is found at its far end).
-- **Changing characters.** Companions wait at camp and join through their own "join me" dialog, with
-  Withers there for respecs and for raising the fallen. Your WoW level sets how many can join, and a popup
-  says so at WoW levels 2 and 5 and when one can't. Needs camp (`camp = 1`); the commands `add` and
-  `remove` still work. Not fully tested yet.
-- **Item mapping.** Every WoW item becomes a BG3 item by rule: a weapon keeps its BG3 base's damage
-  die and gains +1 to +3 from its WoW damage per second, armour gets BG3-style AC from its WoW armour
-  type and item level, and WoW stats become ability and resistance bonuses. WoW slots BG3 has none for
-  (shoulders, legs, waist, trinkets and the rest) are carried as "Worn in WoW" items you can only equip
-  on the WoW side. Random suffixes, on-equip and on-use effects, durability, repair, buyback and bags
-  as BG3 containers are not mapped, and a WoW consumable uses BG3's own effect rather than WoW's spell.
-- **Health and ability mapping.** Your party is pure BG3: BG3 health, spells, saves and proficiency,
-  with WoW gear adding AC and ability bonuses. A WoW mob fights as the nearest BG3 creature, with that
-  creature's own BG3 health at the WoW mob's health fraction; only its damage is scaled to WoW's.
-- **The level cap**: BG3 stops at 12 without a level mod, which we strongly recommend (see
-  [Levelling](#levelling)).
-- **The camera.** It ignores all collision for now, so it can pass through anything. Indoors it keeps
-  to the selected character's height. Walls, roofs, tent cloth, trees and thick posts in its way open
-  in a see-through circle, and so does the ground; small things like fences and lamps do not. The rules are
-  new and rough, so expect odd views, mostly in caves.
-- **Indoors and big cities.** Cities have raised floors, but they are new: heading back across
-  Orgrimmar's upper deck can jump, and rooms behind tall entrance steps cannot be reached on foot. Stairs
-  have been walked in only a few towns.
-- **Cloth and models.** BG3's cloth simulation is not carried onto WoW's picture, so a robe or heavy
-  armour trails behind the character and can clip.
-- **Terrain.** Some ground is walkable in BG3 where WoW would stop you, like some steep hills and
-  slopes, so the party can get to places a WoW character cannot.
-- **Swimming and flying NPCs.** BG3 cannot swim, and there is no handling for either yet. Deep water is
-  a walkable surface, so a mob under the water or in the air probably fights on the surface or the
-  ground below it. This has not been tested.
-- **Spell effects.** Some spells' visual effects are missing or only partly drawn on WoW's picture: the
-  spell still works by BG3's rules, you just do not see all of it.
-- **Picture.** Enemy vision cones show on WoW's ground while you sneak, but their edges are ragged
-  where WoW's ground and BG3's idea of it disagree in height; ground surfaces can look matte, and WoW's
-  minimap and map icons are not drawn.
-- **Saves.** A save made during a fight cannot resume that fight yet: after the load the
-  fight is ended where everyone stands.
-
-Each of these in detail, with the smaller ones: [docs/known-issues.md](docs/known-issues.md).
-
-## Planned
-
-- **Equipment with more interesting effects** than stats: WoW's on-equip and on-use effects, and
-  hand-made ones where a rule falls short.
-- **Hand-made content where rules are not enough**, dungeon bosses first.
-- **Proper balance and pacing** for the whole 1 to 60 journey.
-- **Multiplayer**, then **The Burning Crusade** and **Wrath of the Lich King** once vanilla is mostly
-  complete.
-
-### WoW's signature spells (off by default)
-
-With `wow_spells = 1` in `settings.conf`, Wizards and Sorcerers learn the first batch of the Mage's spells from their
-class level, always prepared and under WoW's names: Frost Armor at 2, Frost Nova and Conjure Food at 3, Ice Barrier at 5.
-BG3's own effects draw them for now. BG3's Level Up screen doesn't list them: they arrive just after you accept it.
-
-- **Frost Armor:** +2 AC with no armour, until a long rest; a melee attacker that damages you loses 3 m of movement. It and Mage Armour replace each other.
-- **Frost Nova:** enemies within 4 m save on Dexterity: 1d8 cold and no moving for 2 turns, or half and free. Once a fight. Damage does not free them.
-- **Ice Barrier:** a bonus action, 15 temporary hit points. Once a fight. A higher slot adds nothing.
-- **Conjure Food:** out of combat, 2 food and 1 drink for your WoW level into your WoW bag, 15 supplies. Once a long rest.
-
-Turn it off and they are gone at the next load; a Frost Armor already on lasts to the next long rest.
-
-### Resting
-
-BG3's camp is the rest in WOW-BG3, with WoW's food and drink as its supplies (`camp = 1` in `settings.conf`;
-with `camp = 0` camp is closed and `/wowbg3 refill` stands in for a long rest).
-
-- **Go to Camp and End the Day work as in BG3.** End the Day only brings on the night; press Long Rest again,
-  or click your bedroll, to open the rest panel. The party goes to BG3's camp, a BG3 level of its own
-  (the mountain pass camp), through a loading screen; the WoW character waits where it stood, logged out. Leaving
-  camp puts the party back on the same spot, through a loading screen again while WoW comes back up. Long Rest
-  pressed out in the world goes to camp first.
-- **Long and short rests are BG3's own**, so spell slots, long-rest-only abilities and rest effects work
-  as BG3 has them. BG3's story nights do not play: no story runs here, so a night is just sleep.
-- **Food and drink are the supplies.** Anything your party carries counts, buying it at a WoW vendor or
-  pickpocketing it from a townsperson. A long rest costs BG3's 40 supplies, and the dearer the food, the more it is worth:
-
-  | Price of one | Example | Supply | Needed for a long rest | Vendor cost of a rest |
-  |---|---|---|---|---|
-  | 5 copper | Tough Hunk of Bread, Refreshing Spring Water | 5 | 8 | 40 copper |
-  | 25 copper | Freshly Baked Bread, Ice Cold Milk | 15 | 3 | 75 copper |
-  | 1 silver | Moist Cornbread, Melon Juice | 30 | 2 | 2 silver |
-  | 2 silver | Mulgore Spice Bread, Sweet Nectar | 40 | 1 | 2 silver |
-  | 4 silver | Soft Banana Bread, Moonberry Juice | 55 | 1 | 4 silver |
-  | 8 silver | Homemade Cherry Pie, Morning Glory Dew | 80 | 1 | 8 silver |
-
-  What is spent or eaten in BG3 is gone from the WoW character's bags too.
-- **Food is eaten at camp.** As in BG3, food has no use from the bag: a long rest is what heals. Food with a WoW buff is
-  also drunk from the bag for that buff, and it replaces an elixir, a mana potion's too. Alcohol is the
-  exception: Consume gives BG3's Alcohol condition (disadvantage on Dexterity and Charisma checks) and counts for only
-  5 supply. Thrown water and alcohol break where they land and leave their surface, and one is gone from WoW too.
-  Conjured food counts for 5 and sells for nothing.
-- **Pickpocketing takes Sneak** and gets a friendly NPC's pocket food for free, or its wares if it is a vendor.
-
-## Good to know
-
-- **Other mods.** WOW-BG3 runs beside other BG3 mods and Script Extender mods, but it has only been
-  tested alone. Mods that change levels, XP, rests or the party size are the likeliest to clash.
-- **Your saves.** Saves made without WOW-BG3 stay plain BG3 games and stay loadable; back them up
-  before you try a beta anyway.
-- **Uninstall.** In this order: switch WoW-BG3 Passthrough off in the mod manager (the WoW side then stops at
-  once) and close BG3; run the installer with `--uninstall`, which takes the Script Extender back out of BG3's
-  launch options and removes `~/.local/share/bg3le/` (the installer is inside `Mods/WOW-BG3/`, so run it before
-  you delete that folder); then remove `Mods/WOW-BG3.pak` and `Mods/WOW-BG3/` (everything the mod made is in its
-  `data/` folder). What stays: the copy of Steam's file, `localconfig.vdf.bg3le-backup`, which you can delete, and
-  the memory folder in `/dev/shm`, which goes at the next reboot.
-- **When something goes wrong.** The logs are in `Mods/WOW-BG3/data/logs/` (the WoW side) and
-  `~/.local/share/bg3le/logs/` (BG3's side). Please attach both to a bug report, with what you did
-  just before.
-
-## If it crashes
-
-If the WoW side crashes, WOW-BG3 starts it again and a popup names one file. To send a report yourself at any
-time, for a crash or anything that looks wrong, type `/wowbg3 report` in chat.
-
-1. Find the newest `WOW-BG3-report-<time>.zip` in `Mods/WOW-BG3/data/reports/`.
-2. Open an [issue](https://github.com/sebastianlofi/wow-bg3-passthrough/issues), say what you were doing, and
-   attach that one file.
-
-It holds the mod's logs, crash reports, your GPU's crash data and what your machine is. Your home folder, your user
-name and your PC's name are masked, and lines naming a password or token are blanked. Your saves and game files are not in it. The
-logs do show your character's name and where it went, and the GPU data is raw, so open the zip first if you prefer.
-
-## Credits
-
-WOW-BG3 stands on [vmangos](https://github.com/vmangos/core) (the WoW server),
-[benilla](https://github.com/samwhosung/benilla) (the WoW client) and
-[bg3le](https://github.com/lenonk/bg3le) (the Linux Script Extender), each patched for this project
-(`patches/`).
-
-## Build from source
-
-Every part of the release zip is built from this repository plus pinned upstream sources:
-`release/build-all.sh` (version 0.1.0 unless given). What it needs and what each step does:
-[docs/build.md](docs/build.md).
-
-## How it works
-
-BG3 is the game you see and control. A hidden WoW client (benilla, a WoW 1.12.1 client written in
-Rust) runs offscreen and logs in to a local vmangos server; its picture of the world is drawn behind
-BG3's characters, and BG3 walks on WoW's ground. When a fight starts, the server holds the mobs and
-BG3 fights them as stand-ins; the result goes back to the server as real WoW damage, XP, loot and
-quest credit. Details: [docs/architecture.md](docs/architecture.md).
+Every part of the release zip is built from this repository plus pinned upstream sources: `release/build-all.sh` (version 0.1.0 unless given). What it needs and what each step does: [docs/build.md](docs/build.md).
 
 | Folder | What it is |
-|---|---|
+| --- | --- |
 | `mod/` | The BG3 mod (Script Extender Lua, `meta.lsx`), packed into `WOW-BG3.pak` |
 | `plugins/` | bg3le native plugins: the launcher, the main plugin (`wowbg3.so`), the render plugin, the quest cursor plugin; `plugins/capture/` is the render code they share |
 | `bridge/` | The fight bridge (Rust crate `wow-bg3-link`) between BG3's fights and the WoW server |
@@ -504,14 +216,12 @@ quest credit. Details: [docs/architecture.md](docs/architecture.md).
 | `docs/` | Install, build, architecture, known issues |
 | `LICENSES/`, `THIRD-PARTY-NOTICES.md` | Licences of the bundled third-party parts |
 
+## Looking to contribute?
+
+Hand-made mob abilities are the easiest place to start: which BG3 spells a WoW mob gets comes from a JSON rules file you can extend with your own boss fights or mob packs, no code needed. How it works, with an example: [docs/mob-abilities.md](docs/mob-abilities.md). Bug reports, balance notes and pull requests are welcome too.
+
 ## Licence
 
-WOW-BG3's own code is under the MIT licence ([LICENSE](LICENSE)). The patches in `patches/` are
-under the licence of the project they patch (see the README in each folder), and the programs the
-release bundles keep their own licences ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)). bg3le's
-Script Extender part carries the Commons Clause: WOW-BG3 releases may not be sold.
+MIT ([LICENSE](LICENSE)). The upstream parts the release bundles or patches (vmangos, benilla, bg3le, MariaDB, Python) keep their own licences ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)); bg3le's Commons Clause means WOW-BG3 releases may not be sold.
 
-WOW-BG3 is not affiliated with or endorsed by Blizzard Entertainment or Larian Studios. World of
-Warcraft is a trademark of Blizzard Entertainment, Inc.; Baldur's Gate is a trademark of its owner
-(Wizards of the Coast, whose game Larian Studios develops). This project contains no Blizzard or
-Larian files.
+WOW-BG3 is not affiliated with or endorsed by Blizzard Entertainment or Larian Studios. World of Warcraft is a trademark of Blizzard Entertainment, Inc.; Baldur's Gate is a trademark of its owner (Wizards of the Coast, whose game Larian Studios develops). This project contains no Blizzard or Larian files.

@@ -79,10 +79,11 @@ This is the first public version. What we know is missing or rough:
   turned on mid-ride: both are BG3's own rules for its platforms (the same in stock).
 
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
-  `/wowbg3 refill` stands in for a long rest). The camp is a BG3 level of its own, the mountain pass
-  camp (Wyrm's Lookout) whatever the zone: going there and coming back are loading screens (about 6 s there, about
-  20 s back while the WoW side comes up again), and the WoW side is down while you are at camp. Food has no use from the bag (as in
-  BG3): it is eaten at camp, by a long rest.
+  `/wowbg3 refill` stands in for a long rest). The camp is a corner of WOW-BG3's own level, whatever the zone:
+  Go to Camp, Long Rest and leaving camp are a jump within the level, not a loading screen, and the WoW side stays
+  up while you are at camp. Companions wait at their own spots (Minsc at the entry, as in BG3). In a game started
+  before 0.1.2358 the camp is still BG3's mountain pass level, with loading screens both ways. Food has no use from
+  the bag (as in BG3): it is eaten at camp, by a long rest.
 - The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
   in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.
 - A save made during a fight cannot resume that fight: after the load, BG3's fight from the save is
@@ -142,10 +143,9 @@ This is the first public version. What we know is missing or rough:
   held, relic, ammo) are carried as plain items whose text says "Worn in WoW"; they can only be
   equipped on the WoW side.
 - Every item looks like its BG3 base item, not like the WoW item.
-- Not mapped yet: random suffixes ("of the Bear"), on-equip effects (attack power, crit), item
-  durability and repair, vendor buyback, and bags as BG3 containers. A mapping for suffixes and part of
-  the on-equip and on-use effects exists behind a switch, on by default:
-  [item-effects.md](item-effects.md).
+- Random suffixes ("of the Bear") and on-equip and on-use effects (attack power, crit, a consumable's spell) are
+  mapped in part, by rule; [item-effects.md](item-effects.md) says which have been seen working in a game. Not
+  mapped yet: item durability and repair, vendor buyback, and bags as BG3 containers.
 - A WoW consumable uses BG3's own effect, not WoW's spell. One elixir at a time, as in BG3: eating a Well
   Fed food can replace a mana potion's elixir and take its spell slot. Dropping or destroying an item from
   BG3 has nowhere to go in WoW 1.12, which has no ground drop.

@@ -9,7 +9,8 @@ Output in OUT/WOW-BG3-VERSION/ and OUT/WOW-BG3-VERSION.zip:
                   benilla, AddOns/WowBg3Layout), tools/ (the coordinator wowbg3-coord.py and the tools it
                   runs: link/tools/*.py, server/tools/world-console.py, bin/wow-bg3-link),
                   WoW/ (empty: the player's own WoW 1.12.1 files), NOTICES/ (licence texts)
-  README.md       for players (release/README-player.md)
+  README.md       the repository's README.md (one file for GitHub and the zip, the maintainer 2026-11-14), with the
+                  docs/ pages and LICENSE it links to, so its links work offline
   THIRD-PARTY-NOTICES.md, MANIFEST.txt (sha256 of every file)
 
   build-release.py [--version 0.1.0] --out DIR [--launcher SO] [--plugin SO] [--render SO ...]
@@ -42,7 +43,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-RELEASE_VERSION = "0.1.0"  # the public release; README.md, docs/ and README-player.md name it
+RELEASE_VERSION = "0.1.0"  # the public release; README.md and docs/ name it
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import lspk  # noqa: E402
@@ -415,10 +416,17 @@ def main():
     else:
         missing.append("LICENSES (release/licences/collect.py texts)")
 
-    # The player README names the release version; a test build's zip says its own.
-    (dist / "README.md").write_text((HERE / "README-player.md").read_text(encoding="utf-8")
-                                    .replace(f"WOW-BG3-{RELEASE_VERSION}", f"WOW-BG3-{a.version}")
-                                    .replace(f"WOW-BG3 {RELEASE_VERSION}", f"WOW-BG3 {a.version}"), encoding="utf-8")
+    # The README is the repository's own, and it names the release version; a test build's zip says its own. Its
+    # links go to docs/ and LICENSE: they come along, so they work offline (the developer pages too: Building from
+    # source and Looking to contribute? link them).
+    def versioned(text):
+        return (text.replace(f"WOW-BG3-{RELEASE_VERSION}", f"WOW-BG3-{a.version}")
+                .replace(f"WOW-BG3 {RELEASE_VERSION}", f"WOW-BG3 {a.version}"))
+    (dist / "README.md").write_text(versioned((ROOT / "README.md").read_text(encoding="utf-8")), encoding="utf-8")
+    shutil.copytree(ROOT / "docs", dist / "docs", ignore=shutil.ignore_patterns("__pycache__"))
+    for page in (dist / "docs").glob("*.md"):
+        page.write_text(versioned(page.read_text(encoding="utf-8")), encoding="utf-8")
+    shutil.copy2(ROOT / "LICENSE", dist / "LICENSE")
     shutil.copy2(ROOT / "THIRD-PARTY-NOTICES.md", dist / "THIRD-PARTY-NOTICES.md")
 
     import tarfile

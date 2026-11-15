@@ -3,7 +3,7 @@
 
 Race decides start zone and side, class follows the BG3 class where vanilla allows the pair.
 Mapping (the plug-and-play-plan notes, "More decisions"):
-  Human, Half-Elf, Halfling -> Human     Elf -> Night Elf     Dwarf -> Dwarf     Gnome -> Gnome
+  Human, Half-Elf -> Human     Elf -> Night Elf     Dwarf -> Dwarf     Gnome, Halfling -> Gnome (the maintainer, 2026-11-14)
   Half-Orc -> Orc      Githyanki -> Troll      Tiefling, Drow -> Undead      Dragonborn -> Tauren
   Barbarian, Fighter, Monk -> Warrior; Ranger -> Hunter; Rogue, Bard -> Rogue; Cleric -> Priest;
   Wizard, Sorcerer -> Mage; Warlock -> Warlock; Druid -> Druid; Paladin -> Paladin;
@@ -41,7 +41,7 @@ START = {"Human": "Northshire", "Dwarf": "Coldridge Valley", "Gnome": "Coldridge
          "Undead": "Deathknell", "Tauren": "Camp Narache (Mulgore)"}
 
 # BG3 race (parent race name, letters only, lower case) -> WoW race
-BG3_RACE = {"human": "Human", "halfelf": "Human", "halfling": "Human", "elf": "NightElf",
+BG3_RACE = {"human": "Human", "halfelf": "Human", "halfling": "Gnome", "elf": "NightElf",
             "drow": "Undead", "dwarf": "Dwarf", "gnome": "Gnome", "halforc": "Orc",
             "githyanki": "Troll", "tiefling": "Undead", "dragonborn": "Tauren"}
 # template prefixes BG3 uses for player bodies (fallback when the race component can't be read)
