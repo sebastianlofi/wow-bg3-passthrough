@@ -81,8 +81,7 @@ This is the first public version. What we know is missing or rough:
 - Camp and real long rests are on (`camp = 0` in `settings.conf` turns them off: Go to Camp is greyed out and
   `/wowbg3 refill` stands in for a long rest). The camp is a corner of WOW-BG3's own level, whatever the zone:
   Go to Camp, Long Rest and leaving camp are a jump within the level, not a loading screen, and the WoW side stays
-  up while you are at camp. Companions wait at their own spots (Minsc at the entry, as in BG3). In a game started
-  before 0.1.2358 the camp is still BG3's mountain pass level, with loading screens both ways. Food has no use from
+  up while you are at camp. Companions wait at their own spots (Minsc at the entry, as in BG3). Food has no use from
   the bag (as in BG3): it is eaten at camp, by a long rest.
 - The camera ignores all collision for now. Walls, roofs, tent cloth, trees, thick posts and the ground open
   in a see-through circle; fences, lamps and other small things do not. Expect odd views, mostly in caves.
